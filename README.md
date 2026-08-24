@@ -1,1 +1,3 @@
 # diffusion-ot
+
+initial test
