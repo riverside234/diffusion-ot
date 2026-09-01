@@ -1,0 +1,23 @@
+name: bilisakura_sit_b2_256
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+repo_id: BiliSakura/SiT-diffusers
+subfolder: SiT-B-2-256
+revision: main
+trust_remote_code: true
+local_dir: artifacts/pretrained/SiT-B-2-256
+download_if_missing: false
+allow_patterns:
+  - SiT-B-2-256/**
+expected_files:
+  - pipeline.py
+  - model_index.json
+  - transformer/config.json
+  - transformer/transformer_sit.py
+  - transformer/diffusion_pytorch_model.safetensors
+  - scheduler/scheduler_config.json
+  - vae/config.json
+  - vae/diffusion_pytorch_model.safetensors
+metadata_file: artifacts/pretrained/SiT-B-2-256/snapshot_report.json
+notes:
+  - Keep this checkpoint snapshot out of git.
+  - Replace revision with an exact commit SHA before reporting paper experiments.

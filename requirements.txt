@@ -1,0 +1,31 @@
+# Core training stack
+# For the lab GPU, install the PyTorch build that matches the machine's CUDA
+# version if the default pip wheel is not appropriate.
+torch>=2.4
+torchvision>=0.19
+accelerate>=1.0
+
+# Hugging Face / Diffusers
+diffusers>=0.35.0
+transformers>=4.45.0
+huggingface-hub>=0.24.0
+datasets>=2.20.0
+safetensors>=0.4.5
+
+# Data, image, and config utilities
+numpy>=1.26
+pillow>=10.0
+PyYAML>=6.0
+tqdm>=4.66
+einops>=0.8
+
+# Alignment / evaluation utilities planned for InfoOT experiments
+scipy>=1.13
+scikit-learn>=1.5
+POT>=0.9.4
+pandas>=2.2
+matplotlib>=3.8
+
+# Development checks
+pytest>=8.0
+ruff>=0.6

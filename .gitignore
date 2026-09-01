@@ -226,6 +226,8 @@ __marimo__/
 /artifacts/infoot/
 /artifacts/reports/
 /outputs/
+/data/hf_cache/
+/data/downloads/
 /data/raw/
 /data/processed/
 /data/latents/

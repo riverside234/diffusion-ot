@@ -1,0 +1,29 @@
+name: afhq_huggan_cat_dog
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+dataset_id: huggan/AFHQ
+split: train
+cache_dir: data/hf_cache/afhq_huggan
+download_dir: data/downloads/afhq_huggan
+image_column: image
+label_column: label
+domains:
+  - cat
+  - dog
+  - wild
+active_domains:
+  - cat
+  - dog
+heldout_domains:
+  - wild
+seed: 20260901
+val_fraction: 0.1
+max_samples_per_domain:
+image_size: 256
+center_crop: true
+manifest_dir: data/manifests
+latent_dir: data/latents/afhq_sit_b2_256
+latent_manifest_name: latent_manifest.jsonl
+write_processed_images: false
+notes:
+  - First experiment uses only cat and dog.
+  - Wild remains held out for later robustness experiments.

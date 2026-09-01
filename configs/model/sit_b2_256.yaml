@@ -1,0 +1,29 @@
+name: sit_b2_256
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+family: sit
+pretrained: configs/pretrained/bilisakura_sit_b2_256.yaml
+resolution: 256
+latent_channels: 4
+latent_size: 32
+patch_size: 2
+hidden_size: 768
+depth: 12
+num_heads: 12
+num_classes: 1000
+learn_sigma: true
+class_conditioning:
+  enabled: true
+  sanity_label: 207
+  sanity_label_name: golden retriever
+latent_cache:
+  batch_size: 16
+  dtype: float16
+  use_posterior_mean: true
+  vae_scaling_factor: auto
+expected_transformer_config:
+  depth: 12
+  hidden_size: 768
+  in_channels: 4
+  input_size: 32
+  num_heads: 12
+  patch_size: 2
