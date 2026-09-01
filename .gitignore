@@ -219,3 +219,19 @@ __marimo__/
 
 /notes/
 
+# Project-local generated data and model artifacts
+/artifacts/pretrained/SiT-B-2-256/
+/artifacts/pretrained/*
+/artifacts/latent_banks/
+/artifacts/infoot/
+/artifacts/reports/
+/outputs/
+/data/raw/
+/data/processed/
+/data/latents/
+/data/manifests/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
