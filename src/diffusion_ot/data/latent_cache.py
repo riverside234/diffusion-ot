@@ -12,7 +12,7 @@ from diffusion_ot.integrations.hf_snapshot import (
     resolve_project_local_path,
     resolve_project_path,
 )
-from diffusion_ot.integrations.sit_diffusers import load_sit_components
+from diffusion_ot.integrations.sit_diffusers import load_sit_vae
 
 
 def _center_crop_square(image: Any) -> Any:
@@ -76,8 +76,7 @@ def cache_vae_latents(
     dtype_name = model_config.get("latent_cache", {}).get("dtype", "float16")
     use_half_load = device is not None and str(device).startswith("cuda")
     torch_dtype = dtype_name if use_half_load else None
-    components = None if dry_run else load_sit_components(pretrained_config, root, device=device, torch_dtype=torch_dtype)
-    vae = None if components is None else components.vae
+    vae = None if dry_run else load_sit_vae(pretrained_config, root, device=device, torch_dtype=torch_dtype)
     if vae is not None:
         vae.eval()
 

@@ -34,6 +34,22 @@ def _torch_dtype(dtype_name: str | None):
     return mapping[dtype_name]
 
 
+def _from_pretrained_kwargs(dtype_name: str | None) -> dict[str, Any]:
+    dtype = _torch_dtype(dtype_name)
+    return {"dtype": dtype} if dtype is not None else {}
+
+
+def _load_with_dtype_fallback(loader: Any, path: str | Path, **kwargs: Any):
+    try:
+        return loader(path, **kwargs)
+    except TypeError:
+        if "dtype" not in kwargs:
+            raise
+        legacy_kwargs = dict(kwargs)
+        legacy_kwargs["torch_dtype"] = legacy_kwargs.pop("dtype")
+        return loader(path, **legacy_kwargs)
+
+
 def load_sit_pipeline(
     pretrained_config_path: str | Path,
     project_root: str | Path | None = None,
@@ -55,15 +71,51 @@ def load_sit_pipeline(
             f"SiT snapshot is incomplete at {report.local_dir}.\nMissing files:\n{missing}"
         )
 
-    pipe = DiffusionPipeline.from_pretrained(
+    kwargs = {
+        "trust_remote_code": bool(config.get("trust_remote_code", True)),
+        **_from_pretrained_kwargs(torch_dtype),
+    }
+    pipe = _load_with_dtype_fallback(
+        DiffusionPipeline.from_pretrained,
         report.local_dir,
-        trust_remote_code=bool(config.get("trust_remote_code", True)),
-        torch_dtype=_torch_dtype(torch_dtype),
+        **kwargs,
     )
     pipe._diffusion_ot_local_dir = Path(report.local_dir)
     if device:
         pipe = pipe.to(device)
     return pipe
+
+
+def load_sit_vae(
+    pretrained_config_path: str | Path,
+    project_root: str | Path | None = None,
+    device: str | None = None,
+    torch_dtype: str | None = None,
+):
+    from diffusers import AutoencoderKL
+
+    config = load_yaml_config(pretrained_config_path)
+    report = verify_sit_snapshot(
+        pretrained_config_path,
+        project_root=project_root,
+        allow_download=config.get("download_if_missing", False),
+        write_report=True,
+    )
+    if not report.ok:
+        missing = "\n".join(f"  - {item}" for item in report.missing_files)
+        raise FileNotFoundError(
+            f"SiT snapshot is incomplete at {report.local_dir}.\nMissing files:\n{missing}"
+        )
+
+    vae_path = Path(report.local_dir) / "vae"
+    vae = _load_with_dtype_fallback(
+        AutoencoderKL.from_pretrained,
+        vae_path,
+        **_from_pretrained_kwargs(torch_dtype),
+    )
+    if device:
+        vae = vae.to(device)
+    return vae
 
 
 def load_sit_components(
