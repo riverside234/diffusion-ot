@@ -5,7 +5,7 @@ split: train
 data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
 output_dir: outputs/stage1a_cat_sit_b2
-device: cuda
+device: cuda:0
 torch_dtype: float32
 
 dataloader:
