@@ -15,10 +15,11 @@ expected_files:
   - transformer/transformer_sit.py
   - transformer/diffusion_pytorch_model.safetensors
   - scheduler/scheduler_config.json
-  - scheduler/scheduling_flow_match_sit.py
   - vae/config.json
   - vae/diffusion_pytorch_model.safetensors
 metadata_file: artifacts/pretrained/SiT-B-2-256/snapshot_report.json
 notes:
   - Keep this checkpoint snapshot out of git.
+  - Current HF main uses scheduler/scheduler_config.json with Diffusers FlowMatchEulerDiscreteScheduler.
+  - Older converted commits listed scheduler/scheduling_flow_match_sit.py; do not require it unless using that pinned old commit.
   - Replace revision with an exact commit SHA before reporting paper experiments.

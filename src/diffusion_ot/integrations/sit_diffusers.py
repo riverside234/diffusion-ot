@@ -75,11 +75,25 @@ def load_sit_pipeline(
         "trust_remote_code": bool(config.get("trust_remote_code", True)),
         **_from_pretrained_kwargs(torch_dtype),
     }
-    pipe = _load_with_dtype_fallback(
-        DiffusionPipeline.from_pretrained,
-        report.local_dir,
-        **kwargs,
-    )
+    try:
+        pipe = _load_with_dtype_fallback(
+            DiffusionPipeline.from_pretrained,
+            report.local_dir,
+            **kwargs,
+        )
+    except Exception as exc:
+        message = str(exc)
+        if "scheduling_flow_match_sit" in message or "SiTFlowMatchScheduler" in message:
+            raise RuntimeError(
+                "The local SiT snapshot appears to mix scheduler metadata from an older "
+                "BiliSakura/SiT-diffusers conversion with files from the current snapshot. "
+                "Current HF main uses Diffusers FlowMatchEulerDiscreteScheduler via "
+                "scheduler/scheduler_config.json and does not require "
+                "scheduler/scheduling_flow_match_sit.py. Re-sync the local "
+                "artifacts/pretrained/SiT-B-2-256 snapshot, or pin/download a commit whose "
+                "model_index.json and scheduler files match."
+            ) from exc
+        raise
     pipe._diffusion_ot_local_dir = Path(report.local_dir)
     if device:
         pipe = pipe.to(device)
