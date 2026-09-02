@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+import time
 from typing import Any
 
 from diffusion_ot.integrations.hf_snapshot import (
@@ -27,6 +28,8 @@ class PDAETrainReport:
     effective_batch_size: int
     checkpoint_path: str | None
     resumed_from: str | None
+    train_log_path: str | None
+    validation_log_path: str | None
     dry_run: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -220,6 +223,21 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _jsonl_contains_step(path: Path, step: int) -> bool:
+    if not path.is_file():
+        return False
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                if int(json.loads(line).get("step", -1)) == int(step):
+                    return True
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+    return False
 
 
 def _gradient_norm(parameters) -> float:
@@ -661,6 +679,8 @@ def train_pdae_domain(
             effective_batch_size=effective_batch_size,
             checkpoint_path=None,
             resumed_from=str(resolved_resume_path) if resolved_resume_path is not None else None,
+            train_log_path=None,
+            validation_log_path=None,
             dry_run=True,
         )
         _write_json(output_dir / "dry_run_report.json", report.to_dict())
@@ -725,6 +745,7 @@ def train_pdae_domain(
     loss_ema: float | None = None
     clip_events = 0
     clip_checks = 0
+    training_seconds = 0.0
     if resolved_resume_path is not None:
         if not resolved_resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resolved_resume_path}")
@@ -742,6 +763,7 @@ def train_pdae_domain(
         loss_ema = saved_train_state.get("loss_ema")
         clip_events = int(saved_train_state.get("clip_events", 0))
         clip_checks = int(saved_train_state.get("clip_checks", 0))
+        training_seconds = float(saved_train_state.get("training_seconds", 0.0))
         if checkpoint.get("rng_state") is not None:
             torch.set_rng_state(checkpoint["rng_state"].cpu())
         if checkpoint.get("dataloader_generator_state") is not None:
@@ -799,9 +821,13 @@ def train_pdae_domain(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "resolved_config.json", config)
-    metrics_path = output_dir / "metrics.jsonl"
+    logs_dir = output_dir / "logs"
+    train_metrics_path = logs_dir / "train.jsonl"
+    validation_metrics_path = logs_dir / "validation.jsonl"
     if resolved_resume_path is None:
-        metrics_path.write_text("", encoding="utf-8")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        train_metrics_path.write_text("", encoding="utf-8")
+        validation_metrics_path.write_text("", encoding="utf-8")
         _save_checkpoint(
             checkpoint_path,
             step=0,
@@ -814,6 +840,7 @@ def train_pdae_domain(
                 "loss_ema": loss_ema,
                 "clip_events": clip_events,
                 "clip_checks": clip_checks,
+                "training_seconds": training_seconds,
             },
             loader_generator=loader_generator,
         )
@@ -821,6 +848,8 @@ def train_pdae_domain(
     def run_validation(step: int) -> None:
         if validation_loader is None:
             return
+        print(json.dumps({"event": "validation_start", "step": step}, sort_keys=True))
+        validation_started = time.perf_counter()
         metrics = _evaluate_z_dependence(
             branch,
             transformer,
@@ -837,7 +866,8 @@ def train_pdae_domain(
             ema=ema,
             use_ema=bool(evaluation_config.get("use_ema", True)),
         )
-        _append_jsonl(metrics_path, metrics)
+        metrics["duration_seconds"] = time.perf_counter() - validation_started
+        _append_jsonl(validation_metrics_path, metrics)
         print(
             json.dumps(
                 {
@@ -848,12 +878,17 @@ def train_pdae_domain(
                     "z_gain": metrics["z_gain"],
                     "zero_z_gain": metrics["zero_z_gain"],
                     "z_effective_rank": metrics["z_statistics"]["effective_rank"],
+                    "duration_seconds": metrics["duration_seconds"],
                 },
                 sort_keys=True,
             )
         )
 
-    if evaluation_enabled and bool(evaluation_config.get("evaluate_at_start", True)):
+    if (
+        evaluation_enabled
+        and bool(evaluation_config.get("evaluate_at_start", True))
+        and not _jsonl_contains_step(validation_metrics_path, initial_step)
+    ):
         run_validation(initial_step)
 
     trainable_parameters = [
@@ -870,10 +905,16 @@ def train_pdae_domain(
         if parameter.requires_grad and not name.startswith("encoder.")
     ]
 
+    clip_events_tensor = torch.tensor(float(clip_events), device=device)
+    interval_training_seconds = 0.0
+    last_logged_step = initial_step
+
     for step in range(initial_step + 1, final_step + 1):
+        step_started = time.perf_counter()
+        should_log = step == initial_step + 1 or step % log_every == 0
         optimizer.zero_grad(set_to_none=True)
-        loss_sum = 0.0
-        weight_mean_sum = 0.0
+        loss_sum = None
+        weight_mean_sum = None
         diagnostic_sums: dict[str, float] = {}
 
         for _ in range(accumulation_steps):
@@ -918,49 +959,69 @@ def train_pdae_domain(
                 base_v.float(),
                 weight=weight.to(device=pred_delta_v.device, dtype=torch.float32),
             )
-            if not bool(torch.isfinite(loss)):
-                raise FloatingPointError(f"Non-finite Stage 1A loss at step {step}.")
             (loss / accumulation_steps).backward()
 
-            loss_sum += float(loss.detach().cpu())
-            weight_mean_sum += float(weight.detach().mean().cpu())
-            diagnostics = _residual_diagnostics(
-                pred_delta_v,
-                target.target_v,
-                base_v,
+            detached_loss = loss.detach().float()
+            detached_weight_mean = weight.detach().float().mean()
+            loss_sum = detached_loss if loss_sum is None else loss_sum + detached_loss
+            weight_mean_sum = (
+                detached_weight_mean
+                if weight_mean_sum is None
+                else weight_mean_sum + detached_weight_mean
             )
-            for name, value in diagnostics.items():
-                diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value
+            if should_log:
+                diagnostics = _residual_diagnostics(
+                    pred_delta_v,
+                    target.target_v,
+                    base_v,
+                )
+                for name, value in diagnostics.items():
+                    diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value
 
-        should_log = step == initial_step + 1 or step % log_every == 0
         encoder_grad_norm = _gradient_norm(encoder_parameters) if should_log else None
         adapter_grad_norm = _gradient_norm(adapter_parameters) if should_log else None
         if grad_clip_norm is not None:
             total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
                 trainable_parameters,
                 float(grad_clip_norm),
+                error_if_nonfinite=True,
             )
-            total_grad_norm = float(total_grad_norm_tensor.detach().cpu())
             clip_checks += 1
-            if math.isfinite(total_grad_norm) and total_grad_norm > float(grad_clip_norm):
-                clip_events += 1
+            clip_events_tensor.add_(
+                (total_grad_norm_tensor.detach() > float(grad_clip_norm)).to(
+                    dtype=clip_events_tensor.dtype
+                )
+            )
         else:
-            total_grad_norm = _gradient_norm(trainable_parameters)
-        if not math.isfinite(total_grad_norm):
-            raise FloatingPointError(f"Non-finite gradient norm at step {step}.")
+            total_grad_norm_tensor = None
         optimizer.step()
         if ema is not None and step % ema_update_every == 0:
             ema.update(branch)
 
-        loss_value = loss_sum / accumulation_steps
-        loss_ema = loss_value if loss_ema is None else 0.98 * loss_ema + 0.02 * loss_value
+        step_training_seconds = time.perf_counter() - step_started
+        training_seconds += step_training_seconds
+        interval_training_seconds += step_training_seconds
         if should_log:
+            if loss_sum is None or weight_mean_sum is None:
+                raise RuntimeError("No microbatches were processed for this optimizer update.")
+            loss_value = float((loss_sum / accumulation_steps).cpu())
+            if not math.isfinite(loss_value):
+                raise FloatingPointError(f"Non-finite Stage 1A loss at step {step}.")
+            weight_mean_value = float((weight_mean_sum / accumulation_steps).cpu())
+            total_grad_norm = (
+                float(total_grad_norm_tensor.detach().cpu())
+                if total_grad_norm_tensor is not None
+                else _gradient_norm(trainable_parameters)
+            )
+            clip_events = int(clip_events_tensor.detach().cpu())
+            loss_ema = loss_value if loss_ema is None else 0.98 * loss_ema + 0.02 * loss_value
+            logged_steps = step - last_logged_step
             metrics: dict[str, Any] = {
                 "event": "train",
                 "step": step,
                 "loss": loss_value,
                 "loss_ema": loss_ema,
-                "weight_mean": weight_mean_sum / accumulation_steps,
+                "weight_mean": weight_mean_value,
                 "effective_batch_size": effective_batch_size,
                 "gradient_accumulation_steps": accumulation_steps,
                 "total_grad_norm_pre_clip": total_grad_norm,
@@ -968,6 +1029,12 @@ def train_pdae_domain(
                 "adapter_grad_norm_pre_clip": adapter_grad_norm,
                 "gradient_clip_fraction": clip_events / max(clip_checks, 1),
                 "ema_decay": ema.effective_decay if ema is not None else None,
+                "training_seconds_total": training_seconds,
+                "optimizer_steps_per_second": logged_steps / max(interval_training_seconds, 1.0e-12),
+                "samples_per_second": (
+                    logged_steps * effective_batch_size
+                    / max(interval_training_seconds, 1.0e-12)
+                ),
             }
             metrics.update(
                 {
@@ -976,9 +1043,12 @@ def train_pdae_domain(
                 }
             )
             print(json.dumps(metrics, sort_keys=True))
-            _append_jsonl(metrics_path, metrics)
+            _append_jsonl(train_metrics_path, metrics)
+            interval_training_seconds = 0.0
+            last_logged_step = step
 
         if step % save_every == 0 or step == final_step:
+            clip_events = int(clip_events_tensor.detach().cpu())
             _save_checkpoint(
                 checkpoint_path,
                 step=step,
@@ -991,6 +1061,7 @@ def train_pdae_domain(
                     "loss_ema": loss_ema,
                     "clip_events": clip_events,
                     "clip_checks": clip_checks,
+                    "training_seconds": training_seconds,
                 },
                 loader_generator=loader_generator,
             )
@@ -1009,5 +1080,7 @@ def train_pdae_domain(
         effective_batch_size=effective_batch_size,
         checkpoint_path=str(checkpoint_path) if checkpoint_path.is_file() else None,
         resumed_from=str(resolved_resume_path) if resolved_resume_path is not None else None,
+        train_log_path=str(train_metrics_path),
+        validation_log_path=str(validation_metrics_path),
         dry_run=False,
     )
