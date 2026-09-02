@@ -26,6 +26,7 @@ scikit-learn>=1.5
 POT>=0.9.4
 pandas>=2.2
 matplotlib>=3.8
+torchmetrics[image]>=1.9,<2.0
 
 # Development checks
 pytest>=8.0
