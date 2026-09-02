@@ -27,10 +27,14 @@ def _config_value(config: Any, key: str, default: Any = None) -> Any:
 
 
 def _module_config_value(module: Any, key: str, default: Any = None) -> Any:
-    value = getattr(module, key, None)
+    config = getattr(module, "config", None)
+    value = _config_value(config, key, None)
     if value is not None:
         return value
-    return _config_value(getattr(module, "config", None), key, default)
+
+    # Diffusers emits deprecation warnings when config fields are read as direct
+    # model attributes, so only inspect real instance attributes as a fallback.
+    return getattr(module, "__dict__", {}).get(key, default)
 
 
 def _valid_group_count(channels: int, preferred_groups: int) -> int:

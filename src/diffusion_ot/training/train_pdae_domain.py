@@ -221,6 +221,7 @@ def train_pdae_domain(
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "resolved_config.json", config)
 
+    loss_ema: float | None = None
     for step in range(1, final_step + 1):
         batch = next(batch_iter)
         x0 = batch["x0_latent"].to(device=device, dtype=model_dtype, non_blocking=True)
@@ -263,16 +264,38 @@ def train_pdae_domain(
                 float(grad_clip_norm),
             )
         optimizer.step()
+        loss_value = float(loss.detach().cpu())
+        loss_ema = loss_value if loss_ema is None else 0.98 * loss_ema + 0.02 * loss_value
 
         if step == 1 or step % log_every == 0:
-            target_delta = velocity_gap_target(target.target_v.float(), base_v.float(), detach=True)
-            residual_rms = target_delta.square().mean().sqrt().item()
+            with torch.no_grad():
+                target_delta = velocity_gap_target(target.target_v.float(), base_v.float(), detach=True)
+                pred_delta = pred_delta_v.detach().float()
+                error = pred_delta - target_delta
+                target_delta_rms = target_delta.square().mean().sqrt()
+                pred_delta_rms = pred_delta.square().mean().sqrt()
+                error_rms = error.square().mean().sqrt()
+                base_rms = base_v.detach().float().square().mean().sqrt()
+                relative_error = error_rms / target_delta_rms.clamp_min(1.0e-8)
+                delta_to_base = pred_delta_rms / base_rms.clamp_min(1.0e-8)
+                cosine = torch.nn.functional.cosine_similarity(
+                    pred_delta.flatten(start_dim=1),
+                    target_delta.flatten(start_dim=1),
+                    dim=1,
+                ).mean()
             print(
                 json.dumps(
                     {
                         "step": step,
-                        "loss": float(loss.detach().cpu()),
-                        "target_delta_rms": residual_rms,
+                        "base_rms": float(base_rms.cpu()),
+                        "delta_target_cosine": float(cosine.cpu()),
+                        "delta_to_base_rms": float(delta_to_base.cpu()),
+                        "error_rms": float(error_rms.cpu()),
+                        "loss": loss_value,
+                        "loss_ema": loss_ema,
+                        "pred_delta_rms": float(pred_delta_rms.cpu()),
+                        "relative_error": float(relative_error.cpu()),
+                        "target_delta_rms": float(target_delta_rms.cpu()),
                         "weight_mean": float(weight.detach().mean().cpu()),
                     },
                     sort_keys=True,
