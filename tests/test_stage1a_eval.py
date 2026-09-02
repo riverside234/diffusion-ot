@@ -43,8 +43,8 @@ def test_ema_checkpoint_loading_updates_only_trainable_parameters(tmp_path):
     checkpoint = _load_checkpoint(path)
     _apply_ema_weights(branch, checkpoint)
 
-    assert float(branch.trainable) == pytest.approx(4.5)
-    assert float(branch.frozen) == pytest.approx(7.0)
+    assert float(branch.trainable.detach()) == pytest.approx(4.5)
+    assert float(branch.frozen.detach()) == pytest.approx(7.0)
 
 
 def test_reconstruction_is_deterministic_for_the_same_seed():
@@ -144,4 +144,3 @@ def test_interpolation_includes_exact_endpoints():
     torch.testing.assert_close(values[0], z_start)
     torch.testing.assert_close(values[-1], z_end)
     torch.testing.assert_close(values[2], (z_start + z_end) / 2.0)
-
