@@ -19,6 +19,7 @@ latent_cache:
   batch_size: 16
   dtype: float16
   use_posterior_mean: true
+  posterior_sampling_seed: 20260901
   vae_scaling_factor: auto
 expected_transformer_config:
   depth: 12

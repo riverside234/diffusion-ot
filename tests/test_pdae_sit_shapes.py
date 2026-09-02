@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -125,3 +126,40 @@ def test_zero_initialized_semantic_wrapper_matches_base_at_start():
     torch.testing.assert_close(output.sample, expected, atol=1.0e-6, rtol=1.0e-6)
     torch.testing.assert_close(output.delta_sample, torch.zeros_like(output.delta_sample), atol=1.0e-6, rtol=0.0)
     assert not any(parameter.requires_grad for parameter in base.parameters())
+
+
+def test_branch_can_predict_from_supplied_z_and_reload_trainable_state():
+    from diffusion_ot.models.pdae_sit import (
+        PDAELatentEncoder,
+        PDAESiTBranch,
+        SemanticSiTWrapper,
+        make_null_class_labels,
+    )
+
+    torch.manual_seed(1)
+    base = FakeSiT()
+    encoder = PDAELatentEncoder(
+        input_channels=4,
+        channels=[8, 16],
+        z_dim=16,
+        spatial_size=2,
+        num_groups=4,
+    )
+    wrapper = SemanticSiTWrapper(base, z_dim=16, injection_layers=[0, 1], bottleneck_dim=4)
+    branch = PDAESiTBranch(encoder, wrapper)
+    saved_state = deepcopy(branch.pdae_state_dict())
+
+    x0 = torch.randn(2, 4, 8, 8)
+    x_t = torch.randn_like(x0)
+    timestep = torch.rand(2)
+    labels = make_null_class_labels(base, batch_size=2, device=x0.device)
+    z = branch.encode(x0)
+    output = branch.predict_with_z(x_t, timestep, z, class_labels=labels)
+    assert output.sample.shape == x0.shape
+
+    with torch.no_grad():
+        next(branch.encoder.parameters()).add_(1.0)
+    branch.load_pdae_state_dict(saved_state)
+
+    for name, value in branch.pdae_state_dict()["encoder"].items():
+        torch.testing.assert_close(value, saved_state["encoder"][name])

@@ -140,6 +140,7 @@ class CachedLatentDataset:
         limit: int | None = None,
         validate_exists: bool = True,
         validate_shape: bool = True,
+        random_horizontal_flip: float = 0.0,
     ) -> None:
         self.data_config_path = Path(data_config_path)
         self.domain = domain.lower()
@@ -148,6 +149,9 @@ class CachedLatentDataset:
         if limit is not None:
             self.records = self.records[:limit]
         self.validate_shape = validate_shape
+        self.random_horizontal_flip = float(random_horizontal_flip)
+        if not 0.0 <= self.random_horizontal_flip <= 1.0:
+            raise ValueError("random_horizontal_flip must be between 0 and 1.")
 
         if validate_exists:
             missing = [record["latent_path"] for record in self.records if not Path(record["latent_path"]).exists()]
@@ -161,6 +165,8 @@ class CachedLatentDataset:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        import torch
+
         record = self.records[index]
         latent = load_latent_tensor(record["latent_path"])
         expected_shape = record.get("latent_shape")
@@ -169,6 +175,9 @@ class CachedLatentDataset:
                 f"Latent shape mismatch for {record['latent_path']}: "
                 f"expected {expected_shape}, got {list(latent.shape)}"
             )
+        if self.random_horizontal_flip > 0.0:
+            if self.random_horizontal_flip >= 1.0 or torch.rand(()) < self.random_horizontal_flip:
+                latent = torch.flip(latent, dims=(-1,))
         return {
             "x0_latent": latent,
             "sample_id": record.get("sample_id"),

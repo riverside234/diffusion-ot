@@ -18,7 +18,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train one Stage 1A PDAE domain branch on cached SiT latents.")
     parser.add_argument("--config", required=True, help="Path to a Stage 1A PDAE config.")
     parser.add_argument("--device", default=None, help="Torch device override, for example cuda or cpu.")
-    parser.add_argument("--max-steps", type=int, default=None, help="Optional max-step override.")
+    parser.add_argument("--max-steps", type=int, default=None, help="Optional optimizer-update limit override.")
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="latest",
+        default=None,
+        help="Resume from a checkpoint path, or from this run's latest.pt when passed without a path.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Resolve config/dataset paths without loading SiT.")
     return parser.parse_args()
 
@@ -31,6 +38,7 @@ def main() -> int:
         repo_path(args.config),
         device=args.device,
         max_steps=args.max_steps,
+        resume_from=args.resume,
         dry_run=args.dry_run,
     )
     print("pdae_train_report:")

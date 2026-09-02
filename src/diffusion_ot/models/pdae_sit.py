@@ -221,6 +221,15 @@ class SemanticSiTWrapper(nn.Module):
             "final_adapter": self.final_adapter.state_dict(),
         }
 
+    def load_trainable_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        strict: bool = True,
+    ) -> None:
+        self.z_proj.load_state_dict(state_dict["z_proj"], strict=strict)
+        self.adapters.load_state_dict(state_dict["adapters"], strict=strict)
+        self.final_adapter.load_state_dict(state_dict["final_adapter"], strict=strict)
+
     def _label_embedding(self, class_labels, batch_size: int, device, force_drop_ids=None):
         y_embedder = getattr(self.base, "y_embedder", None)
         if y_embedder is None:
@@ -290,6 +299,27 @@ class PDAESiTBranch(nn.Module):
         self.encoder = encoder
         self.semantic_transformer = semantic_transformer
 
+    def encode(self, x0_latent: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x0_latent)
+
+    def predict_with_z(
+        self,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        z: torch.Tensor,
+        class_labels: torch.Tensor | None = None,
+        force_drop_ids=None,
+        return_dict: bool = True,
+    ):
+        return self.semantic_transformer(
+            hidden_states=x_t,
+            timestep=timestep,
+            z=z,
+            class_labels=class_labels,
+            force_drop_ids=force_drop_ids,
+            return_dict=return_dict,
+        )
+
     def forward(
         self,
         x0_latent: torch.Tensor,
@@ -299,9 +329,9 @@ class PDAESiTBranch(nn.Module):
         force_drop_ids=None,
         return_dict: bool = True,
     ):
-        z = self.encoder(x0_latent)
-        return self.semantic_transformer(
-            hidden_states=x_t,
+        z = self.encode(x0_latent)
+        return self.predict_with_z(
+            x_t=x_t,
             timestep=timestep,
             z=z,
             class_labels=class_labels,
@@ -314,6 +344,17 @@ class PDAESiTBranch(nn.Module):
             "encoder": self.encoder.state_dict(),
             "semantic_transformer": self.semantic_transformer.trainable_state_dict(),
         }
+
+    def load_pdae_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        strict: bool = True,
+    ) -> None:
+        self.encoder.load_state_dict(state_dict["encoder"], strict=strict)
+        self.semantic_transformer.load_trainable_state_dict(
+            state_dict["semantic_transformer"],
+            strict=strict,
+        )
 
 
 def build_pdae_sit_branch(

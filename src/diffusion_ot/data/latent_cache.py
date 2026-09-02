@@ -43,6 +43,17 @@ def _batched(records: list[dict[str, Any]], batch_size: int):
         yield records[start : start + batch_size]
 
 
+def select_posterior_latent(
+    posterior: Any,
+    *,
+    use_posterior_mean: bool,
+    generator: Any = None,
+):
+    if use_posterior_mean:
+        return posterior.mean
+    return posterior.sample(generator=generator)
+
+
 def _resolve_pretrained_config(model_config: dict[str, Any], project_root: Path) -> Path:
     pretrained = model_config.get("pretrained")
     if not pretrained:
@@ -74,11 +85,26 @@ def cache_vae_latents(
 
     dataset = load_afhq_dataset(data_config_path)
     dtype_name = model_config.get("latent_cache", {}).get("dtype", "float16")
+    use_posterior_mean = bool(
+        model_config.get("latent_cache", {}).get("use_posterior_mean", True)
+    )
+    posterior_sampling_seed = int(
+        model_config.get("latent_cache", {}).get(
+            "posterior_sampling_seed",
+            data_config.get("seed", 0),
+        )
+    )
     use_half_load = device is not None and str(device).startswith("cuda")
     torch_dtype = dtype_name if use_half_load else None
     vae = None if dry_run else load_sit_vae(pretrained_config, root, device=device, torch_dtype=torch_dtype)
     if vae is not None:
         vae.eval()
+
+    latent_generator = None
+    if vae is not None and not use_posterior_mean:
+        vae_param = next(vae.parameters())
+        latent_generator = torch.Generator(device=vae_param.device)
+        latent_generator.manual_seed(posterior_sampling_seed)
 
     image_size = int(data_config.get("image_size", model_config.get("resolution", 256)))
     center_crop = bool(data_config.get("center_crop", True))
@@ -111,7 +137,11 @@ def cache_vae_latents(
                 pixel_values = torch.stack(images).to(device=vae_param.device, dtype=vae_param.dtype)
                 with torch.no_grad():
                     posterior = vae.encode(pixel_values).latent_dist
-                    latents = posterior.mean
+                    latents = select_posterior_latent(
+                        posterior,
+                        use_posterior_mean=use_posterior_mean,
+                        generator=latent_generator,
+                    )
                     scaling_factor = getattr(getattr(vae, "config", None), "scaling_factor", 1.0)
                     latents = latents * scaling_factor
                 save_dtype = torch.float16 if dtype_name in {"float16", "fp16"} else torch.float32
@@ -123,6 +153,7 @@ def cache_vae_latents(
                 item["latent_path"] = str(latent_path)
                 item["latent_shape"] = [4, 32, 32]
                 item["latent_dtype"] = dtype_name
+                item["posterior_statistic"] = "mean" if use_posterior_mean else "sample"
                 item["dry_run"] = dry_run
                 written_records.append(item)
 
@@ -132,6 +163,10 @@ def cache_vae_latents(
     report = {
         "latent_manifest": str(latent_manifest_path),
         "num_records": len(written_records),
+        "posterior_statistic": "mean" if use_posterior_mean else "sample",
+        "posterior_sampling_seed": (
+            None if use_posterior_mean else posterior_sampling_seed
+        ),
         "dry_run": dry_run,
     }
     (latent_root / "cache_report.json").write_text(

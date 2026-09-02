@@ -42,6 +42,58 @@ def test_flow_snr_weight_is_finite_and_positive():
     assert torch.all(weight > 0)
 
 
+def test_fixed_uniform_weight_normalization_has_unit_population_mean():
+    from diffusion_ot.losses.pdae_flow import pdae_flow_snr_weight
+
+    sample_count = 65536
+    t = (torch.arange(sample_count, dtype=torch.float64) + 0.5) / sample_count
+    weight = pdae_flow_snr_weight(
+        t=t,
+        direction="noise_to_data",
+        gamma=0.1,
+        normalization_mode="fixed_uniform",
+        normalization_samples=sample_count,
+        clamp_min=None,
+        clamp_max=None,
+    )
+
+    torch.testing.assert_close(weight.mean(), torch.tensor(1.0, dtype=weight.dtype))
+
+
+def test_fixed_uniform_weight_does_not_depend_on_minibatch_composition():
+    from diffusion_ot.losses.pdae_flow import pdae_flow_snr_weight
+
+    kwargs = {
+        "direction": "noise_to_data",
+        "gamma": 0.1,
+        "normalization_mode": "fixed_uniform",
+        "clamp_min": None,
+        "clamp_max": None,
+    }
+    single = pdae_flow_snr_weight(t=torch.tensor([0.25]), **kwargs)
+    mixed = pdae_flow_snr_weight(t=torch.tensor([0.25, 0.9]), **kwargs)
+
+    torch.testing.assert_close(single[0], mixed[0])
+
+
+def test_gamma_point_one_weight_peaks_near_noisy_quarter_path():
+    from diffusion_ot.losses.pdae_flow import pdae_flow_snr_weight
+
+    t = torch.linspace(0.001, 0.999, 10000)
+    weight = pdae_flow_snr_weight(
+        t=t,
+        direction="noise_to_data",
+        gamma=0.1,
+        normalize_mean_to=None,
+        normalization_mode="none",
+        clamp_min=None,
+        clamp_max=None,
+    )
+
+    peak_t = float(t[weight.argmax()])
+    assert peak_t == pytest.approx(0.25, abs=0.002)
+
+
 def test_velocity_gap_target_detaches_by_default():
     from diffusion_ot.losses.pdae_flow import velocity_gap_target
 

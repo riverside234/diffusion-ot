@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 
@@ -101,6 +102,27 @@ def pdae_flow_snr_weight_from_snr(
     return noise_factor * clean_factor
 
 
+@lru_cache(maxsize=64)
+def fixed_uniform_pdae_weight_mean(
+    gamma: float,
+    eps: float = 1.0e-8,
+    num_samples: int = 65536,
+) -> float:
+    """Numerically integrate the raw PDAE Flow-SNR weight over uniform time."""
+    import torch
+
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive.")
+    t = (torch.arange(num_samples, dtype=torch.float64) + 0.5) / num_samples
+    alpha_t, sigma_t = linear_alpha_sigma(t, direction="noise_to_data")
+    weight = pdae_flow_snr_weight_from_snr(
+        flow_snr(alpha_t, sigma_t, eps=eps),
+        gamma=gamma,
+        eps=eps,
+    )
+    return float(weight.mean())
+
+
 def pdae_flow_snr_weight(
     alpha_t=None,
     sigma_t=None,
@@ -109,6 +131,8 @@ def pdae_flow_snr_weight(
     gamma: float = 0.25,
     eps: float = 1.0e-8,
     normalize_mean_to: float | None = 1.0,
+    normalization_mode: str = "batch",
+    normalization_samples: int = 65536,
     clamp_min: float | None = 0.05,
     clamp_max: float | None = 5.0,
 ):
@@ -122,9 +146,22 @@ def pdae_flow_snr_weight(
         gamma=gamma,
         eps=eps,
     )
-    if normalize_mean_to is not None:
+    normalization_mode = str(normalization_mode).lower()
+    if normalize_mean_to is not None and normalization_mode == "batch":
         target_mean = weight.new_tensor(float(normalize_mean_to))
         weight = weight * target_mean / weight.mean().clamp_min(eps)
+    elif normalize_mean_to is not None and normalization_mode == "fixed_uniform":
+        fixed_mean = fixed_uniform_pdae_weight_mean(
+            gamma=float(gamma),
+            eps=float(eps),
+            num_samples=int(normalization_samples),
+        )
+        target_mean = weight.new_tensor(float(normalize_mean_to))
+        weight = weight * target_mean / weight.new_tensor(fixed_mean).clamp_min(eps)
+    elif normalization_mode not in {"none", "batch", "fixed_uniform"}:
+        raise ValueError(
+            "normalization_mode must be one of: none, batch, fixed_uniform."
+        )
     if clamp_min is not None or clamp_max is not None:
         weight = weight.clamp(min=clamp_min, max=clamp_max)
     return weight
