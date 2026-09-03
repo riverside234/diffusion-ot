@@ -1,0 +1,47 @@
+{
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae/cat_sit_b2.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/sit_b2_256.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2/checkpoints/latest.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2/stage1a_eval/step_025000/ema/smoke",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 25000,
+  "weights": "ema",
+  "seed": 20260902,
+  "num_samples": 8,
+  "num_steps": 100,
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "correct_z",
+    "shuffled_z",
+    "zero_z"
+  ],
+  "metrics": {
+    "correct_z": {
+      "latent_mse": 0.6935988068580627,
+      "pixel_mse": 0.037008605897426605,
+      "pixel_psnr": 14.316972743336445
+    },
+    "shuffled_z": {
+      "latent_mse": 1.057664394378662,
+      "pixel_mse": 0.09580870717763901,
+      "pixel_psnr": 10.185950200721411
+    },
+    "zero_z": {
+      "latent_mse": 1.1986041069030762,
+      "pixel_mse": 0.11627503484487534,
+      "pixel_psnr": 9.345135216686513
+    }
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2/stage1a_eval/step_025000/ema/smoke/reconstruction_grid.png"
+}
