@@ -16,8 +16,12 @@ from diffusion_ot.integrations.hf_snapshot import (
 )
 
 
+_ALLOWED_Z_VARIANTS = {"correct_z", "shuffled_z", "zero_z"}
+
+
 @dataclass
 class Stage1ASmokeReport:
+    protocol: str
     training_config_path: str
     evaluation_config_path: str
     checkpoint_path: str
@@ -32,6 +36,32 @@ class Stage1ASmokeReport:
     sample_ids: list[str | None]
     row_order: list[str]
     metrics: dict[str, dict[str, float]]
+    grid_path: str
+    extra_reports: dict[str, str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Stage1ARoundTripReport:
+    protocol: str
+    training_config_path: str
+    evaluation_config_path: str
+    checkpoint_path: str
+    output_dir: str
+    domain: str
+    split: str
+    checkpoint_step: int
+    weights: str
+    seed: int
+    num_samples: int
+    backward_num_steps: int
+    forward_num_steps: int
+    sample_ids: list[str | None]
+    row_order: list[str]
+    metrics: dict[str, dict[str, float]]
+    inferred_noise_stats: dict[str, float]
     grid_path: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -122,13 +152,22 @@ def _validate_eval_config(config: dict[str, Any]) -> None:
     if not bool(sampling.get("fixed_starting_noise", True)):
         raise ValueError("Fixed starting noise is required for fair z-variant comparisons.")
 
-    allowed_variants = {"correct_z", "shuffled_z", "zero_z"}
     variants = list(sampling.get("variants") or [])
-    if not variants or set(variants) - allowed_variants:
+    if not variants or set(variants) - _ALLOWED_Z_VARIANTS:
         raise ValueError(
             "sampling.variants must be a non-empty subset of "
             "[correct_z, shuffled_z, zero_z]."
         )
+    inferred_config = _nested(sampling, "inferred_noise")
+    if bool(inferred_config.get("enabled", False)):
+        inferred_variants = list(inferred_config.get("variants") or ["correct_z"])
+        if not inferred_variants or set(inferred_variants) - _ALLOWED_Z_VARIANTS:
+            raise ValueError(
+                "sampling.inferred_noise.variants must be a non-empty subset of "
+                "[correct_z, shuffled_z, zero_z]."
+            )
+        if "correct_z" not in inferred_variants:
+            raise ValueError("sampling.inferred_noise.variants must include correct_z.")
 
 
 def load_stage1a_evaluator(
@@ -487,7 +526,7 @@ def _save_grid(path: Path, rows: list[torch.Tensor], samples_per_row: int) -> No
     )
 
 
-def _smoke_output_dir(evaluator: LoadedStage1AEvaluator) -> Path:
+def _evaluation_output_dir(evaluator: LoadedStage1AEvaluator, protocol: str) -> Path:
     output_config = _nested(evaluator.evaluation_config, "output")
     training_output = resolve_project_local_path(
         evaluator.training_config.get(
@@ -503,8 +542,122 @@ def _smoke_output_dir(evaluator: LoadedStage1AEvaluator) -> Path:
         / subdir
         / f"step_{evaluator.checkpoint_step:06d}"
         / evaluator.weights
-        / "smoke"
+        / protocol
     )
+
+
+def _smoke_output_dir(evaluator: LoadedStage1AEvaluator) -> Path:
+    return _evaluation_output_dir(evaluator, "smoke")
+
+
+def _roundtrip_output_dir(evaluator: LoadedStage1AEvaluator) -> Path:
+    return _evaluation_output_dir(evaluator, "roundtrip")
+
+
+def _image_and_latent_metrics(
+    latent_outputs: dict[str, torch.Tensor],
+    decoded_outputs: dict[str, torch.Tensor],
+    target_latents: torch.Tensor,
+    target_images: torch.Tensor,
+) -> dict[str, dict[str, float]]:
+    metrics = {}
+    for name, latent in latent_outputs.items():
+        latent_mse = float(torch.mean((latent.float() - target_latents.float()) ** 2).cpu())
+        pixel_values = _mse_and_psnr(decoded_outputs[name], target_images)
+        metrics[name] = {
+            "latent_mse": latent_mse,
+            "pixel_mse": pixel_values["mse"],
+            "pixel_psnr": pixel_values["psnr"],
+        }
+    return metrics
+
+
+def _inferred_noise_stats(inferred_noise: torch.Tensor) -> dict[str, float]:
+    value = inferred_noise.float()
+    return {
+        "mean": float(value.mean().cpu()),
+        "std": float(value.std(unbiased=False).cpu()),
+        "rms": float(torch.sqrt(torch.mean(value**2)).cpu()),
+    }
+
+
+@torch.inference_mode()
+def _run_inferred_noise_roundtrip(
+    evaluator: LoadedStage1AEvaluator,
+    batch: dict[str, Any],
+    x0: torch.Tensor,
+    z: torch.Tensor,
+    original_images: torch.Tensor,
+    *,
+    seed: int,
+    guidance_scale: float,
+    null_label: int | None,
+) -> Stage1ARoundTripReport:
+    sampling_config = _nested(evaluator.evaluation_config, "sampling")
+    inferred_config = _nested(sampling_config, "inferred_noise")
+    shared_num_steps = int(inferred_config.get("num_steps", sampling_config.get("num_steps", 100)))
+    backward_num_steps = int(inferred_config.get("backward_num_steps", shared_num_steps))
+    forward_num_steps = int(inferred_config.get("forward_num_steps", shared_num_steps))
+    variants = list(inferred_config.get("variants") or ["correct_z"])
+
+    inferred_noise = infer_starting_noise(
+        evaluator.branch,
+        evaluator.transformer,
+        x0,
+        z,
+        num_steps=backward_num_steps,
+        guidance_scale=guidance_scale,
+        null_label=null_label,
+    )
+    latent_outputs = reconstruct_z_variants(
+        evaluator.branch,
+        evaluator.transformer,
+        inferred_noise,
+        z,
+        variants,
+        num_steps=forward_num_steps,
+        guidance_scale=guidance_scale,
+        null_label=null_label,
+    )
+    decoded_outputs = {
+        name: decode_vae_latents(evaluator.vae, value)
+        for name, value in latent_outputs.items()
+    }
+    metrics = _image_and_latent_metrics(
+        latent_outputs,
+        decoded_outputs,
+        x0,
+        original_images,
+    )
+
+    row_order = ["original", *latent_outputs.keys()]
+    rows = [original_images, *[decoded_outputs[name] for name in latent_outputs]]
+    output_dir = _roundtrip_output_dir(evaluator)
+    grid_path = output_dir / "roundtrip_grid.png"
+    _save_grid(grid_path, rows, samples_per_row=x0.shape[0])
+
+    report = Stage1ARoundTripReport(
+        protocol="inferred_noise_roundtrip",
+        training_config_path=str(evaluator.training_config_path),
+        evaluation_config_path=str(evaluator.evaluation_config_path),
+        checkpoint_path=str(evaluator.checkpoint_path),
+        output_dir=str(output_dir),
+        domain=evaluator.domain,
+        split=evaluator.split,
+        checkpoint_step=evaluator.checkpoint_step,
+        weights=evaluator.weights,
+        seed=seed,
+        num_samples=x0.shape[0],
+        backward_num_steps=backward_num_steps,
+        forward_num_steps=forward_num_steps,
+        sample_ids=list(batch["sample_id"]),
+        row_order=row_order,
+        metrics=metrics,
+        inferred_noise_stats=_inferred_noise_stats(inferred_noise),
+        grid_path=str(grid_path),
+    )
+    _write_json(output_dir / "roundtrip_report.json", report.to_dict())
+    return report
 
 
 @torch.inference_mode()
@@ -559,41 +712,17 @@ def run_stage1a_smoke_test(
         null_label=null_label,
     )
 
-    inferred_config = _nested(sampling_config, "inferred_noise")
-    if bool(inferred_config.get("enabled", False)):
-        inferred_noise = infer_starting_noise(
-            evaluator.branch,
-            evaluator.transformer,
-            x0,
-            z,
-            num_steps=num_steps,
-            guidance_scale=guidance_scale,
-            null_label=null_label,
-        )
-        latent_outputs["inferred_correct_z"] = integrate_pdae_flow(
-            evaluator.branch,
-            evaluator.transformer,
-            inferred_noise,
-            z,
-            num_steps=num_steps,
-            guidance_scale=guidance_scale,
-            null_label=null_label,
-        )
-
     original_images = decode_vae_latents(evaluator.vae, x0)
     decoded_outputs = {
         name: decode_vae_latents(evaluator.vae, value)
         for name, value in latent_outputs.items()
     }
-    metrics = {}
-    for name, latent in latent_outputs.items():
-        latent_mse = float(torch.mean((latent.float() - x0.float()) ** 2).cpu())
-        pixel_values = _mse_and_psnr(decoded_outputs[name], original_images)
-        metrics[name] = {
-            "latent_mse": latent_mse,
-            "pixel_mse": pixel_values["mse"],
-            "pixel_psnr": pixel_values["psnr"],
-        }
+    metrics = _image_and_latent_metrics(
+        latent_outputs,
+        decoded_outputs,
+        x0,
+        original_images,
+    )
 
     row_order = ["original", *latent_outputs.keys()]
     rows = [original_images, *[decoded_outputs[name] for name in latent_outputs]]
@@ -601,7 +730,25 @@ def run_stage1a_smoke_test(
     grid_path = output_dir / "reconstruction_grid.png"
     _save_grid(grid_path, rows, samples_per_row=num_samples)
 
+    extra_reports: dict[str, str] = {}
+    inferred_config = _nested(sampling_config, "inferred_noise")
+    if bool(inferred_config.get("enabled", False)):
+        roundtrip_report = _run_inferred_noise_roundtrip(
+            evaluator,
+            batch,
+            x0,
+            z,
+            original_images,
+            seed=seed,
+            guidance_scale=guidance_scale,
+            null_label=null_label,
+        )
+        extra_reports["inferred_noise_roundtrip"] = str(
+            Path(roundtrip_report.output_dir) / "roundtrip_report.json"
+        )
+
     report = Stage1ASmokeReport(
+        protocol="fixed_noise_smoke",
         training_config_path=str(evaluator.training_config_path),
         evaluation_config_path=str(evaluator.evaluation_config_path),
         checkpoint_path=str(evaluator.checkpoint_path),
@@ -617,6 +764,7 @@ def run_stage1a_smoke_test(
         row_order=row_order,
         metrics=metrics,
         grid_path=str(grid_path),
+        extra_reports=extra_reports,
     )
     _write_json(output_dir / "smoke_report.json", report.to_dict())
     return report

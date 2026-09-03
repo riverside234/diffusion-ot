@@ -16,7 +16,10 @@ def repo_path(path: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the Stage 1A PDAE reconstruction smoke gate for one domain."
+        description=(
+            "Run the Stage 1A PDAE fixed-noise smoke gate and optional "
+            "inferred-noise round-trip gate for one domain."
+        )
     )
     parser.add_argument(
         "--train-config",
@@ -61,9 +64,12 @@ def main() -> int:
     print("stage1a_smoke_report:")
     for key, value in sorted(report.to_dict().items()):
         print(f"  {key}: {value}")
+    if report.extra_reports:
+        print("stage1a_extra_reports:")
+        for key, value in sorted(report.extra_reports.items()):
+            print(f"  {key}: {value}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -112,6 +112,54 @@ def test_solver_integrates_in_noise_to_data_direction():
     assert branch.timesteps == pytest.approx([0.125, 0.375, 0.625, 0.875])
 
 
+def test_inferred_noise_roundtrip_is_exact_for_constant_velocity():
+    from diffusion_ot.evaluation.stage1a_eval import infer_starting_noise, integrate_pdae_flow
+
+    branch = TinyBranch(velocity=1.0)
+    x0 = torch.ones(2, 1, 2, 2)
+    z = torch.zeros(2, 4)
+
+    inferred_noise = infer_starting_noise(
+        branch,
+        TinyTransformer(),
+        x0,
+        z,
+        num_steps=4,
+    )
+    reconstructed = integrate_pdae_flow(
+        branch,
+        TinyTransformer(),
+        inferred_noise,
+        z,
+        num_steps=4,
+    )
+
+    torch.testing.assert_close(inferred_noise, torch.zeros_like(inferred_noise))
+    torch.testing.assert_close(reconstructed, x0)
+
+
+def test_eval_config_accepts_separate_inferred_noise_protocol():
+    from diffusion_ot.evaluation.stage1a_eval import _validate_eval_config
+
+    _validate_eval_config(
+        {
+            "sampling": {
+                "solver": "euler",
+                "direction": "noise_to_data",
+                "time_evaluation": "midpoint",
+                "fixed_starting_noise": True,
+                "variants": ["correct_z", "shuffled_z", "zero_z"],
+                "inferred_noise": {
+                    "enabled": True,
+                    "report_separately": True,
+                    "num_steps": 100,
+                    "variants": ["correct_z"],
+                },
+            },
+        }
+    )
+
+
 def test_identical_image_metrics_are_exact():
     from diffusion_ot.evaluation.stage1a_eval import _mse_and_psnr
 
