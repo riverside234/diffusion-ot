@@ -1,0 +1,42 @@
+{
+  "protocol": "inferred_noise_roundtrip",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae/cat_sit_b2.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/sit_b2_256.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2/checkpoints/latest.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2/stage1a_eval/step_025000/ema/roundtrip",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 25000,
+  "weights": "ema",
+  "seed": 20260902,
+  "num_samples": 8,
+  "backward_num_steps": 100,
+  "forward_num_steps": 100,
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "correct_z"
+  ],
+  "metrics": {
+    "correct_z": {
+      "latent_mse": 0.00020683836191892624,
+      "pixel_mse": 1.9132719899062067e-05,
+      "pixel_psnr": 47.18223286470983
+    }
+  },
+  "inferred_noise_stats": {
+    "mean": -0.006112033501267433,
+    "std": 0.991824209690094,
+    "rms": 0.9918429851531982
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2/stage1a_eval/step_025000/ema/roundtrip/roundtrip_grid.png"
+}
