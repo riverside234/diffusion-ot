@@ -19,7 +19,7 @@ sampling:
   solver: euler
   direction: noise_to_data
   time_evaluation: midpoint
-  smoke_num_steps: 50
+  smoke_num_steps: 100
   num_steps: 250
   guidance_scale: 1.0
   variants: [correct_z, shuffled_z, zero_z]
