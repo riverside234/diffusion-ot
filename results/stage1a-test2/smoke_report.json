@@ -9,7 +9,7 @@
   "weights": "ema",
   "seed": 20260902,
   "num_samples": 8,
-  "num_steps": 100,
+  "num_steps": 50,
   "sample_ids": [
     "afhq_cat_010805",
     "afhq_cat_013491",
@@ -28,19 +28,19 @@
   ],
   "metrics": {
     "correct_z": {
-      "latent_mse": 0.6935988068580627,
-      "pixel_mse": 0.037008605897426605,
-      "pixel_psnr": 14.316972743336445
+      "latent_mse": 0.692147970199585,
+      "pixel_mse": 0.036908142268657684,
+      "pixel_psnr": 14.32877813996303
     },
     "shuffled_z": {
-      "latent_mse": 1.057664394378662,
-      "pixel_mse": 0.09580870717763901,
-      "pixel_psnr": 10.185950200721411
+      "latent_mse": 1.054880142211914,
+      "pixel_mse": 0.09543734043836594,
+      "pixel_psnr": 10.202816716955887
     },
     "zero_z": {
-      "latent_mse": 1.1986041069030762,
-      "pixel_mse": 0.11627503484487534,
-      "pixel_psnr": 9.345135216686513
+      "latent_mse": 1.1810108423233032,
+      "pixel_mse": 0.11437588930130005,
+      "pixel_psnr": 9.41665516163564
     }
   },
   "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2/stage1a_eval/step_025000/ema/smoke/reconstruction_grid.png"
