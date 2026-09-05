@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+
+def repo_path(path: str) -> Path:
+    value = Path(path)
+    return value if value.is_absolute() else ROOT / value
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate the Stage 1A offline-InfoOT baseline or a Stage 1B-1 checkpoint."
+    )
+    parser.add_argument("--alignment-config", required=True)
+    parser.add_argument("--eval-config", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Stage 1B checkpoint. Omit it to evaluate frozen Stage 1A encoders plus offline InfoOT.",
+    )
+    parser.add_argument("--weights", choices=["ema", "raw"], default="ema")
+    parser.add_argument("--device-cat", default=None)
+    parser.add_argument("--device-dog", default=None)
+    parser.add_argument("--max-reference", type=int, default=None)
+    parser.add_argument("--max-query", type=int, default=None)
+    return parser.parse_args()
+
+
+def main() -> int:
+    from diffusion_ot.evaluation.stage1b_eval import run_stage1b_evaluation
+
+    args = parse_args()
+    report = run_stage1b_evaluation(
+        repo_path(args.alignment_config),
+        repo_path(args.eval_config),
+        checkpoint_path=repo_path(args.checkpoint) if args.checkpoint else None,
+        weights=args.weights,
+        device_cat=args.device_cat,
+        device_dog=args.device_dog,
+        max_reference=args.max_reference,
+        max_query=args.max_query,
+    )
+    print("stage1b_evaluation_report:")
+    print(f"  mode: {report.mode}")
+    print(f"  output_dir: {report.output_dir}")
+    print(f"  mutual_information: {report.solver['mutual_information']}")
+    print(f"  row_residual: {report.solver['row_residual']}")
+    print(f"  column_residual: {report.solver['column_residual']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
