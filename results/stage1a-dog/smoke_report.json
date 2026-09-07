@@ -1,0 +1,51 @@
+{
+  "protocol": "fixed_noise_smoke",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae/dog_sit_b2.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/sit_b2_256.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_dog_sit_b2/checkpoints/latest.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_dog_sit_b2/stage1a_eval/step_030000/ema/smoke",
+  "domain": "dog",
+  "split": "val",
+  "checkpoint_step": 30000,
+  "weights": "ema",
+  "seed": 20260902,
+  "num_samples": 8,
+  "num_steps": 50,
+  "sample_ids": [
+    "afhq_dog_002321",
+    "afhq_dog_014881",
+    "afhq_dog_001871",
+    "afhq_dog_004512",
+    "afhq_dog_014778",
+    "afhq_dog_002849",
+    "afhq_dog_001701",
+    "afhq_dog_000345"
+  ],
+  "row_order": [
+    "original",
+    "correct_z",
+    "shuffled_z",
+    "zero_z"
+  ],
+  "metrics": {
+    "correct_z": {
+      "latent_mse": 0.7115834951400757,
+      "pixel_mse": 0.03500564023852348,
+      "pixel_psnr": 14.558619748749091
+    },
+    "shuffled_z": {
+      "latent_mse": 1.134784460067749,
+      "pixel_mse": 0.1092555969953537,
+      "pixel_psnr": 9.615563055526467
+    },
+    "zero_z": {
+      "latent_mse": 1.1573864221572876,
+      "pixel_mse": 0.11367277801036835,
+      "pixel_psnr": 9.443435263004863
+    }
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_dog_sit_b2/stage1a_eval/step_030000/ema/smoke/reconstruction_grid.png",
+  "extra_reports": {
+    "inferred_noise_roundtrip": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_dog_sit_b2/stage1a_eval/step_030000/ema/roundtrip/roundtrip_report.json"
+  }
+}

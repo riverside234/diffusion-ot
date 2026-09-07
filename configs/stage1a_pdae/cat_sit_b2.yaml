@@ -17,7 +17,7 @@ dataloader:
   drop_last: true
 
 train:
-  max_steps: 10000
+  max_steps: 30000
   resume_from: null
   seed: 20260901
   lr_encoder: 0.0001
