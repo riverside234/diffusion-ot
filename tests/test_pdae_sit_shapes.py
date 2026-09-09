@@ -163,3 +163,112 @@ def test_branch_can_predict_from_supplied_z_and_reload_trainable_state():
 
     for name, value in branch.pdae_state_dict()["encoder"].items():
         torch.testing.assert_close(value, saved_state["encoder"][name])
+
+
+def test_learned_semantic_condition_drops_individual_samples_and_gets_gradients():
+    from diffusion_ot.models.pdae_sit import LearnedSemanticCondition
+
+    condition = LearnedSemanticCondition(z_dim=3, dropout_probability=0.1)
+    with torch.no_grad():
+        condition.null_token.copy_(torch.tensor([2.0, 3.0, 4.0]))
+    z = torch.ones(3, 3, requires_grad=True)
+    dropped, mask = condition(
+        z,
+        apply_dropout=True,
+        force_drop_mask=torch.tensor([True, False, True]),
+    )
+
+    assert mask.tolist() == [True, False, True]
+    torch.testing.assert_close(dropped[0], condition.null_token)
+    torch.testing.assert_close(dropped[1], z[1])
+    torch.testing.assert_close(dropped[2], condition.null_token)
+    dropped.sum().backward()
+    torch.testing.assert_close(z.grad[0], torch.zeros(3))
+    torch.testing.assert_close(z.grad[1], torch.ones(3))
+    torch.testing.assert_close(condition.null_token.grad, torch.full((3,), 2.0))
+
+
+class LinearSemanticTransformer(nn.Module):
+    def forward(
+        self,
+        hidden_states,
+        timestep,
+        z,
+        class_labels=None,
+        force_drop_ids=None,
+        return_dict=True,
+    ):
+        from diffusion_ot.models.pdae_sit import PDAESiTOutput
+
+        base = torch.full_like(hidden_states, 2.0)
+        delta = z[:, :1, None, None].expand_as(hidden_states)
+        return PDAESiTOutput(
+            sample=base + delta,
+            z=z,
+            base_sample=base,
+            delta_sample=delta,
+        )
+
+    def trainable_state_dict(self):
+        return self.state_dict()
+
+    def load_trainable_state_dict(self, state_dict, strict=True):
+        self.load_state_dict(state_dict, strict=strict)
+
+
+def test_semantic_cfg_scale_zero_one_and_two_follow_learned_null_formula():
+    from diffusion_ot.models.pdae_sit import PDAESiTBranch
+
+    branch = PDAESiTBranch(
+        nn.Identity(),
+        LinearSemanticTransformer(),
+        z_dim=2,
+        semantic_cfg_enabled=True,
+    )
+    with torch.no_grad():
+        branch.semantic_conditioner.null_token.copy_(torch.tensor([1.0, 0.0]))
+    x_t = torch.zeros(2, 1, 2, 2)
+    timestep = torch.zeros(2)
+    z = torch.tensor([[4.0, 0.0], [4.0, 0.0]])
+
+    scale_zero = branch.predict_cfg_with_z(x_t, timestep, z, guidance_scale=0.0)
+    scale_one = branch.predict_cfg_with_z(x_t, timestep, z, guidance_scale=1.0)
+    scale_two = branch.predict_cfg_with_z(x_t, timestep, z, guidance_scale=2.0)
+
+    torch.testing.assert_close(scale_zero.sample, torch.full_like(x_t, 3.0))
+    torch.testing.assert_close(scale_one.sample, torch.full_like(x_t, 6.0))
+    torch.testing.assert_close(scale_two.sample, torch.full_like(x_t, 9.0))
+
+
+def test_cfg_checkpoint_roundtrip_includes_null_token_and_rejects_legacy_state():
+    from diffusion_ot.models.pdae_sit import PDAESiTBranch
+
+    branch = PDAESiTBranch(
+        nn.Linear(2, 2),
+        LinearSemanticTransformer(),
+        z_dim=2,
+        semantic_cfg_enabled=True,
+    )
+    with torch.no_grad():
+        branch.semantic_conditioner.null_token.fill_(3.5)
+    state = deepcopy(branch.pdae_state_dict())
+    assert "semantic_conditioner" in state["generator"]
+
+    restored = PDAESiTBranch(
+        nn.Linear(2, 2),
+        LinearSemanticTransformer(),
+        z_dim=2,
+        semantic_cfg_enabled=True,
+    )
+    restored.load_pdae_state_dict(state)
+    torch.testing.assert_close(
+        restored.semantic_conditioner.null_token,
+        branch.semantic_conditioner.null_token,
+    )
+
+    legacy = {
+        "encoder": branch.encoder.state_dict(),
+        "semantic_transformer": branch.semantic_transformer.trainable_state_dict(),
+    }
+    with pytest.raises(ValueError, match="no learned null token"):
+        restored.load_pdae_state_dict(legacy)

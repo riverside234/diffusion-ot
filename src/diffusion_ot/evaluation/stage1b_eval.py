@@ -494,7 +494,7 @@ def _load_domain_context(
         fixed_generator = (joint.get("fixed_generators") or {}).get(domain)
         if fixed_generator is None:
             raise ValueError(f"Joint checkpoint has no fixed_generators.{domain} state.")
-        branch.semantic_transformer.load_trainable_state_dict(fixed_generator)
+        branch.load_generator_state_dict(fixed_generator)
         state_key = "encoder_ema" if joint_weights == "ema" else "encoders"
         state = (joint.get(state_key) or {}).get(domain)
         if state is None:

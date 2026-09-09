@@ -4,7 +4,7 @@ domain: cat
 split: train
 data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
-output_dir: outputs/stage1a_cat_sit_b2
+output_dir: outputs/stage1a_cat_sit_b2_cfg
 device: cuda:0
 torch_dtype: float32
 
@@ -52,6 +52,12 @@ flow:
 class_conditioning:
   mode: null
   null_label: 1000
+
+semantic_cfg:
+  enabled: true
+  dropout_probability: 0.10
+  drop_granularity: sample
+  null_condition: learned_token
 
 encoder:
   input_channels: 4

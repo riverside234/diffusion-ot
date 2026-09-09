@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval
+output_dir: outputs/stage1b_eval_cfg
 seed: 20260906
 alignment_device: cuda:0
 

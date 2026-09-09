@@ -383,7 +383,10 @@ def _evaluate_z_dependence(
     if num_time_bins <= 0:
         raise ValueError("evaluation.num_time_bins must be positive.")
 
-    variants = ("correct_z", "shuffled_z", "zero_z")
+    variants = ["correct_z", "shuffled_z"]
+    if branch.semantic_cfg_enabled:
+        variants.append("null_z")
+    variants.append("zero_z")
     global_stats = {name: _empty_variant_stats() for name in variants}
     binned_stats = [
         {name: _empty_variant_stats() for name in variants}
@@ -464,13 +467,20 @@ def _evaluate_z_dependence(
                         z=torch.roll(z, shifts=1, dims=0),
                         class_labels=class_labels,
                     ).delta_sample.detach().float(),
-                    "zero_z": branch.predict_with_z(
+                }
+                if branch.semantic_cfg_enabled:
+                    predictions["null_z"] = branch.predict_with_z(
                         x_t=target.x_t,
                         timestep=target.t,
-                        z=torch.zeros_like(z),
+                        z=branch.semantic_null_like(z),
                         class_labels=class_labels,
-                    ).delta_sample.detach().float(),
-                }
+                    ).delta_sample.detach().float()
+                predictions["zero_z"] = branch.predict_with_z(
+                    x_t=target.x_t,
+                    timestep=target.t,
+                    z=torch.zeros_like(z),
+                    class_labels=class_labels,
+                ).delta_sample.detach().float()
                 time_bin = (target.t.detach().float() * num_time_bins).long()
                 time_bin = time_bin.clamp(0, num_time_bins - 1)
                 for name, prediction in predictions.items():
@@ -502,24 +512,27 @@ def _evaluate_z_dependence(
             for name, stats in bin_stats.items()
         }
         bin_correct_mse = float(values["correct_z"]["mse"])
-        time_bins.append(
-            {
-                "index": bin_index,
-                "t_min": bin_index / num_time_bins,
-                "t_max": (bin_index + 1) / num_time_bins,
-                "count": values["correct_z"]["count"],
-                "z_gain": (
-                    float(values["shuffled_z"]["mse"]) / max(bin_correct_mse, 1.0e-12) - 1.0
-                    if values["correct_z"]["count"]
-                    else None
-                ),
-                "correct_z": values["correct_z"],
-                "shuffled_z": values["shuffled_z"],
-                "zero_z": values["zero_z"],
-            }
-        )
+        item = {
+            "index": bin_index,
+            "t_min": bin_index / num_time_bins,
+            "t_max": (bin_index + 1) / num_time_bins,
+            "count": values["correct_z"]["count"],
+            "z_gain": (
+                float(values["shuffled_z"]["mse"]) / max(bin_correct_mse, 1.0e-12) - 1.0
+                if values["correct_z"]["count"]
+                else None
+            ),
+        }
+        item.update({name: values[name] for name in variants})
+        if "null_z" in values:
+            item["null_z_gain"] = (
+                float(values["null_z"]["mse"]) / max(bin_correct_mse, 1.0e-12) - 1.0
+                if values["correct_z"]["count"]
+                else None
+            )
+        time_bins.append(item)
 
-    return {
+    result = {
         "event": "validation",
         "step": int(step),
         "use_ema": bool(use_ema and ema is not None),
@@ -532,6 +545,11 @@ def _evaluate_z_dependence(
         "z_statistics": _z_statistics(z_values),
         "time_bins": time_bins,
     }
+    if "null_z" in finalized:
+        null_mse = float(finalized["null_z"]["mse"])
+        result["null_z_gain"] = null_mse / max(correct_mse, 1.0e-12) - 1.0
+        result["null_z"] = finalized["null_z"]
+    return result
 
 
 def _resolve_resume_path(
@@ -575,7 +593,7 @@ def _save_checkpoint(
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         "step": int(step),
         "domain": domain,
         "model": branch.pdae_state_dict(),
@@ -876,6 +894,7 @@ def train_pdae_domain(
                     "correct_z_relative_error": metrics["correct_z"]["relative_error"],
                     "correct_z_cosine": metrics["correct_z"]["cosine"],
                     "z_gain": metrics["z_gain"],
+                    "null_z_gain": metrics.get("null_z_gain"),
                     "zero_z_gain": metrics["zero_z_gain"],
                     "z_effective_rank": metrics["z_statistics"]["effective_rank"],
                     "duration_seconds": metrics["duration_seconds"],
@@ -904,9 +923,16 @@ def train_pdae_domain(
         for name, parameter in branch.named_parameters()
         if parameter.requires_grad and not name.startswith("encoder.")
     ]
+    null_condition_parameters = (
+        list(branch.semantic_conditioner.parameters())
+        if branch.semantic_conditioner is not None
+        else []
+    )
 
     clip_events_tensor = torch.tensor(float(clip_events), device=device)
     interval_training_seconds = 0.0
+    interval_semantic_drop_sum = torch.tensor(0.0, device=device)
+    interval_semantic_drop_count = 0
     last_logged_step = initial_step
 
     for step in range(initial_step + 1, final_step + 1):
@@ -943,6 +969,11 @@ def train_pdae_domain(
             )
             pred_delta_v = output.delta_sample
             base_v = output.base_sample
+            if output.semantic_drop_mask is not None:
+                interval_semantic_drop_sum.add_(
+                    output.semantic_drop_mask.detach().float().sum()
+                )
+                interval_semantic_drop_count += output.semantic_drop_mask.numel()
             weight = pdae_flow_snr_weight(
                 t=target.t.float(),
                 direction=flow_direction,
@@ -980,6 +1011,11 @@ def train_pdae_domain(
 
         encoder_grad_norm = _gradient_norm(encoder_parameters) if should_log else None
         adapter_grad_norm = _gradient_norm(adapter_parameters) if should_log else None
+        null_condition_grad_norm = (
+            _gradient_norm(null_condition_parameters)
+            if should_log and null_condition_parameters
+            else None
+        )
         if grad_clip_norm is not None:
             total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
                 trainable_parameters,
@@ -1027,6 +1063,23 @@ def train_pdae_domain(
                 "total_grad_norm_pre_clip": total_grad_norm,
                 "encoder_grad_norm_pre_clip": encoder_grad_norm,
                 "adapter_grad_norm_pre_clip": adapter_grad_norm,
+                "null_condition_grad_norm_pre_clip": null_condition_grad_norm,
+                "semantic_cfg_enabled": branch.semantic_cfg_enabled,
+                "semantic_dropout_probability": (
+                    branch.semantic_conditioner.dropout_probability
+                    if branch.semantic_conditioner is not None
+                    else 0.0
+                ),
+                "semantic_dropout_fraction": (
+                    float(interval_semantic_drop_sum.cpu()) / interval_semantic_drop_count
+                    if interval_semantic_drop_count > 0
+                    else 0.0
+                ),
+                "semantic_null_norm": (
+                    float(branch.semantic_conditioner.null_token.detach().float().norm().cpu())
+                    if branch.semantic_conditioner is not None
+                    else None
+                ),
                 "gradient_clip_fraction": clip_events / max(clip_checks, 1),
                 "ema_decay": ema.effective_decay if ema is not None else None,
                 "training_seconds_total": training_seconds,
@@ -1045,6 +1098,8 @@ def train_pdae_domain(
             print(json.dumps(metrics, sort_keys=True))
             _append_jsonl(train_metrics_path, metrics)
             interval_training_seconds = 0.0
+            interval_semantic_drop_sum.zero_()
+            interval_semantic_drop_count = 0
             last_logged_step = step
 
         if step % save_every == 0 or step == final_step:

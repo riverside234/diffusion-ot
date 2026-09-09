@@ -16,7 +16,7 @@ from diffusion_ot.integrations.hf_snapshot import (
 )
 
 
-_ALLOWED_Z_VARIANTS = {"correct_z", "shuffled_z", "zero_z"}
+_ALLOWED_Z_VARIANTS = {"correct_z", "shuffled_z", "null_z", "zero_z"}
 
 
 @dataclass
@@ -33,6 +33,7 @@ class Stage1ASmokeReport:
     seed: int
     num_samples: int
     num_steps: int
+    guidance_scales: list[float]
     sample_ids: list[str | None]
     row_order: list[str]
     metrics: dict[str, dict[str, float]]
@@ -58,6 +59,7 @@ class Stage1ARoundTripReport:
     num_samples: int
     backward_num_steps: int
     forward_num_steps: int
+    guidance_scale: float
     sample_ids: list[str | None]
     row_order: list[str]
     metrics: dict[str, dict[str, float]]
@@ -141,8 +143,25 @@ def _apply_ema_weights(branch: Any, checkpoint: dict[str, Any]) -> None:
             parameter.copy_(shadow[name].to(device=parameter.device, dtype=parameter.dtype))
 
 
+def _configured_guidance_scales(sampling: dict[str, Any]) -> list[float]:
+    raw_scales = sampling.get("guidance_scales")
+    if raw_scales is None:
+        raw_scales = [sampling.get("guidance_scale", 1.0)]
+    elif isinstance(raw_scales, (int, float)):
+        raw_scales = [raw_scales]
+    if not isinstance(raw_scales, (list, tuple)) or not raw_scales:
+        raise ValueError("sampling.guidance_scales must be a non-empty list.")
+    scales = [float(value) for value in raw_scales]
+    if any(not math.isfinite(value) or value < 0.0 for value in scales):
+        raise ValueError("sampling.guidance_scales must contain finite, non-negative values.")
+    if len(set(scales)) != len(scales):
+        raise ValueError("sampling.guidance_scales must not contain duplicates.")
+    return scales
+
+
 def _validate_eval_config(config: dict[str, Any]) -> None:
     sampling = _nested(config, "sampling")
+    _configured_guidance_scales(sampling)
     if str(sampling.get("solver", "euler")) != "euler":
         raise ValueError("The first Stage 1A evaluator supports sampling.solver=euler only.")
     if str(sampling.get("direction", "noise_to_data")) != "noise_to_data":
@@ -156,15 +175,20 @@ def _validate_eval_config(config: dict[str, Any]) -> None:
     if not variants or set(variants) - _ALLOWED_Z_VARIANTS:
         raise ValueError(
             "sampling.variants must be a non-empty subset of "
-            "[correct_z, shuffled_z, zero_z]."
+            "[correct_z, shuffled_z, null_z, zero_z]."
         )
     inferred_config = _nested(sampling, "inferred_noise")
     if bool(inferred_config.get("enabled", False)):
+        inferred_guidance_scale = float(inferred_config.get("guidance_scale", 1.0))
+        if not math.isfinite(inferred_guidance_scale) or inferred_guidance_scale < 0.0:
+            raise ValueError(
+                "sampling.inferred_noise.guidance_scale must be finite and non-negative."
+            )
         inferred_variants = list(inferred_config.get("variants") or ["correct_z"])
         if not inferred_variants or set(inferred_variants) - _ALLOWED_Z_VARIANTS:
             raise ValueError(
                 "sampling.inferred_noise.variants must be a non-empty subset of "
-                "[correct_z, shuffled_z, zero_z]."
+                "[correct_z, shuffled_z, null_z, zero_z]."
             )
         if "correct_z" not in inferred_variants:
             raise ValueError("sampling.inferred_noise.variants must include correct_z.")
@@ -337,13 +361,24 @@ def integrate_pdae_flow(
             device=state.device,
             dtype=torch.float32,
         )
-        output = branch.predict_with_z(
-            x_t=state,
-            timestep=timestep,
-            z=z,
-            class_labels=class_labels,
-        )
-        velocity = output.base_sample + float(guidance_scale) * output.delta_sample
+        if bool(getattr(branch, "semantic_cfg_enabled", False)):
+            output = branch.predict_cfg_with_z(
+                x_t=state,
+                timestep=timestep,
+                z=z,
+                guidance_scale=guidance_scale,
+                class_labels=class_labels,
+            )
+            velocity = output.sample
+        else:
+            # Compatibility path for Stage 1A checkpoints trained before learned-null CFG.
+            output = branch.predict_with_z(
+                x_t=state,
+                timestep=timestep,
+                z=z,
+                class_labels=class_labels,
+            )
+            velocity = output.base_sample + float(guidance_scale) * output.delta_sample
         state = state + dt * velocity
     return state
 
@@ -410,9 +445,13 @@ def _noise_like(value: torch.Tensor, seed: int) -> torch.Tensor:
     )
 
 
-def _variant_z(z: torch.Tensor, variant: str) -> torch.Tensor:
+def _variant_z(branch: Any, z: torch.Tensor, variant: str) -> torch.Tensor:
     if variant == "correct_z":
         return z
+    if variant == "null_z":
+        if not bool(getattr(branch, "semantic_cfg_enabled", False)):
+            raise ValueError("null_z evaluation requires a learned-null semantic-CFG checkpoint.")
+        return branch.semantic_null_like(z)
     if variant == "zero_z":
         return torch.zeros_like(z)
     if variant == "shuffled_z":
@@ -441,11 +480,51 @@ def reconstruct_z_variants(
             branch,
             transformer,
             starting_noise,
-            _variant_z(z, variant),
+            _variant_z(branch, z, variant),
             num_steps=num_steps,
             guidance_scale=guidance_scale,
             null_label=null_label,
         )
+    return outputs
+
+
+def _cfg_output_key(variant: str, guidance_scale: float) -> str:
+    return f"{variant}_cfg_{float(guidance_scale):g}"
+
+
+@torch.inference_mode()
+def reconstruct_cfg_sweep(
+    branch: Any,
+    transformer: Any,
+    starting_noise: torch.Tensor,
+    z: torch.Tensor,
+    variants: list[str],
+    guidance_scales: list[float],
+    *,
+    num_steps: int,
+    null_label: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Evaluate every z variant and semantic-CFG scale from identical noise."""
+    outputs: dict[str, torch.Tensor] = {}
+    for guidance_scale in guidance_scales:
+        scale_zero_output = None
+        for variant in variants:
+            variant_z = _variant_z(branch, z, variant)
+            key = _cfg_output_key(variant, guidance_scale)
+            if guidance_scale == 0.0 and scale_zero_output is not None:
+                outputs[key] = scale_zero_output.clone()
+                continue
+            outputs[key] = integrate_pdae_flow(
+                branch,
+                transformer,
+                starting_noise,
+                variant_z,
+                num_steps=num_steps,
+                guidance_scale=guidance_scale,
+                null_label=null_label,
+            )
+            if guidance_scale == 0.0:
+                scale_zero_output = outputs[key]
     return outputs
 
 
@@ -650,6 +729,7 @@ def _run_inferred_noise_roundtrip(
         num_samples=x0.shape[0],
         backward_num_steps=backward_num_steps,
         forward_num_steps=forward_num_steps,
+        guidance_scale=guidance_scale,
         sample_ids=list(batch["sample_id"]),
         row_order=row_order,
         metrics=metrics,
@@ -682,10 +762,10 @@ def run_stage1a_smoke_test(
     seed = int(evaluator.evaluation_config.get("seed", 20260902))
     num_samples = int(dataset_config.get("smoke_samples", 8))
     num_steps = int(sampling_config.get("smoke_num_steps", 50))
-    guidance_scale = float(sampling_config.get("guidance_scale", 1.0))
+    guidance_scales = _configured_guidance_scales(sampling_config)
     variants = list(
         sampling_config.get("variants")
-        or ["correct_z", "shuffled_z", "zero_z"]
+        or ["correct_z", "shuffled_z"]
     )
     null_label_value = _nested(
         evaluator.training_config,
@@ -701,14 +781,14 @@ def run_stage1a_smoke_test(
     z = evaluator.branch.encode(x0)
     starting_noise = _noise_like(x0, seed + 1)
 
-    latent_outputs = reconstruct_z_variants(
+    latent_outputs = reconstruct_cfg_sweep(
         evaluator.branch,
         evaluator.transformer,
         starting_noise,
         z,
         variants,
+        guidance_scales,
         num_steps=num_steps,
-        guidance_scale=guidance_scale,
         null_label=null_label,
     )
 
@@ -733,6 +813,7 @@ def run_stage1a_smoke_test(
     extra_reports: dict[str, str] = {}
     inferred_config = _nested(sampling_config, "inferred_noise")
     if bool(inferred_config.get("enabled", False)):
+        roundtrip_guidance_scale = float(inferred_config.get("guidance_scale", 1.0))
         roundtrip_report = _run_inferred_noise_roundtrip(
             evaluator,
             batch,
@@ -740,7 +821,7 @@ def run_stage1a_smoke_test(
             z,
             original_images,
             seed=seed,
-            guidance_scale=guidance_scale,
+            guidance_scale=roundtrip_guidance_scale,
             null_label=null_label,
         )
         extra_reports["inferred_noise_roundtrip"] = str(
@@ -760,6 +841,7 @@ def run_stage1a_smoke_test(
         seed=seed,
         num_samples=num_samples,
         num_steps=num_steps,
+        guidance_scales=guidance_scales,
         sample_ids=list(batch["sample_id"]),
         row_order=row_order,
         metrics=metrics,

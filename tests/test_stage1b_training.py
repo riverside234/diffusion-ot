@@ -14,6 +14,7 @@ class TinyBranch(nn.Module):
         super().__init__()
         self.encoder = nn.Linear(3, 2)
         self.semantic_transformer = nn.Linear(2, 3)
+        self.semantic_conditioner = nn.Linear(2, 2)
 
 
 class TinySemanticTransformer(nn.Linear):
@@ -29,8 +30,10 @@ def test_stage1b_freezes_generator_and_keeps_encoder_trainable():
 
     assert all(parameter.requires_grad for parameter in branch.encoder.parameters())
     assert not any(parameter.requires_grad for parameter in branch.semantic_transformer.parameters())
+    assert not any(parameter.requires_grad for parameter in branch.semantic_conditioner.parameters())
     assert branch.encoder.training
     assert not branch.semantic_transformer.training
+    assert not branch.semantic_conditioner.training
 
 
 def test_reconstruction_gradient_passes_through_frozen_generator_to_encoder():
@@ -44,6 +47,7 @@ def test_reconstruction_gradient_passes_through_frozen_generator_to_encoder():
 
     assert all(parameter.grad is not None for parameter in branch.encoder.parameters())
     assert all(parameter.grad is None for parameter in branch.semantic_transformer.parameters())
+    assert all(parameter.grad is None for parameter in branch.semantic_conditioner.parameters())
 
 
 def test_anchor_loss_is_variance_scaled_and_reference_is_detached():

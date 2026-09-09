@@ -21,13 +21,16 @@ sampling:
   time_evaluation: midpoint
   smoke_num_steps: 50
   num_steps: 100
-  guidance_scale: 1.0
-  variants: [correct_z, shuffled_z, zero_z]
+  # Learned-null semantic CFG: G(null) + scale * (G(z) - G(null)).
+  guidance_scales: [0.0, 1.0, 1.5, 2.0]
+  # Add null_z or zero_z only for explicit ablations; scale 0 is the primary null baseline.
+  variants: [correct_z, shuffled_z]
   fixed_starting_noise: true
   inferred_noise:
     enabled: true
     report_separately: true
     num_steps: 100
+    guidance_scale: 1.0
     variants: [correct_z]
 
 metrics:

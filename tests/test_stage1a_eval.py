@@ -93,6 +93,43 @@ def test_all_z_variants_receive_identical_starting_noise(monkeypatch):
     torch.testing.assert_close(starting_noise, original)
 
 
+def test_cfg_sweep_compares_correct_and_shuffled_z_at_each_scale(monkeypatch):
+    import diffusion_ot.evaluation.stage1a_eval as evaluation
+
+    observed = []
+
+    def fake_integrate(branch, transformer, initial_state, z, **kwargs):
+        observed.append((initial_state.clone(), kwargs["guidance_scale"]))
+        return initial_state + kwargs["guidance_scale"] * z[:, :1, None, None]
+
+    monkeypatch.setattr(evaluation, "integrate_pdae_flow", fake_integrate)
+    starting_noise = torch.zeros(3, 1, 2, 2)
+    z = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    outputs = evaluation.reconstruct_cfg_sweep(
+        object(),
+        object(),
+        starting_noise,
+        z,
+        ["correct_z", "shuffled_z"],
+        [0.0, 1.0, 1.5],
+        num_steps=2,
+    )
+
+    assert list(outputs) == [
+        "correct_z_cfg_0",
+        "shuffled_z_cfg_0",
+        "correct_z_cfg_1",
+        "shuffled_z_cfg_1",
+        "correct_z_cfg_1.5",
+        "shuffled_z_cfg_1.5",
+    ]
+    torch.testing.assert_close(outputs["correct_z_cfg_0"], outputs["shuffled_z_cfg_0"])
+    assert not torch.equal(outputs["correct_z_cfg_1"], outputs["shuffled_z_cfg_1"])
+    assert [scale for _, scale in observed] == [0.0, 1.0, 1.0, 1.5, 1.5]
+    for initial_state, _ in observed:
+        torch.testing.assert_close(initial_state, starting_noise)
+
+
 def test_solver_integrates_in_noise_to_data_direction():
     from diffusion_ot.evaluation.stage1a_eval import integrate_pdae_flow
 
@@ -110,6 +147,41 @@ def test_solver_integrates_in_noise_to_data_direction():
 
     torch.testing.assert_close(result, torch.ones_like(result))
     assert branch.timesteps == pytest.approx([0.125, 0.375, 0.625, 0.875])
+
+
+def test_solver_uses_semantic_cfg_field_for_learned_null_branch():
+    from diffusion_ot.evaluation.stage1a_eval import integrate_pdae_flow
+
+    class CfgBranch:
+        semantic_cfg_enabled = True
+
+        def __init__(self):
+            self.scales = []
+
+        def predict_cfg_with_z(
+            self,
+            x_t,
+            timestep,
+            z,
+            guidance_scale,
+            class_labels,
+        ):
+            self.scales.append(guidance_scale)
+            return SimpleNamespace(sample=torch.full_like(x_t, 0.5))
+
+    branch = CfgBranch()
+    initial = torch.zeros(2, 1, 2, 2)
+    result = integrate_pdae_flow(
+        branch,
+        TinyTransformer(),
+        initial,
+        torch.zeros(2, 4),
+        num_steps=2,
+        guidance_scale=1.5,
+    )
+
+    torch.testing.assert_close(result, torch.full_like(result, 0.5))
+    assert branch.scales == [1.5, 1.5]
 
 
 def test_inferred_noise_roundtrip_is_exact_for_constant_velocity():
@@ -148,7 +220,8 @@ def test_eval_config_accepts_separate_inferred_noise_protocol():
                 "direction": "noise_to_data",
                 "time_evaluation": "midpoint",
                 "fixed_starting_noise": True,
-                "variants": ["correct_z", "shuffled_z", "zero_z"],
+                "guidance_scales": [0.0, 1.0, 1.5, 2.0],
+                "variants": ["correct_z", "shuffled_z"],
                 "inferred_noise": {
                     "enabled": True,
                     "report_separately": True,
@@ -158,6 +231,20 @@ def test_eval_config_accepts_separate_inferred_noise_protocol():
             },
         }
     )
+
+
+def test_null_z_variant_uses_the_learned_null_token():
+    from diffusion_ot.evaluation.stage1a_eval import _variant_z
+
+    class Branch:
+        semantic_cfg_enabled = True
+
+        @staticmethod
+        def semantic_null_like(z):
+            return torch.full_like(z, 7.0)
+
+    z = torch.randn(3, 4)
+    torch.testing.assert_close(_variant_z(Branch(), z, "null_z"), torch.full_like(z, 7.0))
 
 
 def test_identical_image_metrics_are_exact():

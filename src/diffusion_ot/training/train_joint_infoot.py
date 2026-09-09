@@ -155,8 +155,19 @@ def freeze_generator_train_encoder(branch: Any) -> None:
         parameter.requires_grad_(True)
     for parameter in branch.semantic_transformer.parameters():
         parameter.requires_grad_(False)
+    semantic_conditioner = getattr(branch, "semantic_conditioner", None)
+    if semantic_conditioner is not None:
+        for parameter in semantic_conditioner.parameters():
+            parameter.requires_grad_(False)
+        semantic_conditioner.eval()
     branch.encoder.train()
     branch.semantic_transformer.eval()
+
+
+def _fixed_generator_state_dict(branch: Any) -> dict[str, Any]:
+    if hasattr(branch, "generator_state_dict"):
+        return branch.generator_state_dict()
+    return branch.semantic_transformer.trainable_state_dict()
 
 
 def encoder_anchor_loss(
@@ -371,13 +382,13 @@ def _build_checkpoint_payload(
     loader_generators: dict[str, torch.Generator],
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "format_version": 1,
+        "format_version": 2,
         "stage": "stage1b_plain_infoot",
         "step": int(step),
         "encoders": {domain: _cpu_state_dict(encoder) for domain, encoder in encoders.items()},
         "fixed_generators": {
             domain: _cpu_nested_state_dict(
-                value.branch.semantic_transformer.trainable_state_dict()
+                _fixed_generator_state_dict(value.branch)
             )
             for domain, value in domains.items()
         },
