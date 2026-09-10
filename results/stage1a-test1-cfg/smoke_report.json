@@ -1,0 +1,90 @@
+{
+  "protocol": "fixed_noise_smoke",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae/cat_sit_b2.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/sit_b2_256.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2_cfg/checkpoints/latest.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2_cfg/stage1a_eval/step_035000/ema/smoke",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 35000,
+  "weights": "ema",
+  "attention_lora": {
+    "enabled": false
+  },
+  "seed": 20260902,
+  "num_samples": 8,
+  "num_steps": 50,
+  "guidance_scales": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "correct_z_cfg_0",
+    "shuffled_z_cfg_0",
+    "correct_z_cfg_1",
+    "shuffled_z_cfg_1",
+    "correct_z_cfg_1.5",
+    "shuffled_z_cfg_1.5",
+    "correct_z_cfg_2",
+    "shuffled_z_cfg_2"
+  ],
+  "metrics": {
+    "correct_z_cfg_0": {
+      "latent_mse": 1.186427116394043,
+      "pixel_mse": 0.11519128084182739,
+      "pixel_psnr": 9.385803926627199
+    },
+    "shuffled_z_cfg_0": {
+      "latent_mse": 1.186427116394043,
+      "pixel_mse": 0.11519128084182739,
+      "pixel_psnr": 9.385803926627199
+    },
+    "correct_z_cfg_1": {
+      "latent_mse": 0.6468407511711121,
+      "pixel_mse": 0.031799446791410446,
+      "pixel_psnr": 14.975804352837311
+    },
+    "shuffled_z_cfg_1": {
+      "latent_mse": 1.075263500213623,
+      "pixel_mse": 0.10006283223628998,
+      "pixel_psnr": 9.997272087563838
+    },
+    "correct_z_cfg_1.5": {
+      "latent_mse": 0.6430248022079468,
+      "pixel_mse": 0.03097527101635933,
+      "pixel_psnr": 15.089848851005849
+    },
+    "shuffled_z_cfg_1.5": {
+      "latent_mse": 1.130971074104309,
+      "pixel_mse": 0.10672199726104736,
+      "pixel_psnr": 9.717460556976235
+    },
+    "correct_z_cfg_2": {
+      "latent_mse": 0.656601071357727,
+      "pixel_mse": 0.031946491450071335,
+      "pixel_psnr": 14.955768316384027
+    },
+    "shuffled_z_cfg_2": {
+      "latent_mse": 1.166344165802002,
+      "pixel_mse": 0.10986483097076416,
+      "pixel_psnr": 9.591413081198988
+    }
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2_cfg/stage1a_eval/step_035000/ema/smoke/reconstruction_grid.png",
+  "extra_reports": {
+    "inferred_noise_roundtrip": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_sit_b2_cfg/stage1a_eval/step_035000/ema/roundtrip/roundtrip_report.json"
+  }
+}
