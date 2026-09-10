@@ -18,13 +18,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run the Stage 1A PDAE fixed-noise smoke gate and optional "
-            "inferred-noise round-trip gate for one domain."
+            "inferred-noise round-trip gate for one domain. The training "
+            "config selects the matching AdaLN-only or attention-LoRA architecture."
         )
     )
     parser.add_argument(
         "--train-config",
         required=True,
-        help="Cat or Dog Stage 1A training config.",
+        help=(
+            "Cat or Dog Stage 1A training config; use a *_lora.yaml config "
+            "to load and evaluate an attention-LoRA checkpoint."
+        ),
     )
     parser.add_argument(
         "--eval-config",

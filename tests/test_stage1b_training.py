@@ -120,6 +120,8 @@ def test_joint_checkpoint_payload_contains_no_transport_plan():
     assert payload["stage"] == "stage1b_plain_infoot"
     assert set(payload["encoders"]) == {"cat", "dog"}
     assert set(payload["fixed_generators"]) == {"cat", "dog"}
+    assert payload["stage1a_provenance"]["cat"]["checkpoint_step"] == 25_000
+    assert payload["stage1a_provenance"]["dog"]["weights"] == "ema"
 
 
 def test_joint_checkpoint_roundtrip(tmp_path):
@@ -136,3 +138,32 @@ def test_joint_checkpoint_roundtrip(tmp_path):
 
     assert loaded["step"] == 12
     assert set(loaded["encoders"]) == {"cat", "dog"}
+
+
+def test_resume_rejects_different_stage1a_provenance(tmp_path):
+    from diffusion_ot.training.train_joint_infoot import _validate_resume_provenance
+
+    cat_path = tmp_path / "cat.pt"
+    dog_path = tmp_path / "dog.pt"
+    domains = {
+        "cat": SimpleNamespace(checkpoint_path=cat_path, checkpoint_step=10),
+        "dog": SimpleNamespace(checkpoint_path=dog_path, checkpoint_step=10),
+    }
+    checkpoint = {
+        "stage1a_provenance": {
+            "cat": {
+                "checkpoint_path": str(cat_path),
+                "checkpoint_step": 10,
+                "weights": "ema",
+            },
+            "dog": {
+                "checkpoint_path": str(dog_path),
+                "checkpoint_step": 9,
+                "weights": "ema",
+            },
+        },
+        "fixed_generators": {"cat": {}, "dog": {}},
+    }
+
+    with pytest.raises(ValueError, match="dog.*step"):
+        _validate_resume_provenance(checkpoint, domains, weights="ema")

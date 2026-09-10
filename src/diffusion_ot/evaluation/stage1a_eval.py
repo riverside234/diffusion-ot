@@ -30,6 +30,7 @@ class Stage1ASmokeReport:
     split: str
     checkpoint_step: int
     weights: str
+    attention_lora: dict[str, Any]
     seed: int
     num_samples: int
     num_steps: int
@@ -55,6 +56,7 @@ class Stage1ARoundTripReport:
     split: str
     checkpoint_step: int
     weights: str
+    attention_lora: dict[str, Any]
     seed: int
     num_samples: int
     backward_num_steps: int
@@ -141,6 +143,23 @@ def _apply_ema_weights(branch: Any, checkpoint: dict[str, Any]) -> None:
     with torch.no_grad():
         for name, parameter in parameters.items():
             parameter.copy_(shadow[name].to(device=parameter.device, dtype=parameter.dtype))
+
+
+def _attention_lora_metadata(branch: Any) -> dict[str, Any]:
+    wrapper = getattr(branch, "semantic_transformer", None)
+    enabled = bool(getattr(wrapper, "attention_lora_enabled", False))
+    metadata: dict[str, Any] = {"enabled": enabled}
+    if enabled:
+        metadata.update(
+            {
+                "rank": int(wrapper.lora_rank),
+                "alpha": float(wrapper.lora_alpha),
+                "dropout": float(wrapper.lora_dropout),
+                "layers": list(wrapper.lora_layers),
+                "targets": list(wrapper.lora_targets),
+            }
+        )
+    return metadata
 
 
 def _configured_guidance_scales(sampling: dict[str, Any]) -> list[float]:
@@ -725,6 +744,7 @@ def _run_inferred_noise_roundtrip(
         split=evaluator.split,
         checkpoint_step=evaluator.checkpoint_step,
         weights=evaluator.weights,
+        attention_lora=_attention_lora_metadata(evaluator.branch),
         seed=seed,
         num_samples=x0.shape[0],
         backward_num_steps=backward_num_steps,
@@ -838,6 +858,7 @@ def run_stage1a_smoke_test(
         split=evaluator.split,
         checkpoint_step=evaluator.checkpoint_step,
         weights=evaluator.weights,
+        attention_lora=_attention_lora_metadata(evaluator.branch),
         seed=seed,
         num_samples=num_samples,
         num_steps=num_steps,

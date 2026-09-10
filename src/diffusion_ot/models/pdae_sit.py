@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import torch
@@ -207,6 +209,61 @@ class AdaLNZeroResidualAdapter(nn.Module):
         return self.out_proj(h)
 
 
+class SemanticLoRALinear(nn.Module):
+    """A frozen linear layer with a LoRA update enabled only on semantic passes."""
+
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        *,
+        rank: int = 4,
+        alpha: float | None = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if not isinstance(base_layer, nn.Linear):
+            raise TypeError("SemanticLoRALinear requires an nn.Linear base layer.")
+        if rank <= 0:
+            raise ValueError("LoRA rank must be positive.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("LoRA dropout must be in [0, 1).")
+
+        self.base_layer = base_layer
+        self.rank = int(rank)
+        self.alpha = float(self.rank if alpha is None else alpha)
+        if self.alpha <= 0.0:
+            raise ValueError("LoRA alpha must be positive.")
+        self.scaling = self.alpha / self.rank
+        self.dropout = nn.Dropout(float(dropout)) if dropout > 0.0 else nn.Identity()
+        self.lora_down = nn.Linear(base_layer.in_features, self.rank, bias=False)
+        self.lora_up = nn.Linear(self.rank, base_layer.out_features, bias=False)
+        self.lora_down.to(device=base_layer.weight.device, dtype=base_layer.weight.dtype)
+        self.lora_up.to(device=base_layer.weight.device, dtype=base_layer.weight.dtype)
+        self.active = False
+
+        for parameter in self.base_layer.parameters():
+            parameter.requires_grad_(False)
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        output = self.base_layer(inputs)
+        if not self.active:
+            return output
+        delta = self.lora_up(self.dropout(self.lora_down(inputs)))
+        return output + delta.to(dtype=output.dtype) * self.scaling
+
+    def lora_state_dict(self) -> dict[str, Any]:
+        return {
+            "lora_down": self.lora_down.state_dict(),
+            "lora_up": self.lora_up.state_dict(),
+        }
+
+    def load_lora_state_dict(self, state_dict: dict[str, Any], strict: bool = True) -> None:
+        self.lora_down.load_state_dict(state_dict["lora_down"], strict=strict)
+        self.lora_up.load_state_dict(state_dict["lora_up"], strict=strict)
+
+
 class SemanticSiTWrapper(nn.Module):
     """Frozen SiT transformer plus trainable z-conditioned residual adapters."""
 
@@ -217,8 +274,15 @@ class SemanticSiTWrapper(nn.Module):
         injection_layers: Iterable[int] | None = None,
         bottleneck_dim: int = 64,
         freeze_base: bool = True,
+        attention_lora: bool = False,
+        lora_rank: int = 4,
+        lora_alpha: float | None = None,
+        lora_dropout: float = 0.0,
+        lora_layers: Iterable[int] | None = None,
     ) -> None:
         super().__init__()
+        if attention_lora and not freeze_base:
+            raise ValueError("Semantic attention LoRA requires adapter.freeze_base=true.")
         self.base = transformer
         if freeze_base:
             for parameter in self.base.parameters():
@@ -253,27 +317,155 @@ class SemanticSiTWrapper(nn.Module):
             out_dim=_final_patch_dim(transformer),
             bottleneck_dim=bottleneck_dim,
         )
+        self.attention_lora_enabled = bool(attention_lora)
+        default_lora_layers = self.injection_layers
+        requested_lora_layers = _as_list(lora_layers, default=default_lora_layers)
+        self.lora_layers = sorted(set(requested_lora_layers))
+        invalid_lora_layers = [
+            layer for layer in self.lora_layers if not 0 <= layer < depth
+        ]
+        if invalid_lora_layers:
+            raise ValueError(f"LoRA layers are outside the SiT depth: {invalid_lora_layers}")
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(self.lora_rank if lora_alpha is None else lora_alpha)
+        self.lora_dropout = float(lora_dropout)
+        self.lora_targets = ("qkv", "proj")
+        self._attention_lora_modules: dict[int, dict[str, SemanticLoRALinear]] = {}
+        if self.attention_lora_enabled:
+            if not self.lora_layers:
+                raise ValueError("At least one LoRA layer is required when LoRA is enabled.")
+            self._install_attention_lora()
+
+    def _install_attention_lora(self) -> None:
+        for layer_index in self.lora_layers:
+            block = self.base.blocks[layer_index]
+            attention = getattr(block, "attn", None)
+            if attention is None:
+                raise ValueError(f"SiT block {layer_index} has no attn module for LoRA.")
+            layer_modules: dict[str, SemanticLoRALinear] = {}
+            for target in self.lora_targets:
+                base_layer = getattr(attention, target, None)
+                if not isinstance(base_layer, nn.Linear):
+                    raise ValueError(
+                        f"SiT block {layer_index} attention target {target!r} is not nn.Linear."
+                    )
+                wrapped = SemanticLoRALinear(
+                    base_layer,
+                    rank=self.lora_rank,
+                    alpha=self.lora_alpha,
+                    dropout=self.lora_dropout,
+                )
+                setattr(attention, target, wrapped)
+                layer_modules[target] = wrapped
+            self._attention_lora_modules[layer_index] = layer_modules
+
+    @contextmanager
+    def _semantic_lora(self, layer_index: int):
+        modules = self._attention_lora_modules.get(layer_index, {}).values()
+        for module in modules:
+            module.active = True
+        try:
+            yield
+        finally:
+            for module in modules:
+                module.active = False
+
+    def _attention_lora_state_dict(self) -> dict[str, Any]:
+        return {
+            str(layer): {
+                target: module.lora_state_dict()
+                for target, module in modules.items()
+            }
+            for layer, modules in self._attention_lora_modules.items()
+        }
+
+    def _load_attention_lora_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        strict: bool,
+    ) -> None:
+        expected_layers = {str(layer) for layer in self._attention_lora_modules}
+        received_layers = set(state_dict)
+        if strict and received_layers != expected_layers:
+            raise ValueError(
+                "Attention LoRA checkpoint layers do not match the model: "
+                f"expected {sorted(expected_layers)}, received {sorted(received_layers)}."
+            )
+        for layer, modules in self._attention_lora_modules.items():
+            saved_modules = state_dict.get(str(layer))
+            if saved_modules is None:
+                if strict:
+                    raise ValueError(f"Attention LoRA checkpoint is missing layer {layer}.")
+                continue
+            if strict and set(saved_modules) != set(modules):
+                raise ValueError(
+                    f"Attention LoRA targets differ at layer {layer}: "
+                    f"expected {sorted(modules)}, received {sorted(saved_modules)}."
+                )
+            for target, module in modules.items():
+                if target in saved_modules:
+                    module.load_lora_state_dict(saved_modules[target], strict=strict)
 
     def train(self, mode: bool = True):
         super().train(mode)
         self.base.eval()
+        for modules in self._attention_lora_modules.values():
+            for module in modules.values():
+                module.train(mode)
         return self
 
     def trainable_state_dict(self) -> dict[str, Any]:
-        return {
+        state = {
             "z_proj": self.z_proj.state_dict(),
             "adapters": self.adapters.state_dict(),
             "final_adapter": self.final_adapter.state_dict(),
+            "attention_lora_enabled": self.attention_lora_enabled,
         }
+        if self.attention_lora_enabled:
+            state["attention_lora_config"] = {
+                "rank": self.lora_rank,
+                "alpha": self.lora_alpha,
+                "dropout": self.lora_dropout,
+                "layers": self.lora_layers,
+                "targets": list(self.lora_targets),
+            }
+            state["attention_lora"] = self._attention_lora_state_dict()
+        return state
 
     def load_trainable_state_dict(
         self,
         state_dict: dict[str, Any],
         strict: bool = True,
     ) -> None:
+        saved_lora_enabled = bool(
+            state_dict.get("attention_lora_enabled", "attention_lora" in state_dict)
+        )
+        if saved_lora_enabled != self.attention_lora_enabled:
+            raise ValueError(
+                "Checkpoint attention-LoRA setting does not match the Stage 1A config."
+            )
+        if self.attention_lora_enabled and strict:
+            saved_config = state_dict.get("attention_lora_config") or {}
+            expected_config = {
+                "rank": self.lora_rank,
+                "alpha": self.lora_alpha,
+                "dropout": self.lora_dropout,
+                "layers": self.lora_layers,
+                "targets": list(self.lora_targets),
+            }
+            if saved_config != expected_config:
+                raise ValueError(
+                    "Checkpoint attention-LoRA configuration does not match the model: "
+                    f"expected {expected_config}, received {saved_config}."
+                )
         self.z_proj.load_state_dict(state_dict["z_proj"], strict=strict)
         self.adapters.load_state_dict(state_dict["adapters"], strict=strict)
         self.final_adapter.load_state_dict(state_dict["final_adapter"], strict=strict)
+        if self.attention_lora_enabled:
+            saved_lora = state_dict.get("attention_lora")
+            if saved_lora is None:
+                raise ValueError("Attention-LoRA checkpoint is missing its LoRA weights.")
+            self._load_attention_lora_state_dict(saved_lora, strict=strict)
 
     def _label_embedding(self, class_labels, batch_size: int, device, force_drop_ids=None):
         y_embedder = getattr(self.base, "y_embedder", None)
@@ -312,7 +504,8 @@ class SemanticSiTWrapper(nn.Module):
         x_sem = x
         for layer_index, block in enumerate(self.base.blocks):
             x_base = block(x_base, c_base)
-            x_sem = block(x_sem, c_base)
+            with self._semantic_lora(layer_index):
+                x_sem = block(x_sem, c_base)
             adapter = self.adapters[str(layer_index)] if str(layer_index) in self.adapters else None
             if adapter is not None:
                 x_sem = x_sem + adapter(x_sem, c_sem)
@@ -575,7 +768,7 @@ class PDAESiTBranch(nn.Module):
 
     def pdae_state_dict(self) -> dict[str, Any]:
         return {
-            "format_version": 2,
+            "format_version": 3,
             "encoder": self.encoder.state_dict(),
             "generator": self.generator_state_dict(),
         }
@@ -629,6 +822,13 @@ def build_pdae_sit_branch(
         injection_layers=adapter_config.get("injection_layers"),
         bottleneck_dim=int(adapter_config.get("bottleneck_dim", 64)),
         freeze_base=bool(adapter_config.get("freeze_base", True)),
+        attention_lora=bool(adapter_config.get("lora", False)),
+        lora_rank=int(adapter_config.get("lora_rank", 4)),
+        lora_alpha=float(
+            adapter_config.get("lora_alpha", adapter_config.get("lora_rank", 4))
+        ),
+        lora_dropout=float(adapter_config.get("lora_dropout", 0.0)),
+        lora_layers=adapter_config.get("lora_layers"),
     )
     semantic_cfg_enabled = bool(semantic_cfg_config.get("enabled", False))
     null_condition = str(semantic_cfg_config.get("null_condition", "learned_token"))

@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-cat", default=None)
     parser.add_argument("--device-dog", default=None)
     parser.add_argument("--max-reference", type=int, default=None)
+    parser.add_argument(
+        "--max-projection",
+        type=int,
+        default=None,
+        help="Bound the Eq. (7) target projection bank; the config default uses all samples.",
+    )
     parser.add_argument("--max-query", type=int, default=None)
     return parser.parse_args()
 
@@ -45,6 +51,7 @@ def main() -> int:
         device_cat=args.device_cat,
         device_dog=args.device_dog,
         max_reference=args.max_reference,
+        max_projection=args.max_projection,
         max_query=args.max_query,
     )
     print("stage1b_evaluation_report:")
@@ -53,6 +60,7 @@ def main() -> int:
     print(f"  mutual_information: {report.solver['mutual_information']}")
     print(f"  row_residual: {report.solver['row_residual']}")
     print(f"  column_residual: {report.solver['column_residual']}")
+    print(f"  baseline_comparison: {report.baseline_comparison['status']}")
     return 0
 
 

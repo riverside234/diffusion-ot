@@ -168,6 +168,9 @@ def _cycle(loader):
 
 
 def _optimizer_groups(branch, train_config: dict[str, Any]):
+    def is_lora_parameter(name: str) -> bool:
+        return ".lora_down." in name or ".lora_up." in name
+
     encoder_params = [
         parameter
         for name, parameter in branch.named_parameters()
@@ -176,7 +179,14 @@ def _optimizer_groups(branch, train_config: dict[str, Any]):
     adapter_params = [
         parameter
         for name, parameter in branch.named_parameters()
-        if parameter.requires_grad and not name.startswith("encoder.")
+        if parameter.requires_grad
+        and not name.startswith("encoder.")
+        and not is_lora_parameter(name)
+    ]
+    lora_params = [
+        parameter
+        for name, parameter in branch.named_parameters()
+        if parameter.requires_grad and is_lora_parameter(name)
     ]
     groups = []
     if encoder_params:
@@ -193,6 +203,14 @@ def _optimizer_groups(branch, train_config: dict[str, Any]):
                 "group_name": "adapter",
                 "params": adapter_params,
                 "lr": float(train_config.get("lr_adapter", train_config.get("lr", 1.0e-4))),
+            }
+        )
+    if lora_params:
+        groups.append(
+            {
+                "group_name": "lora",
+                "params": lora_params,
+                "lr": float(train_config.get("lr_lora", 5.0e-5)),
             }
         )
     return groups
@@ -921,7 +939,16 @@ def train_pdae_domain(
     adapter_parameters = [
         parameter
         for name, parameter in branch.named_parameters()
-        if parameter.requires_grad and not name.startswith("encoder.")
+        if parameter.requires_grad
+        and not name.startswith("encoder.")
+        and ".lora_down." not in name
+        and ".lora_up." not in name
+    ]
+    lora_parameters = [
+        parameter
+        for name, parameter in branch.named_parameters()
+        if parameter.requires_grad
+        and (".lora_down." in name or ".lora_up." in name)
     ]
     null_condition_parameters = (
         list(branch.semantic_conditioner.parameters())
@@ -1011,6 +1038,9 @@ def train_pdae_domain(
 
         encoder_grad_norm = _gradient_norm(encoder_parameters) if should_log else None
         adapter_grad_norm = _gradient_norm(adapter_parameters) if should_log else None
+        lora_grad_norm = (
+            _gradient_norm(lora_parameters) if should_log and lora_parameters else None
+        )
         null_condition_grad_norm = (
             _gradient_norm(null_condition_parameters)
             if should_log and null_condition_parameters
@@ -1063,6 +1093,7 @@ def train_pdae_domain(
                 "total_grad_norm_pre_clip": total_grad_norm,
                 "encoder_grad_norm_pre_clip": encoder_grad_norm,
                 "adapter_grad_norm_pre_clip": adapter_grad_norm,
+                "lora_grad_norm_pre_clip": lora_grad_norm,
                 "null_condition_grad_norm_pre_clip": null_condition_grad_norm,
                 "semantic_cfg_enabled": branch.semantic_cfg_enabled,
                 "semantic_dropout_probability": (

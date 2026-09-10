@@ -229,8 +229,136 @@ def test_conditional_projection_weights_are_normalized():
     query = torch.randn(3, 4)
     a, b = uniform_marginals(5, 7)
     coupling = seeded_nonindependent_coupling(a, b, seed=29)
-    weights = conditional_reference_weights(query, reference_x, coupling, a=a)
+    weights = conditional_reference_weights(query, reference_x, target_codes, coupling, a=a, b=b)
     projected = weighted_target_codes(weights, target_codes)
 
     torch.testing.assert_close(weights.sum(dim=1), torch.ones(3), atol=1.0e-6, rtol=0)
     assert projected.shape == (3, 4)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_conditional_reference_weights_match_equation7_with_target_correction(reverse):
+    import math
+
+    from diffusion_ot.losses.infoot import conditional_reference_weights, weighted_target_codes
+
+    source = torch.tensor([[0.0], [1.4]], dtype=torch.float64)
+    target = torch.tensor([[0.0, 0.0], [0.2, 0.4], [2.0, 1.4]], dtype=torch.float64)
+    coupling = torch.tensor([[0.20, 0.06, 0.04], [0.10, 0.14, 0.46]], dtype=torch.float64)
+    if reverse:
+        source, target, coupling = target, source, coupling.T
+    query = source[:1] + 0.3
+    a, b = coupling.sum(1), coupling.sum(0)
+    bandwidth, scale_x, scale_y = 0.7, 0.8, 1.3
+
+    def kernel(x, y, scale):
+        return math.exp(-float(((x - y) ** 2).sum()) / (2 * (bandwidth * scale) ** 2))
+
+    # Independent scalar evaluation of the joint and both marginals in Eq. (7).
+    source_density = sum(float(a[i]) * kernel(query[0], x, scale_x) for i, x in enumerate(source))
+    scores = []
+    uncorrected = []
+    for j, y in enumerate(target):
+        joint = sum(
+            float(coupling[i, l]) * kernel(query[0], x, scale_x) * kernel(y, v, scale_y)
+            for i, x in enumerate(source) for l, v in enumerate(target)
+        )
+        target_density = sum(float(b[l]) * kernel(y, v, scale_y) for l, v in enumerate(target))
+        scores.append(float(b[j]) * joint / (source_density * target_density))
+        uncorrected.append(float(b[j]) * joint)
+    expected = torch.tensor([scores], dtype=torch.float64)
+    expected /= expected.sum(1, keepdim=True)
+    weights = conditional_reference_weights(
+        query, source, target, coupling, a=a, b=b,
+        bandwidth=bandwidth, distance_scale_x=scale_x, distance_scale_y=scale_y,
+    )
+    torch.testing.assert_close(weights, expected)
+    source_only = torch.tensor(
+        [[kernel(query[0], x, scale_x) for x in source]], dtype=torch.float64
+    ) @ coupling
+    source_only /= source_only.sum(1, keepdim=True)
+    no_target_correction = torch.tensor([uncorrected], dtype=torch.float64)
+    no_target_correction /= no_target_correction.sum(1, keepdim=True)
+    assert not torch.allclose(weights, source_only)
+    assert not torch.allclose(weights, no_target_correction)
+    # Decoder values are raw codes, separate from the lower-dimensional KDE features.
+    raw = torch.arange(len(target) * 4, dtype=torch.float64).reshape(len(target), 4)
+    torch.testing.assert_close(weighted_target_codes(weights, raw), expected @ raw)
+
+
+def test_conditional_projection_normalizes_when_source_kernels_underflow():
+    from diffusion_ot.losses.infoot import conditional_reference_weights, gaussian_kernel
+
+    source = torch.tensor([[0.0], [1.0]])
+    target = torch.tensor([[0.0], [0.3], [2.0]])
+    query = torch.tensor([[100.0]])
+    coupling = torch.tensor([[0.20, 0.06, 0.04], [0.10, 0.14, 0.46]])
+    a, b = coupling.sum(1), coupling.sum(0)
+    assert gaussian_kernel(query, source).count_nonzero() == 0
+    weights = conditional_reference_weights(query, source, target, coupling, a=a, b=b)
+    target_kernel = gaussian_kernel(target)
+    expected = (coupling[1:2] @ target_kernel.T) * (b / (target_kernel @ b))
+    expected /= expected.sum(1, keepdim=True)
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(weights.sum(1), torch.ones(1))
+
+
+def test_conditional_projection_independent_plan_recovers_target_masses():
+    from diffusion_ot.losses.infoot import conditional_reference_weights
+
+    source = torch.tensor([[0.0], [1.0]])
+    target = torch.tensor([[0.0], [0.1], [2.0]])
+    a, b = torch.tensor([0.3, 0.7]), torch.tensor([0.2, 0.3, 0.5])
+    weights = conditional_reference_weights(source, source, target, torch.outer(a, b), a=a, b=b)
+    torch.testing.assert_close(weights, b.expand(2, -1))
+
+
+def test_conditional_projection_rejects_zero_normalization():
+    from diffusion_ot.losses.infoot import conditional_reference_weights
+
+    source = torch.tensor([[0.0], [1.0]])
+    with pytest.raises(FloatingPointError, match="normalization"):
+        conditional_reference_weights(source, source, source, torch.zeros(2, 2))
+
+
+def test_conditional_projection_uses_larger_target_bank_and_empirical_masses():
+    from diffusion_ot.losses.infoot import conditional_projection_weights
+
+    source_reference = torch.tensor([[0.0], [1.0]], dtype=torch.float64)
+    target_reference = torch.tensor([[0.0], [0.5], [2.0]], dtype=torch.float64)
+    projection = torch.tensor([[-0.2], [0.3], [1.1], [2.4]], dtype=torch.float64)
+    query = torch.tensor([[0.35], [0.9]], dtype=torch.float64)
+    coupling = torch.tensor(
+        [[0.22, 0.08, 0.10], [0.08, 0.22, 0.30]], dtype=torch.float64
+    )
+    a, b = coupling.sum(1), coupling.sum(0)
+    projection_masses = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float64)
+    bandwidth, scale_x, scale_y = 0.8, 0.7, 1.2
+
+    weights = conditional_projection_weights(
+        query,
+        projection,
+        source_reference,
+        target_reference,
+        coupling,
+        a=a,
+        b=b,
+        projection_masses=projection_masses,
+        bandwidth=bandwidth,
+        distance_scale_x=scale_x,
+        distance_scale_y=scale_y,
+    )
+    kx = torch.exp(
+        -torch.cdist(query, source_reference).square() / (2 * (bandwidth * scale_x) ** 2)
+    )
+    ky = torch.exp(
+        -torch.cdist(projection, target_reference).square()
+        / (2 * (bandwidth * scale_y) ** 2)
+    )
+    expected = (kx @ coupling @ ky.T) / ((kx @ a)[:, None] * (ky @ b)[None, :])
+    expected *= projection_masses
+    expected /= expected.sum(1, keepdim=True)
+
+    assert weights.shape == (2, 4)
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(weights.sum(1), torch.ones(2, dtype=torch.float64))

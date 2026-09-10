@@ -76,7 +76,7 @@ def median_distance_scale(features: torch.Tensor, eps: float = 1.0e-8) -> torch.
     return values.median().clamp_min(eps)
 
 
-def gaussian_kernel(
+def _log_gaussian_kernel(
     x: torch.Tensor,
     y: torch.Tensor | None = None,
     *,
@@ -87,7 +87,20 @@ def gaussian_kernel(
     scale = torch.as_tensor(distance_scale, device=x.device, dtype=x.dtype)
     width = torch.as_tensor(bandwidth, device=x.device, dtype=x.dtype) * scale
     width = width.detach().clamp_min(eps)
-    return torch.exp(-pairwise_squared_distances(x, y) / (2.0 * width.square()))
+    return -pairwise_squared_distances(x, y) / (2.0 * width.square())
+
+
+def gaussian_kernel(
+    x: torch.Tensor,
+    y: torch.Tensor | None = None,
+    *,
+    bandwidth: float | torch.Tensor = 1.0,
+    distance_scale: float | torch.Tensor = 1.0,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    return _log_gaussian_kernel(
+        x, y, bandwidth=bandwidth, distance_scale=distance_scale, eps=eps
+    ).exp()
 
 
 @torch.no_grad()
@@ -389,40 +402,142 @@ def conditional_density_ratio(
         default_a, default_b = uniform_marginals(n, m, device=coupling.device, dtype=coupling.dtype)
         a = default_a if a is None else a
         b = default_b if b is None else b
-    kernel_qx = gaussian_kernel(
+    log_kernel_qx = _log_gaussian_kernel(
         query_x, reference_x, bandwidth=bandwidth, distance_scale=distance_scale_x, eps=eps
     )
-    kernel_gy = gaussian_kernel(
+    log_kernel_gy = _log_gaussian_kernel(
         gallery_y, reference_y, bandwidth=bandwidth, distance_scale=distance_scale_y, eps=eps
     )
+    # Multiplying each KDE-kernel row by a positive constant cancels in the
+    # joint-to-marginal ratio. Row softmax therefore preserves the ratios while
+    # avoiding all-zero rows for low-density queries or gallery samples.
+    kernel_qx = torch.softmax(log_kernel_qx, dim=1)
+    kernel_gy = torch.softmax(log_kernel_gy, dim=1)
     joint = kernel_qx @ coupling @ kernel_gy.transpose(0, 1)
     marginal_q = kernel_qx @ a
     marginal_g = kernel_gy @ b
-    return joint / (marginal_q[:, None] * marginal_g[None, :]).clamp_min(eps)
+    ratios = joint / (marginal_q[:, None] * marginal_g[None, :]).clamp_min(
+        torch.finfo(joint.dtype).tiny
+    )
+    if not torch.isfinite(ratios).all():
+        raise FloatingPointError("Conditional density ratios are non-finite.")
+    return ratios
 
 
 def normalize_rows(weights: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
     return weights.clamp_min(0.0) / weights.clamp_min(0.0).sum(dim=1, keepdim=True).clamp_min(eps)
 
 
-def conditional_reference_weights(
+def conditional_projection_weights(
     query_x: torch.Tensor,
+    projection_y: torch.Tensor,
     reference_x: torch.Tensor,
+    reference_y: torch.Tensor,
     coupling: torch.Tensor,
     *,
     a: torch.Tensor | None = None,
+    b: torch.Tensor | None = None,
+    projection_masses: torch.Tensor | None = None,
     bandwidth: float = 1.0,
     distance_scale_x: float | torch.Tensor = 1.0,
+    distance_scale_y: float | torch.Tensor = 1.0,
     eps: float = 1.0e-8,
 ) -> torch.Tensor:
+    """Eq. (7) weights over a target projection bank, without top-k.
+
+    The fit references define the KDE and may be smaller than ``projection_y``.
+    The source marginal cancels in row normalization. Target smoothing and
+    division by the target marginal do not cancel.
+    """
     n, m = coupling.shape
-    if a is None:
-        a, _ = uniform_marginals(n, m, device=coupling.device, dtype=coupling.dtype)
-    kernel_qx = gaussian_kernel(
-        query_x, reference_x, bandwidth=bandwidth, distance_scale=distance_scale_x, eps=eps
+    if reference_x.shape[0] != n or reference_y.shape[0] != m:
+        raise ValueError("Reference banks do not match the coupling dimensions.")
+    if query_x.ndim != 2 or projection_y.ndim != 2:
+        raise ValueError("Query and projection features must be rank two.")
+    if query_x.shape[1] != reference_x.shape[1]:
+        raise ValueError("Query and source-reference feature dimensions differ.")
+    if projection_y.shape[1] != reference_y.shape[1]:
+        raise ValueError("Projection and target-reference feature dimensions differ.")
+    if a is None or b is None:
+        default_a, default_b = uniform_marginals(n, m, device=coupling.device, dtype=coupling.dtype)
+        a = default_a if a is None else a
+        b = default_b if b is None else b
+    _validate_marginals(a, b, n, m)
+    if not torch.isfinite(coupling).all() or (coupling < 0).any():
+        raise ValueError("Coupling must be finite and nonnegative.")
+    projection_count = projection_y.shape[0]
+    if projection_count <= 0:
+        raise ValueError("Projection bank must contain at least one sample.")
+    if projection_masses is None:
+        projection_masses = torch.full(
+            (projection_count,),
+            1.0 / projection_count,
+            device=coupling.device,
+            dtype=coupling.dtype,
+        )
+    if projection_masses.shape != (projection_count,):
+        raise ValueError("Projection masses do not match the projection bank.")
+    if (
+        not torch.isfinite(projection_masses).all()
+        or (projection_masses < 0).any()
+        or projection_masses.sum() <= 0
+    ):
+        raise ValueError("Projection masses must be finite, nonnegative, and have positive mass.")
+    ratios = conditional_density_ratio(
+        query_x,
+        projection_y,
+        reference_x,
+        reference_y,
+        coupling,
+        a=a,
+        b=b,
+        bandwidth=bandwidth,
+        distance_scale_x=distance_scale_x,
+        distance_scale_y=distance_scale_y,
+        eps=eps,
     )
-    source_density = (kernel_qx @ a).clamp_min(eps)
-    return normalize_rows((kernel_qx @ coupling) / source_density[:, None], eps=eps)
+    weights = ratios * projection_masses[None, :]
+    normalizer = weights.sum(dim=1, keepdim=True)
+    if (
+        not torch.isfinite(weights).all()
+        or not torch.isfinite(normalizer).all()
+        or (normalizer <= 0).any()
+    ):
+        raise FloatingPointError("Conditional projection has no finite positive normalization.")
+    return weights / normalizer
+
+
+def conditional_reference_weights(
+    query_x: torch.Tensor,
+    reference_x: torch.Tensor,
+    reference_y: torch.Tensor,
+    coupling: torch.Tensor,
+    *,
+    a: torch.Tensor | None = None,
+    b: torch.Tensor | None = None,
+    bandwidth: float = 1.0,
+    distance_scale_x: float | torch.Tensor = 1.0,
+    distance_scale_y: float | torch.Tensor = 1.0,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    """Eq. (7) weights when the target references are the projection bank."""
+    n, m = coupling.shape
+    if b is None:
+        _, b = uniform_marginals(n, m, device=coupling.device, dtype=coupling.dtype)
+    return conditional_projection_weights(
+        query_x,
+        reference_y,
+        reference_x,
+        reference_y,
+        coupling,
+        a=a,
+        b=b,
+        projection_masses=b,
+        bandwidth=bandwidth,
+        distance_scale_x=distance_scale_x,
+        distance_scale_y=distance_scale_y,
+        eps=eps,
+    )
 
 
 def nearest_plan_row_weights(

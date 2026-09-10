@@ -443,6 +443,38 @@ def _resolve_resume(value: str | Path | None, root: Path, latest: Path) -> Path 
     )
 
 
+def _validate_resume_provenance(
+    checkpoint: dict[str, Any],
+    domains: dict[str, LoadedTrainingDomain],
+    *,
+    weights: str,
+) -> None:
+    provenance = checkpoint.get("stage1a_provenance") or {}
+    fixed_generators = checkpoint.get("fixed_generators") or {}
+    for domain, value in domains.items():
+        record = provenance.get(domain)
+        if not isinstance(record, dict):
+            raise ValueError(f"Resume checkpoint has no stage1a_provenance.{domain} record.")
+        expected_path = Path(str(record.get("checkpoint_path", ""))).resolve()
+        actual_path = Path(value.checkpoint_path).resolve()
+        mismatches = []
+        if expected_path != actual_path:
+            mismatches.append(f"path {actual_path} != {expected_path}")
+        if int(record.get("checkpoint_step", -1)) != int(value.checkpoint_step):
+            mismatches.append(
+                f"step {value.checkpoint_step} != {record.get('checkpoint_step')}"
+            )
+        if str(record.get("weights")) != str(weights):
+            mismatches.append(f"weights {weights} != {record.get('weights')}")
+        if domain not in fixed_generators:
+            mismatches.append("fixed generator state is missing")
+        if mismatches:
+            raise ValueError(
+                f"Configured Stage 1A {domain} state does not match the resume checkpoint: "
+                + "; ".join(mismatches)
+            )
+
+
 def train_joint_infoot(
     config_path: str | Path,
     *,
@@ -613,6 +645,11 @@ def train_joint_infoot(
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         checkpoint = _load_checkpoint(resume_path)
+        _validate_resume_provenance(
+            checkpoint,
+            domains,
+            weights=str(stage1a.get("weights", "ema")),
+        )
         for domain, encoder in encoders.items():
             encoder.load_state_dict(checkpoint["encoders"][domain])
         optimizer.load_state_dict(checkpoint["optimizer"])

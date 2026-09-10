@@ -47,6 +47,40 @@ def test_ema_checkpoint_loading_updates_only_trainable_parameters(tmp_path):
     assert float(branch.frozen.detach()) == pytest.approx(7.0)
 
 
+def test_attention_lora_metadata_records_the_evaluated_architecture():
+    from diffusion_ot.evaluation.stage1a_eval import _attention_lora_metadata
+
+    branch = SimpleNamespace(
+        semantic_transformer=SimpleNamespace(
+            attention_lora_enabled=True,
+            lora_rank=4,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            lora_layers=[4, 5, 6, 7, 8, 9, 10, 11],
+            lora_targets=("qkv", "proj"),
+        )
+    )
+
+    assert _attention_lora_metadata(branch) == {
+        "enabled": True,
+        "rank": 4,
+        "alpha": 4.0,
+        "dropout": 0.0,
+        "layers": [4, 5, 6, 7, 8, 9, 10, 11],
+        "targets": ["qkv", "proj"],
+    }
+
+
+def test_attention_lora_metadata_marks_adaln_only_evaluation():
+    from diffusion_ot.evaluation.stage1a_eval import _attention_lora_metadata
+
+    branch = SimpleNamespace(
+        semantic_transformer=SimpleNamespace(attention_lora_enabled=False)
+    )
+
+    assert _attention_lora_metadata(branch) == {"enabled": False}
+
+
 def test_reconstruction_is_deterministic_for_the_same_seed():
     from diffusion_ot.evaluation.stage1a_eval import _noise_like, integrate_pdae_flow
 

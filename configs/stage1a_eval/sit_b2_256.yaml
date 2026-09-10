@@ -1,7 +1,8 @@
 stage: stage1a_eval
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
 
-# The Cat or Dog Stage 1A training config is supplied by the future CLI.
+# Supply the matching Cat or Dog training config to the CLI. Model options such
+# as attention LoRA are reconstructed from that config and recorded in reports.
 split: val
 weights: ema
 seed: 20260902

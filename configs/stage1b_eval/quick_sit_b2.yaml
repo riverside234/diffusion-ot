@@ -6,9 +6,12 @@ alignment_device: cuda:0
 
 data:
   reference_split: train
+  # Eq. (7) is fit on the reference subset and averaged over this larger bank.
+  projection_split: train
   query_split: val
   gallery_split: val
   reference_samples_per_domain: 512
+  projection_samples_per_domain: all
   query_samples_per_domain: 256
   gallery_samples_per_domain: 256
   batch_size: 32
@@ -55,7 +58,12 @@ translation:
   num_steps: 50
   guidance_scale: 1.0
   readouts: [conditional_mean, conditional_map, conditional_sample]
+  primary_readout: conditional_mean
   temperature: 1.0
+
+comparison:
+  # A Stage 1B report is only valid against the same versioned Stage 1A protocol.
+  require_stage1a_baseline: true
 
 visualization:
   enabled: true

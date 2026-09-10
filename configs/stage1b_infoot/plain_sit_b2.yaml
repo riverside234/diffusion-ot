@@ -71,3 +71,9 @@ trainable:
   encoders: true
   adapters: false
   base_transformers: false
+
+quick_evaluation:
+  config: configs/stage1b_eval/quick_sit_b2.yaml
+  weights: ema
+  # Invoke scripts/train_joint_infoot.py with --quick-eval to preserve the
+  # Stage 1A baseline before training and compare the final checkpoint to it.

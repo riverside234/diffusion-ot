@@ -18,7 +18,7 @@ from diffusion_ot.integrations.hf_snapshot import (
 )
 from diffusion_ot.losses.infoot import (
     conditional_density_ratio,
-    conditional_reference_weights,
+    conditional_projection_weights,
     effective_target_count,
     kernel_offdiagonal_stats,
     median_distance_scale,
@@ -81,6 +81,9 @@ class DomainEvaluationContext:
     checkpoint_path: Path
     checkpoint_step: int
     weights: str
+    stage1a_checkpoint_path: Path
+    stage1a_checkpoint_step: int
+    stage1a_weights: str
 
 
 @dataclass
@@ -92,12 +95,15 @@ class Stage1BEvaluationReport:
     output_dir: str
     seed: int
     reference_sizes: dict[str, int]
+    projection_sizes: dict[str, int]
     query_sizes: dict[str, int]
     gallery_sizes: dict[str, int]
     distance_scales: dict[str, float]
     solver: dict[str, Any]
     latent_diagnostics: dict[str, dict[str, float]]
     reconstruction: dict[str, Any]
+    baseline_comparison: dict[str, Any]
+    checkpoint_selection: dict[str, Any]
     retrieval: dict[str, Any]
     translation_grids: dict[str, str]
     visualization_paths: dict[str, str]
@@ -113,9 +119,13 @@ def _nested(config: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
-def deterministic_indices(length: int, count: int, seed: int) -> list[int]:
+def deterministic_indices(length: int, count: int | None, seed: int) -> list[int]:
     if length <= 0:
         raise ValueError("Cannot sample from an empty dataset.")
+    if count is None or int(count) >= length:
+        return list(range(length))
+    if int(count) <= 0:
+        raise ValueError("Sample count must be positive or None for the full dataset.")
     count = min(int(count), length)
     generator = torch.Generator().manual_seed(int(seed))
     return torch.randperm(length, generator=generator)[:count].tolist()
@@ -124,6 +134,25 @@ def deterministic_indices(length: int, count: int, seed: int) -> list[int]:
 def _checkpoint_identifier(path: Path, step: int, weights: str) -> str:
     payload = f"{path.resolve()}::{int(step)}::{weights}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _protocol_identifier(
+    evaluation_config: dict[str, Any],
+    *,
+    max_reference: int | None,
+    max_projection: int | None,
+    max_query: int | None,
+) -> str:
+    payload = {
+        "evaluation_config": evaluation_config,
+        "cli_overrides": {
+            "max_reference": max_reference,
+            "max_projection": max_projection,
+            "max_query": max_query,
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:8]
 
 
 def save_latent_bank(path: str | Path, bank: LatentBank) -> None:
@@ -178,7 +207,7 @@ def build_latent_bank(
     *,
     domain: str,
     split: str,
-    count: int,
+    count: int | None,
     seed: int,
     batch_size: int,
     device: str,
@@ -211,6 +240,23 @@ def build_latent_bank(
     )
     bank.validate()
     return bank
+
+
+def subset_latent_bank(bank: LatentBank, *, count: int, seed: int) -> LatentBank:
+    """Select a deterministic fit-reference subset without re-encoding samples."""
+    bank.validate()
+    indices = deterministic_indices(len(bank.sample_ids), count, seed)
+    selected = LatentBank(
+        domain=bank.domain,
+        split=bank.split,
+        raw_codes=bank.raw_codes[indices].clone(),
+        matching_features=bank.matching_features[indices].clone(),
+        sample_ids=[bank.sample_ids[index] for index in indices],
+        metadata=[dict(bank.metadata[index]) for index in indices],
+        checkpoint_id=bank.checkpoint_id,
+    )
+    selected.validate()
+    return selected
 
 
 def load_proxy_labels(
@@ -319,6 +365,7 @@ def _direction_evaluation(
     target_gallery: LatentBank,
     coupling: torch.Tensor,
     *,
+    target_projection: LatentBank | None = None,
     source_scale: float,
     target_scale: float,
     bandwidth: float,
@@ -328,11 +375,14 @@ def _direction_evaluation(
     seed: int,
     eps: float,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    target_projection = target_reference if target_projection is None else target_projection
+    validate_bank_compatibility(target_reference, target_projection, require_disjoint=False)
     device = coupling.device
     source_ref_features = source_reference.matching_features.to(device)
     target_ref_features = target_reference.matching_features.to(device)
     source_query_features = source_query.matching_features.to(device)
     target_gallery_features = target_gallery.matching_features.to(device)
+    target_projection_features = target_projection.matching_features.to(device)
 
     conditional_scores = conditional_density_ratio(
         source_query_features,
@@ -350,18 +400,22 @@ def _direction_evaluation(
         source_query_features, source_ref_features, coupling, eps=eps
     )
     plan_rankings = _rank_descending(plan_weights)
-    conditional_weights = conditional_reference_weights(
+    conditional_weights = conditional_projection_weights(
         source_query_features,
+        target_projection_features,
         source_ref_features,
+        target_ref_features,
         coupling,
         bandwidth=bandwidth,
         distance_scale_x=source_scale,
+        distance_scale_y=target_scale,
         eps=eps,
     )
 
-    target_raw = target_reference.raw_codes.to(device)
-    barycentric_codes = weighted_target_codes(plan_weights, target_raw)
-    conditional_codes = weighted_target_codes(conditional_weights, target_raw)
+    target_reference_raw = target_reference.raw_codes.to(device)
+    target_projection_raw = target_projection.raw_codes.to(device)
+    barycentric_codes = weighted_target_codes(plan_weights, target_reference_raw)
+    conditional_codes = weighted_target_codes(conditional_weights, target_projection_raw)
     barycentric_features = normalize_matching_features(barycentric_codes)
     barycentric_rankings = torch.argsort(
         pairwise_squared_distances(barycentric_features, target_ref_features), dim=1
@@ -375,9 +429,9 @@ def _direction_evaluation(
         dim=1,
     ).to(device)
     nearest_target_distance = pairwise_squared_distances(
-        normalize_matching_features(conditional_codes), target_ref_features
+        normalize_matching_features(conditional_codes), target_projection_features
     ).min(dim=1).values.sqrt()
-    norm_ratio = conditional_codes.norm(dim=1) / target_raw.norm(dim=1).mean().clamp_min(eps)
+    norm_ratio = conditional_codes.norm(dim=1) / target_projection_raw.norm(dim=1).mean().clamp_min(eps)
 
     ranking_sets = {
         "random": (random_rankings, target_gallery.sample_ids),
@@ -406,6 +460,9 @@ def _direction_evaluation(
     ]
     report = {
         "precision": precision,
+        "projection_method": "infoot_eq7_conditional_expectation",
+        "projection_support": "target_training_projection_bank",
+        "projection_target_count": len(target_projection.sample_ids),
         "conditional_top_ids": dict(zip(source_query.sample_ids, top_ids)),
         "mean_conditional_effective_target_count": float(
             effective_target_count(conditional_weights).mean().cpu()
@@ -491,6 +548,34 @@ def _load_domain_context(
     selected_path = stage1a_checkpoint_path
     if checkpoint_path is not None:
         joint = _load_joint_checkpoint(checkpoint_path)
+        provenance = (joint.get("stage1a_provenance") or {}).get(domain)
+        if not isinstance(provenance, dict):
+            raise ValueError(f"Joint checkpoint has no stage1a_provenance.{domain} record.")
+        expected_path = Path(str(provenance.get("checkpoint_path", "")))
+        if not expected_path.is_absolute():
+            expected_path = resolve_project_local_path(
+                expected_path,
+                root,
+                field_name=f"stage1a_provenance.{domain}.checkpoint_path",
+            )
+        provenance_mismatches = []
+        if expected_path.resolve() != stage1a_checkpoint_path.resolve():
+            provenance_mismatches.append(
+                f"path {stage1a_checkpoint_path} != {expected_path.resolve()}"
+            )
+        if int(provenance.get("checkpoint_step", -1)) != checkpoint_step:
+            provenance_mismatches.append(
+                f"step {checkpoint_step} != {provenance.get('checkpoint_step')}"
+            )
+        if str(provenance.get("weights")) != initial_weights:
+            provenance_mismatches.append(
+                f"weights {initial_weights} != {provenance.get('weights')}"
+            )
+        if provenance_mismatches:
+            raise ValueError(
+                f"Configured Stage 1A {domain} checkpoint does not match the Stage 1B "
+                "checkpoint provenance: " + "; ".join(provenance_mismatches)
+            )
         fixed_generator = (joint.get("fixed_generators") or {}).get(domain)
         if fixed_generator is None:
             raise ValueError(f"Joint checkpoint has no fixed_generators.{domain} state.")
@@ -517,6 +602,9 @@ def _load_domain_context(
         checkpoint_path=selected_path,
         checkpoint_step=checkpoint_step,
         weights=joint_weights if checkpoint_path is not None else initial_weights,
+        stage1a_checkpoint_path=stage1a_checkpoint_path,
+        stage1a_checkpoint_step=int(stage1a_checkpoint.get("step", 0)),
+        stage1a_weights=initial_weights,
     )
 
 
@@ -623,7 +711,7 @@ def _save_translation_grid(
     source: DomainEvaluationContext,
     target: DomainEvaluationContext,
     source_query: LatentBank,
-    target_reference: LatentBank,
+    target_projection: LatentBank,
     weights: torch.Tensor,
     *,
     count: int,
@@ -638,14 +726,14 @@ def _save_translation_grid(
 
     count = min(int(count), weights.shape[0])
     weights = weights[:count].float()
-    conditional_mean = weighted_target_codes(weights, target_reference.raw_codes)
-    map_codes = target_reference.raw_codes[weights.argmax(dim=1)]
+    conditional_mean = weighted_target_codes(weights, target_projection.raw_codes)
+    map_codes = target_projection.raw_codes[weights.argmax(dim=1)]
     sampling_weights = torch.softmax(weights.clamp_min(1.0e-12).log() / float(temperature), dim=1)
     sample_generator = torch.Generator().manual_seed(int(seed) + 1)
     sampled_indices = torch.multinomial(
         sampling_weights.cpu(), 1, generator=sample_generator
     ).squeeze(1)
-    sampled_codes = target_reference.raw_codes[sampled_indices]
+    sampled_codes = target_projection.raw_codes[sampled_indices]
 
     source_x0 = _load_latents_from_bank(source_query, count).to(source.device, dtype=source.dtype)
     source_images = decode_vae_latents(source.vae, source_x0).cpu()
@@ -731,6 +819,56 @@ def _write_rankings_csv(
                 writer.writerow([source_id, rank, target_id])
 
 
+def _numeric_comparison(current: Any, baseline: Any, prefix: str = "") -> dict[str, dict[str, float]]:
+    comparisons: dict[str, dict[str, float]] = {}
+    if isinstance(current, dict) and isinstance(baseline, dict):
+        for key in sorted(set(current).intersection(baseline)):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            comparisons.update(_numeric_comparison(current[key], baseline[key], path))
+    elif (
+        isinstance(current, (int, float))
+        and not isinstance(current, bool)
+        and isinstance(baseline, (int, float))
+        and not isinstance(baseline, bool)
+        and math.isfinite(float(current))
+        and math.isfinite(float(baseline))
+    ):
+        comparisons[prefix] = {
+            "baseline": float(baseline),
+            "current": float(current),
+            "delta": float(current) - float(baseline),
+        }
+    return comparisons
+
+
+def _checkpoint_selection_summary(
+    retrieval: dict[str, Any],
+    reconstruction: dict[str, Any],
+    baseline_comparison: dict[str, Any],
+) -> dict[str, Any]:
+    directions = {}
+    for name, result in retrieval.items():
+        directions[name] = {
+            "projection_method": result["projection_method"],
+            "projection_support": result["projection_support"],
+            "projection_target_count": result["projection_target_count"],
+            "mean_effective_target_count": result[
+                "mean_conditional_effective_target_count"
+            ],
+            "mean_nearest_target_distance": result["mean_nearest_target_distance"],
+            "mean_target_norm_ratio": result[
+                "mean_projected_to_target_norm_ratio"
+            ],
+            "conditional_proxy_precision": result["precision"].get("conditional", {}),
+        }
+    return {
+        "primary_readout": "infoot_eq7_conditional_expectation",
+        "directions": directions,
+        "source_reconstruction": reconstruction,
+        "baseline_comparison_status": baseline_comparison["status"],
+    }
+
+
 def run_stage1b_evaluation(
     alignment_config_path: str | Path,
     evaluation_config_path: str | Path,
@@ -740,6 +878,7 @@ def run_stage1b_evaluation(
     device_cat: str | None = None,
     device_dog: str | None = None,
     max_reference: int | None = None,
+    max_projection: int | None = None,
     max_query: int | None = None,
 ) -> Stage1BEvaluationReport:
     alignment_path = Path(alignment_config_path).resolve()
@@ -786,8 +925,47 @@ def run_stage1b_evaluation(
             device_override=device_dog,
         ),
     }
+    protocol_identifier = _protocol_identifier(
+        evaluation_config,
+        max_reference=max_reference,
+        max_projection=max_projection,
+        max_query=max_query,
+    )
+    baseline_identifier = "stage1a_" + "_".join(
+        _checkpoint_identifier(
+            contexts[domain].stage1a_checkpoint_path,
+            contexts[domain].stage1a_checkpoint_step,
+            contexts[domain].stage1a_weights,
+        )[:8]
+        for domain in ("cat", "dog")
+    ) + f"_protocol_{protocol_identifier}"
+    mode = "stage1a_offline_infoot" if resolved_checkpoint is None else "stage1b_plain_infoot"
+    identifier = (
+        baseline_identifier
+        if resolved_checkpoint is None
+        else (
+            f"stage1b_{_checkpoint_identifier(resolved_checkpoint, contexts['cat'].checkpoint_step, weights)[:8]}"
+            f"_step_{contexts['cat'].checkpoint_step:06d}_{weights}_protocol_{protocol_identifier}"
+        )
+    )
+    output_base = resolve_project_local_path(
+        evaluation_config.get("output_dir", "outputs/stage1b_eval"), root, field_name="output_dir"
+    )
+    output_root = output_base / identifier
+    baseline_report_path = output_base / baseline_identifier / "evaluation_report.json"
+    comparison_config = _nested(evaluation_config, "comparison")
+    if (
+        resolved_checkpoint is not None
+        and bool(comparison_config.get("require_stage1a_baseline", True))
+        and not baseline_report_path.is_file()
+    ):
+        raise FileNotFoundError(
+            "Matching Stage 1A + offline-InfoOT baseline is missing. Run the evaluator "
+            f"without --checkpoint first: {baseline_report_path}"
+        )
     data_config = _nested(evaluation_config, "data")
     reference_split = str(data_config.get("reference_split", "train"))
+    projection_split = str(data_config.get("projection_split", reference_split))
     query_split = str(data_config.get("query_split", "val"))
     gallery_split = str(data_config.get("gallery_split", "val"))
     if reference_split == query_split:
@@ -795,6 +973,9 @@ def run_stage1b_evaluation(
     seed = int(evaluation_config.get("seed", 20260906))
     batch_size = int(data_config.get("batch_size", 32))
     reference_count = int(max_reference or data_config.get("reference_samples_per_domain", 512))
+    configured_projection_count = data_config.get("projection_samples_per_domain")
+    projection_count = max_projection if max_projection is not None else configured_projection_count
+    projection_count = None if projection_count in {None, "all"} else int(projection_count)
     query_count = int(max_query or data_config.get("query_samples_per_domain", 256))
     gallery_count = int(max_query or data_config.get("gallery_samples_per_domain", 256))
 
@@ -804,15 +985,45 @@ def run_stage1b_evaluation(
         checkpoint_id = _checkpoint_identifier(
             context.checkpoint_path, context.checkpoint_step, context.weights
         )
+        projection_dataset = _dataset(context, projection_split, root)
+        banks[domain]["projection"] = build_latent_bank(
+            context.branch.encoder,
+            projection_dataset,
+            domain=domain,
+            split=projection_split,
+            count=projection_count,
+            seed=seed + domain_index * 1000 + 50,
+            batch_size=batch_size,
+            device=context.device,
+            dtype=context.dtype,
+            checkpoint_id=checkpoint_id,
+        )
+        if reference_split == projection_split:
+            banks[domain]["reference"] = subset_latent_bank(
+                banks[domain]["projection"],
+                count=reference_count,
+                seed=seed + domain_index * 1000,
+            )
+        else:
+            banks[domain]["reference"] = build_latent_bank(
+                context.branch.encoder,
+                _dataset(context, reference_split, root),
+                domain=domain,
+                split=reference_split,
+                count=reference_count,
+                seed=seed + domain_index * 1000,
+                batch_size=batch_size,
+                device=context.device,
+                dtype=context.dtype,
+                checkpoint_id=checkpoint_id,
+            )
         for kind, split, count, offset in (
-            ("reference", reference_split, reference_count, 0),
             ("query", query_split, query_count, 100),
             ("gallery", gallery_split, gallery_count, 200),
         ):
-            dataset = _dataset(context, split, root)
             banks[domain][kind] = build_latent_bank(
                 context.branch.encoder,
-                dataset,
+                _dataset(context, split, root),
                 domain=domain,
                 split=split,
                 count=count,
@@ -824,6 +1035,11 @@ def run_stage1b_evaluation(
             )
         validate_bank_compatibility(banks[domain]["reference"], banks[domain]["query"])
         validate_bank_compatibility(banks[domain]["reference"], banks[domain]["gallery"])
+        validate_bank_compatibility(
+            banks[domain]["reference"], banks[domain]["projection"], require_disjoint=False
+        )
+        validate_bank_compatibility(banks[domain]["projection"], banks[domain]["query"])
+        validate_bank_compatibility(banks[domain]["projection"], banks[domain]["gallery"])
 
     matching_config = _nested(evaluation_config, "matching")
     bandwidth = float(matching_config.get("bandwidth_multiplier", 1.0))
@@ -845,11 +1061,6 @@ def run_stage1b_evaluation(
         **solver_kwargs(infoot_config),
     )
 
-    mode = "stage1a_offline_infoot" if resolved_checkpoint is None else "stage1b_plain_infoot"
-    identifier = "baseline" if resolved_checkpoint is None else f"step_{contexts['cat'].checkpoint_step:06d}_{weights}"
-    output_root = resolve_project_local_path(
-        evaluation_config.get("output_dir", "outputs/stage1b_eval"), root, field_name="output_dir"
-    ) / identifier
     banks_dir = output_root / "banks"
     for domain in ("cat", "dog"):
         for kind, bank in banks[domain].items():
@@ -859,6 +1070,8 @@ def run_stage1b_evaluation(
             "coupling": solution.coupling.cpu(),
             "cat_reference_ids": banks["cat"]["reference"].sample_ids,
             "dog_reference_ids": banks["dog"]["reference"].sample_ids,
+            "cat_projection_ids": banks["cat"]["projection"].sample_ids,
+            "dog_projection_ids": banks["dog"]["projection"].sample_ids,
             "distance_scales": scales,
             "bandwidth": bandwidth,
         },
@@ -897,6 +1110,7 @@ def run_stage1b_evaluation(
             banks[source_domain]["query"],
             banks[target_domain]["gallery"],
             coupling,
+            target_projection=banks[target_domain]["projection"],
             source_scale=scales[source_domain],
             target_scale=scales[target_domain],
             bandwidth=bandwidth,
@@ -941,7 +1155,7 @@ def run_stage1b_evaluation(
                 contexts[source_domain],
                 contexts[target_domain],
                 banks[source_domain]["query"],
-                banks[target_domain]["reference"],
+                banks[target_domain]["projection"],
                 direction_tensors[name]["conditional_weights"],
                 count=int(translation_config.get("samples_per_direction", 8)),
                 num_steps=int(translation_config.get("num_steps", 50)),
@@ -960,7 +1174,7 @@ def run_stage1b_evaluation(
                 continue
             path = output_root / "visualization" / f"{name}_umap.png"
             _save_umap(
-                banks[target_domain]["reference"],
+                banks[target_domain]["projection"],
                 direction_tensors[name]["conditional_codes"],
                 direction_tensors[name]["barycentric_codes"],
                 labels=labels,
@@ -970,6 +1184,31 @@ def run_stage1b_evaluation(
             )
             visualization_paths[name] = str(path)
 
+    baseline_comparison: dict[str, Any]
+    if resolved_checkpoint is None:
+        baseline_comparison = {"status": "baseline", "baseline_report": str(output_root / "evaluation_report.json")}
+    elif baseline_report_path.is_file():
+        baseline_payload = json.loads(baseline_report_path.read_text(encoding="utf-8"))
+        current_payload = {
+            "latent_diagnostics": {
+                f"{domain}_{kind}": latent_diagnostics(bank)
+                for domain, domain_banks in banks.items()
+                for kind, bank in domain_banks.items()
+            },
+            "reconstruction": reconstruction,
+            "retrieval": retrieval,
+        }
+        baseline_comparison = {
+            "status": "compared",
+            "baseline_report": str(baseline_report_path),
+            "numeric_deltas": _numeric_comparison(current_payload, baseline_payload),
+        }
+    else:
+        baseline_comparison = {"status": "missing", "baseline_report": str(baseline_report_path)}
+    checkpoint_selection = _checkpoint_selection_summary(
+        retrieval, reconstruction, baseline_comparison
+    )
+
     report = Stage1BEvaluationReport(
         alignment_config_path=str(alignment_path),
         evaluation_config_path=str(evaluation_path),
@@ -978,6 +1217,7 @@ def run_stage1b_evaluation(
         output_dir=str(output_root),
         seed=seed,
         reference_sizes={domain: len(banks[domain]["reference"].sample_ids) for domain in banks},
+        projection_sizes={domain: len(banks[domain]["projection"].sample_ids) for domain in banks},
         query_sizes={domain: len(banks[domain]["query"].sample_ids) for domain in banks},
         gallery_sizes={domain: len(banks[domain]["gallery"].sample_ids) for domain in banks},
         distance_scales=scales,
@@ -1006,6 +1246,8 @@ def run_stage1b_evaluation(
             for kind, bank in domain_banks.items()
         },
         reconstruction=reconstruction,
+        baseline_comparison=baseline_comparison,
+        checkpoint_selection=checkpoint_selection,
         retrieval=retrieval,
         translation_grids=translation_paths,
         visualization_paths=visualization_paths,

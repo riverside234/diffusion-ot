@@ -38,14 +38,28 @@ class FakeYEmbedder(nn.Module):
         return self.embedding_table(labels)
 
 
+class FakeAttention(nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.qkv = nn.Linear(hidden_size, 3 * hidden_size)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x):
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        return self.proj((q + k + v) / 3.0)
+
+
 class FakeBlock(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
+        self.attn = FakeAttention(hidden_size)
         self.token_proj = nn.Linear(hidden_size, hidden_size)
         self.cond_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, x, c):
-        return torch.tanh(self.token_proj(x) + self.cond_proj(c)[:, None, :])
+        return torch.tanh(
+            self.token_proj(x) + self.attn(x) + self.cond_proj(c)[:, None, :]
+        )
 
 
 class FakeFinalLayer(nn.Module):
@@ -163,6 +177,184 @@ def test_branch_can_predict_from_supplied_z_and_reload_trainable_state():
 
     for name, value in branch.pdae_state_dict()["encoder"].items():
         torch.testing.assert_close(value, saved_state["encoder"][name])
+
+
+def test_attention_lora_is_zero_initialized_and_only_changes_semantic_path():
+    from diffusion_ot.models.pdae_sit import (
+        SemanticLoRALinear,
+        SemanticSiTWrapper,
+        make_null_class_labels,
+    )
+
+    torch.manual_seed(2)
+    base = FakeSiT()
+    reference = deepcopy(base)
+    wrapper = SemanticSiTWrapper(
+        base,
+        z_dim=16,
+        injection_layers=[0, 1],
+        bottleneck_dim=4,
+        attention_lora=True,
+        lora_rank=2,
+        lora_alpha=2,
+        lora_layers=[0, 1],
+    )
+    x_t = torch.randn(2, 4, 8, 8)
+    timestep = torch.rand(2)
+    labels = make_null_class_labels(base, batch_size=2, device=x_t.device)
+    z = torch.randn(2, 16)
+
+    with torch.no_grad():
+        expected = reference(
+            hidden_states=x_t,
+            timestep=timestep,
+            class_labels=labels,
+        ).sample
+        initial = wrapper(x_t, timestep, z, class_labels=labels)
+
+    torch.testing.assert_close(initial.base_sample, expected, atol=1.0e-6, rtol=1.0e-6)
+    torch.testing.assert_close(initial.sample, expected, atol=1.0e-6, rtol=1.0e-6)
+    qkv_lora = base.blocks[0].attn.qkv
+    assert isinstance(qkv_lora, SemanticLoRALinear)
+    assert not any(parameter.requires_grad for parameter in qkv_lora.base_layer.parameters())
+    assert all(parameter.requires_grad for parameter in qkv_lora.lora_down.parameters())
+    assert all(parameter.requires_grad for parameter in qkv_lora.lora_up.parameters())
+
+    with torch.no_grad():
+        qkv_lora.lora_up.weight.fill_(0.05)
+    updated = wrapper(x_t, timestep, z, class_labels=labels)
+
+    torch.testing.assert_close(updated.base_sample, expected, atol=1.0e-6, rtol=1.0e-6)
+    assert not torch.allclose(updated.sample, expected)
+    updated.delta_sample.square().mean().backward()
+    assert qkv_lora.lora_up.weight.grad is not None
+    assert torch.isfinite(qkv_lora.lora_up.weight.grad).all()
+
+
+def test_attention_lora_checkpoint_roundtrip_and_configuration_guard():
+    from diffusion_ot.models.pdae_sit import SemanticSiTWrapper
+
+    source = SemanticSiTWrapper(
+        FakeSiT(),
+        z_dim=16,
+        injection_layers=[0, 1],
+        bottleneck_dim=4,
+        attention_lora=True,
+        lora_rank=2,
+        lora_alpha=4,
+        lora_layers=[0, 1],
+    )
+    with torch.no_grad():
+        source.base.blocks[1].attn.proj.lora_up.weight.fill_(0.125)
+    state = deepcopy(source.trainable_state_dict())
+
+    restored = SemanticSiTWrapper(
+        FakeSiT(),
+        z_dim=16,
+        injection_layers=[0, 1],
+        bottleneck_dim=4,
+        attention_lora=True,
+        lora_rank=2,
+        lora_alpha=4,
+        lora_layers=[0, 1],
+    )
+    restored.load_trainable_state_dict(state)
+    torch.testing.assert_close(
+        restored.base.blocks[1].attn.proj.lora_up.weight,
+        source.base.blocks[1].attn.proj.lora_up.weight,
+    )
+
+    without_lora = SemanticSiTWrapper(
+        FakeSiT(),
+        z_dim=16,
+        injection_layers=[0, 1],
+        bottleneck_dim=4,
+    )
+    with pytest.raises(ValueError, match="attention-LoRA setting"):
+        without_lora.load_trainable_state_dict(state)
+
+
+def test_stage1a_optimizer_keeps_lora_in_a_separate_learning_rate_group():
+    from diffusion_ot.models.pdae_sit import (
+        PDAELatentEncoder,
+        PDAESiTBranch,
+        SemanticSiTWrapper,
+    )
+    from diffusion_ot.training.train_pdae_domain import _optimizer_groups
+
+    encoder = PDAELatentEncoder(
+        input_channels=4,
+        channels=[8, 16],
+        z_dim=16,
+        spatial_size=2,
+        num_groups=4,
+    )
+    wrapper = SemanticSiTWrapper(
+        FakeSiT(),
+        z_dim=16,
+        injection_layers=[0, 1],
+        bottleneck_dim=4,
+        attention_lora=True,
+        lora_rank=2,
+        lora_layers=[0, 1],
+    )
+    branch = PDAESiTBranch(encoder, wrapper)
+    groups = _optimizer_groups(
+        branch,
+        {"lr_encoder": 1.0e-4, "lr_adapter": 1.0e-4, "lr_lora": 5.0e-5},
+    )
+
+    assert [group["group_name"] for group in groups] == ["encoder", "adapter", "lora"]
+    assert [group["lr"] for group in groups] == [1.0e-4, 1.0e-4, 5.0e-5]
+    grouped_ids = [id(parameter) for group in groups for parameter in group["params"]]
+    trainable_ids = [id(parameter) for parameter in branch.parameters() if parameter.requires_grad]
+    assert len(grouped_ids) == len(set(grouped_ids))
+    assert set(grouped_ids) == set(trainable_ids)
+
+
+def test_build_branch_enables_attention_lora_from_stage_config():
+    from diffusion_ot.models.pdae_sit import (
+        SemanticLoRALinear,
+        build_pdae_sit_branch,
+    )
+
+    branch = build_pdae_sit_branch(
+        FakeSiT(),
+        model_config={"latent_channels": 4},
+        stage_config={
+            "encoder": {
+                "channels": [8, 16],
+                "spatial_size": 2,
+                "z_dim": 16,
+                "num_groups": 4,
+            },
+            "adapter": {
+                "injection_layers": [0, 1],
+                "bottleneck_dim": 4,
+                "lora": True,
+                "lora_rank": 2,
+                "lora_alpha": 2,
+                "lora_dropout": 0.0,
+                "lora_layers": [0, 1],
+            },
+        },
+    )
+
+    assert branch.semantic_transformer.attention_lora_enabled
+    assert isinstance(branch.semantic_transformer.base.blocks[0].attn.qkv, SemanticLoRALinear)
+
+
+def test_attention_lora_rejects_an_unfrozen_base():
+    from diffusion_ot.models.pdae_sit import SemanticSiTWrapper
+
+    with pytest.raises(ValueError, match="freeze_base=true"):
+        SemanticSiTWrapper(
+            FakeSiT(),
+            z_dim=16,
+            injection_layers=[0, 1],
+            attention_lora=True,
+            freeze_base=False,
+        )
 
 
 def test_learned_semantic_condition_drops_individual_samples_and_gets_gradients():
