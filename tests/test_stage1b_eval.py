@@ -6,6 +6,38 @@ import pytest
 torch = pytest.importorskip("torch")
 
 
+def test_legacy_alignment_config_uses_non_cfg_stage1a_models():
+    from pathlib import Path
+
+    from diffusion_ot.integrations.hf_snapshot import load_yaml_config
+
+    root = Path(__file__).resolve().parents[1]
+    alignment = load_yaml_config(
+        root / "configs" / "stage1b_infoot" / "plain_sit_b2_nocfg.yaml"
+    )
+    for domain in ("cat", "dog"):
+        domain_config = alignment["stage1a"][domain]
+        stage1a = load_yaml_config(root / domain_config["config"])
+        assert stage1a["semantic_cfg"]["enabled"] is False
+        assert "_cfg/" not in domain_config["checkpoint"]
+
+
+def test_cfg_alignment_config_uses_cfg_stage1a_checkpoints():
+    from pathlib import Path
+
+    from diffusion_ot.integrations.hf_snapshot import load_yaml_config
+
+    root = Path(__file__).resolve().parents[1]
+    alignment = load_yaml_config(
+        root / "configs" / "stage1b_infoot" / "plain_sit_b2.yaml"
+    )
+    for domain in ("cat", "dog"):
+        domain_config = alignment["stage1a"][domain]
+        stage1a = load_yaml_config(root / domain_config["config"])
+        assert stage1a["semantic_cfg"]["enabled"] is True
+        assert "_cfg/" in domain_config["checkpoint"]
+
+
 def _bank(domain: str, split: str, ids: list[str], checkpoint: str = "same"):
     from diffusion_ot.evaluation.stage1b_eval import LatentBank
 
