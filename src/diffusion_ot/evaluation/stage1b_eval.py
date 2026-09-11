@@ -769,6 +769,7 @@ def _save_umap(
     labels: dict[str, dict[str, Any]],
     attribute: str | None,
     random_state: int,
+    n_jobs: int,
     output_path: Path,
 ) -> None:
     try:
@@ -778,7 +779,11 @@ def _save_umap(
     except ImportError as exc:
         raise RuntimeError("UMAP visualization requires umap-learn and matplotlib.") from exc
 
-    reducer = umap.UMAP(random_state=int(random_state), transform_seed=int(random_state))
+    reducer = umap.UMAP(
+        random_state=int(random_state),
+        transform_seed=int(random_state),
+        n_jobs=int(n_jobs),
+    )
     target_embedding = reducer.fit_transform(target_bank.raw_codes.numpy())
     conditional_embedding = reducer.transform(conditional_codes.numpy())
     barycentric_embedding = reducer.transform(barycentric_codes.numpy())
@@ -1180,6 +1185,7 @@ def run_stage1b_evaluation(
                 labels=labels,
                 attribute=attributes[0] if attributes else None,
                 random_state=int(visualization_config.get("random_state", seed)),
+                n_jobs=int(visualization_config.get("n_jobs", 1)),
                 output_path=path,
             )
             visualization_paths[name] = str(path)

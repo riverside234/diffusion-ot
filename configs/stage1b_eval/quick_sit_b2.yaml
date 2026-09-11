@@ -69,3 +69,5 @@ visualization:
   enabled: true
   method: umap
   random_state: 20260906
+  # A fixed seed makes UMAP deterministic and therefore single-threaded.
+  n_jobs: 1
