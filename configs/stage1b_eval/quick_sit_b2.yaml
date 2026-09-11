@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_cfg
+output_dir: outputs/stage1b_eval_cfg_adaln_all_lora_r64
 seed: 20260906
 alignment_device: cuda:0
 
@@ -18,8 +18,9 @@ data:
   num_workers: 4
   pin_memory: true
 
-# Optional JSONL rows: {"sample_id": "...", "viewpoint": "front", ...}.
-# When absent, rankings and projections are saved but Precision@k is skipped.
+# JSONL rows: {"sample_id": "...", "viewpoint": "front", "framing": "close"}.
+# Set path to populate UMAP colors and proxy precision. When absent, the panels
+# explicitly show "missing" and their precision captions report n/a.
 proxy_labels:
   path: null
   attributes: [viewpoint, framing]
@@ -27,11 +28,14 @@ proxy_labels:
 
 matching:
   normalize: l2
-  bandwidth_multiplier: 1.0
+  # Plain InfoOT uses h=0.55 for separately trained embedding spaces in the
+  # paper. With the median-distance scale below, this also avoids the nearly
+  # constant kernels produced by h=1.0 in the Stage 1A baseline.
+  bandwidth_multiplier: 0.55
 
 infoot:
   mi_weight: 1.0
-  entropy_epsilon: 0.05
+  entropy_epsilon: 0.02
   inner_iterations: 100
   projection_iterations: 300
   projection_tolerance: 0.00001
@@ -71,3 +75,7 @@ visualization:
   random_state: 20260906
   # A fixed seed makes UMAP deterministic and therefore single-threaded.
   n_jobs: 1
+  # Keep both layers translucent so dense target regions and projection
+  # overlaps remain visible.
+  target_alpha: 0.18
+  projection_alpha: 0.55

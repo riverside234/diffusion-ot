@@ -55,12 +55,12 @@ matching:
   normalize: l2
   calibration_samples: 256
   distance_scale: fixed_stage1a_median
-  bandwidth_multiplier: 1.0
+  bandwidth_multiplier: 0.55
 
 infoot:
   variant: plain
   mi_weight: 1.0
-  entropy_epsilon: 0.05
+  entropy_epsilon: 0.02
   inner_iterations: 50
   projection_iterations: 200
   projection_tolerance: 0.00001

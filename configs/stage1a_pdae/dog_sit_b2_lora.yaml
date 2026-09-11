@@ -4,7 +4,7 @@ domain: dog
 split: train
 data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
-output_dir: outputs/stage1a_dog_sit_b2_cfg_lora_r64
+output_dir: outputs/stage1a_dog_sit_b2_cfg_adaln_all_lora_r64
 device: cuda:1
 torch_dtype: float32
 
@@ -70,7 +70,8 @@ encoder:
 
 adapter:
   freeze_base: true
-  injection_layers: [4, 5, 6, 7, 8, 9, 10, 11]
+  # SiT-B/2 has 12 transformer blocks. Apply semantic AdaLN-Zero to each one.
+  injection_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
   bottleneck_dim: 64
   lora: true
   lora_rank: 64

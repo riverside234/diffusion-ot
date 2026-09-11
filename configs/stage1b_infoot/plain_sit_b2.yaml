@@ -1,6 +1,6 @@
 stage: stage1b_plain_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_cat_dog_plain_infoot_sit_b2_cfg_lora_r64
+output_dir: outputs/stage1b_cat_dog_plain_infoot_sit_b2_cfg_adaln_all_lora_r64
 
 stage1a:
   weights: ema
@@ -10,11 +10,11 @@ stage1a:
   require_attention_lora_alpha: 64
   cat:
     config: configs/stage1a_pdae/cat_sit_b2_lora.yaml
-    checkpoint: outputs/stage1a_cat_sit_b2_cfg_lora_r64/checkpoints/latest.pt
+    checkpoint: outputs/stage1a_cat_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
     device: cuda:0
   dog:
     config: configs/stage1a_pdae/dog_sit_b2_lora.yaml
-    checkpoint: outputs/stage1a_dog_sit_b2_cfg_lora_r64/checkpoints/latest.pt
+    checkpoint: outputs/stage1a_dog_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
     device: cuda:1
 
 data:
@@ -56,12 +56,12 @@ matching:
   normalize: l2
   calibration_samples: 256
   distance_scale: fixed_stage1a_median
-  bandwidth_multiplier: 1.0
+  bandwidth_multiplier: 0.55
 
 infoot:
   variant: plain
   mi_weight: 1.0
-  entropy_epsilon: 0.05
+  entropy_epsilon: 0.02
   inner_iterations: 50
   projection_iterations: 200
   projection_tolerance: 0.00001

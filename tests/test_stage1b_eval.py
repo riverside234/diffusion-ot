@@ -20,6 +20,8 @@ def test_legacy_alignment_config_uses_non_cfg_stage1a_models():
         stage1a = load_yaml_config(root / domain_config["config"])
         assert stage1a["semantic_cfg"]["enabled"] is False
         assert "_cfg/" not in domain_config["checkpoint"]
+    assert alignment["matching"]["bandwidth_multiplier"] == pytest.approx(0.55)
+    assert alignment["infoot"]["entropy_epsilon"] == pytest.approx(0.02)
 
 
 def test_cfg_alignment_config_uses_cfg_lora_stage1a_checkpoints():
@@ -39,14 +41,212 @@ def test_cfg_alignment_config_uses_cfg_lora_stage1a_checkpoints():
         assert stage1a["adapter"]["lora"] is True
         assert stage1a["adapter"]["lora_rank"] == 64
         assert stage1a["adapter"]["lora_alpha"] == 64
+        assert stage1a["adapter"]["injection_layers"] == list(range(12))
+        assert stage1a["adapter"]["lora_layers"] == list(range(4, 12))
         assert stage1a["train"]["max_steps"] == 40000
         assert stage1a["train"]["lr_lora"] == pytest.approx(0.000025)
-        assert "_cfg_lora_r64/" in domain_config["checkpoint"]
+        assert "_cfg_adaln_all_lora_r64/" in domain_config["checkpoint"]
     assert alignment["stage1a"]["require_semantic_cfg"] is True
     assert alignment["stage1a"]["require_attention_lora"] is True
     assert alignment["stage1a"]["require_attention_lora_rank"] == 64
     assert alignment["stage1a"]["require_attention_lora_alpha"] == 64
+    assert alignment["matching"]["bandwidth_multiplier"] == pytest.approx(0.55)
+    assert alignment["infoot"]["entropy_epsilon"] == pytest.approx(0.02)
     assert alignment["trainable"]["attention_lora"] is False
+
+
+def test_quick_evaluation_uses_the_training_infoot_kernel_and_entropy():
+    from pathlib import Path
+
+    from diffusion_ot.integrations.hf_snapshot import load_yaml_config
+
+    root = Path(__file__).resolve().parents[1]
+    alignment = load_yaml_config(
+        root / "configs" / "stage1b_infoot" / "plain_sit_b2.yaml"
+    )
+    evaluation = load_yaml_config(
+        root / "configs" / "stage1b_eval" / "quick_sit_b2.yaml"
+    )
+
+    assert evaluation["matching"]["bandwidth_multiplier"] == pytest.approx(
+        alignment["matching"]["bandwidth_multiplier"]
+    )
+    assert evaluation["infoot"]["mi_weight"] == pytest.approx(
+        alignment["infoot"]["mi_weight"]
+    )
+    assert evaluation["infoot"]["entropy_epsilon"] == pytest.approx(
+        alignment["infoot"]["entropy_epsilon"]
+    )
+    assert evaluation["output_dir"].endswith("_cfg_adaln_all_lora_r64")
+    assert evaluation["proxy_labels"]["attributes"] == ["viewpoint", "framing"]
+    assert evaluation["visualization"]["target_alpha"] == pytest.approx(0.18)
+    assert evaluation["visualization"]["projection_alpha"] == pytest.approx(0.55)
+
+
+def test_proxy_precision_caption_includes_every_rule_attribute_and_k():
+    from diffusion_ot.evaluation.stage1b_eval import _proxy_precision_caption
+
+    precision = {
+        rule: {
+            attribute: {
+                "precision_at_1": 0.5,
+                "precision_at_5": 0.4,
+                "precision_at_15": None,
+                "query_coverage": 0.75,
+            }
+            for attribute in ("viewpoint", "framing")
+        }
+        for rule in ("random", "conditional", "nn_plan_row", "nn_barycentric")
+    }
+
+    caption = _proxy_precision_caption(precision, ["viewpoint", "framing"])
+
+    for rule in precision:
+        assert f"{rule}:" in caption
+    assert caption.count("viewpoint:") == 4
+    assert caption.count("framing:") == 4
+    assert caption.count("P@1=50.0%") == 8
+    assert caption.count("P@5=40.0%") == 8
+    assert caption.count("P@15=n/a") == 8
+    assert caption.count("coverage=75.0%") == 8
+
+
+def test_umap_visualization_writes_separate_labeled_readout_images(
+    monkeypatch, tmp_path
+):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    numpy = pytest.importorskip("numpy")
+    from diffusion_ot.evaluation.stage1b_eval import _save_umap_visualizations
+
+    class FakeUMAP:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def fit_transform(self, values):
+            positions = numpy.arange(len(values), dtype=float)
+            return numpy.column_stack((positions, positions * 0.5))
+
+        def transform(self, values):
+            positions = numpy.arange(len(values), dtype=float) + 0.25
+            return numpy.column_stack((positions, positions * 0.5))
+
+    class FakeAxis:
+        def __init__(self):
+            self.scatter_calls = []
+
+        def scatter(self, *args, **kwargs):
+            self.scatter_calls.append(kwargs)
+
+        def legend(self, **kwargs):
+            self.legend_kwargs = kwargs
+
+        def set_title(self, title):
+            self.title = title
+
+        def set_xticks(self, ticks):
+            self.xticks = ticks
+
+        def set_yticks(self, ticks):
+            self.yticks = ticks
+
+    class FakeFigure:
+        def __init__(self, axes):
+            self.axes = axes
+            self.caption = ""
+            self.title = ""
+
+        def suptitle(self, title, **kwargs):
+            self.title = title
+
+        def text(self, *args, **kwargs):
+            self.caption = args[2]
+
+        def tight_layout(self, **kwargs):
+            self.layout_kwargs = kwargs
+
+        def savefig(self, path, **kwargs):
+            path.write_text(self.title + "\n" + self.caption, encoding="utf-8")
+
+    figures = []
+    pyplot = ModuleType("matplotlib.pyplot")
+
+    def fake_subplots(rows, columns, **kwargs):
+        axes = [FakeAxis() for _ in range(columns)]
+        figure = FakeFigure(axes)
+        figures.append(figure)
+        return figure, numpy.asarray([axes], dtype=object)
+
+    pyplot.subplots = fake_subplots
+    pyplot.get_cmap = lambda name, count: lambda index: (
+        index / max(count, 1), 0.2, 0.8, 1.0
+    )
+    pyplot.close = lambda figure: None
+    lines = ModuleType("matplotlib.lines")
+    lines.Line2D = lambda *args, **kwargs: SimpleNamespace(args=args, kwargs=kwargs)
+    matplotlib = ModuleType("matplotlib")
+    matplotlib.pyplot = pyplot
+    monkeypatch.setitem(sys.modules, "matplotlib", matplotlib)
+    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", pyplot)
+    monkeypatch.setitem(sys.modules, "matplotlib.lines", lines)
+    monkeypatch.setitem(sys.modules, "umap", SimpleNamespace(UMAP=FakeUMAP))
+    target = _bank("cat", "train", ["t0", "t1", "t2"])
+    source_ids = ["q0", "q1"]
+    labels = {
+        "t0": {"viewpoint": "front", "framing": "close"},
+        "t1": {"viewpoint": "side", "framing": "wide"},
+        "t2": {"viewpoint": "front", "framing": "wide"},
+        "q0": {"viewpoint": "front", "framing": "close"},
+        "q1": {"viewpoint": "side", "framing": "wide"},
+    }
+    precision = {
+        "conditional": {
+            attribute: {"precision_at_1": 0.5, "query_coverage": 1.0}
+            for attribute in ("viewpoint", "framing")
+        },
+        "nn_barycentric": {
+            attribute: {"precision_at_1": 0.5, "query_coverage": 1.0}
+            for attribute in ("viewpoint", "framing")
+        },
+    }
+    paths = {
+        "conditional": tmp_path / "conditional.png",
+        "barycentric": tmp_path / "barycentric.png",
+    }
+
+    _save_umap_visualizations(
+        target,
+        source_ids,
+        torch.randn(2, 3),
+        torch.randn(2, 3),
+        labels=labels,
+        attributes=["viewpoint", "framing"],
+        precision=precision,
+        direction="dog_to_cat",
+        random_state=7,
+        n_jobs=1,
+        target_alpha=0.18,
+        projection_alpha=0.55,
+        output_paths=paths,
+    )
+
+    assert paths["conditional"].is_file()
+    assert paths["barycentric"].is_file()
+    assert paths["conditional"].read_bytes() != paths["barycentric"].read_bytes()
+    assert len(figures) == 2
+    assert all(
+        [axis.title for axis in figure.axes] == ["Viewpoint", "Framing"]
+        for figure in figures
+    )
+    assert all("P@1=50.0%" in figure.caption for figure in figures)
+    plotted_alphas = {
+        call["alpha"]
+        for figure in figures
+        for axis in figure.axes
+        for call in axis.scatter_calls
+    }
+    assert plotted_alphas == {0.18, 0.55}
 
 
 def _bank(domain: str, split: str, ids: list[str], checkpoint: str = "same"):

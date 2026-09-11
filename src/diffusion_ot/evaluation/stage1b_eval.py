@@ -777,23 +777,73 @@ def _save_translation_grid(
     save_image(torch.cat(rows), str(output_path), nrow=count, padding=2, pad_value=1.0)
 
 
-def _save_umap(
+def _format_proxy_metric(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    return f"{100.0 * float(value):.1f}%"
+
+
+def _proxy_precision_caption(
+    precision: dict[str, dict[str, dict[str, Any]]],
+    attributes: list[str],
+) -> str:
+    if not attributes:
+        return "Proxy precision: no proxy attributes configured."
+    preferred_rules = ["conditional", "nn_barycentric", "nn_plan_row", "random"]
+    rules = [rule for rule in preferred_rules if rule in precision]
+    rules.extend(sorted(set(precision) - set(rules)))
+    lines = ["Proxy precision (source validation queries):"]
+    for rule in rules:
+        parts = []
+        for attribute in attributes:
+            metrics = precision.get(rule, {}).get(attribute, {})
+            precision_keys = sorted(
+                (key for key in metrics if key.startswith("precision_at_")),
+                key=lambda key: int(key.rsplit("_", 1)[-1]),
+            )
+            values = ", ".join(
+                f"P@{key.rsplit('_', 1)[-1]}={_format_proxy_metric(metrics.get(key))}"
+                for key in precision_keys
+            )
+            coverage = _format_proxy_metric(metrics.get("query_coverage"))
+            parts.append(f"{attribute}: {values or 'P@k=n/a'}, coverage={coverage}")
+        lines.append(f"{rule}: " + "; ".join(parts))
+    return "\n".join(lines)
+
+
+def _save_umap_visualizations(
     target_bank: LatentBank,
+    source_query_ids: list[str],
     conditional_codes: torch.Tensor,
     barycentric_codes: torch.Tensor,
     *,
     labels: dict[str, dict[str, Any]],
-    attribute: str | None,
+    attributes: list[str],
+    precision: dict[str, dict[str, dict[str, Any]]],
+    direction: str,
     random_state: int,
     n_jobs: int,
-    output_path: Path,
+    target_alpha: float,
+    projection_alpha: float,
+    output_paths: dict[str, Path],
 ) -> None:
     try:
         import matplotlib.pyplot as plt
         import numpy as np
         import umap
+        from matplotlib.lines import Line2D
     except ImportError as exc:
         raise RuntimeError("UMAP visualization requires umap-learn and matplotlib.") from exc
+
+    if conditional_codes.shape[0] != len(source_query_ids):
+        raise ValueError("Conditional-code rows do not match source query IDs.")
+    if barycentric_codes.shape[0] != len(source_query_ids):
+        raise ValueError("Barycentric-code rows do not match source query IDs.")
+    if not 0.0 < target_alpha <= 1.0 or not 0.0 < projection_alpha <= 1.0:
+        raise ValueError("UMAP point alpha values must be in (0, 1].")
+    expected_readouts = {"conditional", "barycentric"}
+    if set(output_paths) != expected_readouts:
+        raise ValueError(f"UMAP output paths must contain {sorted(expected_readouts)}.")
 
     reducer = umap.UMAP(
         random_state=int(random_state),
@@ -801,24 +851,127 @@ def _save_umap(
         n_jobs=int(n_jobs),
     )
     target_embedding = reducer.fit_transform(target_bank.raw_codes.numpy())
-    conditional_embedding = reducer.transform(conditional_codes.numpy())
-    barycentric_embedding = reducer.transform(barycentric_codes.numpy())
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure, axis = plt.subplots(figsize=(7, 6))
-    colors = None
-    if attribute:
-        values = [labels.get(sample_id, {}).get(attribute, "missing") for sample_id in target_bank.sample_ids]
-        unique = {value: index for index, value in enumerate(sorted(set(map(str, values))))}
-        colors = np.asarray([unique[str(value)] for value in values])
-    axis.scatter(target_embedding[:, 0], target_embedding[:, 1], c=colors, s=12, alpha=0.5, marker="o", label="target")
-    axis.scatter(conditional_embedding[:, 0], conditional_embedding[:, 1], s=24, marker="x", label="conditional")
-    axis.scatter(barycentric_embedding[:, 0], barycentric_embedding[:, 1], s=20, marker="+", label="barycentric")
-    axis.legend()
-    axis.set_xticks([])
-    axis.set_yticks([])
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=180)
-    plt.close(figure)
+    projected_embeddings = {
+        "conditional": reducer.transform(conditional_codes.numpy()),
+        "barycentric": reducer.transform(barycentric_codes.numpy()),
+    }
+    plotted_attributes: list[str | None] = attributes or [None]
+    direction_label = direction.replace("_to_", " to ").replace("_", " ").title()
+    caption = _proxy_precision_caption(precision, attributes)
+
+    for readout, projected_embedding in projected_embeddings.items():
+        output_path = output_paths[readout]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure, axes = plt.subplots(
+            1,
+            len(plotted_attributes),
+            figsize=(7.2 * len(plotted_attributes), 8.0),
+            squeeze=False,
+        )
+        for axis, attribute in zip(axes[0], plotted_attributes):
+            if attribute is None:
+                target_values = ["all"] * len(target_bank.sample_ids)
+                projected_values = ["all"] * len(source_query_ids)
+            else:
+                target_values = []
+                for sample_id in target_bank.sample_ids:
+                    value = labels.get(sample_id, {}).get(attribute)
+                    target_values.append("missing" if value is None else str(value))
+                projected_values = []
+                for sample_id in source_query_ids:
+                    value = labels.get(sample_id, {}).get(attribute)
+                    projected_values.append("missing" if value is None else str(value))
+            categories = sorted(
+                set(target_values).union(projected_values),
+                key=lambda value: (value == "missing", value),
+            )
+            color_map = plt.get_cmap("tab20", max(len(categories), 1))
+            colors = {
+                category: (
+                    "#9e9e9e" if category == "missing" else color_map(index)
+                )
+                for index, category in enumerate(categories)
+            }
+            target_array = np.asarray(target_values)
+            projected_array = np.asarray(projected_values)
+            for category in categories:
+                target_mask = target_array == category
+                projected_mask = projected_array == category
+                axis.scatter(
+                    target_embedding[target_mask, 0],
+                    target_embedding[target_mask, 1],
+                    color=colors[category],
+                    s=11,
+                    alpha=float(target_alpha),
+                    marker="o",
+                    edgecolors="none",
+                    zorder=1,
+                )
+                axis.scatter(
+                    projected_embedding[projected_mask, 0],
+                    projected_embedding[projected_mask, 1],
+                    color=colors[category],
+                    s=26,
+                    alpha=float(projection_alpha),
+                    marker="x" if readout == "conditional" else "+",
+                    linewidths=1.2,
+                    zorder=2,
+                )
+            category_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    linestyle="none",
+                    markerfacecolor=colors[category],
+                    markeredgecolor="none",
+                    label=category,
+                    markersize=6,
+                )
+                for category in categories
+            ]
+            marker_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    linestyle="none",
+                    color="#333333",
+                    label="target",
+                    markersize=5,
+                    alpha=max(float(target_alpha), 0.5),
+                ),
+                Line2D(
+                    [0],
+                    [0],
+                    marker="x" if readout == "conditional" else "+",
+                    linestyle="none",
+                    color="#333333",
+                    label=readout,
+                    markersize=7,
+                    alpha=max(float(projection_alpha), 0.5),
+                ),
+            ]
+            axis.legend(
+                handles=category_handles + marker_handles,
+                title=attribute or "samples",
+                fontsize=7,
+                title_fontsize=8,
+                loc="best",
+                framealpha=0.8,
+                ncols=2 if len(categories) > 5 else 1,
+            )
+            axis.set_title((attribute or "unlabeled").replace("_", " ").title())
+            axis.set_xticks([])
+            axis.set_yticks([])
+        figure.suptitle(
+            f"{direction_label}: {readout.title()} projection",
+            fontsize=14,
+        )
+        figure.text(0.5, 0.012, caption, ha="center", va="bottom", fontsize=7.5)
+        figure.tight_layout(rect=(0.0, 0.20, 1.0, 0.95))
+        figure.savefig(output_path, dpi=180)
+        plt.close(figure)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1193,18 +1346,31 @@ def run_stage1b_evaluation(
         for name, (source_domain, target_domain, _) in directions.items():
             if name not in direction_tensors:
                 continue
-            path = output_root / "visualization" / f"{name}_umap.png"
-            _save_umap(
+            paths = {
+                readout: output_root
+                / "visualization"
+                / f"{name}_{readout}_umap.png"
+                for readout in ("conditional", "barycentric")
+            }
+            _save_umap_visualizations(
                 banks[target_domain]["projection"],
+                banks[source_domain]["query"].sample_ids,
                 direction_tensors[name]["conditional_codes"],
                 direction_tensors[name]["barycentric_codes"],
                 labels=labels,
-                attribute=attributes[0] if attributes else None,
+                attributes=attributes,
+                precision=retrieval[name]["precision"],
+                direction=name,
                 random_state=int(visualization_config.get("random_state", seed)),
                 n_jobs=int(visualization_config.get("n_jobs", 1)),
-                output_path=path,
+                target_alpha=float(visualization_config.get("target_alpha", 0.18)),
+                projection_alpha=float(
+                    visualization_config.get("projection_alpha", 0.55)
+                ),
+                output_paths=paths,
             )
-            visualization_paths[name] = str(path)
+            for readout, path in paths.items():
+                visualization_paths[f"{name}_{readout}"] = str(path)
 
     baseline_comparison: dict[str, Any]
     if resolved_checkpoint is None:
