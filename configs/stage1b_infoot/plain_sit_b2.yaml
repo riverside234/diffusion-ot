@@ -6,11 +6,11 @@ stage1a:
   weights: ema
   cat:
     config: configs/stage1a_pdae/cat_sit_b2.yaml
-    checkpoint: outputs/stage1a_cat_sit_b2_cfg/checkpoints/latest.pt
+    checkpoint: outputs/stage1a_cat_sit_b2/checkpoints/latest.pt
     device: cuda:0
   dog:
     config: configs/stage1a_pdae/dog_sit_b2.yaml
-    checkpoint: outputs/stage1a_dog_sit_b2_cfg/checkpoints/latest.pt
+    checkpoint: outputs/stage1a_dog_sit_b2/checkpoints/latest.pt
     device: cuda:1
 
 data:
