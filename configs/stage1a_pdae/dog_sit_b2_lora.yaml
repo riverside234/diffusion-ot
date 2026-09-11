@@ -9,15 +9,15 @@ device: cuda:1
 torch_dtype: float32
 
 dataloader:
-  batch_size: 16
-  gradient_accumulation_steps: 4
+  batch_size: 64
+  gradient_accumulation_steps: 1
   random_horizontal_flip: 0.5
   num_workers: 4
   pin_memory: true
   drop_last: true
 
 train:
-  max_steps: 30000
+  max_steps: 40000
   resume_from: null
   seed: 20260901
   lr_encoder: 0.0001
