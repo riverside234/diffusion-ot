@@ -22,6 +22,14 @@ class TinySemanticTransformer(nn.Linear):
         return self.state_dict()
 
 
+class TinyLoRATransformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.adapter = nn.Linear(2, 2)
+        self.lora_down = nn.Linear(2, 1, bias=False)
+        self.lora_up = nn.Linear(1, 2, bias=False)
+
+
 def test_stage1b_freezes_generator_and_keeps_encoder_trainable():
     from diffusion_ot.training.train_joint_infoot import freeze_generator_train_encoder
 
@@ -48,6 +56,24 @@ def test_reconstruction_gradient_passes_through_frozen_generator_to_encoder():
     assert all(parameter.grad is not None for parameter in branch.encoder.parameters())
     assert all(parameter.grad is None for parameter in branch.semantic_transformer.parameters())
     assert all(parameter.grad is None for parameter in branch.semantic_conditioner.parameters())
+
+
+def test_stage1b_freezes_stage1a_attention_lora_and_null_token():
+    from diffusion_ot.training.train_joint_infoot import freeze_generator_train_encoder
+
+    branch = TinyBranch()
+    branch.semantic_transformer = TinyLoRATransformer()
+    freeze_generator_train_encoder(branch)
+
+    assert not any(
+        parameter.requires_grad
+        for parameter in branch.semantic_transformer.lora_down.parameters()
+    )
+    assert not any(
+        parameter.requires_grad
+        for parameter in branch.semantic_transformer.lora_up.parameters()
+    )
+    assert not any(parameter.requires_grad for parameter in branch.semantic_conditioner.parameters())
 
 
 def test_anchor_loss_is_variance_scaled_and_reference_is_detached():
@@ -89,6 +115,10 @@ def test_joint_checkpoint_payload_contains_no_transport_plan():
         domain: SimpleNamespace(
             checkpoint_path=f"{domain}.pt",
             checkpoint_step=25_000,
+            stage1a_architecture={
+                "semantic_cfg_enabled": True,
+                "attention_lora": {"enabled": True, "rank": 4},
+            },
             branch=SimpleNamespace(semantic_transformer=TinySemanticTransformer(2, 3)),
         )
         for domain in encoders
@@ -146,8 +176,16 @@ def test_resume_rejects_different_stage1a_provenance(tmp_path):
     cat_path = tmp_path / "cat.pt"
     dog_path = tmp_path / "dog.pt"
     domains = {
-        "cat": SimpleNamespace(checkpoint_path=cat_path, checkpoint_step=10),
-        "dog": SimpleNamespace(checkpoint_path=dog_path, checkpoint_step=10),
+        "cat": SimpleNamespace(
+            checkpoint_path=cat_path,
+            checkpoint_step=10,
+            stage1a_architecture={"semantic_cfg_enabled": True},
+        ),
+        "dog": SimpleNamespace(
+            checkpoint_path=dog_path,
+            checkpoint_step=10,
+            stage1a_architecture={"semantic_cfg_enabled": True},
+        ),
     }
     checkpoint = {
         "stage1a_provenance": {

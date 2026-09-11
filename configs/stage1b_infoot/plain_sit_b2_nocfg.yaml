@@ -5,6 +5,8 @@ output_dir: outputs/stage1b_cat_dog_plain_infoot_sit_b2_nocfg
 
 stage1a:
   weights: ema
+  require_semantic_cfg: false
+  require_attention_lora: false
   cat:
     config: configs/stage1a_pdae/cat_sit_b2_nocfg.yaml
     checkpoint: outputs/stage1a_cat_sit_b2/checkpoints/latest.pt
@@ -71,6 +73,7 @@ infoot:
 trainable:
   encoders: true
   adapters: false
+  attention_lora: false
   base_transformers: false
 
 quick_evaluation:

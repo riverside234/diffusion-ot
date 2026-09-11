@@ -1,16 +1,20 @@
 stage: stage1b_plain_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_cat_dog_plain_infoot_sit_b2_cfg
+output_dir: outputs/stage1b_cat_dog_plain_infoot_sit_b2_cfg_lora_r64
 
 stage1a:
   weights: ema
+  require_semantic_cfg: true
+  require_attention_lora: true
+  require_attention_lora_rank: 64
+  require_attention_lora_alpha: 64
   cat:
-    config: configs/stage1a_pdae/cat_sit_b2.yaml
-    checkpoint: outputs/stage1a_cat_sit_b2_cfg/checkpoints/latest.pt
+    config: configs/stage1a_pdae/cat_sit_b2_lora.yaml
+    checkpoint: outputs/stage1a_cat_sit_b2_cfg_lora_r64/checkpoints/latest.pt
     device: cuda:0
   dog:
-    config: configs/stage1a_pdae/dog_sit_b2.yaml
-    checkpoint: outputs/stage1a_dog_sit_b2_cfg/checkpoints/latest.pt
+    config: configs/stage1a_pdae/dog_sit_b2_lora.yaml
+    checkpoint: outputs/stage1a_dog_sit_b2_cfg_lora_r64/checkpoints/latest.pt
     device: cuda:1
 
 data:
@@ -70,6 +74,7 @@ infoot:
 trainable:
   encoders: true
   adapters: false
+  attention_lora: false
   base_transformers: false
 
 quick_evaluation:

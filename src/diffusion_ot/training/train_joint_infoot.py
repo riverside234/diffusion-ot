@@ -44,6 +44,7 @@ class LoadedTrainingDomain:
     training_config: dict[str, Any]
     checkpoint_path: Path
     checkpoint_step: int
+    stage1a_architecture: dict[str, Any]
     data_config_path: Path
     device: str
     dtype: torch.dtype
@@ -238,7 +239,11 @@ def _load_training_domain(
     *,
     device_override: str | None,
 ) -> LoadedTrainingDomain:
-    from diffusion_ot.evaluation.stage1a_eval import _apply_ema_weights, _load_checkpoint
+    from diffusion_ot.evaluation.stage1a_eval import (
+        _apply_ema_weights,
+        _load_checkpoint,
+        validate_stage1a_architecture,
+    )
     from diffusion_ot.integrations.sit_diffusers import load_sit_components, validate_transformer_config
     from diffusion_ot.models.pdae_sit import build_pdae_sit_branch
 
@@ -284,6 +289,7 @@ def _load_training_domain(
     branch.load_pdae_state_dict(checkpoint["model"])
     if str(stage1a_config.get("weights", "ema")) == "ema":
         _apply_ema_weights(branch, checkpoint)
+    stage1a_architecture = validate_stage1a_architecture(branch, stage1a_config)
     freeze_generator_train_encoder(branch)
     return LoadedTrainingDomain(
         domain=domain,
@@ -292,6 +298,7 @@ def _load_training_domain(
         training_config=train_config,
         checkpoint_path=checkpoint_path,
         checkpoint_step=int(checkpoint.get("step", 0)),
+        stage1a_architecture=stage1a_architecture,
         data_config_path=data_config_path,
         device=device,
         dtype=dtype,
@@ -401,6 +408,7 @@ def _build_checkpoint_payload(
                 "checkpoint_path": str(value.checkpoint_path),
                 "checkpoint_step": value.checkpoint_step,
                 "weights": str(_nested(config, "stage1a").get("weights", "ema")),
+                "architecture": value.stage1a_architecture,
             }
             for domain, value in domains.items()
         },
@@ -468,6 +476,14 @@ def _validate_resume_provenance(
             mismatches.append(f"weights {weights} != {record.get('weights')}")
         if domain not in fixed_generators:
             mismatches.append("fixed generator state is missing")
+        saved_architecture = record.get("architecture")
+        if (
+            saved_architecture is not None
+            and saved_architecture != value.stage1a_architecture
+        ):
+            mismatches.append(
+                f"architecture {value.stage1a_architecture} != {saved_architecture}"
+            )
         if mismatches:
             raise ValueError(
                 f"Configured Stage 1A {domain} state does not match the resume checkpoint: "
@@ -516,7 +532,11 @@ def train_joint_infoot(
     trainable_config = _nested(config, "trainable")
     if not bool(trainable_config.get("encoders", True)):
         raise ValueError("Stage 1B-1 requires trainable encoders.")
-    if bool(trainable_config.get("adapters", False)) or bool(trainable_config.get("base_transformers", False)):
+    if (
+        bool(trainable_config.get("adapters", False))
+        or bool(trainable_config.get("attention_lora", False))
+        or bool(trainable_config.get("base_transformers", False))
+    ):
         raise ValueError("The first Stage 1B-1 experiment trains encoders only.")
 
     seed = int(train_config.get("seed", 20260905))

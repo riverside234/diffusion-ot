@@ -22,7 +22,7 @@ def test_legacy_alignment_config_uses_non_cfg_stage1a_models():
         assert "_cfg/" not in domain_config["checkpoint"]
 
 
-def test_cfg_alignment_config_uses_cfg_stage1a_checkpoints():
+def test_cfg_alignment_config_uses_cfg_lora_stage1a_checkpoints():
     from pathlib import Path
 
     from diffusion_ot.integrations.hf_snapshot import load_yaml_config
@@ -35,7 +35,18 @@ def test_cfg_alignment_config_uses_cfg_stage1a_checkpoints():
         domain_config = alignment["stage1a"][domain]
         stage1a = load_yaml_config(root / domain_config["config"])
         assert stage1a["semantic_cfg"]["enabled"] is True
-        assert "_cfg/" in domain_config["checkpoint"]
+        assert stage1a["semantic_cfg"]["dropout_probability"] == pytest.approx(0.10)
+        assert stage1a["adapter"]["lora"] is True
+        assert stage1a["adapter"]["lora_rank"] == 64
+        assert stage1a["adapter"]["lora_alpha"] == 64
+        assert stage1a["train"]["max_steps"] == 40000
+        assert stage1a["train"]["lr_lora"] == pytest.approx(0.000025)
+        assert "_cfg_lora_r64/" in domain_config["checkpoint"]
+    assert alignment["stage1a"]["require_semantic_cfg"] is True
+    assert alignment["stage1a"]["require_attention_lora"] is True
+    assert alignment["stage1a"]["require_attention_lora_rank"] == 64
+    assert alignment["stage1a"]["require_attention_lora_alpha"] == 64
+    assert alignment["trainable"]["attention_lora"] is False
 
 
 def _bank(domain: str, split: str, ids: list[str], checkpoint: str = "same"):

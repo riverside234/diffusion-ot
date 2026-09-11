@@ -57,6 +57,8 @@ def main() -> int:
     print("stage1b_evaluation_report:")
     print(f"  mode: {report.mode}")
     print(f"  output_dir: {report.output_dir}")
+    print(f"  stage1a_architectures: {report.stage1a_architectures}")
+    print(f"  generation_protocol: {report.generation_protocol}")
     print(f"  mutual_information: {report.solver['mutual_information']}")
     print(f"  row_residual: {report.solver['row_residual']}")
     print(f"  column_residual: {report.solver['column_residual']}")

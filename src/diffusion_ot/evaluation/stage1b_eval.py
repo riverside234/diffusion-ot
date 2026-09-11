@@ -84,6 +84,7 @@ class DomainEvaluationContext:
     stage1a_checkpoint_path: Path
     stage1a_checkpoint_step: int
     stage1a_weights: str
+    stage1a_architecture: dict[str, Any]
 
 
 @dataclass
@@ -94,6 +95,8 @@ class Stage1BEvaluationReport:
     mode: str
     output_dir: str
     seed: int
+    stage1a_architectures: dict[str, dict[str, Any]]
+    generation_protocol: dict[str, Any]
     reference_sizes: dict[str, int]
     projection_sizes: dict[str, int]
     query_sizes: dict[str, int]
@@ -498,7 +501,11 @@ def _load_domain_context(
     joint_weights: str,
     device_override: str | None,
 ) -> DomainEvaluationContext:
-    from diffusion_ot.evaluation.stage1a_eval import _apply_ema_weights, _load_checkpoint
+    from diffusion_ot.evaluation.stage1a_eval import (
+        _apply_ema_weights,
+        _load_checkpoint,
+        validate_stage1a_architecture,
+    )
     from diffusion_ot.integrations.sit_diffusers import load_sit_components, validate_transformer_config
     from diffusion_ot.models.pdae_sit import build_pdae_sit_branch
 
@@ -543,6 +550,9 @@ def _load_domain_context(
     initial_weights = str(_nested(alignment_config, "stage1a").get("weights", "ema"))
     if initial_weights == "ema":
         _apply_ema_weights(branch, stage1a_checkpoint)
+    stage1a_architecture = validate_stage1a_architecture(
+        branch, _nested(alignment_config, "stage1a")
+    )
 
     checkpoint_step = int(stage1a_checkpoint.get("step", 0))
     selected_path = stage1a_checkpoint_path
@@ -570,6 +580,11 @@ def _load_domain_context(
         if str(provenance.get("weights")) != initial_weights:
             provenance_mismatches.append(
                 f"weights {initial_weights} != {provenance.get('weights')}"
+            )
+        saved_architecture = provenance.get("architecture")
+        if saved_architecture is not None and saved_architecture != stage1a_architecture:
+            provenance_mismatches.append(
+                f"architecture {stage1a_architecture} != {saved_architecture}"
             )
         if provenance_mismatches:
             raise ValueError(
@@ -605,6 +620,7 @@ def _load_domain_context(
         stage1a_checkpoint_path=stage1a_checkpoint_path,
         stage1a_checkpoint_step=int(stage1a_checkpoint.get("step", 0)),
         stage1a_weights=initial_weights,
+        stage1a_architecture=stage1a_architecture,
     )
 
 
@@ -1222,6 +1238,31 @@ def run_stage1b_evaluation(
         mode=mode,
         output_dir=str(output_root),
         seed=seed,
+        stage1a_architectures={
+            domain: context.stage1a_architecture for domain, context in contexts.items()
+        },
+        generation_protocol={
+            "semantic_cfg_enabled": all(
+                context.stage1a_architecture["semantic_cfg_enabled"]
+                for context in contexts.values()
+            ),
+            "attention_lora_enabled": all(
+                context.stage1a_architecture["attention_lora"]["enabled"]
+                for context in contexts.values()
+            ),
+            "reconstruction_guidance_scale": float(
+                reconstruction_config.get("guidance_scale", 1.0)
+            ),
+            "translation_guidance_scale": float(
+                translation_config.get("guidance_scale", 1.0)
+            ),
+            "stage1b_frozen_generator_components": [
+                "base_transformer",
+                "adaln_adapters",
+                "attention_lora",
+                "learned_null_token",
+            ],
+        },
         reference_sizes={domain: len(banks[domain]["reference"].sample_ids) for domain in banks},
         projection_sizes={domain: len(banks[domain]["projection"].sample_ids) for domain in banks},
         query_sizes={domain: len(banks[domain]["query"].sample_ids) for domain in banks},

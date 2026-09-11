@@ -81,6 +81,100 @@ def test_attention_lora_metadata_marks_adaln_only_evaluation():
     assert _attention_lora_metadata(branch) == {"enabled": False}
 
 
+def test_stage1a_architecture_requirements_accept_cfg_with_required_lora_shape():
+    from diffusion_ot.evaluation.stage1a_eval import validate_stage1a_architecture
+
+    branch = SimpleNamespace(
+        semantic_cfg_enabled=True,
+        semantic_transformer=SimpleNamespace(
+            attention_lora_enabled=True,
+            lora_rank=64,
+            lora_alpha=64.0,
+            lora_dropout=0.0,
+            lora_layers=[4, 5, 6, 7, 8, 9, 10, 11],
+            lora_targets=("qkv", "proj"),
+        ),
+    )
+    metadata = validate_stage1a_architecture(
+        branch,
+        {
+            "require_semantic_cfg": True,
+            "require_attention_lora": True,
+            "require_attention_lora_rank": 64,
+            "require_attention_lora_alpha": 64,
+        },
+    )
+
+    assert metadata["semantic_cfg_enabled"] is True
+    assert metadata["attention_lora"]["enabled"] is True
+
+
+def test_stage1a_architecture_requirements_reject_wrong_lora_rank():
+    from diffusion_ot.evaluation.stage1a_eval import validate_stage1a_architecture
+
+    branch = SimpleNamespace(
+        semantic_cfg_enabled=True,
+        semantic_transformer=SimpleNamespace(
+            attention_lora_enabled=True,
+            lora_rank=4,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            lora_layers=[4, 5, 6, 7, 8, 9, 10, 11],
+            lora_targets=("qkv", "proj"),
+        ),
+    )
+    with pytest.raises(ValueError, match="LoRA rank is 4, expected 64"):
+        validate_stage1a_architecture(
+            branch,
+            {
+                "require_semantic_cfg": True,
+                "require_attention_lora": True,
+                "require_attention_lora_rank": 64,
+                "require_attention_lora_alpha": 64,
+            },
+        )
+
+
+def test_stage1a_architecture_requirements_reject_wrong_lora_alpha():
+    from diffusion_ot.evaluation.stage1a_eval import validate_stage1a_architecture
+
+    branch = SimpleNamespace(
+        semantic_cfg_enabled=True,
+        semantic_transformer=SimpleNamespace(
+            attention_lora_enabled=True,
+            lora_rank=64,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            lora_layers=[4, 5, 6, 7, 8, 9, 10, 11],
+            lora_targets=("qkv", "proj"),
+        ),
+    )
+    with pytest.raises(ValueError, match="LoRA alpha is 4.0, expected 64.0"):
+        validate_stage1a_architecture(
+            branch,
+            {
+                "require_semantic_cfg": True,
+                "require_attention_lora": True,
+                "require_attention_lora_rank": 64,
+                "require_attention_lora_alpha": 64,
+            },
+        )
+
+
+def test_stage1a_architecture_requirements_reject_missing_lora():
+    from diffusion_ot.evaluation.stage1a_eval import validate_stage1a_architecture
+
+    branch = SimpleNamespace(
+        semantic_cfg_enabled=True,
+        semantic_transformer=SimpleNamespace(attention_lora_enabled=False),
+    )
+    with pytest.raises(ValueError, match="attention LoRA"):
+        validate_stage1a_architecture(
+            branch,
+            {"require_semantic_cfg": True, "require_attention_lora": True},
+        )
+
+
 def test_reconstruction_is_deterministic_for_the_same_seed():
     from diffusion_ot.evaluation.stage1a_eval import _noise_like, integrate_pdae_flow
 

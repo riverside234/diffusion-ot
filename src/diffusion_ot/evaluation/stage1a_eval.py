@@ -30,6 +30,7 @@ class Stage1ASmokeReport:
     split: str
     checkpoint_step: int
     weights: str
+    semantic_cfg_enabled: bool
     attention_lora: dict[str, Any]
     seed: int
     num_samples: int
@@ -56,6 +57,7 @@ class Stage1ARoundTripReport:
     split: str
     checkpoint_step: int
     weights: str
+    semantic_cfg_enabled: bool
     attention_lora: dict[str, Any]
     seed: int
     num_samples: int
@@ -158,6 +160,59 @@ def _attention_lora_metadata(branch: Any) -> dict[str, Any]:
                 "layers": list(wrapper.lora_layers),
                 "targets": list(wrapper.lora_targets),
             }
+        )
+    return metadata
+
+
+def stage1a_architecture_metadata(branch: Any) -> dict[str, Any]:
+    return {
+        "semantic_cfg_enabled": bool(getattr(branch, "semantic_cfg_enabled", False)),
+        "attention_lora": _attention_lora_metadata(branch),
+    }
+
+
+def validate_stage1a_architecture(
+    branch: Any,
+    stage1a_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the Stage 1A architecture required by an alignment protocol."""
+    metadata = stage1a_architecture_metadata(branch)
+    expected_cfg = stage1a_config.get("require_semantic_cfg")
+    expected_lora = stage1a_config.get("require_attention_lora")
+    expected_lora_rank = stage1a_config.get("require_attention_lora_rank")
+    expected_lora_alpha = stage1a_config.get("require_attention_lora_alpha")
+    mismatches = []
+    if expected_cfg is not None and metadata["semantic_cfg_enabled"] != bool(expected_cfg):
+        mismatches.append(
+            "semantic CFG "
+            f"is {metadata['semantic_cfg_enabled']}, expected {bool(expected_cfg)}"
+        )
+    lora_enabled = bool(metadata["attention_lora"]["enabled"])
+    if expected_lora is not None and lora_enabled != bool(expected_lora):
+        mismatches.append(
+            f"attention LoRA is {lora_enabled}, expected {bool(expected_lora)}"
+        )
+    actual_lora_rank = metadata["attention_lora"].get("rank")
+    if (
+        expected_lora_rank is not None
+        and actual_lora_rank != int(expected_lora_rank)
+    ):
+        mismatches.append(
+            f"attention LoRA rank is {actual_lora_rank}, expected {int(expected_lora_rank)}"
+        )
+    actual_lora_alpha = metadata["attention_lora"].get("alpha")
+    if (
+        expected_lora_alpha is not None
+        and actual_lora_alpha != float(expected_lora_alpha)
+    ):
+        mismatches.append(
+            "attention LoRA alpha is "
+            f"{actual_lora_alpha}, expected {float(expected_lora_alpha)}"
+        )
+    if mismatches:
+        raise ValueError(
+            "Stage 1A architecture does not match the alignment protocol: "
+            + "; ".join(mismatches)
         )
     return metadata
 
@@ -744,6 +799,7 @@ def _run_inferred_noise_roundtrip(
         split=evaluator.split,
         checkpoint_step=evaluator.checkpoint_step,
         weights=evaluator.weights,
+        semantic_cfg_enabled=bool(evaluator.branch.semantic_cfg_enabled),
         attention_lora=_attention_lora_metadata(evaluator.branch),
         seed=seed,
         num_samples=x0.shape[0],
@@ -858,6 +914,7 @@ def run_stage1a_smoke_test(
         split=evaluator.split,
         checkpoint_step=evaluator.checkpoint_step,
         weights=evaluator.weights,
+        semantic_cfg_enabled=bool(evaluator.branch.semantic_cfg_enabled),
         attention_lora=_attention_lora_metadata(evaluator.branch),
         seed=seed,
         num_samples=num_samples,

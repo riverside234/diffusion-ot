@@ -4,7 +4,7 @@ domain: dog
 split: train
 data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
-output_dir: outputs/stage1a_dog_sit_b2_cfg_lora_r4
+output_dir: outputs/stage1a_dog_sit_b2_cfg_lora_r64
 device: cuda:1
 torch_dtype: float32
 
@@ -22,7 +22,7 @@ train:
   seed: 20260901
   lr_encoder: 0.0001
   lr_adapter: 0.0001
-  lr_lora: 0.00005
+  lr_lora: 0.000025
   weight_decay: 0.0
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
@@ -73,8 +73,8 @@ adapter:
   injection_layers: [4, 5, 6, 7, 8, 9, 10, 11]
   bottleneck_dim: 64
   lora: true
-  lora_rank: 4
-  lora_alpha: 4
+  lora_rank: 64
+  lora_alpha: 64
   lora_dropout: 0.0
   lora_layers: [4, 5, 6, 7, 8, 9, 10, 11]
 
