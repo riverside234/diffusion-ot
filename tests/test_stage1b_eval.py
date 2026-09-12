@@ -77,6 +77,9 @@ def test_quick_evaluation_uses_the_training_infoot_kernel_and_entropy():
     assert evaluation["matching"]["bandwidth_multiplier"] == pytest.approx(
         alignment["matching"]["bandwidth_multiplier"]
     )
+    assert evaluation["matching"]["projection_bandwidth_multiplier"] == pytest.approx(
+        0.10
+    )
     assert evaluation["matching"]["distance_scale"] == alignment["matching"][
         "distance_scale"
     ]
@@ -94,7 +97,11 @@ def test_quick_evaluation_uses_the_training_infoot_kernel_and_entropy():
     assert evaluation["proxy_labels"]["path"] == (
         "data/proxy_labels/afhq_viewpoint_framing.jsonl"
     )
-    assert evaluation["proxy_labels"]["attributes"] == ["viewpoint", "framing"]
+    assert evaluation["proxy_labels"]["attributes"] == [
+        "viewpoint",
+        "framing",
+        "coat_color",
+    ]
     assert evaluation["visualization"]["target_alpha"] == pytest.approx(0.30)
     assert evaluation["visualization"]["projection_alpha"] == pytest.approx(0.90)
 
@@ -110,21 +117,24 @@ def test_proxy_precision_caption_includes_every_rule_attribute_and_k():
                 "precision_at_15": None,
                 "query_coverage": 0.75,
             }
-            for attribute in ("viewpoint", "framing")
+            for attribute in ("viewpoint", "framing", "coat_color")
         }
         for rule in ("random", "conditional", "nn_plan_row", "nn_barycentric")
     }
 
-    caption = _proxy_precision_caption(precision, ["viewpoint", "framing"])
+    caption = _proxy_precision_caption(
+        precision, ["viewpoint", "framing", "coat_color"]
+    )
 
     for rule in precision:
         assert f"{rule}:" in caption
     assert caption.count("viewpoint:") == 4
     assert caption.count("framing:") == 4
-    assert caption.count("P@1=50.0%") == 8
-    assert caption.count("P@5=40.0%") == 8
-    assert caption.count("P@15=n/a") == 8
-    assert caption.count("coverage=75.0%") == 8
+    assert caption.count("coat_color:") == 4
+    assert caption.count("P@1=50.0%") == 12
+    assert caption.count("P@5=40.0%") == 12
+    assert caption.count("P@15=n/a") == 12
+    assert caption.count("coverage=75.0%") == 12
 
 
 def test_umap_visualization_writes_separate_labeled_readout_images(
@@ -218,20 +228,20 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
     target = _bank("cat", "train", ["t0", "t1", "t2"])
     source_ids = ["q0", "q1"]
     labels = {
-        "t0": {"viewpoint": "front", "framing": "close"},
-        "t1": {"viewpoint": "side", "framing": "wide"},
-        "t2": {"viewpoint": "front", "framing": "wide"},
-        "q0": {"viewpoint": "front", "framing": "close"},
-        "q1": {"viewpoint": "side", "framing": "wide"},
+        "t0": {"viewpoint": "front", "framing": "close", "coat_color": "black"},
+        "t1": {"viewpoint": "side", "framing": "wide", "coat_color": "white"},
+        "t2": {"viewpoint": "front", "framing": "wide", "coat_color": "mixed"},
+        "q0": {"viewpoint": "front", "framing": "close", "coat_color": "black"},
+        "q1": {"viewpoint": "side", "framing": "wide", "coat_color": "white"},
     }
     precision = {
         "conditional": {
             attribute: {"precision_at_1": 0.5, "query_coverage": 1.0}
-            for attribute in ("viewpoint", "framing")
+            for attribute in ("viewpoint", "framing", "coat_color")
         },
         "nn_barycentric": {
             attribute: {"precision_at_1": 0.5, "query_coverage": 1.0}
-            for attribute in ("viewpoint", "framing")
+            for attribute in ("viewpoint", "framing", "coat_color")
         },
     }
     paths = {
@@ -245,7 +255,7 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
         torch.randn(2, 3),
         torch.randn(2, 3),
         labels=labels,
-        attributes=["viewpoint", "framing"],
+        attributes=["viewpoint", "framing", "coat_color"],
         precision=precision,
         direction="dog_to_cat",
         random_state=7,
@@ -260,7 +270,7 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
     assert paths["conditional"].read_bytes() != paths["barycentric"].read_bytes()
     assert len(figures) == 2
     assert all(
-        [axis.title for axis in figure.axes] == ["Viewpoint", "Framing"]
+        [axis.title for axis in figure.axes] == ["Viewpoint", "Framing", "Coat Color"]
         for figure in figures
     )
     assert all("P@1=50.0%" in figure.caption for figure in figures)
@@ -273,7 +283,8 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
     assert plotted_alphas == {0.30, 0.90}
     assert all(len(axis.legend_calls) == 2 for figure in figures for axis in figure.axes)
     assert all(
-        axis.legend_calls[0]["title"] in {"Viewpoint label", "Framing label"}
+        axis.legend_calls[0]["title"]
+        in {"Viewpoint label", "Framing label", "Coat Color label"}
         and axis.legend_calls[1]["title"] == "Point type"
         for figure in figures
         for axis in figure.axes

@@ -7,8 +7,8 @@ initial test
 In `configs/stage1b_eval/quick_sit_b2.yaml`,
 `matching.bandwidth_multiplier` controls fitting the transport plan.
 `matching.projection_bandwidth_multiplier` controls conditional retrieval and
-Eq. (7) projection, including decoded means and UMAP. Set it to `null` to
-inherit the fitting bandwidth, or override it from the CLI:
+Eq. (7) projection, including decoded means and UMAP. The Stage 1A cat/dog
+sweep selected `0.10`; override it from the CLI for sensitivity checks:
 
 ```bash
 python3 scripts/evaluate_infoot_alignment.py \
@@ -45,7 +45,7 @@ in the configs, this setting:
 ```yaml
 proxy_labels:
   path: data/proxy_labels/afhq_viewpoint_framing.jsonl
-  attributes: [viewpoint, framing]
+  attributes: [viewpoint, framing, coat_color]
   sample_id_key: sample_id
 ```
 
@@ -54,11 +54,13 @@ loads
 The file uses one JSON object per line, with no duplicate sample IDs:
 
 ```json
-{"sample_id":"afhq_cat_<hf_index>","viewpoint":"<viewpoint>","framing":"<framing>"}
-{"sample_id":"afhq_dog_<hf_index>","viewpoint":"<viewpoint>","framing":"<framing>"}
+{"sample_id":"afhq_cat_<hf_index>","viewpoint":"<viewpoint>","framing":"<framing>","coat_color":"<coat_color>"}
+{"sample_id":"afhq_dog_<hf_index>","viewpoint":"<viewpoint>","framing":"<framing>","coat_color":"<coat_color>"}
 ```
 
 Use the same vocabulary for both domains. Recommended values are `front`,
 `three_quarter`, `side`, and `back` for viewpoint, and `close_up`, `medium`, and
-`full_body` for framing. Omit an attribute or set it to `null` when it has not
-been labeled; do not guess a label merely to increase coverage.
+`full_body` for framing. Use `black`, `white`, `gray`, `brown`, `orange`, and
+`mixed` for coat color. Omit an attribute or set it to `null` when it has not
+been labeled; do not guess a label merely to increase coverage. Coat color is
+an evaluation readout: it does not add color supervision to InfoOT training.

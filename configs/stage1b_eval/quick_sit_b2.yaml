@@ -18,13 +18,15 @@ data:
   num_workers: 4
   pin_memory: true
 
-# JSONL rows: {"sample_id": "...", "viewpoint": "front", "framing": "close"}.
+# JSONL rows include viewpoint, framing, and a shared cross-domain coat color.
+# Example: {"sample_id": "...", "viewpoint": "front", "framing": "close_up",
+#           "coat_color": "black"}.
 # The relative path resolves under project_root, currently
 # /data/not_backed_up/yxu209/diffusion-ot/. The file must exist and contain
 # labels for the sample IDs whose proxy precision or UMAP colors are required.
 proxy_labels:
   path: data/proxy_labels/afhq_viewpoint_framing.jsonl
-  attributes: [viewpoint, framing]
+  attributes: [viewpoint, framing, coat_color]
   sample_id_key: sample_id
 
 matching:
@@ -35,10 +37,11 @@ matching:
   # paper. With the official RMS distance scale above, this also avoids the nearly
   # constant kernels produced by h=1.0 in the Stage 1A baseline.
   bandwidth_multiplier: 0.55
-  # Conditional retrieval and Eq. (7) readouts only; null inherits the fit
-  # bandwidth above. Try 0.30, 0.40, 0.55 with the same fitting settings.
-  # CLI override: --projection-bandwidth 0.40
-  projection_bandwidth_multiplier: null
+  # Conditional retrieval and Eq. (7) readouts only. The Stage 1A sweep found
+  # 0.10 at the useful knee: about 23-25 effective targets, before the marked
+  # norm shrinkage and support growth at 0.15 and above.
+  # CLI overrides remain available for sensitivity checks.
+  projection_bandwidth_multiplier: 0.10
 
 infoot:
   algorithm: official_projected_sinkhorn
