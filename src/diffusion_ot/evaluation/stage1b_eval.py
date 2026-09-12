@@ -20,6 +20,8 @@ from diffusion_ot.losses.infoot import (
     conditional_density_ratio,
     conditional_projection_weights,
     effective_target_count,
+    infoot_cross_distance_scale,
+    infoot_distance_scale,
     kernel_offdiagonal_stats,
     median_distance_scale,
     nearest_plan_row_weights,
@@ -120,6 +122,22 @@ def _nested(config: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{key} must be a mapping.")
     return value
+
+
+def _evaluation_bandwidths(
+    matching_config: dict[str, Any], projection_override: float | None = None,
+) -> tuple[float, float]:
+    fit = float(matching_config.get("bandwidth_multiplier", 1.0))
+    projection = (
+        projection_override if projection_override is not None
+        else matching_config.get("projection_bandwidth_multiplier")
+    )
+    projection = fit if projection is None else float(projection)
+    for name, value in (("bandwidth_multiplier", fit),
+                        ("projection_bandwidth_multiplier", projection)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"matching.{name} must be finite and positive.")
+    return fit, projection
 
 
 def deterministic_indices(length: int, count: int | None, seed: int) -> list[int]:
@@ -377,7 +395,12 @@ def _direction_evaluation(
     ks: list[int],
     seed: int,
     eps: float,
+    distance_scale_mode: str = "fixed_stage1a_median",
+    projection_bandwidth: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    bandwidth, projection_bandwidth = _evaluation_bandwidths(
+        {"bandwidth_multiplier": bandwidth}, projection_bandwidth
+    )
     target_projection = target_reference if target_projection is None else target_projection
     validate_bank_compatibility(target_reference, target_projection, require_disjoint=False)
     device = coupling.device
@@ -386,6 +409,25 @@ def _direction_evaluation(
     source_query_features = source_query.matching_features.to(device)
     target_gallery_features = target_gallery.matching_features.to(device)
     target_projection_features = target_projection.matching_features.to(device)
+    if distance_scale_mode == "infoot_rms":
+        query_source_scale = float(
+            infoot_cross_distance_scale(source_query_features, source_ref_features)
+        )
+        gallery_target_scale = float(
+            infoot_cross_distance_scale(target_gallery_features, target_ref_features)
+        )
+        projection_target_scale = float(
+            infoot_cross_distance_scale(target_projection_features, target_ref_features)
+        )
+    elif distance_scale_mode == "fixed_stage1a_median":
+        query_source_scale = source_scale
+        gallery_target_scale = target_scale
+        projection_target_scale = target_scale
+    else:
+        raise ValueError(
+            "matching.distance_scale must be 'infoot_rms' or "
+            "'fixed_stage1a_median'."
+        )
 
     conditional_scores = conditional_density_ratio(
         source_query_features,
@@ -393,9 +435,9 @@ def _direction_evaluation(
         source_ref_features,
         target_ref_features,
         coupling,
-        bandwidth=bandwidth,
-        distance_scale_x=source_scale,
-        distance_scale_y=target_scale,
+        bandwidth=projection_bandwidth,
+        distance_scale_x=query_source_scale,
+        distance_scale_y=gallery_target_scale,
         eps=eps,
     )
     conditional_rankings = _rank_descending(conditional_scores)
@@ -409,9 +451,9 @@ def _direction_evaluation(
         source_ref_features,
         target_ref_features,
         coupling,
-        bandwidth=bandwidth,
-        distance_scale_x=source_scale,
-        distance_scale_y=target_scale,
+        bandwidth=projection_bandwidth,
+        distance_scale_x=query_source_scale,
+        distance_scale_y=projection_target_scale,
         eps=eps,
     )
 
@@ -463,6 +505,8 @@ def _direction_evaluation(
     ]
     report = {
         "precision": precision,
+        "fit_bandwidth_multiplier": bandwidth,
+        "projection_bandwidth_multiplier": projection_bandwidth,
         "projection_method": "infoot_eq7_conditional_expectation",
         "projection_support": "target_training_projection_bank",
         "projection_target_count": len(target_projection.sample_ids),
@@ -476,6 +520,11 @@ def _direction_evaluation(
         "mean_nearest_target_distance": float(nearest_target_distance.mean().cpu()),
         "mean_projected_to_target_norm_ratio": float(norm_ratio.mean().cpu()),
         "nearest_source_indices": nearest_source.cpu().tolist(),
+        "conditional_distance_scales": {
+            "query_source": query_source_scale,
+            "gallery_target": gallery_target_scale,
+            "projection_target": projection_target_scale,
+        },
     }
     tensors = {
         "conditional_weights": conditional_weights.detach().cpu(),
@@ -1054,11 +1103,20 @@ def run_stage1b_evaluation(
     max_reference: int | None = None,
     max_projection: int | None = None,
     max_query: int | None = None,
+    projection_bandwidth: float | None = None,
 ) -> Stage1BEvaluationReport:
     alignment_path = Path(alignment_config_path).resolve()
     evaluation_path = Path(evaluation_config_path).resolve()
     alignment_config = load_yaml_config(alignment_path)
     evaluation_config = load_yaml_config(evaluation_path)
+    matching_config = dict(_nested(evaluation_config, "matching"))
+    bandwidth, projection_bandwidth = _evaluation_bandwidths(
+        matching_config, projection_bandwidth
+    )
+    # Store the effective override before hashing the evaluation protocol so
+    # each projection bandwidth gets its own outputs and matching baseline.
+    matching_config["projection_bandwidth_multiplier"] = projection_bandwidth
+    evaluation_config["matching"] = matching_config
     root = effective_project_root(
         alignment_config, fallback=find_project_root(alignment_path.parent)
     )
@@ -1215,12 +1273,26 @@ def run_stage1b_evaluation(
         validate_bank_compatibility(banks[domain]["projection"], banks[domain]["query"])
         validate_bank_compatibility(banks[domain]["projection"], banks[domain]["gallery"])
 
-    matching_config = _nested(evaluation_config, "matching")
-    bandwidth = float(matching_config.get("bandwidth_multiplier", 1.0))
-    scales = {
-        domain: float(median_distance_scale(banks[domain]["reference"].matching_features))
-        for domain in ("cat", "dog")
-    }
+    distance_scale_mode = str(matching_config.get("distance_scale", "infoot_rms"))
+    if distance_scale_mode == "infoot_rms":
+        scales = {
+            domain: float(
+                infoot_distance_scale(banks[domain]["reference"].matching_features)
+            )
+            for domain in ("cat", "dog")
+        }
+    elif distance_scale_mode == "fixed_stage1a_median":
+        scales = {
+            domain: float(
+                median_distance_scale(banks[domain]["reference"].matching_features)
+            )
+            for domain in ("cat", "dog")
+        }
+    else:
+        raise ValueError(
+            "matching.distance_scale must be 'infoot_rms' or "
+            "'fixed_stage1a_median'."
+        )
     alignment_device = str(evaluation_config.get("alignment_device", device_cat or "cpu"))
     cat_features = banks["cat"]["reference"].matching_features.to(alignment_device)
     dog_features = banks["dog"]["reference"].matching_features.to(alignment_device)
@@ -1231,7 +1303,6 @@ def run_stage1b_evaluation(
         bandwidth=bandwidth,
         distance_scale_x=scales["cat"],
         distance_scale_y=scales["dog"],
-        seed=seed,
         **solver_kwargs(infoot_config),
     )
 
@@ -1247,7 +1318,13 @@ def run_stage1b_evaluation(
             "cat_projection_ids": banks["cat"]["projection"].sample_ids,
             "dog_projection_ids": banks["dog"]["projection"].sample_ids,
             "distance_scales": scales,
+            "distance_scale_mode": distance_scale_mode,
             "bandwidth": bandwidth,
+            "projection_bandwidth": projection_bandwidth,
+            "solver_algorithm": str(
+                infoot_config.get("algorithm", "official_projected_sinkhorn")
+            ),
+            "entropy_epsilon": float(infoot_config.get("entropy_epsilon", 0.05)),
         },
         output_root / "coupling.pt",
     )
@@ -1293,6 +1370,8 @@ def run_stage1b_evaluation(
             ks=ks,
             seed=seed + (1 if str(name) == "cat_to_dog" else 2),
             eps=float(infoot_config.get("numerical_epsilon", 1.0e-8)),
+            distance_scale_mode=distance_scale_mode,
+            projection_bandwidth=projection_bandwidth,
         )
         retrieval[str(name)] = direction_report
         direction_tensors[str(name)] = tensors
@@ -1408,6 +1487,8 @@ def run_stage1b_evaluation(
             domain: context.stage1a_architecture for domain, context in contexts.items()
         },
         generation_protocol={
+            "fit_bandwidth_multiplier": bandwidth,
+            "projection_bandwidth_multiplier": projection_bandwidth,
             "semantic_cfg_enabled": all(
                 context.stage1a_architecture["semantic_cfg_enabled"]
                 for context in contexts.values()
@@ -1435,6 +1516,14 @@ def run_stage1b_evaluation(
         gallery_sizes={domain: len(banks[domain]["gallery"].sample_ids) for domain in banks},
         distance_scales=scales,
         solver={
+            "fit_bandwidth_multiplier": bandwidth,
+            "algorithm": str(
+                infoot_config.get("algorithm", "official_projected_sinkhorn")
+            ),
+            "initialization": str(
+                infoot_config.get("initialization", "independent_product")
+            ),
+            "distance_scale_mode": distance_scale_mode,
             "objective": solution.objective,
             "mutual_information": solution.mutual_information,
             "entropy": solution.entropy,

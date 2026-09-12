@@ -76,6 +76,27 @@ def median_distance_scale(features: torch.Tensor, eps: float = 1.0e-8) -> torch.
     return values.median().clamp_min(eps)
 
 
+def infoot_cross_distance_scale(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    """Return the official InfoOT scale for a pairwise-distance matrix."""
+    if x.ndim != 2 or y.ndim != 2:
+        raise ValueError("InfoOT distance scaling requires rank-two feature matrices.")
+    mean_squared_distance = pairwise_squared_distances(x, y).detach().mean()
+    return (mean_squared_distance / 2.0).sqrt().clamp_min(eps)
+
+
+def infoot_distance_scale(features: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
+    """Return the Gaussian-kernel scale used by the official InfoOT code.
+
+    The reference implementation computes ``sqrt(mean(D ** 2) / 2)`` from
+    the full within-domain pairwise-distance matrix, including its diagonal.
+    """
+    return infoot_cross_distance_scale(features, features, eps=eps)
+
+
 def _log_gaussian_kernel(
     x: torch.Tensor,
     y: torch.Tensor | None = None,
@@ -186,7 +207,9 @@ def infoot_plan_gradient(
         - marginal_x.clamp_min(eps).log()[:, None]
         - marginal_y.clamp_min(eps).log()[None, :]
     )
-    joint_dependency = kernel_x.transpose(0, 1) @ (coupling / safe_joint) @ kernel_y
+    joint_dependency = (
+        kernel_x @ (coupling / safe_joint) @ kernel_y.transpose(0, 1)
+    )
     return log_ratio + joint_dependency
 
 
@@ -239,6 +262,47 @@ def sinkhorn_project(
 
 
 @torch.no_grad()
+def sinkhorn_transport_from_cost(
+    cost: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    regularization: float,
+    max_iterations: int = 200,
+    tolerance: float = 1.0e-6,
+) -> torch.Tensor:
+    """Solve entropic OT from a cost matrix with log-domain Sinkhorn scaling."""
+    if cost.ndim != 2:
+        raise ValueError("Sinkhorn cost must be a matrix.")
+    n, m = cost.shape
+    _validate_marginals(a, b, n, m)
+    if not torch.isfinite(cost).all():
+        raise ValueError("Sinkhorn cost must be finite.")
+    if (a <= 0).any() or (b <= 0).any():
+        raise ValueError("Entropic Sinkhorn requires strictly positive marginals.")
+    regularization = float(regularization)
+    if regularization <= 0:
+        raise ValueError("Entropic regularization must be positive.")
+
+    log_kernel = -cost / regularization
+    log_a = a.log()
+    log_b = b.log()
+    log_u = torch.zeros_like(a)
+    log_v = torch.zeros_like(b)
+    coupling = torch.empty_like(cost)
+    for iteration in range(max(int(max_iterations), 1)):
+        log_u = log_a - torch.logsumexp(log_kernel + log_v[None, :], dim=1)
+        log_v = log_b - torch.logsumexp(log_kernel + log_u[:, None], dim=0)
+        if iteration % 10 == 0 or iteration + 1 == int(max_iterations):
+            coupling = (log_kernel + log_u[:, None] + log_v[None, :]).exp()
+            row_error = (coupling.sum(dim=1) - a).abs().max()
+            column_error = (coupling.sum(dim=0) - b).abs().max()
+            if max(float(row_error), float(column_error)) <= tolerance:
+                break
+    return coupling
+
+
+@torch.no_grad()
 def seeded_nonindependent_coupling(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -282,10 +346,6 @@ def solve_plain_infoot(
     inner_iterations: int = 50,
     projection_iterations: int = 200,
     projection_tolerance: float = 1.0e-5,
-    step_size: float = 0.25,
-    gradient_clip: float | None = 50.0,
-    restarts: int = 3,
-    seed: int = 0,
     eps: float = 1.0e-8,
 ) -> InfoOTSolveResult:
     if features_x.ndim != 2 or features_y.ndim != 2:
@@ -305,56 +365,39 @@ def solve_plain_infoot(
         features_y, bandwidth=bandwidth, distance_scale=distance_scale_y, eps=eps
     )
 
-    best: InfoOTSolveResult | None = None
-    for restart in range(max(int(restarts), 1)):
-        coupling = seeded_nonindependent_coupling(
+    # Official InfoOT initializes with the independent coupling. Each outer
+    # iteration applies Eq. (5): use the negative MI gradient as the cost of a
+    # fresh entropic OT solve. The entropy belongs to that Sinkhorn subproblem;
+    # it is not added as an explicit gradient or accumulated in a mirror step.
+    coupling = a[:, None] * b[None, :]
+    completed_iterations = 0
+    for iteration in range(max(int(inner_iterations), 0)):
+        mi_gradient = infoot_plan_gradient(
+            coupling, kernel_x, kernel_y, a, b, eps=eps
+        )
+        coupling = sinkhorn_transport_from_cost(
+            -float(mi_weight) * mi_gradient,
             a,
             b,
-            seed=int(seed) + restart,
-            projection_iterations=projection_iterations,
-            projection_tolerance=projection_tolerance,
-            eps=eps,
+            regularization=entropy_epsilon,
+            max_iterations=projection_iterations,
+            tolerance=projection_tolerance,
         )
-        completed_iterations = 0
-        for iteration in range(max(int(inner_iterations), 0)):
-            mi_gradient = infoot_plan_gradient(
-                coupling, kernel_x, kernel_y, a, b, eps=eps
-            )
-            gradient = -float(mi_weight) * mi_gradient + float(entropy_epsilon) * (
-                coupling.clamp_min(eps).log() + 1.0
-            )
-            if gradient_clip is not None:
-                gradient = gradient.clamp(-float(gradient_clip), float(gradient_clip))
-            log_update = coupling.clamp_min(eps).log() - float(step_size) * gradient
-            log_update = log_update - log_update.max()
-            coupling = sinkhorn_project(
-                log_update.exp().clamp_min(eps),
-                a,
-                b,
-                max_iterations=projection_iterations,
-                tolerance=projection_tolerance,
-                eps=eps,
-            )
-            completed_iterations = iteration + 1
+        completed_iterations = iteration + 1
 
-        mi = infoot_mutual_information(coupling, kernel_x, kernel_y, a, b, eps=eps)
-        entropy = coupling_entropy(coupling, eps=eps)
-        objective = -float(mi_weight) * mi - float(entropy_epsilon) * entropy
-        candidate = InfoOTSolveResult(
-            coupling=coupling,
-            objective=float(objective.cpu()),
-            mutual_information=float(mi.cpu()),
-            entropy=float(entropy.cpu()),
-            row_residual=float((coupling.sum(dim=1) - a).abs().max().cpu()),
-            column_residual=float((coupling.sum(dim=0) - b).abs().max().cpu()),
-            iterations=completed_iterations,
-            restart=restart,
-        )
-        if best is None or candidate.objective < best.objective:
-            best = candidate
-    if best is None:
-        raise RuntimeError("InfoOT solver did not produce a coupling.")
-    return best
+    mi = infoot_mutual_information(coupling, kernel_x, kernel_y, a, b, eps=eps)
+    entropy = coupling_entropy(coupling, eps=eps)
+    objective = -float(mi_weight) * mi - float(entropy_epsilon) * entropy
+    return InfoOTSolveResult(
+        coupling=coupling,
+        objective=float(objective.cpu()),
+        mutual_information=float(mi.cpu()),
+        entropy=float(entropy.cpu()),
+        row_residual=float((coupling.sum(dim=1) - a).abs().max().cpu()),
+        column_residual=float((coupling.sum(dim=0) - b).abs().max().cpu()),
+        iterations=completed_iterations,
+        restart=0,
+    )
 
 
 def plain_infoot_feature_loss(
@@ -566,14 +609,17 @@ def effective_target_count(weights: torch.Tensor, eps: float = 1.0e-8) -> torch.
 
 
 def solver_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    algorithm = str(config.get("algorithm", "official_projected_sinkhorn"))
+    if algorithm != "official_projected_sinkhorn":
+        raise ValueError("infoot.algorithm must be 'official_projected_sinkhorn'.")
+    initialization = str(config.get("initialization", "independent_product"))
+    if initialization != "independent_product":
+        raise ValueError("infoot.initialization must be 'independent_product'.")
     return {
         "mi_weight": float(config.get("mi_weight", 1.0)),
         "entropy_epsilon": float(config.get("entropy_epsilon", 0.05)),
         "inner_iterations": int(config.get("inner_iterations", 50)),
         "projection_iterations": int(config.get("projection_iterations", 200)),
         "projection_tolerance": float(config.get("projection_tolerance", 1.0e-5)),
-        "step_size": float(config.get("step_size", 0.25)),
-        "gradient_clip": config.get("gradient_clip", 50.0),
-        "restarts": int(config.get("restarts", 3)),
         "eps": float(config.get("numerical_epsilon", 1.0e-8)),
     }

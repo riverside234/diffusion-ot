@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         help="Bound the Eq. (7) target projection bank; the config default uses all samples.",
     )
     parser.add_argument("--max-query", type=int, default=None)
+    parser.add_argument(
+        "--projection-bandwidth", type=float, default=None,
+        help="Override the conditional retrieval/projection bandwidth multiplier; "
+        "the InfoOT fitting bandwidth is unchanged.",
+    )
     return parser.parse_args()
 
 
@@ -53,6 +58,7 @@ def main() -> int:
         max_reference=args.max_reference,
         max_projection=args.max_projection,
         max_query=args.max_query,
+        projection_bandwidth=args.projection_bandwidth,
     )
     print("stage1b_evaluation_report:")
     print(f"  mode: {report.mode}")

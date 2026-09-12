@@ -314,8 +314,13 @@ def _calibrate_encoder(
     batch_size: int,
     device: str,
     dtype: torch.dtype,
+    distance_scale_mode: str,
 ) -> tuple[float, float]:
-    from diffusion_ot.losses.infoot import median_distance_scale, normalize_matching_features
+    from diffusion_ot.losses.infoot import (
+        infoot_distance_scale,
+        median_distance_scale,
+        normalize_matching_features,
+    )
 
     values: list[torch.Tensor] = []
     count = min(int(count), len(dataset))
@@ -325,7 +330,16 @@ def _calibrate_encoder(
         values.append(encoder(x0).float().cpu())
     codes = torch.cat(values, dim=0)
     variance = float(codes.var(dim=0, unbiased=False).mean().clamp_min(1.0e-8))
-    distance_scale = float(median_distance_scale(normalize_matching_features(codes)))
+    matching_features = normalize_matching_features(codes)
+    if distance_scale_mode == "infoot_rms":
+        distance_scale = float(infoot_distance_scale(matching_features))
+    elif distance_scale_mode == "fixed_stage1a_median":
+        distance_scale = float(median_distance_scale(matching_features))
+    else:
+        raise ValueError(
+            "matching.distance_scale must be 'infoot_rms' or "
+            "'fixed_stage1a_median'."
+        )
     return variance, distance_scale
 
 
@@ -504,6 +518,7 @@ def train_joint_infoot(
 
     from diffusion_ot.data.latent_dataset import CachedLatentDataset, collate_latent_batch
     from diffusion_ot.losses.infoot import (
+        infoot_distance_scale,
         kernel_offdiagonal_stats,
         normalize_matching_features,
         plain_infoot_feature_loss,
@@ -602,6 +617,7 @@ def train_joint_infoot(
     }
 
     calibration_count = int(matching_config.get("calibration_samples", 256))
+    distance_scale_mode = str(matching_config.get("distance_scale", "infoot_rms"))
     anchor_variances: dict[str, float] = {}
     distance_scales: dict[str, float] = {}
     for domain, value in domains.items():
@@ -620,6 +636,7 @@ def train_joint_infoot(
             batch_size=min(transport_batch_size, 64),
             device=value.device,
             dtype=value.dtype,
+            distance_scale_mode=distance_scale_mode,
         )
 
     loader_generators: dict[str, torch.Generator] = {}
@@ -755,13 +772,19 @@ def train_joint_infoot(
 
         cat_features = normalize_matching_features(z["cat"].float()).to(alignment_device)
         dog_features = normalize_matching_features(z["dog"].float()).to(alignment_device)
+        if distance_scale_mode == "infoot_rms":
+            solve_distance_scales = {
+                "cat": float(infoot_distance_scale(cat_features.detach())),
+                "dog": float(infoot_distance_scale(dog_features.detach())),
+            }
+        else:
+            solve_distance_scales = distance_scales
         solution = solve_plain_infoot(
             cat_features.detach(),
             dog_features.detach(),
             bandwidth=bandwidth,
-            distance_scale_x=distance_scales["cat"],
-            distance_scale_y=distance_scales["dog"],
-            seed=seed + step,
+            distance_scale_x=solve_distance_scales["cat"],
+            distance_scale_y=solve_distance_scales["dog"],
             **solver_options,
         )
         infoot_loss = plain_infoot_feature_loss(
@@ -769,8 +792,8 @@ def train_joint_infoot(
             dog_features,
             solution.coupling.detach(),
             bandwidth=bandwidth,
-            distance_scale_x=distance_scales["cat"],
-            distance_scale_y=distance_scales["dog"],
+            distance_scale_x=solve_distance_scales["cat"],
+            distance_scale_y=solve_distance_scales["dog"],
             mi_weight=float(infoot_config.get("mi_weight", 1.0)),
             eps=float(infoot_config.get("numerical_epsilon", 1.0e-8)),
         )
@@ -829,6 +852,9 @@ def train_joint_infoot(
                 "infoot_row_residual": solution.row_residual,
                 "infoot_column_residual": solution.column_residual,
                 "infoot_restart": solution.restart,
+                "infoot_distance_scale_mode": distance_scale_mode,
+                "cat_distance_scale": solve_distance_scales["cat"],
+                "dog_distance_scale": solve_distance_scales["dog"],
                 "alignment_weight": beta,
                 "cat_encoder_grad_norm_pre_clip": grad_norms["cat"],
                 "dog_encoder_grad_norm_pre_clip": grad_norms["dog"],
@@ -841,12 +867,12 @@ def train_joint_infoot(
                 "cat_kernel": kernel_offdiagonal_stats(
                     cat_features.detach(),
                     bandwidth=bandwidth,
-                    distance_scale=distance_scales["cat"],
+                    distance_scale=solve_distance_scales["cat"],
                 ),
                 "dog_kernel": kernel_offdiagonal_stats(
                     dog_features.detach(),
                     bandwidth=bandwidth,
-                    distance_scale=distance_scales["dog"],
+                    distance_scale=solve_distance_scales["dog"],
                 ),
             }
             metrics.update(gradient_diagnostics)

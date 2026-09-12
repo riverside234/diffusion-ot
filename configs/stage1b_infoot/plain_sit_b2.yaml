@@ -1,6 +1,6 @@
 stage: stage1b_plain_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_cat_dog_plain_infoot_sit_b2_cfg_adaln_all_lora_r64
+output_dir: outputs/stage1b_cat_dog_plain_infoot_official_sit_b2_cfg_adaln_all_lora_r64
 
 stage1a:
   weights: ema
@@ -55,20 +55,19 @@ loss_weights:
 matching:
   normalize: l2
   calibration_samples: 256
-  distance_scale: fixed_stage1a_median
+  # Match InfoOT.compute_kernel: sqrt(mean(pairwise_distance^2) / 2).
+  distance_scale: infoot_rms
   bandwidth_multiplier: 0.55
 
 infoot:
   variant: plain
+  algorithm: official_projected_sinkhorn
   mi_weight: 1.0
   entropy_epsilon: 0.02
-  inner_iterations: 50
+  inner_iterations: 100
   projection_iterations: 200
   projection_tolerance: 0.00001
-  step_size: 0.25
-  gradient_clip: 50.0
-  restarts: 3
-  initialization: seeded_nonindependent_feasible
+  initialization: independent_product
   numerical_epsilon: 0.00000001
 
 trainable:

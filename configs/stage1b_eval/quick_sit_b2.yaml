@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_cfg_adaln_all_lora_r64
+output_dir: outputs/stage1b_eval_infoot_official_cfg_adaln_all_lora_r64
 seed: 20260906
 alignment_device: cuda:0
 
@@ -28,20 +28,25 @@ proxy_labels:
 
 matching:
   normalize: l2
+  # Match InfoOT.compute_kernel on the transported reference bank.
+  distance_scale: infoot_rms
   # Plain InfoOT uses h=0.55 for separately trained embedding spaces in the
-  # paper. With the median-distance scale below, this also avoids the nearly
+  # paper. With the official RMS distance scale above, this also avoids the nearly
   # constant kernels produced by h=1.0 in the Stage 1A baseline.
   bandwidth_multiplier: 0.55
+  # Conditional retrieval and Eq. (7) readouts only; null inherits the fit
+  # bandwidth above. Try 0.30, 0.40, 0.55 with the same fitting settings.
+  # CLI override: --projection-bandwidth 0.40
+  projection_bandwidth_multiplier: null
 
 infoot:
+  algorithm: official_projected_sinkhorn
   mi_weight: 1.0
   entropy_epsilon: 0.02
   inner_iterations: 100
   projection_iterations: 300
   projection_tolerance: 0.00001
-  step_size: 0.25
-  gradient_clip: 50.0
-  restarts: 3
+  initialization: independent_product
   numerical_epsilon: 0.00000001
 
 retrieval:

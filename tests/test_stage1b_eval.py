@@ -21,6 +21,9 @@ def test_legacy_alignment_config_uses_non_cfg_stage1a_models():
         assert stage1a["semantic_cfg"]["enabled"] is False
         assert "_cfg/" not in domain_config["checkpoint"]
     assert alignment["matching"]["bandwidth_multiplier"] == pytest.approx(0.55)
+    assert alignment["matching"]["distance_scale"] == "infoot_rms"
+    assert alignment["infoot"]["algorithm"] == "official_projected_sinkhorn"
+    assert alignment["infoot"]["initialization"] == "independent_product"
     assert alignment["infoot"]["entropy_epsilon"] == pytest.approx(0.02)
 
 
@@ -51,6 +54,9 @@ def test_cfg_alignment_config_uses_cfg_lora_stage1a_checkpoints():
     assert alignment["stage1a"]["require_attention_lora_rank"] == 64
     assert alignment["stage1a"]["require_attention_lora_alpha"] == 64
     assert alignment["matching"]["bandwidth_multiplier"] == pytest.approx(0.55)
+    assert alignment["matching"]["distance_scale"] == "infoot_rms"
+    assert alignment["infoot"]["algorithm"] == "official_projected_sinkhorn"
+    assert alignment["infoot"]["initialization"] == "independent_product"
     assert alignment["infoot"]["entropy_epsilon"] == pytest.approx(0.02)
     assert alignment["trainable"]["attention_lora"] is False
 
@@ -71,6 +77,13 @@ def test_quick_evaluation_uses_the_training_infoot_kernel_and_entropy():
     assert evaluation["matching"]["bandwidth_multiplier"] == pytest.approx(
         alignment["matching"]["bandwidth_multiplier"]
     )
+    assert evaluation["matching"]["distance_scale"] == alignment["matching"][
+        "distance_scale"
+    ]
+    assert evaluation["infoot"]["algorithm"] == alignment["infoot"]["algorithm"]
+    assert evaluation["infoot"]["initialization"] == alignment["infoot"][
+        "initialization"
+    ]
     assert evaluation["infoot"]["mi_weight"] == pytest.approx(
         alignment["infoot"]["mi_weight"]
     )
@@ -371,6 +384,54 @@ def test_direction_evaluation_keeps_query_and_gallery_protocols_distinct():
     assert tensors["barycentric_codes"].shape == (2, 3)
 
 
+def test_direction_evaluation_uses_official_cross_matrix_kernel_scales():
+    from diffusion_ot.evaluation.stage1b_eval import _direction_evaluation
+
+    source_reference = _bank("cat", "train", ["cr0", "cr1"])
+    target_reference = _bank("dog", "train", ["dr0", "dr1", "dr2"])
+    source_query = _bank("cat", "val", ["cq0", "cq1"])
+    target_gallery = _bank("dog", "val", ["dg0", "dg1"])
+    target_projection = _bank("dog", "train", ["dp0", "dp1", "dp2", "dp3"])
+    coupling = torch.tensor([[0.2, 0.1, 0.2], [0.1, 0.25, 0.15]])
+    coupling /= coupling.sum()
+
+    report, _ = _direction_evaluation(
+        source_reference,
+        target_reference,
+        source_query,
+        target_gallery,
+        coupling,
+        target_projection=target_projection,
+        source_scale=99.0,
+        target_scale=98.0,
+        bandwidth=0.55,
+        labels={},
+        attributes=[],
+        ks=[1],
+        seed=5,
+        eps=1.0e-8,
+        distance_scale_mode="infoot_rms",
+    )
+
+    def official_scale(left, right):
+        return float((torch.cdist(left, right).square().mean() / 2.0).sqrt())
+
+    assert report["conditional_distance_scales"] == pytest.approx(
+        {
+            "query_source": official_scale(
+                source_query.matching_features, source_reference.matching_features
+            ),
+            "gallery_target": official_scale(
+                target_gallery.matching_features, target_reference.matching_features
+            ),
+            "projection_target": official_scale(
+                target_projection.matching_features,
+                target_reference.matching_features,
+            ),
+        }
+    )
+
+
 def test_direction_evaluation_projects_over_bank_larger_than_fit_references():
     from diffusion_ot.evaluation.stage1b_eval import _direction_evaluation
     from diffusion_ot.losses.infoot import conditional_projection_weights
@@ -416,6 +477,44 @@ def test_direction_evaluation_projects_over_bank_larger_than_fit_references():
     )
 
 
+@pytest.mark.parametrize("configured,override,expected", [
+    (None, None, 0.55), (0.4, None, 0.4), (0.4, 0.3, 0.3),
+])
+def test_projection_bandwidth_resolution(configured, override, expected):
+    from diffusion_ot.evaluation.stage1b_eval import _evaluation_bandwidths
+
+    config = {"bandwidth_multiplier": 0.55,
+              "projection_bandwidth_multiplier": configured}
+    assert _evaluation_bandwidths(config, override) == (0.55, expected)
+    assert _evaluation_bandwidths({"bandwidth_multiplier": 0.55}) == (0.55, 0.55)
+
+
+@pytest.mark.parametrize("invalid", [0, -0.1, float("nan"), float("inf")])
+def test_projection_bandwidth_rejects_invalid_values(invalid):
+    from diffusion_ot.evaluation.stage1b_eval import _evaluation_bandwidths
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        _evaluation_bandwidths({"projection_bandwidth_multiplier": invalid})
+    with pytest.raises(ValueError, match="finite and positive"):
+        _evaluation_bandwidths({}, invalid)
+    with pytest.raises(ValueError, match="finite and positive"):
+        _evaluation_bandwidths({"bandwidth_multiplier": invalid})
+
+
+def test_protocol_identifier_versions_projection_bandwidth():
+    from diffusion_ot.evaluation.stage1b_eval import _protocol_identifier
+
+    def protocol(width):
+        return _protocol_identifier(
+            {"matching": {"bandwidth_multiplier": 0.55,
+                          "projection_bandwidth_multiplier": width}},
+            max_reference=None, max_projection=None, max_query=None,
+        )
+
+    assert protocol(0.4) != protocol(0.55)
+    assert protocol(0.4) == protocol(0.4)
+
+
 def test_protocol_identifier_versions_projection_bank_overrides():
     from diffusion_ot.evaluation.stage1b_eval import _protocol_identifier
 
@@ -459,7 +558,10 @@ def test_checkpoint_selection_uses_full_mean_metrics():
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-def test_decoded_grid_receives_full_equation7_mean(monkeypatch, tmp_path, reverse):
+@pytest.mark.parametrize("projection_bandwidth", [None, 0.35])
+def test_decoded_grid_receives_full_equation7_mean(
+    monkeypatch, tmp_path, reverse, projection_bandwidth,
+):
     from types import SimpleNamespace
 
     import diffusion_ot.evaluation.stage1a_eval as stage1a
@@ -483,11 +585,13 @@ def test_decoded_grid_receives_full_equation7_mean(monkeypatch, tmp_path, revers
         source, target, query, gallery, coupling,
         source_scale=source_scale, target_scale=target_scale, bandwidth=bandwidth,
         labels={}, attributes=[], ks=[1], seed=5, eps=1.0e-8,
+        projection_bandwidth=projection_bandwidth,
     )
+    effective_bandwidth = bandwidth if projection_bandwidth is None else projection_bandwidth
     kx = torch.exp(-torch.cdist(query.matching_features, source.matching_features).square()
-                   / (2 * (bandwidth * source_scale) ** 2))
+                   / (2 * (effective_bandwidth * source_scale) ** 2))
     ky = torch.exp(-torch.cdist(target.matching_features, target.matching_features).square()
-                   / (2 * (bandwidth * target_scale) ** 2))
+                   / (2 * (effective_bandwidth * target_scale) ** 2))
     a = torch.full((len(source.sample_ids),), 1 / len(source.sample_ids))
     b = torch.full((len(target.sample_ids),), 1 / len(target.sample_ids))
     expected_weights = (kx @ coupling @ ky.T) / ((kx @ a)[:, None] * (ky @ b)[None, :])
@@ -501,6 +605,27 @@ def test_decoded_grid_receives_full_equation7_mean(monkeypatch, tmp_path, revers
     assert not torch.allclose(tensors["conditional_codes"], legacy @ target.raw_codes)
     assert report["projection_method"] == "infoot_eq7_conditional_expectation"
     assert report["projection_target_count"] == len(target.sample_ids)
+    assert report["fit_bandwidth_multiplier"] == bandwidth
+    assert report["projection_bandwidth_multiplier"] == effective_bandwidth
+    # The same coupling gives the same barycentric control for either width.
+    default_report, default_tensors = stage1b._direction_evaluation(
+        source, target, query, gallery, coupling,
+        source_scale=source_scale, target_scale=target_scale, bandwidth=bandwidth,
+        labels={}, attributes=[], ks=[1], seed=5, eps=1.0e-8,
+    )
+    torch.testing.assert_close(tensors["barycentric_codes"], default_tensors["barycentric_codes"])
+    if projection_bandwidth is not None:
+        assert not torch.allclose(tensors["conditional_codes"], default_tensors["conditional_codes"])
+
+    # Retrieval uses the same projection bandwidth, evaluated on gallery points.
+    kg = torch.exp(-torch.cdist(gallery.matching_features, target.matching_features).square()
+                   / (2 * (effective_bandwidth * target_scale) ** 2))
+    scores = (kx @ coupling @ kg.T) / ((kx @ a)[:, None] * (kg @ b)[None, :])
+    expected_top = scores.argmax(dim=1).tolist()
+    assert report["conditional_top_ids"] == {
+        sample_id: [gallery.sample_ids[index]]
+        for sample_id, index in zip(query.sample_ids, expected_top)
+    }
 
     decoder_codes, decoder_noise = [], []
 

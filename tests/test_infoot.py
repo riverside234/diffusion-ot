@@ -18,6 +18,27 @@ def test_sinkhorn_projection_supports_unequal_batches():
     torch.testing.assert_close(coupling.sum(dim=0), b, atol=1.0e-9, rtol=0)
 
 
+def test_infoot_distance_scale_matches_official_compute_kernel():
+    from diffusion_ot.losses.infoot import (
+        infoot_cross_distance_scale,
+        infoot_distance_scale,
+    )
+
+    features = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 2.0]], dtype=torch.float64
+    )
+    distances = torch.cdist(features, features)
+    expected = ((distances.square().mean() / 2.0).sqrt())
+
+    torch.testing.assert_close(infoot_distance_scale(features), expected)
+    query = features[:2] + 0.25
+    cross_distances = torch.cdist(query, features)
+    cross_expected = (cross_distances.square().mean() / 2.0).sqrt()
+    torch.testing.assert_close(
+        infoot_cross_distance_scale(query, features), cross_expected
+    )
+
+
 def test_complete_plan_gradient_matches_autograd():
     from diffusion_ot.losses.infoot import (
         gaussian_kernel,
@@ -138,6 +159,38 @@ def test_projection_matches_pot_kl_reference_when_available():
     torch.testing.assert_close(actual, torch.from_numpy(reference), atol=1.0e-8, rtol=1.0e-7)
 
 
+def test_cost_sinkhorn_matches_pot_reference_when_available():
+    ot = pytest.importorskip("ot")
+    from diffusion_ot.losses.infoot import (
+        sinkhorn_transport_from_cost,
+        uniform_marginals,
+    )
+
+    torch.manual_seed(12)
+    cost = torch.randn(4, 6, dtype=torch.float64)
+    a, b = uniform_marginals(4, 6, dtype=torch.float64)
+    actual = sinkhorn_transport_from_cost(
+        cost,
+        a,
+        b,
+        regularization=0.7,
+        max_iterations=2000,
+        tolerance=1.0e-12,
+    )
+    reference = ot.sinkhorn(
+        a.numpy(),
+        b.numpy(),
+        cost.numpy(),
+        reg=0.7,
+        numItermax=20_000,
+        stopThr=1.0e-12,
+    )
+
+    torch.testing.assert_close(
+        actual, torch.from_numpy(reference), atol=1.0e-9, rtol=1.0e-8
+    )
+
+
 def test_independent_plan_has_zero_kernelized_mutual_information():
     from diffusion_ot.losses.infoot import gaussian_kernel, infoot_mutual_information, uniform_marginals
 
@@ -180,12 +233,69 @@ def test_solver_returns_a_finite_feasible_plan():
     torch.manual_seed(17)
     x = normalize_matching_features(torch.randn(7, 5))
     y = normalize_matching_features(torch.randn(9, 5))
-    result = solve_plain_infoot(x, y, inner_iterations=4, restarts=2, seed=19)
+    result = solve_plain_infoot(x, y, inner_iterations=4)
 
     assert torch.isfinite(result.coupling).all()
     assert result.row_residual < 1.0e-4
     assert result.column_residual < 1.0e-4
     assert result.coupling.grad_fn is None
+
+
+def test_plain_solver_one_step_matches_official_projected_sinkhorn_update():
+    from diffusion_ot.losses.infoot import (
+        gaussian_kernel,
+        infoot_plan_gradient,
+        sinkhorn_project,
+        solve_plain_infoot,
+        uniform_marginals,
+    )
+
+    torch.manual_seed(18)
+    x = torch.randn(4, 3, dtype=torch.float64)
+    y = torch.randn(5, 2, dtype=torch.float64)
+    a, b = uniform_marginals(4, 5, dtype=torch.float64)
+    initial = a[:, None] * b[None, :]
+    kernel_x = gaussian_kernel(x, bandwidth=0.7, distance_scale=0.9)
+    kernel_y = gaussian_kernel(y, bandwidth=0.7, distance_scale=1.1)
+    negative_mi_gradient = -infoot_plan_gradient(
+        initial, kernel_x, kernel_y, a, b
+    )
+    regularization = 0.5
+    expected = sinkhorn_project(
+        (-negative_mi_gradient / regularization).exp(),
+        a,
+        b,
+        max_iterations=2000,
+        tolerance=1.0e-12,
+    )
+
+    result = solve_plain_infoot(
+        x,
+        y,
+        a=a,
+        b=b,
+        bandwidth=0.7,
+        distance_scale_x=0.9,
+        distance_scale_y=1.1,
+        entropy_epsilon=regularization,
+        inner_iterations=1,
+        projection_iterations=2000,
+        projection_tolerance=1.0e-12,
+    )
+
+    torch.testing.assert_close(result.coupling, expected, atol=1.0e-10, rtol=1.0e-9)
+    assert result.restart == 0
+
+
+def test_plain_solver_starts_from_independent_product():
+    from diffusion_ot.losses.infoot import solve_plain_infoot, uniform_marginals
+
+    x = torch.randn(3, 2, dtype=torch.float64)
+    y = torch.randn(5, 4, dtype=torch.float64)
+    a, b = uniform_marginals(3, 5, dtype=torch.float64)
+    result = solve_plain_infoot(x, y, a=a, b=b, inner_iterations=0)
+
+    torch.testing.assert_close(result.coupling, a[:, None] * b[None, :])
 
 
 def test_detached_plan_outer_loss_updates_both_feature_extractors():
@@ -201,7 +311,7 @@ def test_detached_plan_outer_loss_updates_both_feature_extractors():
     features_x = normalize_matching_features(encoder_x(torch.randn(6, 4)))
     features_y = normalize_matching_features(encoder_y(torch.randn(7, 5)))
     solution = solve_plain_infoot(
-        features_x.detach(), features_y.detach(), inner_iterations=3, restarts=1, seed=22
+        features_x.detach(), features_y.detach(), inner_iterations=3
     )
     loss = plain_infoot_feature_loss(
         features_x, features_y, solution.coupling.detach()
