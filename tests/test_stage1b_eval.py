@@ -91,6 +91,9 @@ def test_quick_evaluation_uses_the_training_infoot_kernel_and_entropy():
         alignment["infoot"]["entropy_epsilon"]
     )
     assert evaluation["output_dir"].endswith("_cfg_adaln_all_lora_r64")
+    assert evaluation["proxy_labels"]["path"] == (
+        "data/proxy_labels/afhq_viewpoint_framing.jsonl"
+    )
     assert evaluation["proxy_labels"]["attributes"] == ["viewpoint", "framing"]
     assert evaluation["visualization"]["target_alpha"] == pytest.approx(0.30)
     assert evaluation["visualization"]["projection_alpha"] == pytest.approx(0.90)

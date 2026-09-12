@@ -38,3 +38,27 @@ for dog-to-cat evaluation these are cat codes. `Projected source` means dog quer
 codes mapped into the cat code space. `Unlabeled` means that the requested
 attribute was absent from both dataset metadata and the JSONL file configured at
 `proxy_labels.path`; it is not a learned class or an InfoOT result.
+
+`proxy_labels.path` is resolved relative to `project_root`. With the Linux root
+in the configs, this setting:
+
+```yaml
+proxy_labels:
+  path: data/proxy_labels/afhq_viewpoint_framing.jsonl
+  attributes: [viewpoint, framing]
+  sample_id_key: sample_id
+```
+
+loads
+`/data/not_backed_up/yxu209/diffusion-ot/data/proxy_labels/afhq_viewpoint_framing.jsonl`.
+The file uses one JSON object per line, with no duplicate sample IDs:
+
+```json
+{"sample_id":"afhq_cat_<hf_index>","viewpoint":"<viewpoint>","framing":"<framing>"}
+{"sample_id":"afhq_dog_<hf_index>","viewpoint":"<viewpoint>","framing":"<framing>"}
+```
+
+Use the same vocabulary for both domains. Recommended values are `front`,
+`three_quarter`, `side`, and `back` for viewpoint, and `close_up`, `medium`, and
+`full_body` for framing. Omit an attribute or set it to `null` when it has not
+been labeled; do not guess a label merely to increase coverage.

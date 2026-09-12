@@ -19,10 +19,11 @@ data:
   pin_memory: true
 
 # JSONL rows: {"sample_id": "...", "viewpoint": "front", "framing": "close"}.
-# Set path to populate UMAP colors and proxy precision. When absent, the panels
-# explicitly show "unlabeled" and their precision captions report n/a.
+# The relative path resolves under project_root, currently
+# /data/not_backed_up/yxu209/diffusion-ot/. The file must exist and contain
+# labels for the sample IDs whose proxy precision or UMAP colors are required.
 proxy_labels:
-  path: null
+  path: data/proxy_labels/afhq_viewpoint_framing.jsonl
   attributes: [viewpoint, framing]
   sample_id_key: sample_id
 
