@@ -106,6 +106,18 @@ def test_quick_evaluation_uses_the_training_infoot_kernel_and_entropy():
     assert evaluation["visualization"]["projection_alpha"] == pytest.approx(0.90)
 
 
+def test_stage1a_baseline_requirement_can_be_overridden_for_diagnostics():
+    from diffusion_ot.evaluation.stage1b_eval import _stage1a_baseline_required
+
+    required = {"comparison": {"require_stage1a_baseline": True}}
+    optional = {"comparison": {"require_stage1a_baseline": False}}
+
+    assert _stage1a_baseline_required(required, None) is True
+    assert _stage1a_baseline_required(optional, None) is False
+    assert _stage1a_baseline_required(required, False) is False
+    assert _stage1a_baseline_required(optional, True) is True
+
+
 def test_proxy_precision_caption_includes_every_rule_attribute_and_k():
     from diffusion_ot.evaluation.stage1b_eval import _proxy_precision_caption
 

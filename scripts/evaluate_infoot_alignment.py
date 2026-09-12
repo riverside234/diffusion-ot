@@ -41,6 +41,14 @@ def parse_args() -> argparse.Namespace:
         help="Override the conditional retrieval/projection bandwidth multiplier; "
         "the InfoOT fitting bandwidth is unchanged.",
     )
+    parser.add_argument(
+        "--require-stage1a-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require a protocol-matched Stage 1A report before evaluating a Stage 1B "
+        "checkpoint. The config value is used when this option is omitted; pass "
+        "--no-require-stage1a-baseline for a standalone checkpoint evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -59,6 +67,7 @@ def main() -> int:
         max_projection=args.max_projection,
         max_query=args.max_query,
         projection_bandwidth=args.projection_bandwidth,
+        require_stage1a_baseline=args.require_stage1a_baseline,
     )
     print("stage1b_evaluation_report:")
     print(f"  mode: {report.mode}")

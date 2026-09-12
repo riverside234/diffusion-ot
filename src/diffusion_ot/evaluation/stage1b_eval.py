@@ -1204,6 +1204,15 @@ def _checkpoint_selection_summary(
     }
 
 
+def _stage1a_baseline_required(
+    evaluation_config: dict[str, Any], override: bool | None
+) -> bool:
+    if override is not None:
+        return bool(override)
+    comparison_config = _nested(evaluation_config, "comparison")
+    return bool(comparison_config.get("require_stage1a_baseline", True))
+
+
 def run_stage1b_evaluation(
     alignment_config_path: str | Path,
     evaluation_config_path: str | Path,
@@ -1216,6 +1225,7 @@ def run_stage1b_evaluation(
     max_projection: int | None = None,
     max_query: int | None = None,
     projection_bandwidth: float | None = None,
+    require_stage1a_baseline: bool | None = None,
 ) -> Stage1BEvaluationReport:
     alignment_path = Path(alignment_config_path).resolve()
     evaluation_path = Path(evaluation_config_path).resolve()
@@ -1297,10 +1307,12 @@ def run_stage1b_evaluation(
     )
     output_root = output_base / identifier
     baseline_report_path = output_base / baseline_identifier / "evaluation_report.json"
-    comparison_config = _nested(evaluation_config, "comparison")
+    baseline_required = _stage1a_baseline_required(
+        evaluation_config, require_stage1a_baseline
+    )
     if (
         resolved_checkpoint is not None
-        and bool(comparison_config.get("require_stage1a_baseline", True))
+        and baseline_required
         and not baseline_report_path.is_file()
     ):
         raise FileNotFoundError(
