@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from collections import deque
 from dataclasses import asdict, dataclass
 import json
 import math
@@ -391,6 +392,34 @@ def _reconstruction_loss(
     )
 
 
+@torch.no_grad()
+def fixed_reconstruction_probe(
+    domains: dict[str, LoadedTrainingDomain],
+    anchors: dict[str, torch.nn.Module],
+    inputs: dict[str, torch.Tensor],
+    *, seed: int,
+) -> dict[str, float]:
+    """Fixed validation images/noise/times; preserve the training RNG stream."""
+    result = {}
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=devices):
+        for offset, (domain, value) in enumerate(domains.items()):
+            encoder = value.branch.encoder
+            was_training = encoder.training
+            try:
+                encoder.eval()
+                x = inputs[domain].to(device=value.device, dtype=value.dtype)
+                z = encoder(x)
+                reference = anchors[domain](x)
+                torch.manual_seed(seed + offset)
+                result[f"{domain}_raw_reconstruction"] = float(_reconstruction_loss(value, x, z))
+                torch.manual_seed(seed + offset)
+                result[f"{domain}_stage1a_reconstruction"] = float(_reconstruction_loss(value, x, reference))
+            finally:
+                encoder.train(was_training)
+    return result
+
+
 def _build_checkpoint_payload(
     *,
     step: int,
@@ -404,7 +433,7 @@ def _build_checkpoint_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "format_version": 2,
-        "stage": "stage1b_plain_infoot",
+        "stage": str(config.get("stage", "stage1b_plain_infoot")),
         "step": int(step),
         "encoders": {domain: _cpu_state_dict(encoder) for domain, encoder in encoders.items()},
         "fixed_generators": {
@@ -449,8 +478,8 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(path, map_location="cpu")
-    if not isinstance(payload, dict) or payload.get("stage") != "stage1b_plain_infoot":
-        raise ValueError(f"Not a Stage 1B-1 checkpoint: {path}")
+    if not isinstance(payload, dict) or payload.get("stage") not in {"stage1b_plain_infoot", "stage1b_fused_infoot"}:
+        raise ValueError(f"Not a Stage 1B InfoOT checkpoint: {path}")
     return payload
 
 
@@ -522,14 +551,18 @@ def train_joint_infoot(
         kernel_offdiagonal_stats,
         normalize_matching_features,
         plain_infoot_feature_loss,
-        solve_plain_infoot,
+        solve_infoot,
         solver_kwargs,
+        transport_diagnostics,
+    )
+    from diffusion_ot.losses.semantic_prior import (
+        load_semantic_prior, neighborhood_distillation_loss, validate_prior_resume,
     )
 
     resolved_config_path = Path(config_path).resolve()
     config = load_yaml_config(resolved_config_path)
-    if str(config.get("stage")) != "stage1b_plain_infoot":
-        raise ValueError("Expected a stage1b_plain_infoot config.")
+    if str(config.get("stage")) not in {"stage1b_plain_infoot", "stage1b_fused_infoot"}:
+        raise ValueError("Expected a Stage 1B plain or fused InfoOT config.")
     root = effective_project_root(
         config, fallback=find_project_root(resolved_config_path.parent)
     )
@@ -544,6 +577,14 @@ def train_joint_infoot(
     loss_weights = _nested(config, "loss_weights")
     matching_config = _nested(config, "matching")
     infoot_config = _nested(config, "infoot")
+    expected_variant = "fused" if config["stage"] == "stage1b_fused_infoot" else "plain"
+    if infoot_config.get("variant", "plain") != expected_variant:
+        raise ValueError("stage and infoot.variant disagree.")
+    prior = load_semantic_prior(config, root)
+    if prior is not None:
+        if float(data_config.get("random_horizontal_flip", 0.5)) != 0:
+            raise ValueError("Cached structure descriptors require random_horizontal_flip: 0.0.")
+        config["semantic_prior"]["fingerprint"] = prior.fingerprint
     trainable_config = _nested(config, "trainable")
     if not bool(trainable_config.get("encoders", True)):
         raise ValueError("Stage 1B-1 requires trainable encoders.")
@@ -587,6 +628,8 @@ def train_joint_infoot(
         datasets[domain] = CachedLatentDataset(
             data_paths[domain], domain, **dataset_kwargs
         )
+        if prior is not None:
+            prior.lookup([row["sample_id"] for row in datasets[domain].records], domain, dataset_kwargs["split"])
 
     if dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -682,6 +725,7 @@ def train_joint_infoot(
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         checkpoint = _load_checkpoint(resume_path)
+        validate_prior_resume(checkpoint.get("config") or {}, config)
         _validate_resume_provenance(
             checkpoint,
             domains,
@@ -716,6 +760,12 @@ def train_joint_infoot(
     alignment_weight = float(loss_weights.get("infoot_alignment", 0.02))
     warmup_steps = int(loss_weights.get("alignment_warmup_steps", 1000))
     anchor_weight = float(loss_weights.get("latent_anchor", 0.01))
+    neighborhood_weight = float(loss_weights.get("semantic_neighborhood", 0.0))
+    if not math.isfinite(neighborhood_weight) or neighborhood_weight < 0:
+        raise ValueError("semantic_neighborhood weight must be finite and nonnegative.")
+    if neighborhood_weight > 0 and prior is None:
+        raise ValueError("semantic_neighborhood requires a frozen semantic prior.")
+    prior_temperature = float(_nested(config, "semantic_prior").get("neighborhood_temperature", 0.2))
     rec_weights = {
         "cat": float(loss_weights.get("cat_reconstruction", 1.0)),
         "dog": float(loss_weights.get("dog_reconstruction", 1.0)),
@@ -725,6 +775,24 @@ def train_joint_infoot(
     save_every = int(train_config.get("save_every", 500))
     ema_update_every = int(ema_config.get("update_every", 1))
     solver_options = solver_kwargs(infoot_config)
+    loss_window_size = int(train_config.get("loss_window", 100))
+    if loss_window_size <= 0:
+        raise ValueError("train.loss_window must be positive.")
+    loss_window: deque[dict[str, float]] = deque(maxlen=loss_window_size)
+    probe_every = int(train_config.get("validation_every", 0))
+    probe_inputs = {}
+    if probe_every > 0:
+        for domain in domains:
+            validation = CachedLatentDataset(data_paths[domain], domain, split="val", project_root=root)
+            count = min(int(train_config.get("validation_samples", 8)), len(validation))
+            if count <= 0:
+                raise ValueError("Fixed validation needs nonempty validation samples.")
+            indices = torch.randperm(len(validation), generator=torch.Generator().manual_seed(seed + 19))[:count]
+            probe_inputs[domain] = torch.stack([validation[int(i)]["x0_latent"] for i in indices])
+        _append_jsonl(output_dir / "logs" / "validation.jsonl", {
+            "step": initial_step, "weights": "raw", "seed": seed + 10000,
+            **fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000),
+        })
 
     if resume_path is None:
         _save_checkpoint(
@@ -753,12 +821,22 @@ def train_joint_infoot(
         reference_z: dict[str, torch.Tensor] = {}
         rec_losses: dict[str, torch.Tensor] = {}
         anchor_losses: dict[str, torch.Tensor] = {}
+        teacher_features: dict[str, torch.Tensor] = {}
+        neighborhood_losses: dict[str, torch.Tensor] = {}
         for domain, value in domains.items():
             batch = next(loaders[domain])
             x0[domain] = batch["x0_latent"].to(
                 value.device, dtype=value.dtype, non_blocking=True
             )
             z[domain] = value.branch.encoder(x0[domain])
+            if prior is not None:
+                teacher_features[domain] = prior.lookup(
+                    batch["sample_id"], domain, dataset_kwargs["split"]
+                ).to(alignment_device)
+                neighborhood_losses[domain] = neighborhood_distillation_loss(
+                    z[domain].to(alignment_device), teacher_features[domain],
+                    temperature=prior_temperature,
+                )
             with torch.no_grad():
                 reference_z[domain] = anchors[domain](x0[domain])
             rec_losses[domain] = _reconstruction_loss(
@@ -779,12 +857,15 @@ def train_joint_infoot(
             }
         else:
             solve_distance_scales = distance_scales
-        solution = solve_plain_infoot(
+        cross_cost = prior.cost(teacher_features["cat"], teacher_features["dog"]) if prior is not None else None
+        solution = solve_infoot(
             cat_features.detach(),
             dog_features.detach(),
             bandwidth=bandwidth,
             distance_scale_x=solve_distance_scales["cat"],
             distance_scale_y=solve_distance_scales["dog"],
+            cross_cost=cross_cost,
+            cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
             **solver_options,
         )
         infoot_loss = plain_infoot_feature_loss(
@@ -799,10 +880,12 @@ def train_joint_infoot(
         )
         warmup = 1.0 if warmup_steps <= 0 else min(step / warmup_steps, 1.0)
         beta = alignment_weight * warmup
+        neighborhood_loss = sum(neighborhood_losses.values(), torch.zeros((), device=alignment_device))
         total = (
             rec_weights["cat"] * rec_losses["cat"].to(alignment_device)
             + rec_weights["dog"] * rec_losses["dog"].to(alignment_device)
             + beta * infoot_loss
+            + neighborhood_weight * warmup * neighborhood_loss
             + anchor_weight
             * (anchor_losses["cat"].to(alignment_device) + anchor_losses["dog"].to(alignment_device))
         )
@@ -822,6 +905,14 @@ def train_joint_infoot(
                     beta * infoot_loss, parameters
                 ),
             }
+            gradient_diagnostics["alignment_to_reconstruction_gradient_ratio"] = (
+                gradient_diagnostics["weighted_alignment_gradient_norm"]
+                / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
+            )
+            if prior is not None:
+                gradient_diagnostics["weighted_neighborhood_gradient_norm"] = _autograd_norm(
+                    neighborhood_weight * warmup * neighborhood_loss, parameters
+                )
         total.backward()
         grad_norms = {
             domain: _gradient_norm(list(encoder.parameters()))
@@ -836,6 +927,13 @@ def train_joint_infoot(
 
         elapsed = time.perf_counter() - started
         training_seconds += elapsed
+        loss_window.append({
+            "loss": float(total.detach()),
+            "cat_reconstruction_loss": float(rec_losses["cat"].detach()),
+            "dog_reconstruction_loss": float(rec_losses["dog"].detach()),
+            "infoot_mutual_information": solution.mutual_information,
+            "semantic_neighborhood_loss": float(neighborhood_loss.detach()),
+        })
         if step == initial_step + 1 or step % log_every == 0:
             metrics = {
                 "event": "train",
@@ -876,9 +974,26 @@ def train_joint_infoot(
                 ),
             }
             metrics.update(gradient_diagnostics)
+            metrics["transport"] = transport_diagnostics(solution.coupling)
+            metrics["semantic_neighborhood_loss"] = float(neighborhood_loss.detach())
+            metrics["semantic_neighborhood_weight"] = neighborhood_weight * warmup
+            metrics["window_mean"] = {
+                key: sum(row[key] for row in loss_window) / len(loss_window)
+                for key in loss_window[-1]
+            }
+            metrics["window_updates"] = len(loss_window)
+            if cross_cost is not None:
+                metrics["transport_structure_cost"] = float((solution.coupling * cross_cost).sum())
+                metrics["independent_structure_cost"] = float(cross_cost.mean())
+            metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
             print(json.dumps(metrics, sort_keys=True))
             _append_jsonl(log_path, metrics)
 
+        if probe_every > 0 and (step % probe_every == 0 or step == final_step):
+            _append_jsonl(output_dir / "logs" / "validation.jsonl", {
+                "step": step, "weights": "raw", "seed": seed + 10000,
+                **fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000),
+            })
         if step % save_every == 0 or step == final_step:
             _save_checkpoint(
                 checkpoint_path,
@@ -897,6 +1012,9 @@ def train_joint_infoot(
                     loader_generators=loader_generators,
                 ),
             )
+            if bool(train_config.get("keep_step_checkpoints", False)):
+                import shutil
+                shutil.copyfile(checkpoint_path, checkpoint_path.with_name(f"step_{step:06d}.pt"))
 
     return JointInfoOTTrainReport(
         config_path=str(resolved_config_path),

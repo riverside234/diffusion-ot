@@ -16,7 +16,7 @@ def repo_path(path: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate the Stage 1A offline-InfoOT baseline or a Stage 1B-1 checkpoint."
+        description="Evaluate a Stage 1A offline-InfoOT baseline or a plain/fused Stage 1B checkpoint."
     )
     parser.add_argument("--alignment-config", required=True)
     parser.add_argument("--eval-config", required=True)

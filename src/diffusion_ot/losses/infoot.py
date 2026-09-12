@@ -332,7 +332,7 @@ def seeded_nonindependent_coupling(
 
 
 @torch.no_grad()
-def solve_plain_infoot(
+def solve_infoot(
     features_x: torch.Tensor,
     features_y: torch.Tensor,
     *,
@@ -347,6 +347,8 @@ def solve_plain_infoot(
     projection_iterations: int = 200,
     projection_tolerance: float = 1.0e-5,
     eps: float = 1.0e-8,
+    cross_cost: torch.Tensor | None = None,
+    cross_cost_weight: float = 1.0,
 ) -> InfoOTSolveResult:
     if features_x.ndim != 2 or features_y.ndim != 2:
         raise ValueError("InfoOT expects [batch, dimension] feature matrices.")
@@ -365,6 +367,14 @@ def solve_plain_infoot(
         features_y, bandwidth=bandwidth, distance_scale=distance_scale_y, eps=eps
     )
 
+    fixed_cost = torch.zeros((n, m), device=features_x.device, dtype=features_x.dtype)
+    if cross_cost is not None:
+        if cross_cost.shape != (n, m) or not torch.isfinite(cross_cost).all():
+            raise ValueError("Fused InfoOT cross_cost must be a finite [n, m] matrix.")
+        if not torch.isfinite(torch.tensor(cross_cost_weight)) or cross_cost_weight < 0:
+            raise ValueError("cross_cost_weight must be finite and nonnegative.")
+        fixed_cost = cross_cost.detach().to(fixed_cost) * float(cross_cost_weight)
+
     # Official InfoOT initializes with the independent coupling. Each outer
     # iteration applies Eq. (5): use the negative MI gradient as the cost of a
     # fresh entropic OT solve. The entropy belongs to that Sinkhorn subproblem;
@@ -376,7 +386,7 @@ def solve_plain_infoot(
             coupling, kernel_x, kernel_y, a, b, eps=eps
         )
         coupling = sinkhorn_transport_from_cost(
-            -float(mi_weight) * mi_gradient,
+            fixed_cost - float(mi_weight) * mi_gradient,
             a,
             b,
             regularization=entropy_epsilon,
@@ -387,7 +397,7 @@ def solve_plain_infoot(
 
     mi = infoot_mutual_information(coupling, kernel_x, kernel_y, a, b, eps=eps)
     entropy = coupling_entropy(coupling, eps=eps)
-    objective = -float(mi_weight) * mi - float(entropy_epsilon) * entropy
+    objective = (coupling * fixed_cost).sum() - float(mi_weight) * mi - float(entropy_epsilon) * entropy
     return InfoOTSolveResult(
         coupling=coupling,
         objective=float(objective.cpu()),
@@ -398,6 +408,25 @@ def solve_plain_infoot(
         iterations=completed_iterations,
         restart=0,
     )
+
+
+def solve_plain_infoot(features_x: torch.Tensor, features_y: torch.Tensor, **kwargs) -> InfoOTSolveResult:
+    """Backward-compatible plain solver; fused callers use solve_infoot."""
+    if "cross_cost" in kwargs:
+        raise ValueError("Use solve_infoot for fused transport.")
+    return solve_infoot(features_x, features_y, **kwargs)
+
+
+@torch.no_grad()
+def transport_diagnostics(coupling: torch.Tensor) -> dict[str, float]:
+    """Concentration conditioned on each source, independent of batch size."""
+    rows = coupling / coupling.sum(1, keepdim=True).clamp_min(1e-30)
+    cols = coupling / coupling.sum(0, keepdim=True).clamp_min(1e-30)
+    return {
+        "mean_row_effective_targets": float((-(rows * rows.clamp_min(1e-30).log()).sum(1)).exp().mean()),
+        "mean_column_effective_sources": float((-(cols * cols.clamp_min(1e-30).log()).sum(0)).exp().mean()),
+        "mean_row_max_probability": float(rows.max(1).values.mean()),
+    }
 
 
 def plain_infoot_feature_loss(

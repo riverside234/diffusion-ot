@@ -27,8 +27,9 @@ from diffusion_ot.losses.infoot import (
     nearest_plan_row_weights,
     normalize_matching_features,
     pairwise_squared_distances,
-    solve_plain_infoot,
+    solve_infoot,
     solver_kwargs,
+    transport_diagnostics,
     weighted_target_codes,
 )
 
@@ -678,8 +679,8 @@ def _load_joint_checkpoint(path: Path) -> dict[str, Any]:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         checkpoint = torch.load(path, map_location="cpu")
-    if not isinstance(checkpoint, dict) or checkpoint.get("stage") != "stage1b_plain_infoot":
-        raise ValueError(f"Not a Stage 1B plain-InfoOT checkpoint: {path}")
+    if not isinstance(checkpoint, dict) or checkpoint.get("stage") not in {"stage1b_plain_infoot", "stage1b_fused_infoot"}:
+        raise ValueError(f"Not a Stage 1B InfoOT checkpoint: {path}")
     return checkpoint
 
 
@@ -1245,8 +1246,19 @@ def run_stage1b_evaluation(
     eval_root = effective_project_root(evaluation_config, fallback=root)
     if root != eval_root:
         raise ValueError("Alignment and evaluation configs resolve to different project roots.")
-    if str(alignment_config.get("stage")) != "stage1b_plain_infoot":
-        raise ValueError("The quick evaluator currently supports Stage 1B-1 plain InfoOT.")
+    if str(alignment_config.get("stage")) not in {"stage1b_plain_infoot", "stage1b_fused_infoot"}:
+        raise ValueError("The quick evaluator supports Stage 1B plain and fused InfoOT.")
+    from diffusion_ot.losses.semantic_prior import load_semantic_prior
+    # Evaluation chooses a solver variant explicitly; fitted prior provenance
+    # participates in the protocol hash, including the actual descriptor bytes.
+    eval_variant = str(_nested(evaluation_config, "infoot").get("variant", "plain"))
+    prior_config = dict(alignment_config)
+    prior_config["infoot"] = {"variant": eval_variant}
+    prior = load_semantic_prior(prior_config, root)
+    if prior is not None:
+        evaluation_config["semantic_prior"] = {
+            "fingerprint": prior.fingerprint, "metadata": prior.metadata,
+        }
     if weights not in {"ema", "raw"}:
         raise ValueError("weights must be ema or raw.")
 
@@ -1293,7 +1305,7 @@ def run_stage1b_evaluation(
         )[:8]
         for domain in ("cat", "dog")
     ) + f"_protocol_{protocol_identifier}"
-    mode = "stage1a_offline_infoot" if resolved_checkpoint is None else "stage1b_plain_infoot"
+    mode = "stage1a_offline_infoot" if resolved_checkpoint is None else str(alignment_config["stage"])
     identifier = (
         baseline_identifier
         if resolved_checkpoint is None
@@ -1421,12 +1433,23 @@ def run_stage1b_evaluation(
     cat_features = banks["cat"]["reference"].matching_features.to(alignment_device)
     dog_features = banks["dog"]["reference"].matching_features.to(alignment_device)
     infoot_config = _nested(evaluation_config, "infoot")
-    solution = solve_plain_infoot(
+    cross_cost = None
+    if prior is not None:
+        descriptors = {
+            domain: prior.lookup(banks[domain]["reference"].sample_ids, domain, reference_split).to(alignment_device)
+            for domain in ("cat", "dog")
+        }
+        if reference_split != "train":
+            raise ValueError("Fused prior fitting is restricted to training references.")
+        cross_cost = prior.cost(descriptors["cat"], descriptors["dog"])
+    solution = solve_infoot(
         cat_features,
         dog_features,
         bandwidth=bandwidth,
         distance_scale_x=scales["cat"],
         distance_scale_y=scales["dog"],
+        cross_cost=cross_cost,
+        cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
         **solver_kwargs(infoot_config),
     )
 
@@ -1437,6 +1460,9 @@ def run_stage1b_evaluation(
     torch.save(
         {
             "coupling": solution.coupling.cpu(),
+            "variant": eval_variant,
+            "semantic_prior_fingerprint": prior.fingerprint if prior is not None else None,
+            "cross_cost_weight": float(infoot_config.get("cross_cost_weight", 1.0)),
             "cat_reference_ids": banks["cat"]["reference"].sample_ids,
             "dog_reference_ids": banks["dog"]["reference"].sample_ids,
             "cat_projection_ids": banks["cat"]["projection"].sample_ids,
@@ -1640,6 +1666,11 @@ def run_stage1b_evaluation(
         gallery_sizes={domain: len(banks[domain]["gallery"].sample_ids) for domain in banks},
         distance_scales=scales,
         solver={
+            "variant": eval_variant,
+            "semantic_prior_fingerprint": prior.fingerprint if prior is not None else None,
+            "transport": transport_diagnostics(solution.coupling),
+            "transport_structure_cost": float((solution.coupling * cross_cost).sum()) if cross_cost is not None else None,
+            "independent_structure_cost": float(cross_cost.mean()) if cross_cost is not None else None,
             "fit_bandwidth_multiplier": bandwidth,
             "algorithm": str(
                 infoot_config.get("algorithm", "official_projected_sinkhorn")

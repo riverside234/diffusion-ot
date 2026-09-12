@@ -16,7 +16,7 @@ def repo_path(path: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Jointly fine-tune Cat and Dog PDAE encoders with mini-batch plain InfoOT."
+        description="Jointly fine-tune Cat and Dog PDAE encoders with plain or structure-guided fused InfoOT."
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--device-cat", default=None)
