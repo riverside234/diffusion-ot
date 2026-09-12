@@ -860,6 +860,41 @@ def _proxy_precision_caption(
     return "\n".join(lines)
 
 
+def _proxy_label_value(
+    labels: dict[str, dict[str, Any]], sample_id: str, attribute: str
+) -> str:
+    value = labels.get(sample_id, {}).get(attribute)
+    if value is None or not str(value).strip():
+        return "unlabeled"
+    return str(value)
+
+
+def _proxy_label_coverage_caption(
+    target_ids: list[str],
+    source_ids: list[str],
+    *,
+    labels: dict[str, dict[str, Any]],
+    attributes: list[str],
+) -> str:
+    if not attributes:
+        return "Label coverage: no proxy attributes configured."
+    parts = []
+    for attribute in attributes:
+        target_count = sum(
+            _proxy_label_value(labels, sample_id, attribute) != "unlabeled"
+            for sample_id in target_ids
+        )
+        source_count = sum(
+            _proxy_label_value(labels, sample_id, attribute) != "unlabeled"
+            for sample_id in source_ids
+        )
+        parts.append(
+            f"{attribute}: target {target_count}/{len(target_ids)}, "
+            f"source {source_count}/{len(source_ids)}"
+        )
+    return "Label coverage: " + "; ".join(parts)
+
+
 def _save_umap_visualizations(
     target_bank: LatentBank,
     source_query_ids: list[str],
@@ -906,7 +941,41 @@ def _save_umap_visualizations(
     }
     plotted_attributes: list[str | None] = attributes or [None]
     direction_label = direction.replace("_to_", " to ").replace("_", " ").title()
-    caption = _proxy_precision_caption(precision, attributes)
+    coverage_caption = _proxy_label_coverage_caption(
+        target_bank.sample_ids,
+        source_query_ids,
+        labels=labels,
+        attributes=attributes,
+    )
+    caption = (
+        "Color = proxy attribute when labels exist; an unlabeled panel uses blue for "
+        "the target bank and orange/green for the projected source. Marker = point "
+        "type. Target bank contains real target-domain codes; projected source "
+        "contains mapped source-query codes.\n"
+        f"{coverage_caption}\n{_proxy_precision_caption(precision, attributes)}"
+    )
+    palette = [
+        "#0072B2",  # blue
+        "#D55E00",  # vermillion
+        "#009E73",  # bluish green
+        "#CC79A7",  # reddish purple
+        "#E69F00",  # orange
+        "#56B4E9",  # sky blue
+        "#F0E442",  # yellow
+        "#332288",  # indigo
+    ]
+    readout_style = {
+        "conditional": {
+            "marker": "X",
+            "label": "Projected source (conditional mean)",
+            "fallback_color": "#E45756",
+        },
+        "barycentric": {
+            "marker": "P",
+            "label": "Projected source (barycentric)",
+            "fallback_color": "#2A9D8F",
+        },
+    }
 
     for readout, projected_embedding in projected_embeddings.items():
         output_path = output_paths[readout]
@@ -914,7 +983,7 @@ def _save_umap_visualizations(
         figure, axes = plt.subplots(
             1,
             len(plotted_attributes),
-            figsize=(7.2 * len(plotted_attributes), 8.0),
+            figsize=(7.6 * len(plotted_attributes), 8.4),
             squeeze=False,
         )
         for axis, attribute in zip(axes[0], plotted_attributes):
@@ -922,25 +991,34 @@ def _save_umap_visualizations(
                 target_values = ["all"] * len(target_bank.sample_ids)
                 projected_values = ["all"] * len(source_query_ids)
             else:
-                target_values = []
-                for sample_id in target_bank.sample_ids:
-                    value = labels.get(sample_id, {}).get(attribute)
-                    target_values.append("missing" if value is None else str(value))
-                projected_values = []
-                for sample_id in source_query_ids:
-                    value = labels.get(sample_id, {}).get(attribute)
-                    projected_values.append("missing" if value is None else str(value))
+                target_values = [
+                    _proxy_label_value(labels, sample_id, attribute)
+                    for sample_id in target_bank.sample_ids
+                ]
+                projected_values = [
+                    _proxy_label_value(labels, sample_id, attribute)
+                    for sample_id in source_query_ids
+                ]
             categories = sorted(
                 set(target_values).union(projected_values),
-                key=lambda value: (value == "missing", value),
+                key=lambda value: (value == "unlabeled", value),
             )
-            color_map = plt.get_cmap("tab20", max(len(categories), 1))
+            labeled_categories = [value for value in categories if value != "unlabeled"]
             colors = {
                 category: (
-                    "#9e9e9e" if category == "missing" else color_map(index)
+                    "#5F6368"
+                    if category == "unlabeled"
+                    else palette[labeled_categories.index(category) % len(palette)]
                 )
-                for index, category in enumerate(categories)
+                for category in categories
             }
+            labels_available = bool(labeled_categories)
+            target_role_color = "#2563EB" if not labels_available else "#374151"
+            projection_role_color = (
+                readout_style[readout]["fallback_color"]
+                if not labels_available
+                else "#374151"
+            )
             target_array = np.asarray(target_values)
             projected_array = np.asarray(projected_values)
             for category in categories:
@@ -949,8 +1027,8 @@ def _save_umap_visualizations(
                 axis.scatter(
                     target_embedding[target_mask, 0],
                     target_embedding[target_mask, 1],
-                    color=colors[category],
-                    s=11,
+                    color=colors[category] if labels_available else target_role_color,
+                    s=13,
                     alpha=float(target_alpha),
                     marker="o",
                     edgecolors="none",
@@ -959,12 +1037,15 @@ def _save_umap_visualizations(
                 axis.scatter(
                     projected_embedding[projected_mask, 0],
                     projected_embedding[projected_mask, 1],
-                    color=colors[category],
-                    s=26,
+                    color=(
+                        colors[category] if labels_available else projection_role_color
+                    ),
+                    s=38,
                     alpha=float(projection_alpha),
-                    marker="x" if readout == "conditional" else "+",
-                    linewidths=1.2,
-                    zorder=2,
+                    marker=readout_style[readout]["marker"],
+                    edgecolors="#111827",
+                    linewidths=0.45,
+                    zorder=3,
                 )
             category_handles = [
                 Line2D(
@@ -974,8 +1055,8 @@ def _save_umap_visualizations(
                     linestyle="none",
                     markerfacecolor=colors[category],
                     markeredgecolor="none",
-                    label=category,
-                    markersize=6,
+                    label=category.replace("_", " ").title(),
+                    markersize=7,
                 )
                 for category in categories
             ]
@@ -985,31 +1066,62 @@ def _save_umap_visualizations(
                     [0],
                     marker="o",
                     linestyle="none",
-                    color="#333333",
-                    label="target",
-                    markersize=5,
-                    alpha=max(float(target_alpha), 0.5),
+                    markerfacecolor=target_role_color,
+                    markeredgecolor="none",
+                    label="Target bank (real target codes)",
+                    markersize=6,
+                    alpha=0.75,
                 ),
                 Line2D(
                     [0],
                     [0],
-                    marker="x" if readout == "conditional" else "+",
+                    marker=readout_style[readout]["marker"],
                     linestyle="none",
-                    color="#333333",
-                    label=readout,
-                    markersize=7,
-                    alpha=max(float(projection_alpha), 0.5),
+                    markerfacecolor=projection_role_color,
+                    markeredgecolor="#111827",
+                    label=readout_style[readout]["label"],
+                    markersize=8,
+                    alpha=0.95,
                 ),
             ]
+            if labels_available:
+                category_legend = axis.legend(
+                    handles=category_handles,
+                    title=f"{(attribute or 'sample').replace('_', ' ').title()} label",
+                    fontsize=7,
+                    title_fontsize=8,
+                    loc="upper left",
+                    framealpha=0.94,
+                    ncols=2 if len(categories) > 5 else 1,
+                )
+                axis.add_artist(category_legend)
             axis.legend(
-                handles=category_handles + marker_handles,
-                title=attribute or "samples",
+                handles=marker_handles,
+                title="Point type",
                 fontsize=7,
                 title_fontsize=8,
-                loc="best",
-                framealpha=0.8,
-                ncols=2 if len(categories) > 5 else 1,
+                loc="upper right",
+                framealpha=0.94,
             )
+            if attribute is not None and categories == ["unlabeled"]:
+                axis.text(
+                    0.015,
+                    0.02,
+                    f"No {attribute.replace('_', ' ')} labels found. "
+                    "Set proxy_labels.path or provide this field in dataset metadata.",
+                    transform=axis.transAxes,
+                    ha="left",
+                    va="bottom",
+                    fontsize=8,
+                    color="#7F1D1D",
+                    bbox={
+                        "boxstyle": "round,pad=0.35",
+                        "facecolor": "#FEF2F2",
+                        "edgecolor": "#FCA5A5",
+                        "alpha": 0.96,
+                    },
+                    zorder=5,
+                )
             axis.set_title((attribute or "unlabeled").replace("_", " ").title())
             axis.set_xticks([])
             axis.set_yticks([])
@@ -1018,8 +1130,8 @@ def _save_umap_visualizations(
             fontsize=14,
         )
         figure.text(0.5, 0.012, caption, ha="center", va="bottom", fontsize=7.5)
-        figure.tight_layout(rect=(0.0, 0.20, 1.0, 0.95))
-        figure.savefig(output_path, dpi=180)
+        figure.tight_layout(rect=(0.0, 0.23, 1.0, 0.95))
+        figure.savefig(output_path, dpi=220, facecolor="white")
         plt.close(figure)
 
 
@@ -1442,9 +1554,9 @@ def run_stage1b_evaluation(
                 direction=name,
                 random_state=int(visualization_config.get("random_state", seed)),
                 n_jobs=int(visualization_config.get("n_jobs", 1)),
-                target_alpha=float(visualization_config.get("target_alpha", 0.18)),
+                target_alpha=float(visualization_config.get("target_alpha", 0.30)),
                 projection_alpha=float(
-                    visualization_config.get("projection_alpha", 0.55)
+                    visualization_config.get("projection_alpha", 0.90)
                 ),
                 output_paths=paths,
             )

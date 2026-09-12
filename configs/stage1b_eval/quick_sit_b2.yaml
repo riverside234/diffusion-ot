@@ -20,7 +20,7 @@ data:
 
 # JSONL rows: {"sample_id": "...", "viewpoint": "front", "framing": "close"}.
 # Set path to populate UMAP colors and proxy precision. When absent, the panels
-# explicitly show "missing" and their precision captions report n/a.
+# explicitly show "unlabeled" and their precision captions report n/a.
 proxy_labels:
   path: null
   attributes: [viewpoint, framing]
@@ -80,7 +80,7 @@ visualization:
   random_state: 20260906
   # A fixed seed makes UMAP deterministic and therefore single-threaded.
   n_jobs: 1
-  # Keep both layers translucent so dense target regions and projection
-  # overlaps remain visible.
-  target_alpha: 0.18
-  projection_alpha: 0.55
+  # Target-bank points remain translucent while larger, outlined projection
+  # markers stay legible over dense regions.
+  target_alpha: 0.30
+  projection_alpha: 0.90

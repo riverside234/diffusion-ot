@@ -92,8 +92,8 @@ def test_quick_evaluation_uses_the_training_infoot_kernel_and_entropy():
     )
     assert evaluation["output_dir"].endswith("_cfg_adaln_all_lora_r64")
     assert evaluation["proxy_labels"]["attributes"] == ["viewpoint", "framing"]
-    assert evaluation["visualization"]["target_alpha"] == pytest.approx(0.18)
-    assert evaluation["visualization"]["projection_alpha"] == pytest.approx(0.55)
+    assert evaluation["visualization"]["target_alpha"] == pytest.approx(0.30)
+    assert evaluation["visualization"]["projection_alpha"] == pytest.approx(0.90)
 
 
 def test_proxy_precision_caption_includes_every_rule_attribute_and_k():
@@ -148,12 +148,23 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
     class FakeAxis:
         def __init__(self):
             self.scatter_calls = []
+            self.legend_calls = []
+            self.artist_calls = []
+            self.text_calls = []
+            self.transAxes = object()
 
         def scatter(self, *args, **kwargs):
             self.scatter_calls.append(kwargs)
 
         def legend(self, **kwargs):
-            self.legend_kwargs = kwargs
+            self.legend_calls.append(kwargs)
+            return SimpleNamespace(kwargs=kwargs)
+
+        def add_artist(self, artist):
+            self.artist_calls.append(artist)
+
+        def text(self, *args, **kwargs):
+            self.text_calls.append((args, kwargs))
 
         def set_title(self, title):
             self.title = title
@@ -192,9 +203,6 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
         return figure, numpy.asarray([axes], dtype=object)
 
     pyplot.subplots = fake_subplots
-    pyplot.get_cmap = lambda name, count: lambda index: (
-        index / max(count, 1), 0.2, 0.8, 1.0
-    )
     pyplot.close = lambda figure: None
     lines = ModuleType("matplotlib.lines")
     lines.Line2D = lambda *args, **kwargs: SimpleNamespace(args=args, kwargs=kwargs)
@@ -239,8 +247,8 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
         direction="dog_to_cat",
         random_state=7,
         n_jobs=1,
-        target_alpha=0.18,
-        projection_alpha=0.55,
+        target_alpha=0.30,
+        projection_alpha=0.90,
         output_paths=paths,
     )
 
@@ -259,7 +267,35 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
         for axis in figure.axes
         for call in axis.scatter_calls
     }
-    assert plotted_alphas == {0.18, 0.55}
+    assert plotted_alphas == {0.30, 0.90}
+    assert all(len(axis.legend_calls) == 2 for figure in figures for axis in figure.axes)
+    assert all(
+        axis.legend_calls[0]["title"] in {"Viewpoint label", "Framing label"}
+        and axis.legend_calls[1]["title"] == "Point type"
+        for figure in figures
+        for axis in figure.axes
+    )
+    assert all(len(axis.artist_calls) == 1 for figure in figures for axis in figure.axes)
+    assert all("Color = proxy attribute when labels exist" in figure.caption for figure in figures)
+
+
+def test_proxy_label_helpers_mark_absent_values_as_unlabeled():
+    from diffusion_ot.evaluation.stage1b_eval import (
+        _proxy_label_coverage_caption,
+        _proxy_label_value,
+    )
+
+    labels = {"t0": {"viewpoint": ""}, "q0": {"viewpoint": None}}
+
+    assert _proxy_label_value(labels, "t0", "viewpoint") == "unlabeled"
+    assert _proxy_label_value(labels, "q0", "viewpoint") == "unlabeled"
+    assert _proxy_label_value(labels, "unknown", "viewpoint") == "unlabeled"
+    assert _proxy_label_coverage_caption(
+        ["t0", "t1"],
+        ["q0"],
+        labels=labels,
+        attributes=["viewpoint"],
+    ) == "Label coverage: viewpoint: target 0/2, source 0/1"
 
 
 def _bank(domain: str, split: str, ids: list[str], checkpoint: str = "same"):
