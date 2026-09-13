@@ -27,16 +27,16 @@ data:
   drop_last: true
 
 train:
-  max_steps: 5000
+  max_steps: 8000
   smoke_steps: 500
   seed: 20260905
   lr_encoder: 0.00002
   weight_decay: 0.0
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
-  log_every: 20
+  log_every: 200
   gradient_diagnostics_every: 200
-  save_every: 500
+  save_every: 1000
   resume_from: null
   loss_window: 100
   validation_every: 500
