@@ -2,7 +2,63 @@
 
 Cat/Dog PDAE representations with InfoOT conditional projection.
 
-## Structure-guided co-training experiment
+## Conditional projection co-training revision
+
+The new fused log through update 1,500 shows slow learning, with a nearly hard
+transport plan. Its 100-update average loss drops from 0.9473 to 0.9276, but
+each source still averages only about 1.02 effective targets in the fit plan.
+All 76 logged row-marginal residuals exceed the requested Sinkhorn tolerance.
+See [the log review and research rationale](docs/stage1b_fused_projection_review.md).
+
+The recommended next experiment is
+`configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml`. It adds a
+bidirectional conditional-structure KL loss: each training batch has 96 OT
+references and 32 separate queries per domain. The queries' full Eq. (7)
+probabilities learn to predict frozen DINO structure similarities. The
+transport plan is detached; both encoders receive gradients through the
+source and target KDEs. The log-domain training readout retains smoothing
+and target-density correction, including at small projection bandwidths.
+This loss is a project extension, not part of the official InfoOT algorithm.
+
+The inner MI coefficient changes from 1.0 to 0.10 with entropy regularization
+held at 0.05, reducing the tendency toward hard assignments. The outer MI
+weight changes to 0.20, keeping its coefficient on `-MI` at 0.02. Neighborhood
+KL weight is 0.10 and conditional-structure KL weight is 0.05. Fit/projection
+bandwidths remain 0.70/0.10, LR remains `2e-5`, and the budget remains 5,000
+updates. The solver can stop early on a feasible stable plan, allows up to
+2,000 Sinkhorn iterations, and rejects a final plan outside the marginal
+tolerance. These are starting settings for the new objective, not validated
+AFHQ optima; softer transport alone does not establish better correspondence.
+
+Reuse your existing `data/semantic_priors/afhq_dinov2_structure.pt`. Start this
+experiment from Stage 1A in its new output directory. The earlier fused and
+plain configs remain available as controls; an old fused checkpoint cannot
+be resumed into this different objective.
+
+```bash
+python3 scripts/train_joint_infoot.py \
+  --config configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml
+
+python3 scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/structure_fused_projection_sit_b2.yaml \
+  --checkpoint outputs/stage1b_cat_dog_structure_fused_projection_infoot_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+```
+
+The training command runs 5,000 updates. To inspect an earlier checkpoint,
+use `--max-steps 1500`, then use the same config with `--resume` to continue.
+`logs/validation.jsonl` records a fixed train-reference/validation-query
+projection probe at step 0 and every 500 updates, alongside the fixed
+reconstruction probe. Monitor `conditional_structure_loss`, each direction's
+`expected_structure_cost`, `effective_targets`, and
+`projected_to_target_norm_ratio`. Training logs include the new loss's gradient
+ratio to reconstruction and the solver's convergence status. The small probe
+uses 96 target references; the quick evaluator still projects over all target
+training codes and is the required decoded-image check. Teacher agreement is
+not independent semantic evidence. Use proxy precision and the translation
+grids before accepting the checkpoint; fixed generators and LoRA remain frozen.
+
+## Earlier structure-guided co-training experiment
 
 The 5,000-update plain-InfoOT run produced realistic targets with weak source
 faithfulness. Every logged 64-by-64 plan had entropy `log(64)`, while MI stayed
@@ -10,7 +66,7 @@ near 1.789. This indicates almost permutation-like transport, not successful
 semantic correspondence. Raw training loss also mixes changing minibatches,
 flow times/noise, and alignment warmup, so it need not decrease monotonically.
 
-`structure_fused_sit_b2.yaml` adds an experimental Stage 1B-2 path. It uses
+`structure_fused_sit_b2.yaml` is the earlier Stage 1B-2 control. It uses
 the official Fused InfoOT update `C - lambda * grad(MI)` as a fresh Sinkhorn
 cost, where `C` compares frozen DINOv2 patch self-similarity descriptors in a
 shared space. A separate within-domain neighborhood-distillation loss teaches

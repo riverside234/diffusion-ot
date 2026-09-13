@@ -1,0 +1,94 @@
+stage: stage1b_eval_quick
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+output_dir: outputs/stage1b_eval_structure_fused_projection_infoot_cfg_adaln_all_lora_r64
+seed: 20260906
+alignment_device: cuda:0
+
+data:
+  reference_split: train
+  # Eq. (7) is fit on the reference subset and averaged over this larger bank.
+  projection_split: train
+  query_split: val
+  gallery_split: val
+  reference_samples_per_domain: 512
+  projection_samples_per_domain: all
+  query_samples_per_domain: 256
+  gallery_samples_per_domain: 256
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+
+# JSONL rows include viewpoint, framing, and a shared cross-domain coat color.
+# Example: {"sample_id": "...", "viewpoint": "front", "framing": "close_up",
+#           "coat_color": "black"}.
+# The relative path resolves under project_root, currently
+# /data/not_backed_up/yxu209/diffusion-ot/. The file must exist and contain
+# labels for the sample IDs whose proxy precision or UMAP colors are required.
+proxy_labels:
+  path: data/proxy_labels/afhq_viewpoint_framing.jsonl
+  attributes: [viewpoint, framing, coat_color]
+  sample_id_key: sample_id
+
+matching:
+  normalize: l2
+  # Match InfoOT.compute_kernel on the transported reference bank.
+  distance_scale: infoot_rms
+  # Match the structure-guided fused training pilot.
+  bandwidth_multiplier: 0.70
+  # Conditional retrieval and Eq. (7) readouts only. The Stage 1A sweep found
+  # 0.10 at the useful knee: about 23-25 effective targets, before the marked
+  # norm shrinkage and support growth at 0.15 and above.
+  # CLI overrides remain available for sensitivity checks.
+  projection_bandwidth_multiplier: 0.10
+
+infoot:
+  variant: fused
+  cross_cost_weight: 1.0
+  algorithm: official_projected_sinkhorn
+  mi_weight: 0.10
+  entropy_epsilon: 0.05
+  inner_iterations: 100
+  projection_iterations: 2000
+  projection_tolerance: 0.00001
+  outer_tolerance: 0.00001
+  min_inner_iterations: 5
+  outer_patience: 3
+  strict_convergence: true
+  initialization: independent_product
+  numerical_epsilon: 0.00000001
+
+retrieval:
+  k: [1, 5, 15]
+  directions: [cat_to_dog, dog_to_cat]
+  rules: [random, conditional, nn_plan_row, nn_barycentric]
+
+reconstruction:
+  enabled: true
+  samples_per_domain: 8
+  num_steps: 50
+  guidance_scale: 1.0
+  metrics: [latent_mse, pixel_mse, pixel_psnr, lpips]
+
+translation:
+  enabled: true
+  samples_per_direction: 8
+  num_steps: 50
+  guidance_scale: 1.0
+  readouts: [conditional_mean, conditional_map, conditional_sample]
+  primary_readout: conditional_mean
+  temperature: 1.0
+
+comparison:
+  # Standalone diagnostics are allowed; compare only when a matching baseline exists.
+  require_stage1a_baseline: false
+
+visualization:
+  enabled: true
+  method: umap
+  random_state: 20260906
+  # A fixed seed makes UMAP deterministic and therefore single-threaded.
+  n_jobs: 1
+  # Target-bank points remain translucent while larger, outlined projection
+  # markers stay legible over dense regions.
+  target_alpha: 0.30
+  projection_alpha: 0.90

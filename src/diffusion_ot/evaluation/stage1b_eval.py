@@ -1525,6 +1525,34 @@ def run_stage1b_evaluation(
         )
         retrieval[str(name)] = direction_report
         direction_tensors[str(name)] = tensors
+        if prior is not None and all(
+            key in prior.index for bank in (banks[source_domain]["query"], banks[target_domain]["projection"])
+            for key in bank.sample_ids
+        ):
+            # Teacher-based diagnostics supplement independent proxy precision;
+            # they measure the training prior, not generated-image structure.
+            query_structure = prior.lookup(
+                banks[source_domain]["query"].sample_ids, source_domain, query_split
+            )
+            target_structure = prior.lookup(
+                banks[target_domain]["projection"].sample_ids, target_domain, projection_split
+            )
+            structure_costs = prior.cost(query_structure, target_structure)
+            conditional_weights = tensors["conditional_weights"].detach().cpu()
+            direction_report["structure_prior_diagnostics"] = {
+                "status": "available",
+                "conditional_expected_cost": float((conditional_weights * structure_costs).sum(1).mean()),
+                "uniform_expected_cost": float(structure_costs.mean()),
+                "nearest_descriptor_cost": float(structure_costs.min(1).values.mean()),
+                "semantic_prior_fingerprint": prior.fingerprint,
+                "interpretation": "Frozen training-prior retrieval cost; not independent validation or decoded-image similarity.",
+            }
+        elif prior is not None:
+            direction_report["structure_prior_diagnostics"] = {
+                "status": "unavailable",
+                "reason": "Prior cache lacks some query or projection descriptors; transport evaluation remains available.",
+                "semantic_prior_fingerprint": prior.fingerprint,
+            }
         _write_rankings_csv(
             output_root / "retrieval" / f"{name}_conditional_topk.csv",
             banks[source_domain]["query"].sample_ids,
@@ -1686,6 +1714,10 @@ def run_stage1b_evaluation(
             "column_residual": solution.column_residual,
             "iterations": solution.iterations,
             "restart": solution.restart,
+            "sinkhorn_converged": solution.sinkhorn_converged,
+            "unconverged_inner_steps": solution.unconverged_inner_steps,
+            "outer_converged": solution.outer_converged,
+            "plan_delta_l1": solution.plan_delta_l1,
             "cat_kernel": kernel_offdiagonal_stats(
                 cat_features,
                 bandwidth=bandwidth,

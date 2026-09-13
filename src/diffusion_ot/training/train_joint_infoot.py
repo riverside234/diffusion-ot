@@ -534,6 +534,69 @@ def _validate_resume_provenance(
             )
 
 
+@torch.no_grad()
+def fixed_conditional_structure_probe(
+    domains: dict[str, LoadedTrainingDomain],
+    inputs: dict[str, dict[str, Any]],
+    *,
+    cost_scale: float,
+    bandwidth: float,
+    projection_bandwidth: float,
+    teacher_temperature: float,
+    solver_options: dict[str, Any],
+    cross_cost_weight: float = 1.0,
+) -> dict[str, Any]:
+    """Fixed train references / validation queries; no updates or RNG consumption."""
+    from diffusion_ot.losses.conditional_structure import conditional_structure_loss
+    from diffusion_ot.losses.infoot import infoot_distance_scale, normalize_matching_features, solve_infoot, transport_diagnostics
+
+    states = {domain: value.branch.encoder.training for domain, value in domains.items()}
+    references, queries, reference_structure, query_structure = {}, {}, {}, {}
+    alignment_device = domains["cat"].device
+    try:
+        for domain, value in domains.items():
+            batch = inputs[domain]
+            if set(batch["reference_ids"]) & set(batch["query_ids"]):
+                raise ValueError("Projection probe reference/query IDs overlap.")
+            value.branch.encoder.eval()
+            for kind, codes in (("reference", references), ("query", queries)):
+                latents = batch[f"{kind}_latents"]
+                codes[domain] = torch.cat([
+                    value.branch.encoder(part.to(value.device, dtype=value.dtype)).float().to(alignment_device)
+                    for part in latents.split(32)
+                ])
+            reference_structure[domain] = batch["reference_structure"].to(alignment_device)
+            query_structure[domain] = batch["query_structure"].to(alignment_device)
+        features = {domain: normalize_matching_features(code) for domain, code in references.items()}
+        solution = solve_infoot(
+            features["cat"], features["dog"], bandwidth=bandwidth,
+            distance_scale_x=infoot_distance_scale(features["cat"]),
+            distance_scale_y=infoot_distance_scale(features["dog"]),
+            cross_cost=torch.cdist(reference_structure["cat"], reference_structure["dog"]) / cost_scale,
+            cross_cost_weight=cross_cost_weight, **solver_options,
+        )
+        result = conditional_structure_loss(
+            references, queries, reference_structure, query_structure, solution.coupling,
+            bandwidth=projection_bandwidth, cost_scale=cost_scale, teacher_temperature=teacher_temperature,
+        )
+        return {
+            "conditional_structure_loss": float(result.loss),
+            "conditional_structure": result.metrics,
+            "projection_probe": {
+                "reference_split": "train", "query_split": "val",
+                "sample_ids": {domain: {kind: inputs[domain][f"{kind}_ids"] for kind in ("reference", "query")} for domain in domains},
+                "fit_bandwidth": bandwidth, "projection_bandwidth": projection_bandwidth,
+                "sinkhorn_converged": solution.sinkhorn_converged,
+                "row_residual": solution.row_residual, "column_residual": solution.column_residual,
+                "iterations": solution.iterations, "outer_converged": solution.outer_converged,
+                "transport": transport_diagnostics(solution.coupling),
+            },
+        }
+    finally:
+        for domain, value in domains.items():
+            value.branch.encoder.train(states[domain])
+
+
 def train_joint_infoot(
     config_path: str | Path,
     *,
@@ -558,6 +621,7 @@ def train_joint_infoot(
     from diffusion_ot.losses.semantic_prior import (
         load_semantic_prior, neighborhood_distillation_loss, validate_prior_resume,
     )
+    from diffusion_ot.losses.conditional_structure import conditional_structure_loss
 
     resolved_config_path = Path(config_path).resolve()
     config = load_yaml_config(resolved_config_path)
@@ -577,6 +641,8 @@ def train_joint_infoot(
     loss_weights = _nested(config, "loss_weights")
     matching_config = _nested(config, "matching")
     infoot_config = _nested(config, "infoot")
+    conditional_config = _nested(config, "conditional_structure")
+    conditional_enabled = bool(conditional_config.get("enabled", False))
     expected_variant = "fused" if config["stage"] == "stage1b_fused_infoot" else "plain"
     if infoot_config.get("variant", "plain") != expected_variant:
         raise ValueError("stage and infoot.variant disagree.")
@@ -599,6 +665,19 @@ def train_joint_infoot(
     torch.manual_seed(seed)
     transport_batch_size = int(data_config.get("transport_batch_size", 64))
     reconstruction_batch_size = int(data_config.get("reconstruction_batch_size", 8))
+    query_count = int(conditional_config.get("query_samples_per_domain", 32)) if conditional_enabled else 0
+    conditional_weight = float(loss_weights.get("conditional_structure", 0.0))
+    if conditional_enabled:
+        if prior is None or str(data_config.get("split", "train")) != "train":
+            raise ValueError("Conditional structure training requires a frozen fused prior and train split.")
+        if not 1 <= query_count <= transport_batch_size - 3:
+            raise ValueError("Conditional structure needs disjoint queries and at least three OT references.")
+        if conditional_weight <= 0 or not math.isfinite(conditional_weight):
+            raise ValueError("Enabled conditional structure requires a positive loss weight.")
+        if matching_config.get("distance_scale", "infoot_rms") != "infoot_rms":
+            raise ValueError("Conditional structure training uses InfoOT RMS distance scales.")
+    elif conditional_weight != 0:
+        raise ValueError("Set conditional_structure.enabled to use its nonzero loss weight.")
     if reconstruction_batch_size > transport_batch_size:
         raise ValueError("reconstruction_batch_size cannot exceed transport_batch_size.")
     final_step = int(max_steps or train_config.get("max_steps", 5000))
@@ -781,6 +860,7 @@ def train_joint_infoot(
     loss_window: deque[dict[str, float]] = deque(maxlen=loss_window_size)
     probe_every = int(train_config.get("validation_every", 0))
     probe_inputs = {}
+    projection_probe_inputs = {}
     if probe_every > 0:
         for domain in domains:
             validation = CachedLatentDataset(data_paths[domain], domain, split="val", project_root=root)
@@ -789,9 +869,36 @@ def train_joint_infoot(
                 raise ValueError("Fixed validation needs nonempty validation samples.")
             indices = torch.randperm(len(validation), generator=torch.Generator().manual_seed(seed + 19))[:count]
             probe_inputs[domain] = torch.stack([validation[int(i)]["x0_latent"] for i in indices])
+            if conditional_enabled:
+                projection_probe_inputs[domain] = {}
+                for kind, dataset, requested in (
+                    ("reference", datasets[domain], int(conditional_config.get("validation_reference_samples", 96))),
+                    ("query", validation, int(conditional_config.get("validation_query_samples", 32))),
+                ):
+                    selected = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed + 29))[:requested]
+                    rows = [dataset[int(i)] for i in selected]
+                    if len(rows) < (3 if kind == "reference" else 1):
+                        raise ValueError("Projection validation needs at least three train references and one validation query.")
+                    ids = [row["sample_id"] for row in rows]
+                    projection_probe_inputs[domain][f"{kind}_ids"] = ids
+                    projection_probe_inputs[domain][f"{kind}_latents"] = torch.stack([row["x0_latent"] for row in rows])
+                    projection_probe_inputs[domain][f"{kind}_structure"] = prior.lookup(ids, domain, "train" if kind == "reference" else "val")
+
+    def validation_metrics() -> dict[str, Any]:
+        metrics = fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000)
+        if conditional_enabled:
+            metrics.update(fixed_conditional_structure_probe(
+                domains, projection_probe_inputs, cost_scale=prior.cost_scale, bandwidth=bandwidth,
+                projection_bandwidth=float(conditional_config.get("bandwidth_multiplier", 0.1)),
+                teacher_temperature=float(conditional_config.get("teacher_temperature", 0.05)),
+                solver_options=solver_options, cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
+            ))
+        return metrics
+
+    if probe_every > 0:
         _append_jsonl(output_dir / "logs" / "validation.jsonl", {
             "step": initial_step, "weights": "raw", "seed": seed + 10000,
-            **fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000),
+            **validation_metrics(),
         })
 
     if resume_path is None:
@@ -848,8 +955,20 @@ def train_joint_infoot(
                 z[domain], reference_z[domain], anchor_variances[domain]
             )
 
-        cat_features = normalize_matching_features(z["cat"].float()).to(alignment_device)
-        dog_features = normalize_matching_features(z["dog"].float()).to(alignment_device)
+        # DataLoaders shuffle each domain independently. Reserve the last Q
+        # examples as queries; they must never enter this update's OT fit.
+        references = {
+            domain: (code[:-query_count] if query_count else code).float().to(alignment_device)
+            for domain, code in z.items()
+        }
+        if conditional_enabled and any(len(code) < 3 for code in references.values()):
+            raise ValueError("Short training batch leaves too few OT references; enable drop_last.")
+        reference_structure = {
+            domain: teacher[:-query_count] if query_count else teacher
+            for domain, teacher in teacher_features.items()
+        }
+        cat_features = normalize_matching_features(references["cat"])
+        dog_features = normalize_matching_features(references["dog"])
         if distance_scale_mode == "infoot_rms":
             solve_distance_scales = {
                 "cat": float(infoot_distance_scale(cat_features.detach())),
@@ -857,7 +976,7 @@ def train_joint_infoot(
             }
         else:
             solve_distance_scales = distance_scales
-        cross_cost = prior.cost(teacher_features["cat"], teacher_features["dog"]) if prior is not None else None
+        cross_cost = prior.cost(reference_structure["cat"], reference_structure["dog"]) if prior is not None else None
         solution = solve_infoot(
             cat_features.detach(),
             dog_features.detach(),
@@ -881,11 +1000,23 @@ def train_joint_infoot(
         warmup = 1.0 if warmup_steps <= 0 else min(step / warmup_steps, 1.0)
         beta = alignment_weight * warmup
         neighborhood_loss = sum(neighborhood_losses.values(), torch.zeros((), device=alignment_device))
+        conditional_result = None
+        projection_loss = torch.zeros((), device=alignment_device)
+        if conditional_enabled:
+            conditional_result = conditional_structure_loss(
+                references, {domain: code[-query_count:].float().to(alignment_device) for domain, code in z.items()},
+                reference_structure, {domain: teacher[-query_count:] for domain, teacher in teacher_features.items()},
+                solution.coupling, cost_scale=prior.cost_scale,
+                bandwidth=float(conditional_config.get("bandwidth_multiplier", 0.1)),
+                teacher_temperature=float(conditional_config.get("teacher_temperature", 0.05)),
+            )
+            projection_loss = conditional_result.loss
         total = (
             rec_weights["cat"] * rec_losses["cat"].to(alignment_device)
             + rec_weights["dog"] * rec_losses["dog"].to(alignment_device)
             + beta * infoot_loss
             + neighborhood_weight * warmup * neighborhood_loss
+            + conditional_weight * warmup * projection_loss
             + anchor_weight
             * (anchor_losses["cat"].to(alignment_device) + anchor_losses["dog"].to(alignment_device))
         )
@@ -913,6 +1044,14 @@ def train_joint_infoot(
                 gradient_diagnostics["weighted_neighborhood_gradient_norm"] = _autograd_norm(
                     neighborhood_weight * warmup * neighborhood_loss, parameters
                 )
+            if conditional_enabled:
+                gradient_diagnostics["weighted_conditional_structure_gradient_norm"] = _autograd_norm(
+                    conditional_weight * warmup * projection_loss, parameters
+                )
+                gradient_diagnostics["conditional_structure_to_reconstruction_gradient_ratio"] = (
+                    gradient_diagnostics["weighted_conditional_structure_gradient_norm"]
+                    / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
+                )
         total.backward()
         grad_norms = {
             domain: _gradient_norm(list(encoder.parameters()))
@@ -933,6 +1072,7 @@ def train_joint_infoot(
             "dog_reconstruction_loss": float(rec_losses["dog"].detach()),
             "infoot_mutual_information": solution.mutual_information,
             "semantic_neighborhood_loss": float(neighborhood_loss.detach()),
+            "conditional_structure_loss": float(projection_loss.detach()),
         })
         if step == initial_step + 1 or step % log_every == 0:
             metrics = {
@@ -950,6 +1090,13 @@ def train_joint_infoot(
                 "infoot_row_residual": solution.row_residual,
                 "infoot_column_residual": solution.column_residual,
                 "infoot_restart": solution.restart,
+                "infoot_sinkhorn_converged": solution.sinkhorn_converged,
+                "infoot_unconverged_inner_steps": solution.unconverged_inner_steps,
+                "infoot_outer_converged": solution.outer_converged,
+                "infoot_plan_delta_l1": solution.plan_delta_l1,
+                "infoot_iterations": solution.iterations,
+                "infoot_reference_counts": {domain: len(code) for domain, code in references.items()},
+                "conditional_query_samples_per_domain": query_count,
                 "infoot_distance_scale_mode": distance_scale_mode,
                 "cat_distance_scale": solve_distance_scales["cat"],
                 "dog_distance_scale": solve_distance_scales["dog"],
@@ -977,6 +1124,10 @@ def train_joint_infoot(
             metrics["transport"] = transport_diagnostics(solution.coupling)
             metrics["semantic_neighborhood_loss"] = float(neighborhood_loss.detach())
             metrics["semantic_neighborhood_weight"] = neighborhood_weight * warmup
+            metrics["conditional_structure_loss"] = float(projection_loss.detach())
+            metrics["conditional_structure_weight"] = conditional_weight * warmup
+            if conditional_result is not None:
+                metrics["conditional_structure"] = conditional_result.metrics
             metrics["window_mean"] = {
                 key: sum(row[key] for row in loss_window) / len(loss_window)
                 for key in loss_window[-1]
@@ -992,7 +1143,7 @@ def train_joint_infoot(
         if probe_every > 0 and (step % probe_every == 0 or step == final_step):
             _append_jsonl(output_dir / "logs" / "validation.jsonl", {
                 "step": step, "weights": "raw", "seed": seed + 10000,
-                **fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000),
+                **validation_metrics(),
             })
         if step % save_every == 0 or step == final_step:
             _save_checkpoint(

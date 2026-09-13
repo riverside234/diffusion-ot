@@ -1,0 +1,110 @@
+stage: stage1b_fused_infoot
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+output_dir: outputs/stage1b_cat_dog_structure_fused_projection_infoot_sit_b2_cfg_adaln_all_lora_r64
+
+stage1a:
+  weights: ema
+  require_semantic_cfg: true
+  require_attention_lora: true
+  require_attention_lora_rank: 64
+  require_attention_lora_alpha: 64
+  cat:
+    config: configs/stage1a_pdae/cat_sit_b2_lora.yaml
+    checkpoint: outputs/stage1a_cat_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+    device: cuda:0
+  dog:
+    config: configs/stage1a_pdae/dog_sit_b2_lora.yaml
+    checkpoint: outputs/stage1a_dog_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+    device: cuda:1
+
+data:
+  split: train
+  transport_batch_size: 128
+  reconstruction_batch_size: 16
+  random_horizontal_flip: 0.0  # Matches the unflipped structure cache.
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+
+train:
+  max_steps: 5000
+  smoke_steps: 500
+  seed: 20260905
+  lr_encoder: 0.00002
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  log_every: 20
+  gradient_diagnostics_every: 200
+  save_every: 500
+  resume_from: null
+  loss_window: 100
+  validation_every: 500
+  validation_samples: 8
+  keep_step_checkpoints: true
+
+ema:
+  enabled: true
+  decay: 0.995  # About 200 updates of EMA history; suitable for a 5k pilot.
+  warmup_steps: 500
+  update_every: 1
+
+loss_weights:
+  cat_reconstruction: 1.0
+  dog_reconstruction: 1.0
+  # Keep the coefficient on -MI at 0.02: outer 0.20 * inner lambda 0.10.
+  infoot_alignment: 0.20
+  latent_anchor: 0.01
+  semantic_neighborhood: 0.10
+  conditional_structure: 0.05
+  alignment_warmup_steps: 1000
+
+matching:
+  normalize: l2
+  calibration_samples: 256
+  # Match InfoOT.compute_kernel: sqrt(mean(pairwise_distance^2) / 2).
+  distance_scale: infoot_rms
+  bandwidth_multiplier: 0.70
+
+infoot:
+  variant: fused
+  cross_cost_weight: 1.0
+  algorithm: official_projected_sinkhorn
+  mi_weight: 0.10  # Weaker MI feedback in the inner plan; fixed structure cost remains 1.0.
+  entropy_epsilon: 0.05
+  inner_iterations: 100
+  projection_iterations: 2000
+  projection_tolerance: 0.00001
+  outer_tolerance: 0.00001
+  min_inner_iterations: 5
+  outer_patience: 3
+  strict_convergence: true
+  initialization: independent_product
+  numerical_epsilon: 0.00000001
+
+trainable:
+  encoders: true
+  adapters: false
+  attention_lora: false
+  base_transformers: false
+
+quick_evaluation:
+  config: configs/stage1b_eval/structure_fused_projection_sit_b2.yaml
+  weights: ema
+  # Invoke scripts/train_joint_infoot.py with --quick-eval to preserve the
+  # Stage 1A baseline before training and compare the final checkpoint to it.
+
+# Frozen DINOv2 pooled patch self-similarity; no proxy labels enter training.
+semantic_prior:
+  path: data/semantic_priors/afhq_dinov2_structure.pt
+  neighborhood_temperature: 0.20
+
+# Project extension: teach Eq. (7) on queries excluded from the current OT fit.
+# 128 encoded samples/domain = 96 fit references + 32 disjoint queries.
+conditional_structure:
+  enabled: true
+  query_samples_per_domain: 32
+  bandwidth_multiplier: 0.10  # Match the quick evaluator's conditional readout.
+  teacher_temperature: 0.05  # On the fixed, training-calibrated structure cost.
+  validation_reference_samples: 96
+  validation_query_samples: 32

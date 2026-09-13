@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import torch
@@ -17,6 +18,10 @@ class InfoOTSolveResult:
     column_residual: float
     iterations: int
     restart: int
+    sinkhorn_converged: bool = True
+    unconverged_inner_steps: int = 0
+    outer_converged: bool = False
+    plan_delta_l1: float = 0.0
 
 
 def uniform_marginals(
@@ -281,8 +286,10 @@ def sinkhorn_transport_from_cost(
     if (a <= 0).any() or (b <= 0).any():
         raise ValueError("Entropic Sinkhorn requires strictly positive marginals.")
     regularization = float(regularization)
-    if regularization <= 0:
+    if not math.isfinite(regularization) or regularization <= 0:
         raise ValueError("Entropic regularization must be positive.")
+    if max_iterations < 1 or not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("Sinkhorn iterations and tolerance must be positive.")
 
     log_kernel = -cost / regularization
     log_a = a.log()
@@ -349,11 +356,21 @@ def solve_infoot(
     eps: float = 1.0e-8,
     cross_cost: torch.Tensor | None = None,
     cross_cost_weight: float = 1.0,
+    outer_tolerance: float = 0.0,
+    min_inner_iterations: int = 5,
+    outer_patience: int = 3,
+    strict_convergence: bool = False,
 ) -> InfoOTSolveResult:
     if features_x.ndim != 2 or features_y.ndim != 2:
         raise ValueError("InfoOT expects [batch, dimension] feature matrices.")
     if features_x.device != features_y.device:
         raise ValueError("InfoOT feature matrices must be on the same device.")
+    if not math.isfinite(mi_weight) or mi_weight < 0:
+        raise ValueError("InfoOT mi_weight must be finite and nonnegative.")
+    if not math.isfinite(outer_tolerance) or outer_tolerance < 0:
+        raise ValueError("InfoOT outer_tolerance must be finite and nonnegative.")
+    if min_inner_iterations < 1 or outer_patience < 1:
+        raise ValueError("InfoOT minimum iterations and patience must be positive.")
     n, m = features_x.shape[0], features_y.shape[0]
     if a is None or b is None:
         default_a, default_b = uniform_marginals(n, m, device=features_x.device, dtype=features_x.dtype)
@@ -381,10 +398,15 @@ def solve_infoot(
     # it is not added as an explicit gradient or accumulated in a mirror step.
     coupling = a[:, None] * b[None, :]
     completed_iterations = 0
+    unconverged_inner_steps = 0
+    stable_iterations = 0
+    outer_converged = False
+    plan_delta_l1 = 0.0
     for iteration in range(max(int(inner_iterations), 0)):
         mi_gradient = infoot_plan_gradient(
             coupling, kernel_x, kernel_y, a, b, eps=eps
         )
+        previous_coupling = coupling
         coupling = sinkhorn_transport_from_cost(
             fixed_cost - float(mi_weight) * mi_gradient,
             a,
@@ -394,7 +416,31 @@ def solve_infoot(
             tolerance=projection_tolerance,
         )
         completed_iterations = iteration + 1
+        residual = max(
+            float((coupling.sum(1) - a).abs().max()),
+            float((coupling.sum(0) - b).abs().max()),
+        )
+        inner_converged = residual <= projection_tolerance
+        unconverged_inner_steps += int(not inner_converged)
+        plan_delta_l1 = float((coupling - previous_coupling).abs().sum())
+        stable_iterations = (
+            stable_iterations + 1
+            if outer_tolerance > 0 and inner_converged and plan_delta_l1 <= outer_tolerance
+            else 0
+        )
+        if completed_iterations >= min_inner_iterations and stable_iterations >= outer_patience:
+            outer_converged = True
+            break
 
+    row_residual = float((coupling.sum(dim=1) - a).abs().max().cpu())
+    column_residual = float((coupling.sum(dim=0) - b).abs().max().cpu())
+    sinkhorn_converged = max(row_residual, column_residual) <= projection_tolerance
+    if strict_convergence and not sinkhorn_converged:
+        raise RuntimeError(
+            f"InfoOT Sinkhorn marginals did not converge: row={row_residual:.3g}, "
+            f"column={column_residual:.3g}, tolerance={projection_tolerance:.3g}. "
+            "Increase projection_iterations or reassess the cost/MI/entropy scales."
+        )
     mi = infoot_mutual_information(coupling, kernel_x, kernel_y, a, b, eps=eps)
     entropy = coupling_entropy(coupling, eps=eps)
     objective = (coupling * fixed_cost).sum() - float(mi_weight) * mi - float(entropy_epsilon) * entropy
@@ -403,10 +449,14 @@ def solve_infoot(
         objective=float(objective.cpu()),
         mutual_information=float(mi.cpu()),
         entropy=float(entropy.cpu()),
-        row_residual=float((coupling.sum(dim=1) - a).abs().max().cpu()),
-        column_residual=float((coupling.sum(dim=0) - b).abs().max().cpu()),
+        row_residual=row_residual,
+        column_residual=column_residual,
         iterations=completed_iterations,
         restart=0,
+        sinkhorn_converged=sinkhorn_converged,
+        unconverged_inner_steps=unconverged_inner_steps,
+        outer_converged=outer_converged,
+        plan_delta_l1=plan_delta_l1,
     )
 
 
@@ -423,6 +473,10 @@ def transport_diagnostics(coupling: torch.Tensor) -> dict[str, float]:
     rows = coupling / coupling.sum(1, keepdim=True).clamp_min(1e-30)
     cols = coupling / coupling.sum(0, keepdim=True).clamp_min(1e-30)
     return {
+        "mean_row_entropy": float(-(rows * rows.clamp_min(1e-30).log()).sum(1).mean()),
+        "normalized_row_entropy": float(
+            -(rows * rows.clamp_min(1e-30).log()).sum(1).mean() / max(math.log(coupling.shape[1]), 1e-30)
+        ),
         "mean_row_effective_targets": float((-(rows * rows.clamp_min(1e-30).log()).sum(1)).exp().mean()),
         "mean_column_effective_sources": float((-(cols * cols.clamp_min(1e-30).log()).sum(0)).exp().mean()),
         "mean_row_max_probability": float(rows.max(1).values.mean()),
@@ -612,6 +666,58 @@ def conditional_reference_weights(
     )
 
 
+def conditional_reference_log_weights(
+    query_x: torch.Tensor,
+    reference_x: torch.Tensor,
+    reference_y: torch.Tensor,
+    coupling: torch.Tensor,
+    *,
+    a: torch.Tensor | None = None,
+    b: torch.Tensor | None = None,
+    bandwidth: float = 1.0,
+    distance_scale_x: float | torch.Tensor = 1.0,
+    distance_scale_y: float | torch.Tensor = 1.0,
+) -> torch.Tensor:
+    """Log Eq. (7) probabilities for small differentiable training banks.
+
+    Equivalent to conditional_reference_weights, including target smoothing,
+    target-density correction and target masses. Log-sum-exp contractions avoid
+    zero-probability clipping and its dead gradients at small bandwidths.
+    Temporary storage scales as query_count * source_count * target_count;
+    large evaluation galleries should use the matrix-multiply weight helper.
+    """
+    n, m = coupling.shape
+    if reference_x.shape[0] != n or reference_y.shape[0] != m:
+        raise ValueError("Reference banks do not match the coupling dimensions.")
+    if a is None or b is None:
+        default_a, default_b = uniform_marginals(n, m, device=coupling.device, dtype=coupling.dtype)
+        a = default_a if a is None else a
+        b = default_b if b is None else b
+    _validate_marginals(a, b, n, m)
+    if (a <= 0).any() or (b <= 0).any():
+        raise ValueError("Log conditional projection requires positive reference masses.")
+    if not torch.isfinite(coupling).all() or (coupling < 0).any() or coupling.sum() <= 0:
+        raise ValueError("Coupling must be finite, nonnegative and have positive mass.")
+    if (coupling.sum(0) <= 0).any() or (coupling.sum(1) <= 0).any():
+        raise ValueError("Positive reference masses require nonempty coupling rows and columns.")
+    if not math.isfinite(bandwidth) or bandwidth <= 0:
+        raise ValueError("Projection bandwidth must be finite and positive.")
+    log_qx = F.log_softmax(_log_gaussian_kernel(
+        query_x, reference_x, bandwidth=bandwidth, distance_scale=distance_scale_x,
+    ), dim=1)
+    log_yy = F.log_softmax(_log_gaussian_kernel(
+        reference_y, bandwidth=bandwidth, distance_scale=distance_scale_y,
+    ), dim=1)
+    log_plan = torch.where(coupling > 0, coupling, torch.ones_like(coupling)).log().masked_fill(
+        coupling == 0, -torch.inf
+    )
+    log_source_transport = torch.logsumexp(log_qx[:, :, None] + log_plan[None, :, :], dim=1)
+    log_joint = torch.logsumexp(log_source_transport[:, None, :] + log_yy[None, :, :], dim=2)
+    log_target_density = torch.logsumexp(log_yy + b.log()[None, :], dim=1)
+    # The source marginal cancels when probabilities are normalized per query.
+    return F.log_softmax(log_joint - log_target_density[None, :] + b.log()[None, :], dim=1)
+
+
 def nearest_plan_row_weights(
     query_x: torch.Tensor,
     reference_x: torch.Tensor,
@@ -651,4 +757,8 @@ def solver_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         "projection_iterations": int(config.get("projection_iterations", 200)),
         "projection_tolerance": float(config.get("projection_tolerance", 1.0e-5)),
         "eps": float(config.get("numerical_epsilon", 1.0e-8)),
+        "outer_tolerance": float(config.get("outer_tolerance", 0.0)),
+        "min_inner_iterations": int(config.get("min_inner_iterations", 5)),
+        "outer_patience": int(config.get("outer_patience", 3)),
+        "strict_convergence": bool(config.get("strict_convergence", False)),
     }

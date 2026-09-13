@@ -197,9 +197,11 @@ def test_structure_cache_builder_uses_training_only_calibration(monkeypatch, tmp
     assert first.metadata["resolved_revision"] == "test_revision"
 
 
-def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path):
+@pytest.mark.parametrize("conditional_enabled", [False, True])
+def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, conditional_enabled):
     """Exercise real orchestration and autograd, replacing only datasets/SiT."""
     import yaml
+    import json
     import diffusion_ot.data.latent_dataset as data
     import diffusion_ot.training.train_joint_infoot as train
     import diffusion_ot.evaluation.stage1b_eval as evaluation
@@ -255,6 +257,13 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path):
               "semantic_prior": {"path": "prior.pt"}, "ema": {"decay": .995},
               "train": {"max_steps": 2, "log_every": 1, "save_every": 1, "validation_every": 1,
                         "keep_step_checkpoints": True, "gradient_diagnostics_every": 1}}
+    if conditional_enabled:
+        config["loss_weights"]["conditional_structure"] = .05
+        config["conditional_structure"] = {
+            "enabled": True, "query_samples_per_domain": 2,
+            "bandwidth_multiplier": .1, "teacher_temperature": .05,
+            "validation_reference_samples": 6, "validation_query_samples": 4,
+        }
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(config))
     report = train.train_joint_infoot(path)
@@ -269,6 +278,20 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path):
     assert resumed.initial_step == 2 and resumed.final_step == 3
     payload = train._load_checkpoint(Path(resumed.checkpoint_path))
     assert payload["ema_state"]["num_updates"] == 3
+    logs = [json.loads(line) for line in (tmp_path / "out/logs/train.jsonl").read_text().splitlines()]
+    assert all(r["infoot_reference_counts"] == {"cat": 6 if conditional_enabled else 8, "dog": 6 if conditional_enabled else 8} for r in logs)
+    if conditional_enabled:
+        assert all(r["conditional_structure_loss"] > 0 for r in logs)
+        assert all(r["weighted_conditional_structure_gradient_norm"] > 0 for r in logs)
+        validation = [json.loads(line) for line in (tmp_path / "out/logs/validation.jsonl").read_text().splitlines()]
+        fixed_ids = validation[0]["projection_probe"]["sample_ids"]
+        for row in validation:
+            assert row["projection_probe"]["sample_ids"] == fixed_ids
+            assert row["projection_probe"]["reference_split"] == "train"
+            assert row["projection_probe"]["query_split"] == "val"
+            for domain, ids in row["projection_probe"]["sample_ids"].items():
+                assert all(key.startswith(f"{domain}_train_") for key in ids["reference"])
+                assert all(key.startswith(f"{domain}_val_") for key in ids["query"])
 
     def eval_context(config, root, domain, **kwargs):
         context = latest_domains[domain]
@@ -295,3 +318,5 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path):
     assert result.solver["semantic_prior_fingerprint"] == payload["config"]["semantic_prior"]["fingerprint"]
     assert result.baseline_comparison["status"] == "missing"
     assert result.retrieval["dog_to_cat"]["projection_target_count"] == 8
+    assert result.retrieval["dog_to_cat"]["structure_prior_diagnostics"]["conditional_expected_cost"] > 0
+    assert "sinkhorn_converged" in result.solver
