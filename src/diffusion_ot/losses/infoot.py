@@ -24,6 +24,71 @@ class InfoOTSolveResult:
     plan_delta_l1: float = 0.0
 
 
+@dataclass
+class SinkhornDivergenceResult:
+    loss: torch.Tensor
+    max_marginal_residual: float
+    converged: bool
+
+
+def sinkhorn_divergence(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    source_masses: torch.Tensor | None = None,
+    target_masses: torch.Tensor | None = None,
+    cost_scale: float = 1.0,
+    regularization: float = 0.1,
+    max_iterations: int = 1000,
+    tolerance: float = 1.0e-5,
+    require_converged: bool = True,
+) -> SinkhornDivergenceResult:
+    """Debiased entropic OT on same-space empirical distributions (Feydy 2019).
+
+    S(x,y) = OT(x,y) - OT(x,x)/2 - OT(y,y)/2, where OT includes
+    epsilon * KL(plan || a outer b). The detached converged optimal plans give
+    envelope gradients through the costs, including BOTH source self-cost
+    arguments. This is an auxiliary loss, not a replacement InfoOT objective.
+    Callers detach any fixed decoder-code target; no coordinate normalization
+    is applied here because raw-code contraction is the quantity of interest.
+    """
+    if source.ndim != 2 or target.ndim != 2 or source.shape[1] != target.shape[1]:
+        raise ValueError("Sinkhorn divergence requires matching feature dimensions.")
+    if not len(source) or not len(target) or source.device != target.device:
+        raise ValueError("Sinkhorn divergence requires nonempty banks on the same device.")
+    if not math.isfinite(cost_scale) or cost_scale <= 0:
+        raise ValueError("Sinkhorn cost_scale must be finite and positive.")
+    dtype = torch.float64 if source.dtype == torch.float64 or target.dtype == torch.float64 else torch.float32
+    source, target = source.to(dtype=dtype), target.to(dtype=dtype)
+    a, b = uniform_marginals(len(source), len(target), device=source.device, dtype=dtype)
+    a = a if source_masses is None else source_masses.detach().to(a)
+    b = b if target_masses is None else target_masses.detach().to(b)
+    _validate_marginals(a, b, len(source), len(target))
+    if not torch.allclose(a.sum(), a.new_tensor(1.0), atol=1e-6):
+        raise ValueError("Sinkhorn divergence expects probability masses summing to one.")
+    costs = [pairwise_squared_distances(x, y) / cost_scale for x, y in
+             ((source, target), (source, source), (target, target))]
+    values, residuals = [], []
+    for cost, (left_mass, right_mass) in zip(costs, ((a, b), (a, a), (b, b))):
+        plan = sinkhorn_transport_from_cost(
+            cost.detach(), left_mass, right_mass, regularization=regularization,
+            max_iterations=max_iterations, tolerance=tolerance,
+        )
+        residuals.append(max(float((plan.sum(1) - left_mass).abs().max()), float((plan.sum(0) - right_mass).abs().max())))
+        log_ratio = plan.clamp_min(torch.finfo(plan.dtype).tiny).log() - left_mass.log()[:, None] - right_mass.log()[None, :]
+        values.append((plan * cost).sum() + regularization * (plan * log_ratio).sum())
+    residual = max(residuals)
+    converged = residual <= tolerance
+    if require_converged and not converged:
+        raise RuntimeError(
+            f"Projection-support Sinkhorn residual {residual:.3g} exceeds {tolerance:.3g}; "
+            "increase projection_support.max_iterations or its regularization."
+        )
+    # Do not clamp small negative numerical errors: that would hide feasibility
+    # failures and introduce a dead gradient near equality.
+    return SinkhornDivergenceResult(values[0] - .5 * values[1] - .5 * values[2], residual, converged)
+
+
 def uniform_marginals(
     n: int,
     m: int,

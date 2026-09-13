@@ -520,6 +520,14 @@ def _direction_evaluation(
         ),
         "mean_nearest_target_distance": float(nearest_target_distance.mean().cpu()),
         "mean_projected_to_target_norm_ratio": float(norm_ratio.mean().cpu()),
+        "projected_to_target_variance_ratio": float(
+            conditional_codes.var(0, unbiased=False).mean()
+            / target_projection_raw.var(0, unbiased=False).mean().clamp_min(eps)
+        ),
+        "projected_mean_shift_squared": float(
+            (conditional_codes.mean(0) - target_projection_raw.mean(0)).square().mean()
+            / target_projection_raw.var(0, unbiased=False).mean().clamp_min(eps)
+        ),
         "nearest_source_indices": nearest_source.cpu().tolist(),
         "conditional_distance_scales": {
             "query_source": query_source_scale,

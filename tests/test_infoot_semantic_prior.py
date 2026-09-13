@@ -197,14 +197,15 @@ def test_structure_cache_builder_uses_training_only_calibration(monkeypatch, tmp
     assert first.metadata["resolved_revision"] == "test_revision"
 
 
-@pytest.mark.parametrize("conditional_enabled", [False, True])
-def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, conditional_enabled):
+@pytest.mark.parametrize("training_mode", ["fused", "conditional", "guarded"])
+def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, training_mode):
     """Exercise real orchestration and autograd, replacing only datasets/SiT."""
     import yaml
     import json
     import diffusion_ot.data.latent_dataset as data
     import diffusion_ot.training.train_joint_infoot as train
     import diffusion_ot.evaluation.stage1b_eval as evaluation
+    conditional_enabled = training_mode != "fused"
 
     class Dataset:
         def __init__(self, config, domain, split="train", **kwargs):
@@ -264,6 +265,10 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, co
             "bandwidth_multiplier": .1, "teacher_temperature": .05,
             "validation_reference_samples": 6, "validation_query_samples": 4,
         }
+    if training_mode == "guarded":
+        config["projection_support"] = {"enabled": True, "regularization": .3, "max_iterations": 3000}
+        config["loss_weights"]["projection_support"] = .02
+        config["gradient_guard"] = {"enabled": True, "max_auxiliary_ratio": .25}
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(config))
     report = train.train_joint_infoot(path)
@@ -271,6 +276,8 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, co
         assert not torch.equal(latest_domains[d].branch.encoder.weight, originals[d].encoder.weight)
         torch.testing.assert_close(latest_domains[d].branch.semantic_transformer.weight, originals[d].semantic_transformer.weight)
     payload = train._load_checkpoint(Path(report.checkpoint_path))
+    with pytest.raises(FileExistsError, match="--resume"):
+        train.train_joint_infoot(path)
     assert payload["stage"] == "stage1b_fused_infoot"
     assert payload["config"]["semantic_prior"]["fingerprint"]
     assert (tmp_path / "out/checkpoints/step_000001.pt").is_file()
@@ -292,6 +299,11 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, co
             for domain, ids in row["projection_probe"]["sample_ids"].items():
                 assert all(key.startswith(f"{domain}_train_") for key in ids["reference"])
                 assert all(key.startswith(f"{domain}_val_") for key in ids["query"])
+        if training_mode == "guarded":
+            assert all(r["projection_support_loss"] >= -1e-4 for r in logs)
+            assert all(r["optimizer_gradient_mode"] == "primary_guarded" for r in logs)
+            assert all(m["auxiliary_ratio_after"] <= .25 + 1e-6 for r in logs for m in r["gradient_guard"].values())
+            assert all(r["projection_support"]["cat_to_dog"]["converged"] for r in validation)
 
     def eval_context(config, root, domain, **kwargs):
         context = latest_domains[domain]

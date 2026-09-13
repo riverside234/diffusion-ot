@@ -1,6 +1,6 @@
 stage: stage1b_fused_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_cat_dog_structure_fused_projection_guarded_infoot_sit_b2_cfg_adaln_all_lora_r64
+output_dir: outputs/stage1b_cat_dog_structure_fused_projection_infoot_sit_b2_cfg_adaln_all_lora_r64
 
 stage1a:
   weights: ema
@@ -56,8 +56,7 @@ loss_weights:
   infoot_alignment: 0.20
   latent_anchor: 0.01
   semantic_neighborhood: 0.10
-  conditional_structure: 0.02
-  projection_support: 0.02
+  conditional_structure: 0.05
   alignment_warmup_steps: 1000
 
 matching:
@@ -109,19 +108,3 @@ conditional_structure:
   teacher_temperature: 0.05  # On the fixed, training-calibrated structure cost.
   validation_reference_samples: 96
   validation_query_samples: 32
-
-# Projection KL exceeded reconstruction gradients in the 1,000-update run.
-# Protect reconstruction + anchoring independently for each encoder.
-gradient_guard:
-  enabled: true
-  max_auxiliary_ratio: 0.25
-  project_conflicts: true
-
-# Compare full projected means with the fixed Stage 1A target-code distribution.
-# Target masses follow the frozen teacher mixture for this query batch.
-# Both target values and anchors are detached; gradients teach the KDE weights.
-projection_support:
-  enabled: true
-  regularization: 0.10
-  max_iterations: 2000
-  tolerance: 0.00001

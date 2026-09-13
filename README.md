@@ -2,38 +2,47 @@
 
 Cat/Dog PDAE representations with InfoOT conditional projection.
 
-## Conditional projection co-training revision
+## Current conditional projection co-training experiment
 
-The new fused log through update 1,500 shows slow learning, with a nearly hard
-transport plan. Its 100-update average loss drops from 0.9473 to 0.9276, but
-each source still averages only about 1.02 effective targets in the fit plan.
-All 76 logged row-marginal residuals exceed the requested Sinkhorn tolerance.
-See [the log review and research rationale](docs/stage1b_fused_projection_review.md).
+The latest logs stop at update 1,000, exactly the end of alignment warmup.
+Every logged InfoOT solve converges. Fixed-validation conditional KL falls
+6.3%, but expected structure cost improves only about 0.3-0.5%, while Cat/Dog
+reconstruction losses increase 2.0%/2.8%. This is measurable learning with
+limited correspondence gains; it is too early to establish a post-warmup
+plateau. The conditional-loss gradient reaches 2.15 times the reconstruction
+gradient. See [the new log review](docs/stage1b_projection_1000_review.md) for
+measurements, research sources, and limits of this diagnosis. The
+[earlier 1,500-update review](docs/stage1b_fused_projection_review.md) describes
+a different run before the solver revision.
 
-The recommended next experiment is
-`configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml`. It adds a
-bidirectional conditional-structure KL loss: each training batch has 96 OT
-references and 32 separate queries per domain. The queries' full Eq. (7)
-probabilities learn to predict frozen DINO structure similarities. The
-transport plan is detached; both encoders receive gradients through the
-source and target KDEs. The log-domain training readout retains smoothing
-and target-density correction, including at small projection bandwidths.
-This loss is a project extension, not part of the official InfoOT algorithm.
+`configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml` now adds:
 
-The inner MI coefficient changes from 1.0 to 0.10 with entropy regularization
-held at 0.05, reducing the tendency toward hard assignments. The outer MI
-weight changes to 0.20, keeping its coefficient on `-MI` at 0.02. Neighborhood
-KL weight is 0.10 and conditional-structure KL weight is 0.05. Fit/projection
-bandwidths remain 0.70/0.10, LR remains `2e-5`, and the budget remains 5,000
-updates. The solver can stop early on a feasible stable plan, allows up to
-2,000 Sinkhorn iterations, and rejects a final plan outside the marginal
-tolerance. These are starting settings for the new objective, not validated
-AFHQ optima; softer transport alone does not establish better correspondence.
+- A per-encoder gradient guard: reconstruction plus latent anchoring is the
+  primary objective. Conflicting auxiliary components are projected away,
+  then their combined norm is capped at 25% of the primary norm. This is an
+  asymmetric adaptation inspired by PCGrad, not its complete algorithm or a
+  guarantee that Adam steps preserve held-out reconstruction.
+- A debiased Sinkhorn divergence between full conditional means and frozen
+  Stage 1A target codes. Target masses follow the frozen structural teacher's
+  mixture for the current queries, so a small batch need not cover every
+  target mode. Gradients teach the Eq. (7) weights; target values and anchors
+  are detached for this term. Output codes are still unmodified conditional
+  means, with target smoothing, density correction, and no top-k truncation.
+- Fixed-probe and full-evaluator variance diagnostics alongside norms. A
+  larger norm alone cannot establish recovery from mean contraction.
 
-Reuse your existing `data/semantic_priors/afhq_dinov2_structure.pt`. Start this
-experiment from Stage 1A in its new output directory. The earlier fused and
-plain configs remain available as controls; an old fused checkpoint cannot
-be resumed into this different objective.
+Conditional-structure KL weight changes from 0.05 to 0.02 and the new
+projection-support weight is 0.02. LR stays `2e-5`, fit/projection bandwidths
+stay 0.70/0.10, inner MI weight stays 0.10, and entropy regularization stays
+0.05. The 5,000-update budget and 1,000-update warmup are unchanged. Each
+domain still supplies 96 OT references and 32 disjoint training queries.
+These are experimental settings; the new losses are project extensions to
+official InfoOT and need validation on generated images.
+
+Reuse `data/semantic_priors/afhq_dinov2_structure.pt`. Start from Stage 1A in
+the new `...projection_guarded...` output directory. Changed objectives are
+rejected on resume; existing checkpoints and old output directories are kept.
+Both generators, attention LoRA, and learned null tokens remain frozen.
 
 ```bash
 python3 scripts/train_joint_infoot.py \
@@ -42,21 +51,49 @@ python3 scripts/train_joint_infoot.py \
 python3 scripts/evaluate_infoot_alignment.py \
   --alignment-config configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml \
   --eval-config configs/stage1b_eval/structure_fused_projection_sit_b2.yaml \
-  --checkpoint outputs/stage1b_cat_dog_structure_fused_projection_infoot_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+  --checkpoint outputs/stage1b_cat_dog_structure_fused_projection_guarded_infoot_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
 ```
 
-The training command runs 5,000 updates. To inspect an earlier checkpoint,
+The training command runs 5,000 real updates. To inspect an earlier checkpoint,
 use `--max-steps 1500`, then use the same config with `--resume` to continue.
 `logs/validation.jsonl` records a fixed train-reference/validation-query
 projection probe at step 0 and every 500 updates, alongside the fixed
-reconstruction probe. Monitor `conditional_structure_loss`, each direction's
-`expected_structure_cost`, `effective_targets`, and
-`projected_to_target_norm_ratio`. Training logs include the new loss's gradient
-ratio to reconstruction and the solver's convergence status. The small probe
-uses 96 target references; the quick evaluator still projects over all target
-training codes and is the required decoded-image check. Teacher agreement is
-not independent semantic evidence. Use proxy precision and the translation
-grids before accepting the checkpoint; fixed generators and LoRA remain frozen.
+reconstruction probe. Monitor validation KL, expected structure cost,
+reconstruction drift, `projection_support_loss`, and
+`projected_to_target_variance_ratio`. In training logs,
+`gradient_guard.cat.auxiliary_ratio_after` and the Dog equivalent describe
+the applied auxiliary contributions. The older weighted-gradient diagnostics
+measure gradients before this guard. With this update rule, the logged total
+loss is descriptive; it is not a scalar objective whose gradient Adam uses
+unchanged. Warmup and random training batches also prevent a monotonic-loss
+expectation.
+
+The probe uses 96 target references; the quick evaluator projects over the
+full target training bank and supplies the required decoded-image check.
+Teacher agreement is not independent semantic evidence. Use viewpoint,
+framing, and color precision plus both translation directions before accepting
+a checkpoint. A matching Stage 1A report is optional for standalone evaluation.
+
+## Preserved official-based version
+
+The prior InfoOT core, training/evaluation modules, CLIs, configs, tests, and
+documentation are preserved byte for byte in
+[`legacy/infoot_official_v1`](legacy/infoot_official_v1/README.md), with SHA-256
+verification and a launcher that isolates their imports from the active code.
+The snapshot includes the previous project extensions and shares unchanged
+Stage 1A model/data dependencies with the main tree.
+
+```bash
+python3 scripts/run_legacy_infoot.py check
+python3 scripts/run_legacy_infoot.py train \
+  --config configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml
+```
+
+The legacy command resolves the preserved config and its original output
+directory. Use `--resume` to continue that old experiment, or a copied legacy
+config with a different output directory for a separate reproduction. Plain
+official-based InfoOT and the first fused configs are also preserved. See the
+legacy README for evaluation and test commands.
 
 ## Earlier structure-guided co-training experiment
 

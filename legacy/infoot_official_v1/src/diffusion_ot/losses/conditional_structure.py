@@ -23,7 +23,6 @@ class ConditionalStructureResult:
     loss: torch.Tensor
     metrics: dict[str, dict[str, float]]
     weights: dict[str, torch.Tensor]
-    teacher_weights: dict[str, torch.Tensor]
 
 
 def conditional_structure_loss(
@@ -48,7 +47,7 @@ def conditional_structure_loss(
         raise ValueError("Structure cost scale must be finite and positive.")
     if not math.isfinite(teacher_temperature) or teacher_temperature <= 0:
         raise ValueError("Projection teacher temperature must be finite and positive.")
-    losses, metrics, weights, teacher_distributions = [], {}, {}, {}
+    losses, metrics, weights = [], {}, {}
     for source, target in (("cat", "dog"), ("dog", "cat")):
         if len(queries[source]) < 1 or len(references[target]) < 2:
             raise ValueError("Conditional structure training needs queries and at least two target references.")
@@ -74,7 +73,6 @@ def conditional_structure_loss(
         losses.append(loss)
         direction = f"{source}_to_{target}"
         weights[direction] = log_weights.exp()
-        teacher_distributions[direction] = teacher_weights
         with torch.no_grad():
             probability = weights[direction]
             projected = probability @ references[target].float()
@@ -88,9 +86,5 @@ def conditional_structure_loss(
                 "projected_to_target_norm_ratio": float(
                     projected.norm(dim=1).mean() / references[target].float().norm(dim=1).mean().clamp_min(1e-8)
                 ),
-                "projected_to_target_variance_ratio": float(
-                    projected.var(0, unbiased=False).mean()
-                    / references[target].float().var(0, unbiased=False).mean().clamp_min(1e-12)
-                ),
             }
-    return ConditionalStructureResult(torch.stack(losses).mean(), metrics, weights, teacher_distributions)
+    return ConditionalStructureResult(torch.stack(losses).mean(), metrics, weights)

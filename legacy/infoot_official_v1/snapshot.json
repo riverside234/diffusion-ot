@@ -1,0 +1,117 @@
+{
+  "version": "infoot_official_v1",
+  "source_commit": "9274a66b082ef0d46cab563429cbe95e7b269a4e",
+  "upstream": "https://github.com/chingyaoc/InfoOT",
+  "description": "Byte-preserved official-based InfoOT core and pre-revision Stage 1B workflows, including prior project extensions. Shared Stage 1A/data/model dependencies come from the parent repository.",
+  "files": [
+    {
+      "path": "src/diffusion_ot/losses/infoot.py",
+      "sha256": "57a1a4c526430edf427057cf139fef546740103e691a2c2b76787100bd85dada"
+    },
+    {
+      "path": "src/diffusion_ot/losses/semantic_prior.py",
+      "sha256": "7e4d5fb055d4a71e2eb08bd1f0ab3f7ed9634742ee4a8e220c093a9445fc5f76"
+    },
+    {
+      "path": "src/diffusion_ot/losses/conditional_structure.py",
+      "sha256": "4d0ceceb409824abf03a284c90ed49429536995a10d3d6d3f5199b80adc6d5d6"
+    },
+    {
+      "path": "src/diffusion_ot/training/train_joint_infoot.py",
+      "sha256": "e5b044cdef20fc914034b3ff252d53962687432138087a9514a25d1524b8fda9"
+    },
+    {
+      "path": "src/diffusion_ot/evaluation/stage1b_eval.py",
+      "sha256": "181cee0bf95ee1e9b6d28e62ccd701e62d463a6aa06805224c9d332759709026"
+    },
+    {
+      "path": "scripts/train_joint_infoot.py",
+      "sha256": "6a9ec8ec14dbd1018fb73a7ea81212cef71bc154a2fd9a7b6ee6f14c50f6319b"
+    },
+    {
+      "path": "scripts/evaluate_infoot_alignment.py",
+      "sha256": "24d1a53492e5a9745121891ab069e7dcce75716c0ada8906d17fca574fec32b3"
+    },
+    {
+      "path": "scripts/cache_infoot_structure.py",
+      "sha256": "e92ad792c75328ef56ccf7c81ffbe2bdbe6d221072814ef58511b9355b565d68"
+    },
+    {
+      "path": "tests/conftest.py",
+      "sha256": "2255c11ff78df3c7ad13864275df5553d92252535ae6cc0ee0cd46b045aceb01"
+    },
+    {
+      "path": "tests/test_infoot.py",
+      "sha256": "621919a13783025231da86ff1be5ce53c2286ac18bc47758b9ad518abe94b729"
+    },
+    {
+      "path": "tests/test_infoot_semantic_prior.py",
+      "sha256": "7b983ba1fa1f930ff941bf4d7d2d2132c778dc09a24d151d3a45c7012a83370c"
+    },
+    {
+      "path": "tests/test_infoot_conditional_training.py",
+      "sha256": "cbe0811d758a480bc84392f27c0fd3317b9ef05d660d14886688e1e04b3bcb01"
+    },
+    {
+      "path": "tests/test_stage1b_training.py",
+      "sha256": "cf441bc76efbf8973526ed0b058044ca3b88160b14eb4baaeeeb6bf49605ee99"
+    },
+    {
+      "path": "tests/test_stage1b_eval.py",
+      "sha256": "ee9f9b07a3ce00269c064f85e4b817b572d051379abe52935e9962b3cfe0c481"
+    },
+    {
+      "path": "docs/stage1b_fused_projection_review.md",
+      "sha256": "f3cf5884db882461d88ec35cfdf3f3e860907fdc60b460e47e32164da0789b74"
+    },
+    {
+      "path": "configs/stage1b_infoot/plain_sit_b2.yaml",
+      "sha256": "31182b7d252237e22a351ea6d6d366c07bdecf681fcab411f4069edf194dc610"
+    },
+    {
+      "path": "configs/stage1b_infoot/plain_sit_b2_nocfg.yaml",
+      "sha256": "29a1df587a9cb3d9d75b867e479b50dc2296e6cc9c3e3d599ff884c6a1881c54"
+    },
+    {
+      "path": "configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml",
+      "sha256": "d4d23b3c2239ceee5dc115d0fef7a0e318a66403d561cfcebff2ee336142d649"
+    },
+    {
+      "path": "configs/stage1b_infoot/structure_fused_sit_b2.yaml",
+      "sha256": "aaa27485a0bd341437925b90dc011f444ce371b16be58783d91cb43fe59a49f0"
+    },
+    {
+      "path": "configs/stage1b_eval/quick_sit_b2.yaml",
+      "sha256": "cd84d377da6a3a1cd030f78e5ac20ba29adcf3dc9c1f0bfd131534e98b6aeea3"
+    },
+    {
+      "path": "configs/stage1b_eval/structure_fused_projection_sit_b2.yaml",
+      "sha256": "76c18d1573235aea76244e50bddb40c5e72262975da000dde112d9f3e019789d"
+    },
+    {
+      "path": "configs/stage1b_eval/structure_fused_sit_b2.yaml",
+      "sha256": "03eae7ef10525bebb947419b44a0b7b23859468c30fa0c1392e027bff96a59ee"
+    },
+    {
+      "path": "PROJECT_README.md",
+      "original_path": "README.md",
+      "sha256": "d8a30a55807ccc5d132af00869fc015cd890b093f1448dd1bf9f0658fa651ca9"
+    },
+    {
+      "path": "configs/stage1a_pdae/cat_sit_b2_lora.yaml",
+      "sha256": "1cd78173d8bfc5043d85f6e7f612dea618e71376e9fd68be0a1ca5c67e99904a"
+    },
+    {
+      "path": "configs/stage1a_pdae/dog_sit_b2_lora.yaml",
+      "sha256": "d93052195728989361a7ed825bea96fb7ef217ba1a47ea1a2923ec600ec57c59"
+    },
+    {
+      "path": "configs/stage1a_pdae/cat_sit_b2_nocfg.yaml",
+      "sha256": "efd409d5449a6b6dfb437a07ce9d87f2e64f8c11138b07cd3c1c87031d68c8f9"
+    },
+    {
+      "path": "configs/stage1a_pdae/dog_sit_b2_nocfg.yaml",
+      "sha256": "4f24b2f9f8df19d3a3ceb2f3b8c070b32ca06b3e0a9d75cde8923af94d8a6fe8"
+    }
+  ]
+}

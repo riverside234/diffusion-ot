@@ -545,13 +545,16 @@ def fixed_conditional_structure_probe(
     teacher_temperature: float,
     solver_options: dict[str, Any],
     cross_cost_weight: float = 1.0,
+    anchors: dict[str, torch.nn.Module] | None = None,
+    anchor_variances: dict[str, float] | None = None,
+    projection_support_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fixed train references / validation queries; no updates or RNG consumption."""
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
     from diffusion_ot.losses.infoot import infoot_distance_scale, normalize_matching_features, solve_infoot, transport_diagnostics
 
     states = {domain: value.branch.encoder.training for domain, value in domains.items()}
-    references, queries, reference_structure, query_structure = {}, {}, {}, {}
+    references, queries, reference_structure, query_structure, anchor_codes = {}, {}, {}, {}, {}
     alignment_device = domains["cat"].device
     try:
         for domain, value in domains.items():
@@ -567,6 +570,13 @@ def fixed_conditional_structure_probe(
                 ])
             reference_structure[domain] = batch["reference_structure"].to(alignment_device)
             query_structure[domain] = batch["query_structure"].to(alignment_device)
+            if projection_support_options is not None:
+                if anchors is None or anchor_variances is None:
+                    raise ValueError("Projection-support validation requires fixed Stage 1A anchors.")
+                anchor_codes[domain] = torch.cat([
+                    anchors[domain](part.to(value.device, dtype=value.dtype)).float().to(alignment_device)
+                    for part in batch["reference_latents"].split(32)
+                ])
         features = {domain: normalize_matching_features(code) for domain, code in references.items()}
         solution = solve_infoot(
             features["cat"], features["dog"], bandwidth=bandwidth,
@@ -579,7 +589,7 @@ def fixed_conditional_structure_probe(
             references, queries, reference_structure, query_structure, solution.coupling,
             bandwidth=projection_bandwidth, cost_scale=cost_scale, teacher_temperature=teacher_temperature,
         )
-        return {
+        metrics = {
             "conditional_structure_loss": float(result.loss),
             "conditional_structure": result.metrics,
             "projection_probe": {
@@ -592,6 +602,15 @@ def fixed_conditional_structure_probe(
                 "transport": transport_diagnostics(solution.coupling),
             },
         }
+        if projection_support_options is not None:
+            from diffusion_ot.losses.projection_support import projection_support_loss
+            support = projection_support_loss(
+                result.weights, references, anchor_codes, anchor_variances,
+                teacher_weights=result.teacher_weights, **projection_support_options
+            )
+            metrics["projection_support_loss"] = float(support.loss)
+            metrics["projection_support"] = support.metrics
+        return metrics
     finally:
         for domain, value in domains.items():
             value.branch.encoder.train(states[domain])
@@ -622,6 +641,8 @@ def train_joint_infoot(
         load_semantic_prior, neighborhood_distillation_loss, validate_prior_resume,
     )
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
+    from diffusion_ot.losses.projection_support import projection_support_loss, support_options
+    from diffusion_ot.training.gradient_guard import guarded_backward
 
     resolved_config_path = Path(config_path).resolve()
     config = load_yaml_config(resolved_config_path)
@@ -643,6 +664,16 @@ def train_joint_infoot(
     infoot_config = _nested(config, "infoot")
     conditional_config = _nested(config, "conditional_structure")
     conditional_enabled = bool(conditional_config.get("enabled", False))
+    support_config = _nested(config, "projection_support")
+    support_enabled = bool(support_config.get("enabled", False))
+    gradient_guard_config = _nested(config, "gradient_guard")
+    gradient_guard_enabled = bool(gradient_guard_config.get("enabled", False))
+    support_weight = float(loss_weights.get("projection_support", 0.0))
+    if support_enabled:
+        if not conditional_enabled or not math.isfinite(support_weight) or support_weight <= 0:
+            raise ValueError("Projection support requires conditional structure training and a positive support loss weight.")
+    elif support_weight != 0:
+        raise ValueError("Enable projection_support for its nonzero loss weight.")
     expected_variant = "fused" if config["stage"] == "stage1b_fused_infoot" else "plain"
     if infoot_config.get("variant", "plain") != expected_variant:
         raise ValueError("stage and infoot.variant disagree.")
@@ -684,6 +715,11 @@ def train_joint_infoot(
     checkpoint_path = output_dir / "checkpoints" / "latest.pt"
     requested_resume = resume_from if resume_from is not None else train_config.get("resume_from")
     resume_path = _resolve_resume(requested_resume, root, checkpoint_path)
+    if resume_path is None and checkpoint_path.exists() and not dry_run:
+        raise FileExistsError(
+            f"A training checkpoint already exists at {checkpoint_path}. "
+            "Use --resume for the same experiment or a different output_dir for a fresh run."
+        )
 
     dataset_kwargs = {
         "split": str(data_config.get("split", "train")),
@@ -833,6 +869,9 @@ def train_joint_infoot(
     if resume_path is None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("", encoding="utf-8")
+        # A failed initialization may leave a step-0 probe without a checkpoint.
+        # Start its validation log afresh together with the training log.
+        (log_path.parent / "validation.jsonl").write_text("", encoding="utf-8")
 
     alignment_device = domains["cat"].device
     bandwidth = float(matching_config.get("bandwidth_multiplier", 1.0))
@@ -892,6 +931,8 @@ def train_joint_infoot(
                 projection_bandwidth=float(conditional_config.get("bandwidth_multiplier", 0.1)),
                 teacher_temperature=float(conditional_config.get("teacher_temperature", 0.05)),
                 solver_options=solver_options, cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
+                anchors=anchors, anchor_variances=anchor_variances,
+                projection_support_options=support_options(support_config) if support_enabled else None,
             ))
         return metrics
 
@@ -1011,15 +1052,29 @@ def train_joint_infoot(
                 teacher_temperature=float(conditional_config.get("teacher_temperature", 0.05)),
             )
             projection_loss = conditional_result.loss
-        total = (
+        support_result = None
+        support_loss = torch.zeros((), device=alignment_device)
+        if support_enabled:
+            support_result = projection_support_loss(
+                conditional_result.weights, references,
+                {domain: code[:-query_count].float().to(alignment_device) for domain, code in reference_z.items()},
+                anchor_variances, **support_options(support_config),
+                teacher_weights=conditional_result.teacher_weights,
+            )
+            support_loss = support_result.loss
+        primary_objective = (
             rec_weights["cat"] * rec_losses["cat"].to(alignment_device)
             + rec_weights["dog"] * rec_losses["dog"].to(alignment_device)
-            + beta * infoot_loss
-            + neighborhood_weight * warmup * neighborhood_loss
-            + conditional_weight * warmup * projection_loss
             + anchor_weight
             * (anchor_losses["cat"].to(alignment_device) + anchor_losses["dog"].to(alignment_device))
         )
+        auxiliary_objective = (
+            beta * infoot_loss
+            + neighborhood_weight * warmup * neighborhood_loss
+            + conditional_weight * warmup * projection_loss
+            + support_weight * warmup * support_loss
+        )
+        total = primary_objective + auxiliary_objective
         if not torch.isfinite(total):
             raise FloatingPointError(f"Non-finite Stage 1B loss at step {step}.")
         gradient_diagnostics: dict[str, float] = {}
@@ -1052,7 +1107,20 @@ def train_joint_infoot(
                     gradient_diagnostics["weighted_conditional_structure_gradient_norm"]
                     / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
                 )
-        total.backward()
+            if support_enabled:
+                gradient_diagnostics["weighted_projection_support_gradient_norm"] = _autograd_norm(
+                    support_weight * warmup * support_loss, parameters
+                )
+        guard_metrics = {}
+        if gradient_guard_enabled:
+            guard_metrics = guarded_backward(
+                primary_objective, auxiliary_objective,
+                {domain: list(encoder.parameters()) for domain, encoder in encoders.items()},
+                max_auxiliary_ratio=float(gradient_guard_config.get("max_auxiliary_ratio", .25)),
+                project_conflicts=bool(gradient_guard_config.get("project_conflicts", True)),
+            )
+        else:
+            total.backward()
         grad_norms = {
             domain: _gradient_norm(list(encoder.parameters()))
             for domain, encoder in encoders.items()
@@ -1073,10 +1141,14 @@ def train_joint_infoot(
             "infoot_mutual_information": solution.mutual_information,
             "semantic_neighborhood_loss": float(neighborhood_loss.detach()),
             "conditional_structure_loss": float(projection_loss.detach()),
+            "projection_support_loss": float(support_loss.detach()),
+            "primary_objective": float(primary_objective.detach()),
+            "auxiliary_objective": float(auxiliary_objective.detach()),
         })
         if step == initial_step + 1 or step % log_every == 0:
             metrics = {
                 "event": "train",
+                "optimizer_gradient_mode": "primary_guarded" if gradient_guard_enabled else "weighted_sum",
                 "step": step,
                 "loss": float(total.detach().cpu()),
                 "cat_reconstruction_loss": float(rec_losses["cat"].detach().cpu()),
@@ -1126,6 +1198,11 @@ def train_joint_infoot(
             metrics["semantic_neighborhood_weight"] = neighborhood_weight * warmup
             metrics["conditional_structure_loss"] = float(projection_loss.detach())
             metrics["conditional_structure_weight"] = conditional_weight * warmup
+            metrics["projection_support_loss"] = float(support_loss.detach())
+            metrics["projection_support_weight"] = support_weight * warmup
+            metrics["gradient_guard"] = guard_metrics
+            if support_result is not None:
+                metrics["projection_support"] = support_result.metrics
             if conditional_result is not None:
                 metrics["conditional_structure"] = conditional_result.metrics
             metrics["window_mean"] = {
