@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_structure_decoder_infoot_cfg_adaln_all_lora_r64
+output_dir: outputs/stage1b_eval_structure_decoder_infoot_cfg_adaln_all_lora_r64_steps20
 seed: 20260906
 alignment_device: cuda:0
 
@@ -61,7 +61,7 @@ projection:
 reconstruction:
   enabled: true
   samples_per_domain: 8
-  num_steps: 50
+  num_steps: 20
   guidance_scale: 1.0
   metrics: [latent_mse, pixel_mse, pixel_psnr, lpips]
 
@@ -72,7 +72,7 @@ translation:
   # This diagnostic bypasses InfoOT and is not a ground-truth translation.
   include_structure_teacher_mean: true
   samples_per_direction: 8
-  num_steps: 50
+  num_steps: 20
   guidance_scale: 1.0
   readouts: [conditional_mean, conditional_map, conditional_sample, structure_teacher_mean]
   primary_readout: conditional_mean

@@ -91,7 +91,7 @@ weights:
 python3 scripts/evaluate_infoot_alignment.py \
   --alignment-config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
   --eval-config configs/stage1b_eval/structure_decoder_sit_b2.yaml \
-  --checkpoint outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt \
+  --checkpoint outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20/checkpoints/latest.pt \
   --no-require-stage1a-baseline
 ```
 
@@ -118,7 +118,7 @@ The active defaults are:
 | InfoOT fit / projection bandwidth | `0.70` / `0.10` |
 | Entropy regularization | `0.05` |
 | Same-domain semantic dropout | `0.10` |
-| Decoded sampler steps | `50` |
+| Decoded sampler steps | `20` |
 | Decoded structure / adversarial weight | `0.10` / `0.01` |
 | Decoded-loss ramp | 2,000 updates |
 | Validation / checkpoint interval | 500 / 1,000 updates |

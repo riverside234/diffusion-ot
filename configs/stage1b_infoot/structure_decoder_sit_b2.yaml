@@ -1,6 +1,6 @@
 stage: stage1b_fused_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64
+output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20
 
 stage1a:
   weights: ema
@@ -151,8 +151,8 @@ generator_adaptation:
 decoded_translation:
   enabled: true
   batch_size: 4  # Per direction, from the disjoint queries.
-  num_steps: 50
-  validation_num_steps: 50
+  num_steps: 20
+  validation_num_steps: 20
   guidance_scale: 1.0
   every_steps: 1
   start_step: 0
