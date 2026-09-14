@@ -39,7 +39,7 @@ matching:
   # 0.10 at the useful knee: about 23-25 effective targets, before the marked
   # norm shrinkage and support growth at 0.15 and above.
   # CLI overrides remain available for sensitivity checks.
-  projection_bandwidth_multiplier: 0.10
+  projection_bandwidth_multiplier: 0.20
 
 infoot:
   algorithm: official_projected_sinkhorn
