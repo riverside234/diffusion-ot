@@ -2,7 +2,33 @@
 
 Cat/Dog PDAE representations with InfoOT conditional projection.
 
-## Current experiment: learned InfoOT matching heads
+## Current experiment D: trainable G and decoded translation losses
+
+`structure_decoder_sit_b2.yaml` trains both encoders, matching heads, added
+adaLN/token MLP adapters, and existing rank-64 LoRA. Full conditional means are
+decoded through 50 flow steps and supervised with frozen DINO structure and
+target-domain feature discriminators. Semantic dropout stays at 0.1, with a
+fixed Stage 1A null-branch teacher and paired E/head/G EMA checkpoints.
+
+```bash
+python3 scripts/train_joint_infoot.py \
+  --config configs/stage1b_infoot/structure_decoder_sit_b2.yaml
+
+python3 scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/structure_decoder_sit_b2.yaml \
+  --checkpoint outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+```
+
+This is a new 30,000-update experiment initialized from Stage 1A. Use `--resume`
+only with its own checkpoints; `--max-steps 2000` permits an early review.
+The original SiT/VAE/DINO weights and null vectors stay frozen. The new config
+uses separately clipped weighted-sum updates, disabling the earlier encoder
+gradient cap and conditional-mean support loss. See the
+[experiment D design, settings, validation, and workflow](docs/stage1b_experiment_d.md).
+AFHQ quality improvements still require an actual run.
+
+## Previous experiment: learned InfoOT matching heads
 
 The guarded 8,000-update run still has weak structural matching. Validation
 KL improves about 5.1%, but expected structure cost improves only 0.57%/0.12%

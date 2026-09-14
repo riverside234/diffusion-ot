@@ -1,4 +1,4 @@
-"""Learn InfoOT geometry separately from the raw codes used by frozen decoders.
+"""Learn InfoOT geometry separately from the raw codes used by the decoders.
 
 This is a project extension, not part of the official InfoOT solver. Heads
 start at normalized identity, and remain part of inference/checkpoint state.

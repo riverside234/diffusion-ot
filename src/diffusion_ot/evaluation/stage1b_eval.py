@@ -561,10 +561,10 @@ def _load_domain_context(
                 f"Configured Stage 1A {domain} checkpoint does not match the Stage 1B "
                 "checkpoint provenance: " + "; ".join(provenance_mismatches)
             )
-        fixed_generator = (joint.get("fixed_generators") or {}).get(domain)
-        if fixed_generator is None:
-            raise ValueError(f"Joint checkpoint has no fixed_generators.{domain} state.")
-        branch.load_generator_state_dict(fixed_generator)
+        from diffusion_ot.models.generator_adaptation import generator_adaptation_enabled, load_joint_generator
+        if generator_adaptation_enabled(joint.get("config") or {}) != generator_adaptation_enabled(alignment_config):
+            raise ValueError("Alignment config and checkpoint generator_adaptation disagree.")
+        load_joint_generator(branch, joint, domain, weights=joint_weights)
         state_key = "encoder_ema" if joint_weights == "ema" else "encoders"
         state = (joint.get(state_key) or {}).get(domain)
         if state is None:
@@ -713,7 +713,8 @@ def _save_translation_grid(
     seed: int,
     output_path: Path,
     teacher_codes: torch.Tensor | None = None,
-) -> None:
+    image_features: Any | None = None,
+) -> dict[str, Any]:
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
 
@@ -739,10 +740,17 @@ def _save_translation_grid(
     )
     class_config = _nested(target.training_config, "class_conditioning")
     rows = [source_images]
+    decoded_metrics: dict[str, Any] = {}
+    source_structure = None
+    if image_features is not None:
+        feature_device = next(image_features.parameters()).device
+        source_structure, _ = image_features(source_images.to(feature_device))
     code_rows = [conditional_mean, map_codes, sampled_codes]
+    row_names = ["infoot_conditional_mean", "selected_target", "sampled_target"]
     if teacher_codes is not None:
         code_rows.append(teacher_codes[:count])
-    for codes in code_rows:
+        row_names.append("structure_teacher_mean")
+    for row_name, codes in zip(row_names, code_rows):
         latent = integrate_pdae_flow(
             target.branch,
             target.transformer,
@@ -752,9 +760,18 @@ def _save_translation_grid(
             guidance_scale=guidance_scale,
             null_label=class_config.get("null_label"),
         )
-        rows.append(decode_vae_latents(target.vae, latent).cpu())
+        decoded_images = decode_vae_latents(target.vae, latent).cpu()
+        rows.append(decoded_images)
+        if image_features is not None:
+            structure, _ = image_features(decoded_images.to(feature_device))
+            per_image = 1 - torch.nn.functional.cosine_similarity(structure, source_structure, dim=-1)
+            decoded_metrics[row_name] = {"structure_loss": float(per_image.mean()),
+                                         "per_image_structure_loss": per_image.cpu().tolist(), "samples": count}
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_image(torch.cat(rows), str(output_path), nrow=count, padding=2, pad_value=1.0)
+    if image_features is not None:
+        decoded_metrics["interpretation"] = "Decoded DINO structure against source; uses the training feature prior, not independent proxy labels or a calibrated realism score."
+    return decoded_metrics
 
 
 def _proxy_label_value(
@@ -1122,6 +1139,9 @@ def run_stage1b_evaluation(
     evaluation_config["matching"] = matching_config
     if matching_head_spec(alignment_config)["enabled"]:
         evaluation_config["matching_head"] = matching_head_spec(alignment_config)
+    from diffusion_ot.models.generator_adaptation import generator_adaptation_enabled
+    if generator_adaptation_enabled(alignment_config):
+        evaluation_config["generator_adaptation"] = {"enabled": True, "checkpoint_format": 4}
     root = effective_project_root(
         alignment_config, fallback=find_project_root(alignment_path.parent)
     )
@@ -1458,12 +1478,18 @@ def run_stage1b_evaluation(
     translation_paths: dict[str, str] = {}
     translation_config = _nested(evaluation_config, "translation")
     if bool(translation_config.get("enabled", True)):
+        image_features = None
+        if translation_config.get("decoded_structure_metrics", False):
+            if prior is None:
+                raise ValueError("Decoded structure evaluation requires a frozen semantic prior.")
+            from diffusion_ot.training.decoded_translation import load_image_features
+            image_features = load_image_features(prior, root, contexts["cat"].device, checkpoint_features=False)
         for name, (source_domain, target_domain, _) in directions.items():
             if name not in direction_tensors:
                 continue
             path = output_root / "translation" / f"{name}_grid.png"
             teacher_codes = direction_tensors[name].get("structure_teacher_codes") if translation_config.get("include_structure_teacher_mean", False) else None
-            _save_translation_grid(
+            decoded_metrics = _save_translation_grid(
                 contexts[source_domain],
                 contexts[target_domain],
                 banks[source_domain]["query"],
@@ -1476,11 +1502,15 @@ def run_stage1b_evaluation(
                 seed=seed + (30 if name == "cat_to_dog" else 40),
                 output_path=path,
                 teacher_codes=teacher_codes,
+                **({"image_features": image_features} if image_features is not None else {}),
             )
+            if decoded_metrics:
+                projections[name]["decoded_image_diagnostics"] = decoded_metrics
             translation_paths[name] = str(path)
             projections[name]["translation_grid_rows"] = [
                 "source", "infoot_conditional_mean", "selected_target", "sampled_target",
             ] + (["structure_teacher_mean"] if teacher_codes is not None else [])
+        del image_features
 
     visualization_paths: dict[str, str] = {}
     visualization_config = _nested(evaluation_config, "visualization")
@@ -1570,7 +1600,10 @@ def run_stage1b_evaluation(
                 "adaln_adapters",
                 "attention_lora",
                 "learned_null_token",
-            ],
+            ] if not generator_adaptation_enabled(alignment_config) else ["base_transformer", "learned_null_token", "vae"],
+            "stage1b_trainable_generator_components": ["adaln_adapters", "token_mlps", "z_proj", "final_adapter", "attention_lora"]
+                if generator_adaptation_enabled(alignment_config) else [],
+            "generator_weights": weights if checkpoint_path is not None else "stage1a",
         },
         reference_sizes={domain: len(banks[domain]["reference"].sample_ids) for domain in banks},
         projection_sizes={domain: len(banks[domain]["projection"].sample_ids) for domain in banks},

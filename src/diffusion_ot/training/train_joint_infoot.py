@@ -49,6 +49,7 @@ class LoadedTrainingDomain:
     data_config_path: Path
     device: str
     dtype: torch.dtype
+    vae: Any | None = None
 
 
 class EncoderEMA:
@@ -303,6 +304,7 @@ def _load_training_domain(
         data_config_path=data_config_path,
         device=device,
         dtype=dtype,
+        vae=components.vae if (config.get("decoded_translation") or {}).get("enabled", False) else None,
     )
 
 
@@ -348,6 +350,11 @@ def _reconstruction_loss(
     domain: LoadedTrainingDomain,
     x0: torch.Tensor,
     z: torch.Tensor,
+    *,
+    semantic_dropout: bool = False,
+    force_null: bool = False,
+    generator_parameters: dict[str, torch.Tensor] | None = None,
+    diagnostics: dict[str, float] | None = None,
 ) -> torch.Tensor:
     from diffusion_ot.losses.pdae_flow import (
         make_linear_flow_target,
@@ -371,9 +378,18 @@ def _reconstruction_loss(
         device=x0.device,
         null_label=class_config.get("null_label"),
     )
-    output = domain.branch.predict_with_z(
-        target.x_t, target.t, z, class_labels=labels
-    )
+    if force_null:
+        z = domain.branch.semantic_null_like(z)
+    elif semantic_dropout:
+        z, drop_mask = domain.branch.condition_semantic_z(z, apply_dropout=True)
+        if diagnostics is not None:
+            diagnostics["semantic_dropout_fraction"] = float(drop_mask.float().mean())
+    if generator_parameters is None:
+        output = domain.branch.predict_with_z(target.x_t, target.t, z, class_labels=labels)
+    else:
+        from diffusion_ot.models.generator_adaptation import predict_with_parameters
+        output = predict_with_parameters(domain.branch, generator_parameters,
+                                          target.x_t, target.t, z, labels)
     weight = pdae_flow_snr_weight(
         t=target.t.float(),
         direction=direction,
@@ -398,6 +414,7 @@ def fixed_reconstruction_probe(
     anchors: dict[str, torch.nn.Module],
     inputs: dict[str, torch.Tensor],
     *, seed: int,
+    generator_baselines: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> dict[str, float]:
     """Fixed validation images/noise/times; preserve the training RNG stream."""
     result = {}
@@ -414,7 +431,16 @@ def fixed_reconstruction_probe(
                 torch.manual_seed(seed + offset)
                 result[f"{domain}_raw_reconstruction"] = float(_reconstruction_loss(value, x, z))
                 torch.manual_seed(seed + offset)
-                result[f"{domain}_stage1a_reconstruction"] = float(_reconstruction_loss(value, x, reference))
+                if generator_baselines is None:
+                    result[f"{domain}_stage1a_reconstruction"] = float(_reconstruction_loss(value, x, reference))
+                else:
+                    result[f"{domain}_stage1a_reconstruction"] = float(_reconstruction_loss(
+                        value, x, reference, generator_parameters=generator_baselines[domain]))
+                    torch.manual_seed(seed + offset)
+                    result[f"{domain}_null_reconstruction"] = float(_reconstruction_loss(value, x, z, force_null=True))
+                    torch.manual_seed(seed + offset)
+                    result[f"{domain}_stage1a_null_reconstruction"] = float(_reconstruction_loss(
+                        value, x, reference, force_null=True, generator_parameters=generator_baselines[domain]))
             finally:
                 encoder.train(was_training)
     return result
@@ -432,6 +458,7 @@ def _build_checkpoint_payload(
     loader_generators: dict[str, torch.Generator],
     matching_heads: dict[str, torch.nn.Module] | None = None,
     matching_ema: EncoderEMA | None = None,
+    decoder_training: Any | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "format_version": 3 if matching_heads else 2,
@@ -469,6 +496,9 @@ def _build_checkpoint_payload(
         payload["matching_heads"] = {d: _cpu_state_dict(head) for d, head in matching_heads.items()}
         payload["matching_head_ema"] = matching_ema.export() if matching_ema is not None else None
         payload["matching_head_ema_state"] = matching_ema.state_dict() if matching_ema is not None else None
+    if decoder_training is not None:
+        payload["format_version"] = 4
+        payload.update(decoder_training.checkpoint_state())
     return payload
 
 
@@ -632,6 +662,55 @@ def fixed_conditional_structure_probe(
             value.branch.encoder.train(states[domain])
 
 
+@torch.no_grad()
+def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, inputs, *,
+                                    prior, bandwidth, projection_bandwidth, teacher_temperature,
+                                    solver_options, seed, cross_cost_weight=1.0):
+    """Held-out decoded images; fixed noise, train-only OT references, no D update."""
+    from diffusion_ot.losses.infoot import infoot_distance_scale, solve_infoot
+    from diffusion_ot.losses.conditional_structure import conditional_structure_loss
+    from diffusion_ot.models.matching_head import matching_features
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    modes = {d: v.branch.encoder.training for d, v in domains.items()}
+    target_device = domains["cat"].device
+    with torch.random.fork_rng(devices=devices):
+        try:
+            references, queries, ref_matching, query_matching = {}, {}, {}, {}
+            reference_structure, query_structure = {}, {}
+            for domain, value in domains.items():
+                value.branch.encoder.eval()
+                data = inputs[domain]
+                references[domain] = value.branch.encoder(data["reference_latents"].to(value.device, dtype=value.dtype)).float().to(target_device)
+                queries[domain] = value.branch.encoder(data["query_latents"].to(value.device, dtype=value.dtype)).float().to(target_device)
+                ref_matching[domain] = matching_features(references[domain].to(value.device), matching_heads[domain]).to(target_device)
+                query_matching[domain] = matching_features(queries[domain].to(value.device), matching_heads[domain]).to(target_device)
+                reference_structure[domain] = data["reference_structure"].to(target_device)
+                query_structure[domain] = data["query_structure"].to(target_device)
+            solution = solve_infoot(ref_matching["cat"], ref_matching["dog"], bandwidth=bandwidth,
+                                    distance_scale_x=float(infoot_distance_scale(ref_matching["cat"])),
+                                    distance_scale_y=float(infoot_distance_scale(ref_matching["dog"])),
+                                    cross_cost=prior.cost(reference_structure["cat"], reference_structure["dog"]),
+                                    cross_cost_weight=cross_cost_weight, **solver_options)
+            conditional = conditional_structure_loss(
+                references, queries, reference_structure, query_structure, solution.coupling,
+                cost_scale=prior.cost_scale, bandwidth=projection_bandwidth, teacher_temperature=teacher_temperature,
+                reference_matching=ref_matching, query_matching=query_matching)
+            _, metrics = decoder_training.loss(
+                conditional.weights, references,
+                {d: data["query_latents"] for d, data in inputs.items()},
+                {d: data["reference_latents"] for d, data in inputs.items()},
+                step=0, validation_seed=seed)
+            metrics["seed"] = seed
+            metrics["reference_ids"] = {d: data["reference_ids"] for d, data in inputs.items()}
+            count = int(decoder_training.options.get("batch_size", 4))
+            metrics["query_ids"] = {d: data["query_ids"][:count] for d, data in inputs.items()}
+            metrics["interpretation"] = "Decoded DINO structure; training feature prior, not independent semantic validation. Discriminator scores are not calibrated across checkpoints."
+            return metrics
+        finally:
+            for domain, value in domains.items():
+                value.branch.encoder.train(modes[domain])
+
+
 def train_joint_infoot(
     config_path: str | Path,
     *,
@@ -660,6 +739,8 @@ def train_joint_infoot(
     from diffusion_ot.losses.projection_support import projection_support_loss, support_options
     from diffusion_ot.training.gradient_guard import guarded_backward
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec, matching_features
+    from diffusion_ot.models.generator_adaptation import generator_adaptation_enabled
+    from diffusion_ot.training.decoded_translation import DecoderTraining, validate_decoder_config
 
     resolved_config_path = Path(config_path).resolve()
     config = load_yaml_config(resolved_config_path)
@@ -711,12 +792,7 @@ def train_joint_infoot(
     trainable_config = _nested(config, "trainable")
     if not bool(trainable_config.get("encoders", True)):
         raise ValueError("Stage 1B-1 requires trainable encoders.")
-    if (
-        bool(trainable_config.get("adapters", False))
-        or bool(trainable_config.get("attention_lora", False))
-        or bool(trainable_config.get("base_transformers", False))
-    ):
-        raise ValueError("The first Stage 1B-1 experiment trains encoders only.")
+    validate_decoder_config(config)
 
     seed = int(train_config.get("seed", 20260905))
     torch.manual_seed(seed)
@@ -847,10 +923,14 @@ def train_joint_infoot(
         for index, (domain, value) in enumerate(domains.items())
     } if head_spec["enabled"] else {}
     head_parameters = [p for head in matching_heads.values() for p in head.parameters()]
+    decoder_training = DecoderTraining(config, domains, prior, root, seed=seed) if generator_adaptation_enabled(config) else None
+    generator_parameters = decoder_training.parameters if decoder_training is not None else []
     parameters = [parameter for encoder in encoders.values() for parameter in encoder.parameters()]
     parameter_groups = [{"params": parameters}]
     if head_parameters:
         parameter_groups.append({"params": head_parameters, "lr": float(head_config.get("lr", 2e-4))})
+    if decoder_training is not None:
+        parameter_groups.extend(decoder_training.parameter_groups())
     optimizer = torch.optim.AdamW(
         parameter_groups,
         lr=float(train_config.get("lr_encoder", 2.0e-5)),
@@ -896,6 +976,8 @@ def train_joint_infoot(
                 if checkpoint.get("matching_head_ema_state") is None:
                     raise ValueError("Resume checkpoint has no matching head EMA state.")
                 matching_ema.load_state_dict(checkpoint["matching_head_ema_state"], matching_heads)
+        if decoder_training is not None:
+            decoder_training.load_checkpoint(checkpoint)
         optimizer.load_state_dict(checkpoint["optimizer"])
         if ema is not None and checkpoint.get("ema_state") is not None:
             ema.load_state_dict(checkpoint["ema_state"], encoders)
@@ -972,7 +1054,8 @@ def train_joint_infoot(
                     projection_probe_inputs[domain][f"{kind}_structure"] = prior.lookup(ids, domain, "train" if kind == "reference" else "val")
 
     def validation_metrics() -> dict[str, Any]:
-        metrics = fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000)
+        metrics = fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000,
+                                             generator_baselines=decoder_training.baselines if decoder_training else None)
         if conditional_enabled:
             metrics.update(fixed_conditional_structure_probe(
                 domains, projection_probe_inputs, cost_scale=prior.cost_scale, bandwidth=bandwidth,
@@ -983,6 +1066,15 @@ def train_joint_infoot(
                 projection_support_options=support_options(support_config) if support_enabled else None,
                 matching_heads=matching_heads,
             ))
+        if decoder_training is not None:
+            metrics["decoded_translation"] = fixed_decoded_translation_probe(
+                decoder_training, domains, matching_heads, projection_probe_inputs,
+                prior=prior, bandwidth=bandwidth,
+                projection_bandwidth=float(conditional_config.get("bandwidth_multiplier", .1)),
+                teacher_temperature=float(conditional_config.get("teacher_temperature", .05)),
+                solver_options=solver_options, seed=seed + 11000,
+                cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
+            )
         return metrics
 
     if probe_every > 0:
@@ -1008,6 +1100,7 @@ def train_joint_infoot(
                 },
                 loader_generators=loader_generators,
                 matching_heads=matching_heads, matching_ema=matching_ema,
+                decoder_training=decoder_training,
             ),
         )
 
@@ -1022,6 +1115,7 @@ def train_joint_infoot(
         teacher_features: dict[str, torch.Tensor] = {}
         neighborhood_losses: dict[str, torch.Tensor] = {}
         matching_z: dict[str, torch.Tensor] = {}
+        reconstruction_diagnostics: dict[str, dict[str, float]] = {}
         for domain, value in domains.items():
             batch = next(loaders[domain])
             x0[domain] = batch["x0_latent"].to(
@@ -1039,10 +1133,12 @@ def train_joint_infoot(
                 )
             with torch.no_grad():
                 reference_z[domain] = anchors[domain](x0[domain])
+            reconstruction_diagnostics[domain] = {}
+            reconstruction_args = ({"semantic_dropout": True, "diagnostics": reconstruction_diagnostics[domain]}
+                                   if decoder_training is not None else {})
             rec_losses[domain] = _reconstruction_loss(
-                value,
-                x0[domain][:reconstruction_batch_size],
-                z[domain][:reconstruction_batch_size],
+                value, x0[domain][:reconstruction_batch_size], z[domain][:reconstruction_batch_size],
+                **reconstruction_args,
             )
             anchor_losses[domain] = encoder_anchor_loss(
                 z[domain], reference_z[domain], anchor_variances[domain]
@@ -1119,17 +1215,33 @@ def train_joint_infoot(
                 teacher_weights=conditional_result.teacher_weights,
             )
             support_loss = support_result.loss
+        decoded_loss = torch.zeros((), device=alignment_device)
+        decoded_metrics: dict[str, Any] = {"active": False}
+        if decoder_training is not None and decoder_training.active(step):
+            decoded_loss, decoded_metrics = decoder_training.loss(
+                conditional_result.weights, references,
+                {d: latent[-query_count:] for d, latent in x0.items()},
+                {d: latent[:-query_count] for d, latent in x0.items()}, step=step,
+            )
+            decoded_metrics["active"] = True
+        null_preservation = decoder_training.null_preservation_loss(
+            {d: latent[:reconstruction_batch_size] for d, latent in x0.items()},
+            {d: code[:reconstruction_batch_size] for d, code in z.items()},
+        ) if decoder_training is not None else torch.zeros((), device=alignment_device)
+        null_preservation_weight = float(_nested(config, "generator_adaptation").get("null_preservation_weight", .1))
         primary_objective = (
             rec_weights["cat"] * rec_losses["cat"].to(alignment_device)
             + rec_weights["dog"] * rec_losses["dog"].to(alignment_device)
             + anchor_weight
             * (anchor_losses["cat"].to(alignment_device) + anchor_losses["dog"].to(alignment_device))
+            + null_preservation_weight * null_preservation
         )
         auxiliary_objective = (
             beta * infoot_loss
             + neighborhood_weight * warmup * neighborhood_loss
             + conditional_weight * warmup * projection_loss
             + support_weight * warmup * support_loss
+            + decoded_loss
         )
         total = primary_objective + auxiliary_objective
         if not torch.isfinite(total):
@@ -1170,6 +1282,10 @@ def train_joint_infoot(
                 )
         guard_metrics = {}
         if gradient_guard_enabled:
+            if generator_parameters:
+                generator_gradients = torch.autograd.grad(total, generator_parameters, retain_graph=True, allow_unused=True)
+                for parameter, gradient in zip(generator_parameters, generator_gradients):
+                    parameter.grad = None if gradient is None else gradient.detach()
             if head_parameters:
                 # Alignment can change matching geometry without consuming the
                 # encoder's reconstruction-protection budget. Preserve the graph
@@ -1197,11 +1313,18 @@ def train_joint_infoot(
         ) if head_parameters else 0.0
         if not math.isfinite(head_grad_norm):
             raise FloatingPointError(f"Non-finite matching head gradients at step {step}.")
+        generator_grad_norm = _clip_gradient_norm(
+            generator_parameters, _nested(config, "generator_adaptation").get("grad_clip_norm", 1.0)
+        ) if generator_parameters else 0.0
+        if not all(math.isfinite(v) for v in (total_grad_norm, generator_grad_norm)):
+            raise FloatingPointError(f"Non-finite encoder/generator gradients at step {step}.")
         optimizer.step()
         if ema is not None and step % ema_update_every == 0:
             ema.update(encoders)
             if matching_ema is not None:
                 matching_ema.update(matching_heads)
+            if decoder_training is not None and decoder_training.ema is not None:
+                decoder_training.ema.update(decoder_training.views)
 
         elapsed = time.perf_counter() - started
         training_seconds += elapsed
@@ -1215,6 +1338,8 @@ def train_joint_infoot(
             "projection_support_loss": float(support_loss.detach()),
             "primary_objective": float(primary_objective.detach()),
             "auxiliary_objective": float(auxiliary_objective.detach()),
+            **({"decoded_translation_loss": float(decoded_loss.detach())} if decoder_training is not None else {}),
+            **({"null_preservation_loss": float(null_preservation.detach())} if decoder_training is not None else {}),
         })
         if step == initial_step + 1 or step % log_every == 0:
             metrics = {
@@ -1272,6 +1397,12 @@ def train_joint_infoot(
             metrics["projection_support_loss"] = float(support_loss.detach())
             metrics["projection_support_weight"] = support_weight * warmup
             metrics["gradient_guard"] = guard_metrics
+            if decoder_training is not None:
+                metrics["decoded_translation"] = decoded_metrics
+                metrics["generator_gradient_norm_pre_clip"] = generator_grad_norm
+                metrics["generator_learning_rates"] = {g["name"]: g["lr"] for g in optimizer.param_groups if "name" in g}
+                metrics["reconstruction_diagnostics"] = reconstruction_diagnostics
+                metrics["null_preservation_loss"] = float(null_preservation.detach())
             if matching_heads:
                 metrics["matching_head_gradient_norm_pre_clip"] = head_grad_norm
                 metrics["matching_head_learning_rate"] = optimizer.param_groups[1]["lr"]
@@ -1316,6 +1447,7 @@ def train_joint_infoot(
                     },
                     loader_generators=loader_generators,
                     matching_heads=matching_heads, matching_ema=matching_ema,
+                    decoder_training=decoder_training,
                 ),
             )
             if bool(train_config.get("keep_step_checkpoints", False)):
