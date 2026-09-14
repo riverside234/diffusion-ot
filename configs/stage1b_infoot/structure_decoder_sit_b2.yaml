@@ -11,11 +11,11 @@ stage1a:
   cat:
     config: configs/stage1a_pdae/cat_sit_b2_lora.yaml
     checkpoint: outputs/stage1a_cat_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
-    device: cuda:0
+    device: cuda:0  # Experiment D keeps both branches on one GPU.
   dog:
     config: configs/stage1a_pdae/dog_sit_b2_lora.yaml
     checkpoint: outputs/stage1a_dog_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
-    device: cuda:1
+    device: cuda:0
 
 data:
   split: train
