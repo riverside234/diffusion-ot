@@ -77,7 +77,8 @@ adapter:
   lora_rank: 64
   lora_alpha: 64
   lora_dropout: 0.0
-  lora_layers: [4, 5, 6, 7, 8, 9, 10, 11]
+  # Inject semantic attention LoRA into every SiT-B/2 block.
+  lora_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
 loss_weighting:
   type: pdae_flow_snr

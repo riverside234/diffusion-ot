@@ -197,7 +197,7 @@ def test_structure_cache_builder_uses_training_only_calibration(monkeypatch, tmp
     assert first.metadata["resolved_revision"] == "test_revision"
 
 
-@pytest.mark.parametrize("training_mode", ["fused", "conditional", "guarded"])
+@pytest.mark.parametrize("training_mode", ["fused", "conditional", "guarded", "metric"])
 def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, training_mode):
     """Exercise real orchestration and autograd, replacing only datasets/SiT."""
     import yaml
@@ -269,6 +269,9 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, tr
         config["projection_support"] = {"enabled": True, "regularization": .3, "max_iterations": 3000}
         config["loss_weights"]["projection_support"] = .02
         config["gradient_guard"] = {"enabled": True, "max_auxiliary_ratio": .25}
+    if training_mode == "metric":
+        config["matching_head"] = {"enabled": True, "input_dim": 2, "hidden_dim": 4, "lr": .002}
+        config["gradient_guard"] = {"enabled": True, "max_auxiliary_ratio": .25}
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(config))
     report = train.train_joint_infoot(path)
@@ -285,6 +288,16 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, tr
     assert resumed.initial_step == 2 and resumed.final_step == 3
     payload = train._load_checkpoint(Path(resumed.checkpoint_path))
     assert payload["ema_state"]["num_updates"] == 3
+    if training_mode == "metric":
+        assert payload["format_version"] == 3
+        assert payload["matching_head_ema_state"]["num_updates"] == 3
+        assert len(payload["optimizer"]["param_groups"]) == 2
+        from diffusion_ot.models.matching_head import load_matching_head, matching_head_id
+        for domain in originals:
+            raw_head = load_matching_head(payload, domain, weights="raw", device="cpu")
+            ema_head = load_matching_head(payload, domain, weights="ema", device="cpu")
+            assert raw_head.residual[-1].weight.norm() > 0
+            assert matching_head_id(raw_head) != matching_head_id(ema_head)
     logs = [json.loads(line) for line in (tmp_path / "out/logs/train.jsonl").read_text().splitlines()]
     assert all(r["infoot_reference_counts"] == {"cat": 6 if conditional_enabled else 8, "dog": 6 if conditional_enabled else 8} for r in logs)
     if conditional_enabled:
@@ -313,6 +326,8 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, tr
         context.stage1a_checkpoint_path = tmp_path / f"{domain}.pt"
         context.stage1a_checkpoint_step = 100
         context.stage1a_weights = "ema"
+        if training_mode == "metric":
+            context.matching_head = load_matching_head(payload, domain, weights="raw", device="cpu")
         return context
     monkeypatch.setattr(evaluation, "_load_domain_context", eval_context)
     monkeypatch.setattr(evaluation, "_dataset", lambda ctx, split, root: Dataset(None, "cat" if ctx is latest_domains["cat"] else "dog", split))
@@ -332,3 +347,9 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, tr
     assert result.retrieval["dog_to_cat"]["projection_target_count"] == 8
     assert result.retrieval["dog_to_cat"]["structure_prior_diagnostics"]["conditional_expected_cost"] > 0
     assert "sinkhorn_converged" in result.solver
+    if training_mode == "metric":
+        assert result.retrieval["dog_to_cat"]["matching_representation_ids"]["source"].startswith("residual_mlp_v1_")
+        assert result.retrieval["dog_to_cat"]["nearest_target_distance_space"] == "l2_raw_decoder_codes"
+        bank = evaluation.load_latent_bank(Path(result.output_dir) / "banks/dog_reference.pt")
+        head = latest_domains["dog"].matching_head
+        torch.testing.assert_close(bank.matching_features, head(bank.raw_codes))

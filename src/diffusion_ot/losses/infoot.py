@@ -104,6 +104,43 @@ def uniform_marginals(
     )
 
 
+@torch.no_grad()
+def conditional_variance_decomposition(
+    weights: torch.Tensor, target_codes: torch.Tensor,
+) -> dict[str, float | None]:
+    """Total variance = variance of means + average conditional variance.
+
+    Queries have equal mass; the induced target mixture has column masses
+    weights.mean(0). Therefore a correct conditional mean need not reproduce
+    the target mixture's variance. This is a diagnostic, never a loss forcing
+    variance recovery or a normalization of the projected decoder codes.
+    """
+    if weights.ndim != 2 or target_codes.ndim != 2 or weights.shape[1] != len(target_codes):
+        raise ValueError("Conditional weights must have one column per target code.")
+    if not len(weights) or not len(target_codes) or not target_codes.shape[1]:
+        raise ValueError("Conditional variance requires nonempty queries and target codes.")
+    dtype = torch.float64 if weights.dtype == torch.float64 or target_codes.dtype == torch.float64 else torch.float32
+    probability = weights.detach().to(dtype=dtype)
+    codes = target_codes.detach().to(device=probability.device, dtype=dtype)
+    if not torch.isfinite(probability).all() or not torch.isfinite(codes).all() or (probability < 0).any():
+        raise ValueError("Conditional variance requires finite codes and nonnegative finite weights.")
+    if not torch.allclose(probability.sum(1), probability.new_ones(len(probability)), atol=1e-6):
+        raise ValueError("Conditional variance requires normalized probability rows.")
+    means = probability @ codes
+    mixture_mean = means.mean(0)
+    centered_energy = (codes - mixture_mean).square().mean(1)
+    mean_energy = (means - mixture_mean).square().mean(1)
+    total = (probability.mean(0) * centered_energy).sum()
+    between = mean_energy.mean()
+    within = (probability @ centered_energy - mean_energy).mean()
+    return {
+        "mixture_variance": float(total), "mean_variance": float(between),
+        "conditional_variance": float(within),
+        "mean_variance_fraction": float(between / total) if total > 0 else None,
+        "conditional_variance_fraction": float(within / total) if total > 0 else None,
+    }
+
+
 def _validate_marginals(
     a: torch.Tensor,
     b: torch.Tensor,

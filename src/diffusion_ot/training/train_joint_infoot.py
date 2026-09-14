@@ -430,9 +430,11 @@ def _build_checkpoint_payload(
     domains: dict[str, LoadedTrainingDomain],
     train_state: dict[str, Any],
     loader_generators: dict[str, torch.Generator],
+    matching_heads: dict[str, torch.nn.Module] | None = None,
+    matching_ema: EncoderEMA | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "format_version": 2,
+        "format_version": 3 if matching_heads else 2,
         "stage": str(config.get("stage", "stage1b_plain_infoot")),
         "step": int(step),
         "encoders": {domain: _cpu_state_dict(encoder) for domain, encoder in encoders.items()},
@@ -463,6 +465,10 @@ def _build_checkpoint_payload(
     }
     if torch.cuda.is_available():
         payload["cuda_rng_state_all"] = [state.cpu() for state in torch.cuda.get_rng_state_all()]
+    if matching_heads:
+        payload["matching_heads"] = {d: _cpu_state_dict(head) for d, head in matching_heads.items()}
+        payload["matching_head_ema"] = matching_ema.export() if matching_ema is not None else None
+        payload["matching_head_ema_state"] = matching_ema.state_dict() if matching_ema is not None else None
     return payload
 
 
@@ -548,10 +554,12 @@ def fixed_conditional_structure_probe(
     anchors: dict[str, torch.nn.Module] | None = None,
     anchor_variances: dict[str, float] | None = None,
     projection_support_options: dict[str, Any] | None = None,
+    matching_heads: dict[str, torch.nn.Module] | None = None,
 ) -> dict[str, Any]:
     """Fixed train references / validation queries; no updates or RNG consumption."""
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
-    from diffusion_ot.losses.infoot import infoot_distance_scale, normalize_matching_features, solve_infoot, transport_diagnostics
+    from diffusion_ot.losses.infoot import infoot_distance_scale, solve_infoot, transport_diagnostics
+    from diffusion_ot.models.matching_head import matching_features
 
     states = {domain: value.branch.encoder.training for domain, value in domains.items()}
     references, queries, reference_structure, query_structure, anchor_codes = {}, {}, {}, {}, {}
@@ -577,7 +585,11 @@ def fixed_conditional_structure_probe(
                     anchors[domain](part.to(value.device, dtype=value.dtype)).float().to(alignment_device)
                     for part in batch["reference_latents"].split(32)
                 ])
-        features = {domain: normalize_matching_features(code) for domain, code in references.items()}
+        features, query_features = {}, {}
+        for domain, value in domains.items():
+            head = (matching_heads or {}).get(domain)
+            features[domain] = matching_features(references[domain].to(value.device), head).to(alignment_device)
+            query_features[domain] = matching_features(queries[domain].to(value.device), head).to(alignment_device)
         solution = solve_infoot(
             features["cat"], features["dog"], bandwidth=bandwidth,
             distance_scale_x=infoot_distance_scale(features["cat"]),
@@ -588,6 +600,7 @@ def fixed_conditional_structure_probe(
         result = conditional_structure_loss(
             references, queries, reference_structure, query_structure, solution.coupling,
             bandwidth=projection_bandwidth, cost_scale=cost_scale, teacher_temperature=teacher_temperature,
+            reference_matching=features, query_matching=query_features,
         )
         metrics = {
             "conditional_structure_loss": float(result.loss),
@@ -600,6 +613,9 @@ def fixed_conditional_structure_probe(
                 "row_residual": solution.row_residual, "column_residual": solution.column_residual,
                 "iterations": solution.iterations, "outer_converged": solution.outer_converged,
                 "transport": transport_diagnostics(solution.coupling),
+                "matching_feature_variance": {
+                    d: float(feature.var(0, unbiased=False).sum()) for d, feature in features.items()
+                },
             },
         }
         if projection_support_options is not None:
@@ -643,6 +659,7 @@ def train_joint_infoot(
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
     from diffusion_ot.losses.projection_support import projection_support_loss, support_options
     from diffusion_ot.training.gradient_guard import guarded_backward
+    from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec, matching_features
 
     resolved_config_path = Path(config_path).resolve()
     config = load_yaml_config(resolved_config_path)
@@ -664,6 +681,15 @@ def train_joint_infoot(
     infoot_config = _nested(config, "infoot")
     conditional_config = _nested(config, "conditional_structure")
     conditional_enabled = bool(conditional_config.get("enabled", False))
+    head_spec = matching_head_spec(config)
+    head_config = _nested(config, "matching_head")
+    if head_spec["enabled"]:
+        if not conditional_enabled:
+            raise ValueError("Learned matching heads require conditional structure training.")
+        if matching_config.get("distance_scale", "infoot_rms") != "infoot_rms":
+            raise ValueError("Learned matching heads require matching.distance_scale=infoot_rms.")
+        if not math.isfinite(float(head_config.get("lr", 2e-4))) or float(head_config.get("lr", 2e-4)) <= 0:
+            raise ValueError("matching_head.lr must be finite and positive.")
     support_config = _nested(config, "projection_support")
     support_enabled = bool(support_config.get("enabled", False))
     gradient_guard_config = _nested(config, "gradient_guard")
@@ -816,9 +842,17 @@ def train_joint_infoot(
             raise ValueError(f"{domain} DataLoader is empty; reduce transport_batch_size.")
         loaders[domain] = _cycle(loader)
 
+    matching_heads = {
+        domain: make_matching_head(head_spec, device=value.device, seed=seed + 700 + index)
+        for index, (domain, value) in enumerate(domains.items())
+    } if head_spec["enabled"] else {}
+    head_parameters = [p for head in matching_heads.values() for p in head.parameters()]
     parameters = [parameter for encoder in encoders.values() for parameter in encoder.parameters()]
+    parameter_groups = [{"params": parameters}]
+    if head_parameters:
+        parameter_groups.append({"params": head_parameters, "lr": float(head_config.get("lr", 2e-4))})
     optimizer = torch.optim.AdamW(
-        parameters,
+        parameter_groups,
         lr=float(train_config.get("lr_encoder", 2.0e-5)),
         weight_decay=float(train_config.get("weight_decay", 0.0)),
         betas=tuple(float(value) for value in train_config.get("betas", [0.9, 0.999])),
@@ -835,6 +869,10 @@ def train_joint_infoot(
     )
 
     initial_step = 0
+    matching_ema = EncoderEMA(
+        matching_heads, decay=float(ema_config.get("decay", 0.995)),
+        warmup_steps=int(ema_config.get("warmup_steps", 500)),
+    ) if matching_heads and ema is not None else None
     training_seconds = 0.0
     if resume_path is not None:
         if not resume_path.is_file():
@@ -848,6 +886,16 @@ def train_joint_infoot(
         )
         for domain, encoder in encoders.items():
             encoder.load_state_dict(checkpoint["encoders"][domain])
+        if matching_heads:
+            for domain, head in matching_heads.items():
+                state = (checkpoint.get("matching_heads") or {}).get(domain)
+                if state is None:
+                    raise ValueError(f"Resume checkpoint has no matching_heads.{domain}.")
+                head.load_state_dict(state, strict=True)
+            if matching_ema is not None:
+                if checkpoint.get("matching_head_ema_state") is None:
+                    raise ValueError("Resume checkpoint has no matching head EMA state.")
+                matching_ema.load_state_dict(checkpoint["matching_head_ema_state"], matching_heads)
         optimizer.load_state_dict(checkpoint["optimizer"])
         if ema is not None and checkpoint.get("ema_state") is not None:
             ema.load_state_dict(checkpoint["ema_state"], encoders)
@@ -933,6 +981,7 @@ def train_joint_infoot(
                 solver_options=solver_options, cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
                 anchors=anchors, anchor_variances=anchor_variances,
                 projection_support_options=support_options(support_config) if support_enabled else None,
+                matching_heads=matching_heads,
             ))
         return metrics
 
@@ -958,6 +1007,7 @@ def train_joint_infoot(
                     "distance_scales": distance_scales,
                 },
                 loader_generators=loader_generators,
+                matching_heads=matching_heads, matching_ema=matching_ema,
             ),
         )
 
@@ -971,18 +1021,20 @@ def train_joint_infoot(
         anchor_losses: dict[str, torch.Tensor] = {}
         teacher_features: dict[str, torch.Tensor] = {}
         neighborhood_losses: dict[str, torch.Tensor] = {}
+        matching_z: dict[str, torch.Tensor] = {}
         for domain, value in domains.items():
             batch = next(loaders[domain])
             x0[domain] = batch["x0_latent"].to(
                 value.device, dtype=value.dtype, non_blocking=True
             )
             z[domain] = value.branch.encoder(x0[domain])
+            matching_z[domain] = matching_features(z[domain], matching_heads.get(domain)).to(alignment_device)
             if prior is not None:
                 teacher_features[domain] = prior.lookup(
                     batch["sample_id"], domain, dataset_kwargs["split"]
                 ).to(alignment_device)
                 neighborhood_losses[domain] = neighborhood_distillation_loss(
-                    z[domain].to(alignment_device), teacher_features[domain],
+                    matching_z[domain] if matching_heads else z[domain].to(alignment_device), teacher_features[domain],
                     temperature=prior_temperature,
                 )
             with torch.no_grad():
@@ -1008,8 +1060,11 @@ def train_joint_infoot(
             domain: teacher[:-query_count] if query_count else teacher
             for domain, teacher in teacher_features.items()
         }
-        cat_features = normalize_matching_features(references["cat"])
-        dog_features = normalize_matching_features(references["dog"])
+        reference_matching = {
+            domain: code[:-query_count] if query_count else code for domain, code in matching_z.items()
+        }
+        cat_features = reference_matching["cat"]
+        dog_features = reference_matching["dog"]
         if distance_scale_mode == "infoot_rms":
             solve_distance_scales = {
                 "cat": float(infoot_distance_scale(cat_features.detach())),
@@ -1050,6 +1105,8 @@ def train_joint_infoot(
                 solution.coupling, cost_scale=prior.cost_scale,
                 bandwidth=float(conditional_config.get("bandwidth_multiplier", 0.1)),
                 teacher_temperature=float(conditional_config.get("teacher_temperature", 0.05)),
+                reference_matching=reference_matching,
+                query_matching={domain: code[-query_count:] for domain, code in matching_z.items()},
             )
             projection_loss = conditional_result.loss
         support_result = None
@@ -1113,6 +1170,13 @@ def train_joint_infoot(
                 )
         guard_metrics = {}
         if gradient_guard_enabled:
+            if head_parameters:
+                # Alignment can change matching geometry without consuming the
+                # encoder's reconstruction-protection budget. Preserve the graph
+                # for the separate guarded encoder gradients below.
+                head_gradients = torch.autograd.grad(auxiliary_objective, head_parameters, retain_graph=True)
+                for parameter, gradient in zip(head_parameters, head_gradients):
+                    parameter.grad = gradient.detach()
             guard_metrics = guarded_backward(
                 primary_objective, auxiliary_objective,
                 {domain: list(encoder.parameters()) for domain, encoder in encoders.items()},
@@ -1128,9 +1192,16 @@ def train_joint_infoot(
         total_grad_norm = _clip_gradient_norm(
             parameters, train_config.get("grad_clip_norm", 1.0)
         )
+        head_grad_norm = _clip_gradient_norm(
+            head_parameters, head_config.get("grad_clip_norm", 1.0)
+        ) if head_parameters else 0.0
+        if not math.isfinite(head_grad_norm):
+            raise FloatingPointError(f"Non-finite matching head gradients at step {step}.")
         optimizer.step()
         if ema is not None and step % ema_update_every == 0:
             ema.update(encoders)
+            if matching_ema is not None:
+                matching_ema.update(matching_heads)
 
         elapsed = time.perf_counter() - started
         training_seconds += elapsed
@@ -1201,6 +1272,12 @@ def train_joint_infoot(
             metrics["projection_support_loss"] = float(support_loss.detach())
             metrics["projection_support_weight"] = support_weight * warmup
             metrics["gradient_guard"] = guard_metrics
+            if matching_heads:
+                metrics["matching_head_gradient_norm_pre_clip"] = head_grad_norm
+                metrics["matching_head_learning_rate"] = optimizer.param_groups[1]["lr"]
+                metrics["matching_feature_variance"] = {
+                    d: float(code.detach().var(0, unbiased=False).sum()) for d, code in reference_matching.items()
+                }
             if support_result is not None:
                 metrics["projection_support"] = support_result.metrics
             if conditional_result is not None:
@@ -1238,6 +1315,7 @@ def train_joint_infoot(
                         "distance_scales": distance_scales,
                     },
                     loader_generators=loader_generators,
+                    matching_heads=matching_heads, matching_ema=matching_ema,
                 ),
             )
             if bool(train_config.get("keep_step_checkpoints", False)):

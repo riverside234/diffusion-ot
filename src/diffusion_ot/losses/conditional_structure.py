@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from diffusion_ot.losses.infoot import (
+    conditional_variance_decomposition,
     conditional_reference_log_weights,
     infoot_cross_distance_scale,
     infoot_distance_scale,
@@ -21,7 +22,7 @@ from diffusion_ot.losses.infoot import (
 @dataclass
 class ConditionalStructureResult:
     loss: torch.Tensor
-    metrics: dict[str, dict[str, float]]
+    metrics: dict[str, dict[str, float | None]]
     weights: dict[str, torch.Tensor]
     teacher_weights: dict[str, torch.Tensor]
 
@@ -36,6 +37,8 @@ def conditional_structure_loss(
     bandwidth: float,
     cost_scale: float,
     teacher_temperature: float = 0.1,
+    reference_matching: dict[str, torch.Tensor] | None = None,
+    query_matching: dict[str, torch.Tensor] | None = None,
 ) -> ConditionalStructureResult:
     """Average bidirectional KL(teacher || full Eq. 7 conditional readout).
 
@@ -43,20 +46,29 @@ def conditional_structure_loss(
     portion of the training batch (or validation split during fixed probes).
     Only encoder features receive gradients; the plan and teacher are detached.
     Each target bank is its complete reference set, without top-k truncation.
+    Optional matching features change the KDE geometry, while references and
+    queries remain raw decoder codes. They must retain the same row ordering.
     """
     if not math.isfinite(cost_scale) or cost_scale <= 0:
         raise ValueError("Structure cost scale must be finite and positive.")
     if not math.isfinite(teacher_temperature) or teacher_temperature <= 0:
         raise ValueError("Projection teacher temperature must be finite and positive.")
+    if (reference_matching is None) != (query_matching is None):
+        raise ValueError("Supply both reference and query matching features, or neither.")
     losses, metrics, weights, teacher_distributions = [], {}, {}, {}
     for source, target in (("cat", "dog"), ("dog", "cat")):
         if len(queries[source]) < 1 or len(references[target]) < 2:
             raise ValueError("Conditional structure training needs queries and at least two target references.")
         if len(query_structure[source]) != len(queries[source]) or len(reference_structure[target]) != len(references[target]):
             raise ValueError("Structure descriptors must match query/reference sample counts.")
-        source_features = F.normalize(queries[source].float(), dim=-1)
-        source_references = F.normalize(references[source].float(), dim=-1)
-        target_references = F.normalize(references[target].float(), dim=-1)
+        match_ref = references if reference_matching is None else reference_matching
+        match_query = queries if query_matching is None else query_matching
+        if any(len(match_ref[d]) != len(references[d]) or len(match_query[d]) != len(queries[d])
+               for d in (source, target)):
+            raise ValueError("Matching feature rows must correspond to raw code rows.")
+        source_features = F.normalize(match_query[source].float(), dim=-1)
+        source_references = F.normalize(match_ref[source].float(), dim=-1)
+        target_references = F.normalize(match_ref[target].float(), dim=-1)
         log_weights = conditional_reference_log_weights(
             source_features, source_references, target_references,
             coupling.detach() if source == "cat" else coupling.detach().T,
@@ -78,6 +90,11 @@ def conditional_structure_loss(
         with torch.no_grad():
             probability = weights[direction]
             projected = probability @ references[target].float()
+            teacher_projected = teacher_weights @ references[target].float()
+            target_variance = references[target].float().var(0, unbiased=False).mean().clamp_min(1e-12)
+            uniform_cost = costs.mean()
+            teacher_cost = (teacher_weights * costs).sum(1).mean()
+            student_cost = (probability * costs).sum(1).mean()
             metrics[direction] = {
                 "kl": float(loss.detach()),
                 "expected_structure_cost": float((probability * costs).sum(1).mean()),
@@ -89,8 +106,21 @@ def conditional_structure_loss(
                     projected.norm(dim=1).mean() / references[target].float().norm(dim=1).mean().clamp_min(1e-8)
                 ),
                 "projected_to_target_variance_ratio": float(
-                    projected.var(0, unbiased=False).mean()
-                    / references[target].float().var(0, unbiased=False).mean().clamp_min(1e-12)
+                    projected.var(0, unbiased=False).mean() / target_variance
+                ),
+                "teacher_projected_to_target_variance_ratio": float(
+                    teacher_projected.var(0, unbiased=False).mean() / target_variance
+                ),
+                "teacher_projected_to_target_norm_ratio": float(
+                    teacher_projected.norm(dim=1).mean()
+                    / references[target].float().norm(dim=1).mean().clamp_min(1e-8)
+                ),
+                "fraction_of_teacher_cost_gain": float(
+                    (uniform_cost - student_cost) / (uniform_cost - teacher_cost).clamp_min(1e-12)
                 ),
             }
+            metrics[direction].update({
+                f"teacher_{key}": value for key, value in
+                conditional_variance_decomposition(teacher_weights, references[target]).items()
+            })
     return ConditionalStructureResult(torch.stack(losses).mean(), metrics, weights, teacher_distributions)

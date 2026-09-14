@@ -713,3 +713,15 @@ def test_decoded_grid_receives_full_equation7_mean(
     assert len(decoder_codes) == 3
     torch.testing.assert_close(decoder_noise[0], decoder_noise[1])
     torch.testing.assert_close(decoder_noise[0], decoder_noise[2])
+    decoder_codes.clear()
+    decoder_noise.clear()
+    teacher_mean = target.raw_codes.mean(0, keepdim=True).repeat(2, 1)
+    stage1b._save_translation_grid(
+        context, context, query, target, tensors["conditional_weights"],
+        count=2, num_steps=2, guidance_scale=1.0, temperature=0.5, seed=7,
+        output_path=tmp_path / "teacher_grid.png", teacher_codes=teacher_mean,
+    )
+    assert len(decoder_codes) == 4
+    torch.testing.assert_close(decoder_codes[0], expected_mean)
+    torch.testing.assert_close(decoder_codes[3], teacher_mean)
+    assert all(torch.equal(noise, decoder_noise[0]) for noise in decoder_noise)

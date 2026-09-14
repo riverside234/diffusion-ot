@@ -2,9 +2,46 @@
 
 Cat/Dog PDAE representations with InfoOT conditional projection.
 
-## Current conditional projection co-training experiment
+## Current experiment: learned InfoOT matching heads
 
-The latest logs stop at update 1,000, exactly the end of alignment warmup.
+The guarded 8,000-update run still has weak structural matching. Validation
+KL improves about 5.1%, but expected structure cost improves only 0.57%/0.12%
+Cat-to-Dog/Dog-to-Cat. Reconstruction drifts 2.13%/2.69%, the support divergence
+increases, and Cat-to-Dog projected variance decreases. All logged InfoOT
+solves converge. See the [8,000-update review, plots, and research rationale](docs/stage1b_guarded_8000_review.md).
+
+The new opt-in `structure_metric_sit_b2.yaml` trains residual matching heads
+alongside the encoders. Heads start at normalized identity and learn InfoOT
+geometry outside the encoder's gradient cap. Decoder inputs remain the raw
+semantic codes. Encoder/head learning rates are `2e-5`/`2e-4`; the budget is
+8,000 updates. The previous support loss is disabled: a conditional mean
+generally has less variance than the target distribution, and the prior
+experiment did not demonstrate benefit from forcing those distributions
+together. The original guarded config and official-based legacy snapshot
+remain available as controls.
+
+```bash
+python3 scripts/train_joint_infoot.py \
+  --config configs/stage1b_infoot/structure_metric_sit_b2.yaml
+
+python3 scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/structure_metric_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/structure_metric_sit_b2.yaml \
+  --checkpoint outputs/stage1b_cat_dog_structure_metric_infoot_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+```
+
+Start from Stage 1A in the new output directory, then use `--resume` only for
+that experiment. To inspect an initial 2,000-update run, add `--max-steps 2000`.
+Evaluation preserves head/encoder raw-or-EMA pairing and adds a fifth grid row
+for the direct structural-teacher mean when descriptors are available. New
+variance diagnostics separate variability of means from conditional
+uncertainty. Decoder-code nearest-neighbor diagnostics remain in raw-code
+coordinates. Independent proxy labels and generated grids must still establish
+translation quality; the new architecture is an experiment, not a proven fix.
+
+## Earlier guarded conditional projection experiment
+
+The preceding, unguarded logs stop at update 1,000, exactly the end of alignment warmup.
 Every logged InfoOT solve converges. Fixed-validation conditional KL falls
 6.3%, but expected structure cost improves only about 0.3-0.5%, while Cat/Dog
 reconstruction losses increase 2.0%/2.8%. This is measurable learning with
@@ -15,7 +52,7 @@ measurements, research sources, and limits of this diagnosis. The
 [earlier 1,500-update review](docs/stage1b_fused_projection_review.md) describes
 a different run before the solver revision.
 
-`configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml` now adds:
+`configs/stage1b_infoot/structure_fused_projection_sit_b2.yaml` introduced:
 
 - A per-encoder gradient guard: reconstruction plus latent anchoring is the
   primary objective. Conflicting auxiliary components are projected away,
@@ -34,7 +71,8 @@ a different run before the solver revision.
 Conditional-structure KL weight changes from 0.05 to 0.02 and the new
 projection-support weight is 0.02. LR stays `2e-5`, fit/projection bandwidths
 stay 0.70/0.10, inner MI weight stays 0.10, and entropy regularization stays
-0.05. The 5,000-update budget and 1,000-update warmup are unchanged. Each
+0.05. The original budget was 5,000 updates and was extended to 8,000 for the
+reviewed guarded run, with 1,000-update warmup. Each
 domain still supplies 96 OT references and 32 disjoint training queries.
 These are experimental settings; the new losses are project extensions to
 official InfoOT and need validation on generated images.
@@ -54,7 +92,7 @@ python3 scripts/evaluate_infoot_alignment.py \
   --checkpoint outputs/stage1b_cat_dog_structure_fused_projection_guarded_infoot_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
 ```
 
-The training command runs 5,000 real updates. To inspect an earlier checkpoint,
+The current guarded-control config runs 8,000 real updates. To inspect an earlier checkpoint,
 use `--max-steps 1500`, then use the same config with `--resume` to continue.
 `logs/validation.jsonl` records a fixed train-reference/validation-query
 projection probe at step 0 and every 500 updates, alongside the fixed

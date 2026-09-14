@@ -19,6 +19,7 @@ from diffusion_ot.integrations.hf_snapshot import (
 from diffusion_ot.losses.infoot import (
     conditional_density_ratio,
     conditional_projection_weights,
+    conditional_variance_decomposition,
     effective_target_count,
     infoot_cross_distance_scale,
     infoot_distance_scale,
@@ -32,6 +33,9 @@ from diffusion_ot.losses.infoot import (
     transport_diagnostics,
     weighted_target_codes,
 )
+from diffusion_ot.models.matching_head import (
+    load_matching_head, matching_features, matching_head_id, matching_head_spec,
+)
 
 
 @dataclass
@@ -43,6 +47,7 @@ class LatentBank:
     sample_ids: list[str]
     metadata: list[dict[str, Any]]
     checkpoint_id: str
+    matching_id: str = "l2_raw_v1"
 
     def validate(self) -> None:
         count = self.raw_codes.shape[0]
@@ -60,7 +65,7 @@ class LatentBank:
     def to_payload(self) -> dict[str, Any]:
         self.validate()
         return {
-            "format_version": 1,
+            "format_version": 2,
             "domain": self.domain,
             "split": self.split,
             "raw_codes": self.raw_codes.detach().cpu(),
@@ -68,6 +73,7 @@ class LatentBank:
             "sample_ids": self.sample_ids,
             "metadata": self.metadata,
             "checkpoint_id": self.checkpoint_id,
+            "matching_id": self.matching_id,
         }
 
 
@@ -88,6 +94,7 @@ class DomainEvaluationContext:
     stage1a_checkpoint_step: int
     stage1a_weights: str
     stage1a_architecture: dict[str, Any]
+    matching_head: Any | None = None
 
 
 @dataclass
@@ -198,6 +205,7 @@ def load_latent_bank(path: str | Path) -> LatentBank:
         sample_ids=[str(value) for value in payload["sample_ids"]],
         metadata=list(payload["metadata"]),
         checkpoint_id=str(payload["checkpoint_id"]),
+        matching_id=str(payload.get("matching_id", "l2_raw_v1")),
     )
     bank.validate()
     return bank
@@ -215,6 +223,8 @@ def validate_bank_compatibility(
         raise ValueError("Reference and query banks must belong to the same domain.")
     if reference.checkpoint_id != query.checkpoint_id:
         raise ValueError("Reference and query banks were produced by different encoders.")
+    if reference.matching_id != query.matching_id:
+        raise ValueError("Reference and query banks were produced by different matching heads.")
     if reference.raw_codes.shape[1] != query.raw_codes.shape[1]:
         raise ValueError("Reference and query raw-code dimensions differ.")
     if reference.matching_features.shape[1] != query.matching_features.shape[1]:
@@ -235,19 +245,25 @@ def build_latent_bank(
     device: str,
     dtype: torch.dtype,
     checkpoint_id: str,
+    matching_head: Any | None = None,
 ) -> LatentBank:
     indices = deterministic_indices(len(dataset), count, seed)
     codes: list[torch.Tensor] = []
+    features: list[torch.Tensor] = []
     sample_ids: list[str] = []
     metadata: list[dict[str, Any]] = []
     encoder.eval()
+    if matching_head is not None:
+        matching_head.eval()
     with torch.inference_mode():
         for offset in range(0, len(indices), int(batch_size)):
             items = [dataset[index] for index in indices[offset : offset + int(batch_size)]]
             x0 = torch.stack([item["x0_latent"] for item in items]).to(
                 device=device, dtype=dtype
             )
-            codes.append(encoder(x0).detach().float().cpu())
+            raw = encoder(x0).detach().float()
+            codes.append(raw.cpu())
+            features.append(matching_features(raw, matching_head).cpu())
             sample_ids.extend(str(item["sample_id"]) for item in items)
             metadata.extend(dict(item["metadata"]) for item in items)
     raw_codes = torch.cat(codes, dim=0)
@@ -255,10 +271,11 @@ def build_latent_bank(
         domain=domain,
         split=split,
         raw_codes=raw_codes,
-        matching_features=normalize_matching_features(raw_codes),
+        matching_features=torch.cat(features),
         sample_ids=sample_ids,
         metadata=metadata,
         checkpoint_id=checkpoint_id,
+        matching_id=matching_head_id(matching_head),
     )
     bank.validate()
     return bank
@@ -276,6 +293,7 @@ def subset_latent_bank(bank: LatentBank, *, count: int, seed: int) -> LatentBank
         sample_ids=[bank.sample_ids[index] for index in indices],
         metadata=[dict(bank.metadata[index]) for index in indices],
         checkpoint_id=bank.checkpoint_id,
+        matching_id=bank.matching_id,
     )
     selected.validate()
     return selected
@@ -373,6 +391,8 @@ def latent_diagnostics(bank: LatentBank) -> dict[str, float]:
         "mean_norm": float(codes.norm(dim=1).mean()),
         "mean_feature_std": float(codes.std(dim=0, unbiased=False).mean()),
         "effective_rank": _effective_rank(codes),
+        "matching_effective_rank": _effective_rank(bank.matching_features),
+        "matching_feature_variance": float(bank.matching_features.float().var(0, unbiased=False).sum()),
     }
 
 
@@ -403,6 +423,8 @@ def _direction_evaluation(
         {"bandwidth_multiplier": bandwidth}, projection_bandwidth
     )
     target_projection = target_reference if target_projection is None else target_projection
+    validate_bank_compatibility(source_reference, source_query, require_disjoint=False)
+    validate_bank_compatibility(target_reference, target_gallery, require_disjoint=False)
     validate_bank_compatibility(target_reference, target_projection, require_disjoint=False)
     device = coupling.device
     source_ref_features = source_reference.matching_features.to(device)
@@ -464,7 +486,7 @@ def _direction_evaluation(
     conditional_codes = weighted_target_codes(conditional_weights, target_projection_raw)
     barycentric_features = normalize_matching_features(barycentric_codes)
     barycentric_rankings = torch.argsort(
-        pairwise_squared_distances(barycentric_features, target_ref_features), dim=1
+        pairwise_squared_distances(barycentric_features, normalize_matching_features(target_reference_raw)), dim=1
     )
     random_generator = torch.Generator().manual_seed(int(seed))
     random_rankings = torch.argsort(
@@ -475,7 +497,7 @@ def _direction_evaluation(
         dim=1,
     ).to(device)
     nearest_target_distance = pairwise_squared_distances(
-        normalize_matching_features(conditional_codes), target_projection_features
+        normalize_matching_features(conditional_codes), normalize_matching_features(target_projection_raw)
     ).min(dim=1).values.sqrt()
     norm_ratio = conditional_codes.norm(dim=1) / target_projection_raw.norm(dim=1).mean().clamp_min(eps)
 
@@ -519,6 +541,11 @@ def _direction_evaluation(
             effective_target_count(plan_weights).mean().cpu()
         ),
         "mean_nearest_target_distance": float(nearest_target_distance.mean().cpu()),
+        "nearest_target_distance_space": "l2_raw_decoder_codes",
+        "barycentric_retrieval_space": "l2_raw_decoder_codes",
+        "matching_representation_ids": {
+            "source": source_reference.matching_id, "target": target_reference.matching_id,
+        },
         "mean_projected_to_target_norm_ratio": float(norm_ratio.mean().cpu()),
         "projected_to_target_variance_ratio": float(
             conditional_codes.var(0, unbiased=False).mean()
@@ -661,6 +688,11 @@ def _load_domain_context(
         checkpoint_step = int(joint.get("step", 0))
         selected_path = checkpoint_path
 
+    matching_head = None
+    if checkpoint_path is not None:
+        if matching_head_spec(joint.get("config") or {}) != matching_head_spec(alignment_config):
+            raise ValueError("Alignment config and checkpoint matching_head architectures disagree.")
+        matching_head = load_matching_head(joint, domain, weights=joint_weights, device=device)
     branch.eval()
     components.vae.eval()
     return DomainEvaluationContext(
@@ -679,6 +711,7 @@ def _load_domain_context(
         stage1a_checkpoint_step=int(stage1a_checkpoint.get("step", 0)),
         stage1a_weights=initial_weights,
         stage1a_architecture=stage1a_architecture,
+        matching_head=matching_head,
     )
 
 
@@ -794,6 +827,7 @@ def _save_translation_grid(
     temperature: float,
     seed: int,
     output_path: Path,
+    teacher_codes: torch.Tensor | None = None,
 ) -> None:
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
@@ -820,7 +854,10 @@ def _save_translation_grid(
     )
     class_config = _nested(target.training_config, "class_conditioning")
     rows = [source_images]
-    for codes in (conditional_mean, map_codes, sampled_codes):
+    code_rows = [conditional_mean, map_codes, sampled_codes]
+    if teacher_codes is not None:
+        code_rows.append(teacher_codes[:count])
+    for codes in code_rows:
         latent = integrate_pdae_flow(
             target.branch,
             target.transformer,
@@ -1248,6 +1285,8 @@ def run_stage1b_evaluation(
     # each projection bandwidth gets its own outputs and matching baseline.
     matching_config["projection_bandwidth_multiplier"] = projection_bandwidth
     evaluation_config["matching"] = matching_config
+    if matching_head_spec(alignment_config)["enabled"]:
+        evaluation_config["matching_head"] = matching_head_spec(alignment_config)
     root = effective_project_root(
         alignment_config, fallback=find_project_root(alignment_path.parent)
     )
@@ -1373,6 +1412,7 @@ def run_stage1b_evaluation(
             device=context.device,
             dtype=context.dtype,
             checkpoint_id=checkpoint_id,
+            matching_head=getattr(context, "matching_head", None),
         )
         if reference_split == projection_split:
             banks[domain]["reference"] = subset_latent_bank(
@@ -1392,6 +1432,7 @@ def run_stage1b_evaluation(
                 device=context.device,
                 dtype=context.dtype,
                 checkpoint_id=checkpoint_id,
+                matching_head=getattr(context, "matching_head", None),
             )
         for kind, split, count, offset in (
             ("query", query_split, query_count, 100),
@@ -1408,6 +1449,7 @@ def run_stage1b_evaluation(
                 device=context.device,
                 dtype=context.dtype,
                 checkpoint_id=checkpoint_id,
+                matching_head=getattr(context, "matching_head", None),
             )
         validate_bank_compatibility(banks[domain]["reference"], banks[domain]["query"])
         validate_bank_compatibility(banks[domain]["reference"], banks[domain]["gallery"])
@@ -1475,6 +1517,8 @@ def run_stage1b_evaluation(
             "dog_reference_ids": banks["dog"]["reference"].sample_ids,
             "cat_projection_ids": banks["cat"]["projection"].sample_ids,
             "dog_projection_ids": banks["dog"]["projection"].sample_ids,
+            "matching_head_config": matching_head_spec(alignment_config),
+            "matching_representation_ids": {d: banks[d]["reference"].matching_id for d in ("cat", "dog")},
             "distance_scales": scales,
             "distance_scale_mode": distance_scale_mode,
             "bandwidth": bandwidth,
@@ -1555,6 +1599,18 @@ def run_stage1b_evaluation(
                 "semantic_prior_fingerprint": prior.fingerprint,
                 "interpretation": "Frozen training-prior retrieval cost; not independent validation or decoded-image similarity.",
             }
+            teacher_temperature = float(_nested(alignment_config, "conditional_structure").get("teacher_temperature", .05))
+            if not math.isfinite(teacher_temperature) or teacher_temperature <= 0:
+                raise ValueError("Teacher temperature must be finite and positive.")
+            teacher_weights = torch.softmax(-structure_costs / teacher_temperature, dim=1)
+            target_codes = banks[target_domain]["projection"].raw_codes
+            tensors["structure_teacher_codes"] = weighted_target_codes(teacher_weights, target_codes)
+            direction_report["structure_prior_diagnostics"].update({
+                "teacher_temperature": teacher_temperature,
+                "teacher_expected_cost": float((teacher_weights * structure_costs).sum(1).mean()),
+                "teacher_variance_decomposition": conditional_variance_decomposition(teacher_weights, target_codes),
+                "conditional_variance_decomposition": conditional_variance_decomposition(conditional_weights, target_codes),
+            })
         elif prior is not None:
             direction_report["structure_prior_diagnostics"] = {
                 "status": "unavailable",
@@ -1590,6 +1646,7 @@ def run_stage1b_evaluation(
             if name not in direction_tensors:
                 continue
             path = output_root / "translation" / f"{name}_grid.png"
+            teacher_codes = direction_tensors[name].get("structure_teacher_codes") if translation_config.get("include_structure_teacher_mean", False) else None
             _save_translation_grid(
                 contexts[source_domain],
                 contexts[target_domain],
@@ -1602,8 +1659,12 @@ def run_stage1b_evaluation(
                 temperature=float(translation_config.get("temperature", 1.0)),
                 seed=seed + (30 if name == "cat_to_dog" else 40),
                 output_path=path,
+                teacher_codes=teacher_codes,
             )
             translation_paths[name] = str(path)
+            retrieval[name]["translation_grid_rows"] = [
+                "source", "infoot_conditional_mean", "selected_target", "sampled_target",
+            ] + (["structure_teacher_mean"] if teacher_codes is not None else [])
 
     visualization_paths: dict[str, str] = {}
     visualization_config = _nested(evaluation_config, "visualization")
