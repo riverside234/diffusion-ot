@@ -218,6 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 /notes/
+/docs/
 
 # Project-local generated data and model artifacts
 /artifacts/pretrained/SiT-B-2-256/
