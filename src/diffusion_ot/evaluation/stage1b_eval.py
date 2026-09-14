@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import csv
 import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import torch
 
@@ -17,7 +16,6 @@ from diffusion_ot.integrations.hf_snapshot import (
     resolve_project_local_path,
 )
 from diffusion_ot.losses.infoot import (
-    conditional_density_ratio,
     conditional_projection_weights,
     conditional_variance_decomposition,
     effective_target_count,
@@ -110,14 +108,13 @@ class Stage1BEvaluationReport:
     reference_sizes: dict[str, int]
     projection_sizes: dict[str, int]
     query_sizes: dict[str, int]
-    gallery_sizes: dict[str, int]
     distance_scales: dict[str, float]
     solver: dict[str, Any]
     latent_diagnostics: dict[str, dict[str, float]]
     reconstruction: dict[str, Any]
     baseline_comparison: dict[str, Any]
     checkpoint_selection: dict[str, Any]
-    retrieval: dict[str, Any]
+    projections: dict[str, Any]
     translation_grids: dict[str, str]
     visualization_paths: dict[str, str]
 
@@ -333,50 +330,6 @@ def _labels_for_bank(
     return result
 
 
-def precision_at_k(
-    rankings: torch.Tensor,
-    query_ids: list[str],
-    gallery_ids: list[str],
-    labels: dict[str, dict[str, Any]],
-    *,
-    attribute: str,
-    ks: Iterable[int],
-) -> dict[str, Any]:
-    if rankings.shape[0] != len(query_ids):
-        raise ValueError("Ranking rows do not match query IDs.")
-    values: dict[int, list[float]] = {int(k): [] for k in ks}
-    relevant_counts: list[int] = []
-    missing_queries = 0
-    for row, query_id in zip(rankings.cpu(), query_ids):
-        query_value = labels.get(query_id, {}).get(attribute)
-        if query_value is None:
-            missing_queries += 1
-            continue
-        relevant = [labels.get(gallery_id, {}).get(attribute) == query_value for gallery_id in gallery_ids]
-        relevant_count = sum(relevant)
-        if relevant_count == 0:
-            continue
-        relevant_counts.append(relevant_count)
-        for k in values:
-            width = min(k, len(gallery_ids))
-            hits = sum(bool(relevant[int(index)]) for index in row[:width])
-            values[k].append(hits / max(width, 1))
-    eligible = len(relevant_counts)
-    return {
-        "attribute": attribute,
-        "eligible_queries": eligible,
-        "missing_query_labels": missing_queries,
-        "query_coverage": eligible / max(len(query_ids), 1),
-        "mean_relevant_gallery_count": (
-            sum(relevant_counts) / eligible if eligible else None
-        ),
-        **{
-            f"precision_at_{k}": (sum(scores) / len(scores) if scores else None)
-            for k, scores in values.items()
-        },
-    }
-
-
 def _effective_rank(codes: torch.Tensor, eps: float = 1.0e-8) -> float:
     centered = codes.float() - codes.float().mean(dim=0, keepdim=True)
     singular_values = torch.linalg.svdvals(centered)
@@ -396,25 +349,16 @@ def latent_diagnostics(bank: LatentBank) -> dict[str, float]:
     }
 
 
-def _rank_descending(scores: torch.Tensor) -> torch.Tensor:
-    return torch.argsort(scores, dim=1, descending=True)
-
-
-def _direction_evaluation(
+def _direction_projection_evaluation(
     source_reference: LatentBank,
     target_reference: LatentBank,
     source_query: LatentBank,
-    target_gallery: LatentBank,
     coupling: torch.Tensor,
     *,
     target_projection: LatentBank | None = None,
     source_scale: float,
     target_scale: float,
     bandwidth: float,
-    labels: dict[str, dict[str, Any]],
-    attributes: list[str],
-    ks: list[int],
-    seed: int,
     eps: float,
     distance_scale_mode: str = "fixed_stage1a_median",
     projection_bandwidth: float | None = None,
@@ -424,27 +368,21 @@ def _direction_evaluation(
     )
     target_projection = target_reference if target_projection is None else target_projection
     validate_bank_compatibility(source_reference, source_query, require_disjoint=False)
-    validate_bank_compatibility(target_reference, target_gallery, require_disjoint=False)
     validate_bank_compatibility(target_reference, target_projection, require_disjoint=False)
     device = coupling.device
     source_ref_features = source_reference.matching_features.to(device)
     target_ref_features = target_reference.matching_features.to(device)
     source_query_features = source_query.matching_features.to(device)
-    target_gallery_features = target_gallery.matching_features.to(device)
     target_projection_features = target_projection.matching_features.to(device)
     if distance_scale_mode == "infoot_rms":
         query_source_scale = float(
             infoot_cross_distance_scale(source_query_features, source_ref_features)
-        )
-        gallery_target_scale = float(
-            infoot_cross_distance_scale(target_gallery_features, target_ref_features)
         )
         projection_target_scale = float(
             infoot_cross_distance_scale(target_projection_features, target_ref_features)
         )
     elif distance_scale_mode == "fixed_stage1a_median":
         query_source_scale = source_scale
-        gallery_target_scale = target_scale
         projection_target_scale = target_scale
     else:
         raise ValueError(
@@ -452,22 +390,9 @@ def _direction_evaluation(
             "'fixed_stage1a_median'."
         )
 
-    conditional_scores = conditional_density_ratio(
-        source_query_features,
-        target_gallery_features,
-        source_ref_features,
-        target_ref_features,
-        coupling,
-        bandwidth=projection_bandwidth,
-        distance_scale_x=query_source_scale,
-        distance_scale_y=gallery_target_scale,
-        eps=eps,
-    )
-    conditional_rankings = _rank_descending(conditional_scores)
     plan_weights, nearest_source = nearest_plan_row_weights(
         source_query_features, source_ref_features, coupling, eps=eps
     )
-    plan_rankings = _rank_descending(plan_weights)
     conditional_weights = conditional_projection_weights(
         source_query_features,
         target_projection_features,
@@ -484,56 +409,17 @@ def _direction_evaluation(
     target_projection_raw = target_projection.raw_codes.to(device)
     barycentric_codes = weighted_target_codes(plan_weights, target_reference_raw)
     conditional_codes = weighted_target_codes(conditional_weights, target_projection_raw)
-    barycentric_features = normalize_matching_features(barycentric_codes)
-    barycentric_rankings = torch.argsort(
-        pairwise_squared_distances(barycentric_features, normalize_matching_features(target_reference_raw)), dim=1
-    )
-    random_generator = torch.Generator().manual_seed(int(seed))
-    random_rankings = torch.argsort(
-        torch.rand(
-            (len(source_query.sample_ids), len(target_gallery.sample_ids)),
-            generator=random_generator,
-        ),
-        dim=1,
-    ).to(device)
     nearest_target_distance = pairwise_squared_distances(
         normalize_matching_features(conditional_codes), normalize_matching_features(target_projection_raw)
     ).min(dim=1).values.sqrt()
     norm_ratio = conditional_codes.norm(dim=1) / target_projection_raw.norm(dim=1).mean().clamp_min(eps)
 
-    ranking_sets = {
-        "random": (random_rankings, target_gallery.sample_ids),
-        "conditional": (conditional_rankings, target_gallery.sample_ids),
-        "nn_plan_row": (plan_rankings, target_reference.sample_ids),
-        "nn_barycentric": (barycentric_rankings, target_reference.sample_ids),
-    }
-    precision: dict[str, Any] = {}
-    for rule, (rankings, gallery_ids) in ranking_sets.items():
-        precision[rule] = {
-            attribute: precision_at_k(
-                rankings,
-                source_query.sample_ids,
-                gallery_ids,
-                labels,
-                attribute=attribute,
-                ks=ks,
-            )
-            for attribute in attributes
-        }
-
-    max_k = min(max(ks), conditional_rankings.shape[1])
-    top_ids = [
-        [target_gallery.sample_ids[int(index)] for index in row[:max_k]]
-        for row in conditional_rankings.cpu()
-    ]
     report = {
-        "precision": precision,
         "fit_bandwidth_multiplier": bandwidth,
         "projection_bandwidth_multiplier": projection_bandwidth,
         "projection_method": "infoot_eq7_conditional_expectation",
         "projection_support": "target_training_projection_bank",
         "projection_target_count": len(target_projection.sample_ids),
-        "conditional_top_ids": dict(zip(source_query.sample_ids, top_ids)),
         "mean_conditional_effective_target_count": float(
             effective_target_count(conditional_weights).mean().cpu()
         ),
@@ -542,7 +428,7 @@ def _direction_evaluation(
         ),
         "mean_nearest_target_distance": float(nearest_target_distance.mean().cpu()),
         "nearest_target_distance_space": "l2_raw_decoder_codes",
-        "barycentric_retrieval_space": "l2_raw_decoder_codes",
+        "barycentric_projection_space": "l2_raw_decoder_codes",
         "matching_representation_ids": {
             "source": source_reference.matching_id, "target": target_reference.matching_id,
         },
@@ -558,7 +444,6 @@ def _direction_evaluation(
         "nearest_source_indices": nearest_source.cpu().tolist(),
         "conditional_distance_scales": {
             "query_source": query_source_scale,
-            "gallery_target": gallery_target_scale,
             "projection_target": projection_target_scale,
         },
     }
@@ -872,40 +757,6 @@ def _save_translation_grid(
     save_image(torch.cat(rows), str(output_path), nrow=count, padding=2, pad_value=1.0)
 
 
-def _format_proxy_metric(value: Any) -> str:
-    if value is None:
-        return "n/a"
-    return f"{100.0 * float(value):.1f}%"
-
-
-def _proxy_precision_caption(
-    precision: dict[str, dict[str, dict[str, Any]]],
-    attributes: list[str],
-) -> str:
-    if not attributes:
-        return "Proxy precision: no proxy attributes configured."
-    preferred_rules = ["conditional", "nn_barycentric", "nn_plan_row", "random"]
-    rules = [rule for rule in preferred_rules if rule in precision]
-    rules.extend(sorted(set(precision) - set(rules)))
-    lines = ["Proxy precision (source validation queries):"]
-    for rule in rules:
-        parts = []
-        for attribute in attributes:
-            metrics = precision.get(rule, {}).get(attribute, {})
-            precision_keys = sorted(
-                (key for key in metrics if key.startswith("precision_at_")),
-                key=lambda key: int(key.rsplit("_", 1)[-1]),
-            )
-            values = ", ".join(
-                f"P@{key.rsplit('_', 1)[-1]}={_format_proxy_metric(metrics.get(key))}"
-                for key in precision_keys
-            )
-            coverage = _format_proxy_metric(metrics.get("query_coverage"))
-            parts.append(f"{attribute}: {values or 'P@k=n/a'}, coverage={coverage}")
-        lines.append(f"{rule}: " + "; ".join(parts))
-    return "\n".join(lines)
-
-
 def _proxy_label_value(
     labels: dict[str, dict[str, Any]], sample_id: str, attribute: str
 ) -> str:
@@ -949,7 +800,6 @@ def _save_umap_visualizations(
     *,
     labels: dict[str, dict[str, Any]],
     attributes: list[str],
-    precision: dict[str, dict[str, dict[str, Any]]],
     direction: str,
     random_state: int,
     n_jobs: int,
@@ -998,7 +848,7 @@ def _save_umap_visualizations(
         "the target bank and orange/green for the projected source. Marker = point "
         "type. Target bank contains real target-domain codes; projected source "
         "contains mapped source-query codes.\n"
-        f"{coverage_caption}\n{_proxy_precision_caption(precision, attributes)}"
+        f"{coverage_caption}"
     )
     palette = [
         "#0072B2",  # blue
@@ -1186,20 +1036,6 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _write_rankings_csv(
-    path: Path,
-    source_ids: list[str],
-    top_ids: dict[str, list[str]],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["query_id", "rank", "target_id"])
-        for source_id in source_ids:
-            for rank, target_id in enumerate(top_ids[source_id], start=1):
-                writer.writerow([source_id, rank, target_id])
-
-
 def _numeric_comparison(current: Any, baseline: Any, prefix: str = "") -> dict[str, dict[str, float]]:
     comparisons: dict[str, dict[str, float]] = {}
     if isinstance(current, dict) and isinstance(baseline, dict):
@@ -1223,12 +1059,12 @@ def _numeric_comparison(current: Any, baseline: Any, prefix: str = "") -> dict[s
 
 
 def _checkpoint_selection_summary(
-    retrieval: dict[str, Any],
+    projections: dict[str, Any],
     reconstruction: dict[str, Any],
     baseline_comparison: dict[str, Any],
 ) -> dict[str, Any]:
     directions = {}
-    for name, result in retrieval.items():
+    for name, result in projections.items():
         directions[name] = {
             "projection_method": result["projection_method"],
             "projection_support": result["projection_support"],
@@ -1240,7 +1076,6 @@ def _checkpoint_selection_summary(
             "mean_target_norm_ratio": result[
                 "mean_projected_to_target_norm_ratio"
             ],
-            "conditional_proxy_precision": result["precision"].get("conditional", {}),
         }
     return {
         "primary_readout": "infoot_eq7_conditional_expectation",
@@ -1382,7 +1217,6 @@ def run_stage1b_evaluation(
     reference_split = str(data_config.get("reference_split", "train"))
     projection_split = str(data_config.get("projection_split", reference_split))
     query_split = str(data_config.get("query_split", "val"))
-    gallery_split = str(data_config.get("gallery_split", "val"))
     if reference_split == query_split:
         raise ValueError("Train-only evaluation requires different reference and query splits.")
     seed = int(evaluation_config.get("seed", 20260906))
@@ -1392,7 +1226,6 @@ def run_stage1b_evaluation(
     projection_count = max_projection if max_projection is not None else configured_projection_count
     projection_count = None if projection_count in {None, "all"} else int(projection_count)
     query_count = int(max_query or data_config.get("query_samples_per_domain", 256))
-    gallery_count = int(max_query or data_config.get("gallery_samples_per_domain", 256))
 
     banks: dict[str, dict[str, LatentBank]] = {"cat": {}, "dog": {}}
     for domain_index, domain in enumerate(("cat", "dog")):
@@ -1434,30 +1267,24 @@ def run_stage1b_evaluation(
                 checkpoint_id=checkpoint_id,
                 matching_head=getattr(context, "matching_head", None),
             )
-        for kind, split, count, offset in (
-            ("query", query_split, query_count, 100),
-            ("gallery", gallery_split, gallery_count, 200),
-        ):
-            banks[domain][kind] = build_latent_bank(
-                context.branch.encoder,
-                _dataset(context, split, root),
-                domain=domain,
-                split=split,
-                count=count,
-                seed=seed + domain_index * 1000 + offset,
-                batch_size=batch_size,
-                device=context.device,
-                dtype=context.dtype,
-                checkpoint_id=checkpoint_id,
-                matching_head=getattr(context, "matching_head", None),
-            )
+        banks[domain]["query"] = build_latent_bank(
+            context.branch.encoder,
+            _dataset(context, query_split, root),
+            domain=domain,
+            split=query_split,
+            count=query_count,
+            seed=seed + domain_index * 1000 + 100,
+            batch_size=batch_size,
+            device=context.device,
+            dtype=context.dtype,
+            checkpoint_id=checkpoint_id,
+            matching_head=getattr(context, "matching_head", None),
+        )
         validate_bank_compatibility(banks[domain]["reference"], banks[domain]["query"])
-        validate_bank_compatibility(banks[domain]["reference"], banks[domain]["gallery"])
         validate_bank_compatibility(
             banks[domain]["reference"], banks[domain]["projection"], require_disjoint=False
         )
         validate_bank_compatibility(banks[domain]["projection"], banks[domain]["query"])
-        validate_bank_compatibility(banks[domain]["projection"], banks[domain]["gallery"])
 
     distance_scale_mode = str(matching_config.get("distance_scale", "infoot_rms"))
     if distance_scale_mode == "infoot_rms":
@@ -1546,43 +1373,37 @@ def run_stage1b_evaluation(
         for bank in domain_banks.values():
             labels.update(_labels_for_bank(bank, external_labels))
     attributes = [str(value) for value in proxy_config.get("attributes", [])]
-    retrieval_config = _nested(evaluation_config, "retrieval")
-    ks = [int(value) for value in retrieval_config.get("k", [1, 5, 15])]
+    projection_config = _nested(evaluation_config, "projection")
 
-    retrieval: dict[str, Any] = {}
+    projections: dict[str, Any] = {}
     direction_tensors: dict[str, dict[str, torch.Tensor]] = {}
     directions = {
         "cat_to_dog": ("cat", "dog", solution.coupling),
         "dog_to_cat": ("dog", "cat", solution.coupling.transpose(0, 1)),
     }
-    for name in retrieval_config.get("directions", list(directions)):
+    for name in projection_config.get("directions", list(directions)):
         source_domain, target_domain, coupling = directions[str(name)]
-        direction_report, tensors = _direction_evaluation(
+        direction_report, tensors = _direction_projection_evaluation(
             banks[source_domain]["reference"],
             banks[target_domain]["reference"],
             banks[source_domain]["query"],
-            banks[target_domain]["gallery"],
             coupling,
             target_projection=banks[target_domain]["projection"],
             source_scale=scales[source_domain],
             target_scale=scales[target_domain],
             bandwidth=bandwidth,
-            labels=labels,
-            attributes=attributes,
-            ks=ks,
-            seed=seed + (1 if str(name) == "cat_to_dog" else 2),
             eps=float(infoot_config.get("numerical_epsilon", 1.0e-8)),
             distance_scale_mode=distance_scale_mode,
             projection_bandwidth=projection_bandwidth,
         )
-        retrieval[str(name)] = direction_report
+        projections[str(name)] = direction_report
         direction_tensors[str(name)] = tensors
         if prior is not None and all(
             key in prior.index for bank in (banks[source_domain]["query"], banks[target_domain]["projection"])
             for key in bank.sample_ids
         ):
-            # Teacher-based diagnostics supplement independent proxy precision;
-            # they measure the training prior, not generated-image structure.
+            # These diagnostics measure the frozen training prior, not
+            # independent validation or generated-image structure.
             query_structure = prior.lookup(
                 banks[source_domain]["query"].sample_ids, source_domain, query_split
             )
@@ -1597,7 +1418,7 @@ def run_stage1b_evaluation(
                 "uniform_expected_cost": float(structure_costs.mean()),
                 "nearest_descriptor_cost": float(structure_costs.min(1).values.mean()),
                 "semantic_prior_fingerprint": prior.fingerprint,
-                "interpretation": "Frozen training-prior retrieval cost; not independent validation or decoded-image similarity.",
+                "interpretation": "Frozen training-prior projection cost; not independent validation or decoded-image similarity.",
             }
             teacher_temperature = float(_nested(alignment_config, "conditional_structure").get("teacher_temperature", .05))
             if not math.isfinite(teacher_temperature) or teacher_temperature <= 0:
@@ -1617,11 +1438,6 @@ def run_stage1b_evaluation(
                 "reason": "Prior cache lacks some query or projection descriptors; transport evaluation remains available.",
                 "semantic_prior_fingerprint": prior.fingerprint,
             }
-        _write_rankings_csv(
-            output_root / "retrieval" / f"{name}_conditional_topk.csv",
-            banks[source_domain]["query"].sample_ids,
-            direction_report["conditional_top_ids"],
-        )
 
     reconstruction: dict[str, Any] = {}
     reconstruction_config = _nested(evaluation_config, "reconstruction")
@@ -1662,7 +1478,7 @@ def run_stage1b_evaluation(
                 teacher_codes=teacher_codes,
             )
             translation_paths[name] = str(path)
-            retrieval[name]["translation_grid_rows"] = [
+            projections[name]["translation_grid_rows"] = [
                 "source", "infoot_conditional_mean", "selected_target", "sampled_target",
             ] + (["structure_teacher_mean"] if teacher_codes is not None else [])
 
@@ -1685,7 +1501,6 @@ def run_stage1b_evaluation(
                 direction_tensors[name]["barycentric_codes"],
                 labels=labels,
                 attributes=attributes,
-                precision=retrieval[name]["precision"],
                 direction=name,
                 random_state=int(visualization_config.get("random_state", seed)),
                 n_jobs=int(visualization_config.get("n_jobs", 1)),
@@ -1710,7 +1525,7 @@ def run_stage1b_evaluation(
                 for kind, bank in domain_banks.items()
             },
             "reconstruction": reconstruction,
-            "retrieval": retrieval,
+            "projections": projections,
         }
         baseline_comparison = {
             "status": "compared",
@@ -1720,7 +1535,7 @@ def run_stage1b_evaluation(
     else:
         baseline_comparison = {"status": "missing", "baseline_report": str(baseline_report_path)}
     checkpoint_selection = _checkpoint_selection_summary(
-        retrieval, reconstruction, baseline_comparison
+        projections, reconstruction, baseline_comparison
     )
 
     report = Stage1BEvaluationReport(
@@ -1760,7 +1575,6 @@ def run_stage1b_evaluation(
         reference_sizes={domain: len(banks[domain]["reference"].sample_ids) for domain in banks},
         projection_sizes={domain: len(banks[domain]["projection"].sample_ids) for domain in banks},
         query_sizes={domain: len(banks[domain]["query"].sample_ids) for domain in banks},
-        gallery_sizes={domain: len(banks[domain]["gallery"].sample_ids) for domain in banks},
         distance_scales=scales,
         solver={
             "variant": eval_variant,
@@ -1806,7 +1620,7 @@ def run_stage1b_evaluation(
         reconstruction=reconstruction,
         baseline_comparison=baseline_comparison,
         checkpoint_selection=checkpoint_selection,
-        retrieval=retrieval,
+        projections=projections,
         translation_grids=translation_paths,
         visualization_paths=visualization_paths,
     )

@@ -197,7 +197,7 @@ preprocessing, a training-only cost calibration, and a content fingerprint.
 Training refuses missing/mismatched descriptors or a changed prior on resume.
 Evaluation includes the prior fingerprint in its protocol hash. A new descriptor
 bank requires a new output file. Descriptor agreement is training-prior evidence;
-independent proxy labels and decoded grids still determine correspondence quality.
+proxy-colored UMAP panels and decoded grids still show correspondence quality.
 For a matched Stage 1A + Fused InfoOT control, repeat command 3 without
 `--checkpoint`; existing plain-InfoOT reports remain separate controls.
 
@@ -205,8 +205,8 @@ For a matched Stage 1A + Fused InfoOT control, repeat command 3 without
 
 In `configs/stage1b_eval/quick_sit_b2.yaml`,
 `matching.bandwidth_multiplier` controls fitting the transport plan.
-`matching.projection_bandwidth_multiplier` controls conditional retrieval and
-Eq. (7) projection, including decoded means and UMAP. The Stage 1A cat/dog
+`matching.projection_bandwidth_multiplier` controls Eq. (7) projection,
+including decoded means and UMAP. The Stage 1A cat/dog
 sweep selected `0.10`; override it from the CLI for sensitivity checks:
 
 ```bash

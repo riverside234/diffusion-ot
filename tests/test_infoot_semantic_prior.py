@@ -332,8 +332,8 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, tr
     monkeypatch.setattr(evaluation, "_load_domain_context", eval_context)
     monkeypatch.setattr(evaluation, "_dataset", lambda ctx, split, root: Dataset(None, "cat" if ctx is latest_domains["cat"] else "dog", split))
     eval_config = {"project_root": str(tmp_path), "output_dir": "eval", "alignment_device": "cpu",
-                   "data": {"reference_samples_per_domain": 4, "query_samples_per_domain": 4,
-                            "gallery_samples_per_domain": 4}, "matching": {"bandwidth_multiplier": .7},
+                   "data": {"reference_samples_per_domain": 4, "query_samples_per_domain": 4},
+                   "matching": {"bandwidth_multiplier": .7},
                    "infoot": {"variant": "fused", "inner_iterations": 2},
                    "comparison": {"require_stage1a_baseline": False},
                    "reconstruction": {"enabled": False}, "translation": {"enabled": False},
@@ -344,12 +344,18 @@ def test_fused_training_resume_and_evaluation_pipeline(monkeypatch, tmp_path, tr
     assert result.solver["variant"] == "fused"
     assert result.solver["semantic_prior_fingerprint"] == payload["config"]["semantic_prior"]["fingerprint"]
     assert result.baseline_comparison["status"] == "missing"
-    assert result.retrieval["dog_to_cat"]["projection_target_count"] == 8
-    assert result.retrieval["dog_to_cat"]["structure_prior_diagnostics"]["conditional_expected_cost"] > 0
+    assert result.projections["dog_to_cat"]["projection_target_count"] == 8
+    assert result.projections["dog_to_cat"]["structure_prior_diagnostics"]["conditional_expected_cost"] > 0
     assert "sinkhorn_converged" in result.solver
+    output_dir = Path(result.output_dir)
+    assert not (output_dir / "retrieval").exists()
+    assert not (output_dir / "banks/dog_gallery.pt").exists()
+    report_payload = json.loads((output_dir / "evaluation_report.json").read_text())
+    assert "projections" in report_payload
+    assert "retrieval" not in report_payload
     if training_mode == "metric":
-        assert result.retrieval["dog_to_cat"]["matching_representation_ids"]["source"].startswith("residual_mlp_v1_")
-        assert result.retrieval["dog_to_cat"]["nearest_target_distance_space"] == "l2_raw_decoder_codes"
+        assert result.projections["dog_to_cat"]["matching_representation_ids"]["source"].startswith("residual_mlp_v1_")
+        assert result.projections["dog_to_cat"]["nearest_target_distance_space"] == "l2_raw_decoder_codes"
         bank = evaluation.load_latent_bank(Path(result.output_dir) / "banks/dog_reference.pt")
         head = latest_domains["dog"].matching_head
         torch.testing.assert_close(bank.matching_features, head(bank.raw_codes))

@@ -45,8 +45,8 @@ def test_cfg_alignment_config_uses_cfg_lora_stage1a_checkpoints():
         assert stage1a["adapter"]["lora_rank"] == 64
         assert stage1a["adapter"]["lora_alpha"] == 64
         assert stage1a["adapter"]["injection_layers"] == list(range(12))
-        assert stage1a["adapter"]["lora_layers"] == list(range(4, 12))
-        assert stage1a["train"]["max_steps"] == 40000
+        assert stage1a["adapter"]["lora_layers"] == list(range(12))
+        assert stage1a["train"]["max_steps"] == 50000
         assert stage1a["train"]["lr_lora"] == pytest.approx(0.000025)
         assert "_cfg_adaln_all_lora_r64/" in domain_config["checkpoint"]
     assert alignment["stage1a"]["require_semantic_cfg"] is True
@@ -102,6 +102,13 @@ def test_quick_evaluation_uses_the_training_infoot_kernel_and_entropy():
         "framing",
         "coat_color",
     ]
+    assert "retrieval" not in evaluation
+    assert "gallery_split" not in evaluation["data"]
+    assert "gallery_samples_per_domain" not in evaluation["data"]
+    assert evaluation["projection"]["directions"] == [
+        "cat_to_dog",
+        "dog_to_cat",
+    ]
     assert evaluation["visualization"]["target_alpha"] == pytest.approx(0.30)
     assert evaluation["visualization"]["projection_alpha"] == pytest.approx(0.90)
 
@@ -116,37 +123,6 @@ def test_stage1a_baseline_requirement_can_be_overridden_for_diagnostics():
     assert _stage1a_baseline_required(optional, None) is False
     assert _stage1a_baseline_required(required, False) is False
     assert _stage1a_baseline_required(optional, True) is True
-
-
-def test_proxy_precision_caption_includes_every_rule_attribute_and_k():
-    from diffusion_ot.evaluation.stage1b_eval import _proxy_precision_caption
-
-    precision = {
-        rule: {
-            attribute: {
-                "precision_at_1": 0.5,
-                "precision_at_5": 0.4,
-                "precision_at_15": None,
-                "query_coverage": 0.75,
-            }
-            for attribute in ("viewpoint", "framing", "coat_color")
-        }
-        for rule in ("random", "conditional", "nn_plan_row", "nn_barycentric")
-    }
-
-    caption = _proxy_precision_caption(
-        precision, ["viewpoint", "framing", "coat_color"]
-    )
-
-    for rule in precision:
-        assert f"{rule}:" in caption
-    assert caption.count("viewpoint:") == 4
-    assert caption.count("framing:") == 4
-    assert caption.count("coat_color:") == 4
-    assert caption.count("P@1=50.0%") == 12
-    assert caption.count("P@5=40.0%") == 12
-    assert caption.count("P@15=n/a") == 12
-    assert caption.count("coverage=75.0%") == 12
 
 
 def test_umap_visualization_writes_separate_labeled_readout_images(
@@ -246,16 +222,6 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
         "q0": {"viewpoint": "front", "framing": "close", "coat_color": "black"},
         "q1": {"viewpoint": "side", "framing": "wide", "coat_color": "white"},
     }
-    precision = {
-        "conditional": {
-            attribute: {"precision_at_1": 0.5, "query_coverage": 1.0}
-            for attribute in ("viewpoint", "framing", "coat_color")
-        },
-        "nn_barycentric": {
-            attribute: {"precision_at_1": 0.5, "query_coverage": 1.0}
-            for attribute in ("viewpoint", "framing", "coat_color")
-        },
-    }
     paths = {
         "conditional": tmp_path / "conditional.png",
         "barycentric": tmp_path / "barycentric.png",
@@ -268,7 +234,6 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
         torch.randn(2, 3),
         labels=labels,
         attributes=["viewpoint", "framing", "coat_color"],
-        precision=precision,
         direction="dog_to_cat",
         random_state=7,
         n_jobs=1,
@@ -285,7 +250,8 @@ def test_umap_visualization_writes_separate_labeled_readout_images(
         [axis.title for axis in figure.axes] == ["Viewpoint", "Framing", "Coat Color"]
         for figure in figures
     )
-    assert all("P@1=50.0%" in figure.caption for figure in figures)
+    assert all("Label coverage:" in figure.caption for figure in figures)
+    assert all("Proxy precision" not in figure.caption for figure in figures)
     plotted_alphas = {
         call["alpha"]
         for figure in figures
@@ -387,90 +353,52 @@ def test_latent_bank_roundtrip_keeps_raw_and_matching_features_separate(tmp_path
     assert not torch.equal(loaded.raw_codes, loaded.matching_features)
 
 
-def test_precision_at_k_uses_only_requested_proxy_attribute():
-    from diffusion_ot.evaluation.stage1b_eval import precision_at_k
-
-    rankings = torch.tensor([[0, 1, 2], [2, 1, 0]])
-    labels = {
-        "q0": {"viewpoint": "front", "framing": "close"},
-        "q1": {"viewpoint": "side", "framing": "close"},
-        "g0": {"viewpoint": "front", "framing": "wide"},
-        "g1": {"viewpoint": "front", "framing": "wide"},
-        "g2": {"viewpoint": "side", "framing": "wide"},
-    }
-    result = precision_at_k(
-        rankings,
-        ["q0", "q1"],
-        ["g0", "g1", "g2"],
-        labels,
-        attribute="viewpoint",
-        ks=[1, 2],
-    )
-
-    assert result["precision_at_1"] == pytest.approx(1.0)
-    assert result["precision_at_2"] == pytest.approx(0.75)
-    assert result["query_coverage"] == pytest.approx(1.0)
-
-
-def test_direction_evaluation_keeps_query_and_gallery_protocols_distinct():
-    from diffusion_ot.evaluation.stage1b_eval import _direction_evaluation
+def test_direction_projection_evaluation_uses_only_projection_support():
+    from diffusion_ot.evaluation.stage1b_eval import _direction_projection_evaluation
 
     source_reference = _bank("cat", "train", ["cr0", "cr1"])
     target_reference = _bank("dog", "train", ["dr0", "dr1", "dr2"])
     source_query = _bank("cat", "val", ["cq0", "cq1"])
-    target_gallery = _bank("dog", "val", ["dg0", "dg1"])
     coupling = torch.tensor([[0.2, 0.1, 0.2], [0.1, 0.25, 0.15]])
     coupling = coupling / coupling.sum()
-    labels = {sample_id: {"viewpoint": "front"} for sample_id in [
-        *source_query.sample_ids, *target_reference.sample_ids, *target_gallery.sample_ids
-    ]}
 
-    report, tensors = _direction_evaluation(
+    report, tensors = _direction_projection_evaluation(
         source_reference,
         target_reference,
         source_query,
-        target_gallery,
         coupling,
         source_scale=1.0,
         target_scale=1.0,
         bandwidth=1.0,
-        labels=labels,
-        attributes=["viewpoint"],
-        ks=[1],
-        seed=5,
         eps=1.0e-8,
     )
 
-    assert all(target_id.startswith("dg") for ids in report["conditional_top_ids"].values() for target_id in ids)
+    assert report["projection_target_count"] == len(target_reference.sample_ids)
+    assert "conditional_top_ids" not in report
+    assert "precision" not in report
     assert tensors["conditional_codes"].shape == (2, 3)
     assert tensors["barycentric_codes"].shape == (2, 3)
 
 
-def test_direction_evaluation_uses_official_cross_matrix_kernel_scales():
-    from diffusion_ot.evaluation.stage1b_eval import _direction_evaluation
+def test_direction_projection_evaluation_uses_official_cross_matrix_kernel_scales():
+    from diffusion_ot.evaluation.stage1b_eval import _direction_projection_evaluation
 
     source_reference = _bank("cat", "train", ["cr0", "cr1"])
     target_reference = _bank("dog", "train", ["dr0", "dr1", "dr2"])
     source_query = _bank("cat", "val", ["cq0", "cq1"])
-    target_gallery = _bank("dog", "val", ["dg0", "dg1"])
     target_projection = _bank("dog", "train", ["dp0", "dp1", "dp2", "dp3"])
     coupling = torch.tensor([[0.2, 0.1, 0.2], [0.1, 0.25, 0.15]])
     coupling /= coupling.sum()
 
-    report, _ = _direction_evaluation(
+    report, _ = _direction_projection_evaluation(
         source_reference,
         target_reference,
         source_query,
-        target_gallery,
         coupling,
         target_projection=target_projection,
         source_scale=99.0,
         target_scale=98.0,
         bandwidth=0.55,
-        labels={},
-        attributes=[],
-        ks=[1],
-        seed=5,
         eps=1.0e-8,
         distance_scale_mode="infoot_rms",
     )
@@ -483,9 +411,6 @@ def test_direction_evaluation_uses_official_cross_matrix_kernel_scales():
             "query_source": official_scale(
                 source_query.matching_features, source_reference.matching_features
             ),
-            "gallery_target": official_scale(
-                target_gallery.matching_features, target_reference.matching_features
-            ),
             "projection_target": official_scale(
                 target_projection.matching_features,
                 target_reference.matching_features,
@@ -494,33 +419,27 @@ def test_direction_evaluation_uses_official_cross_matrix_kernel_scales():
     )
 
 
-def test_direction_evaluation_projects_over_bank_larger_than_fit_references():
-    from diffusion_ot.evaluation.stage1b_eval import _direction_evaluation
+def test_direction_projection_evaluation_projects_over_bank_larger_than_fit_references():
+    from diffusion_ot.evaluation.stage1b_eval import _direction_projection_evaluation
     from diffusion_ot.losses.infoot import conditional_projection_weights
 
     source_reference = _bank("cat", "train", ["cr0", "cr1"])
     target_reference = _bank("dog", "train", ["dr0", "dr1", "dr2"])
     target_projection = _bank("dog", "train", ["dp0", "dp1", "dp2", "dp3"])
     source_query = _bank("cat", "val", ["cq0", "cq1"])
-    target_gallery = _bank("dog", "val", ["dg0", "dg1"])
     target_projection.raw_codes += 50
     coupling = torch.tensor([[0.2, 0.1, 0.2], [0.1, 0.25, 0.15]])
     coupling /= coupling.sum()
 
-    report, tensors = _direction_evaluation(
+    report, tensors = _direction_projection_evaluation(
         source_reference,
         target_reference,
         source_query,
-        target_gallery,
         coupling,
         target_projection=target_projection,
         source_scale=1.0,
         target_scale=1.0,
         bandwidth=1.0,
-        labels={},
-        attributes=[],
-        ks=[1],
-        seed=5,
         eps=1.0e-8,
     )
     expected_weights = conditional_projection_weights(
@@ -606,7 +525,6 @@ def test_checkpoint_selection_uses_full_mean_metrics():
                 "mean_conditional_effective_target_count": 12.5,
                 "mean_nearest_target_distance": 0.3,
                 "mean_projected_to_target_norm_ratio": 0.9,
-                "precision": {"conditional": {"viewpoint": {"precision_at_1": 0.6}}},
             }
         },
         {"cat": {"latent_mse": 0.1}},
@@ -639,14 +557,11 @@ def test_decoded_grid_receives_full_equation7_mean(
     coupling = coupling.T if reverse else coupling
     query = _bank(source.domain, "val", ["q0", "q1"])
     query.matching_features = source.matching_features[:2] + 0.3
-    gallery = _bank(target.domain, "val", ["g0", "g1"])
-    # Make accidental averaging of validation-gallery codes easy to detect.
-    gallery.raw_codes += 1000
     bandwidth, source_scale, target_scale = 0.7, 0.8, 1.3
-    report, tensors = stage1b._direction_evaluation(
-        source, target, query, gallery, coupling,
+    report, tensors = stage1b._direction_projection_evaluation(
+        source, target, query, coupling,
         source_scale=source_scale, target_scale=target_scale, bandwidth=bandwidth,
-        labels={}, attributes=[], ks=[1], seed=5, eps=1.0e-8,
+        eps=1.0e-8,
         projection_bandwidth=projection_bandwidth,
     )
     effective_bandwidth = bandwidth if projection_bandwidth is None else projection_bandwidth
@@ -670,24 +585,14 @@ def test_decoded_grid_receives_full_equation7_mean(
     assert report["fit_bandwidth_multiplier"] == bandwidth
     assert report["projection_bandwidth_multiplier"] == effective_bandwidth
     # The same coupling gives the same barycentric control for either width.
-    default_report, default_tensors = stage1b._direction_evaluation(
-        source, target, query, gallery, coupling,
+    _, default_tensors = stage1b._direction_projection_evaluation(
+        source, target, query, coupling,
         source_scale=source_scale, target_scale=target_scale, bandwidth=bandwidth,
-        labels={}, attributes=[], ks=[1], seed=5, eps=1.0e-8,
+        eps=1.0e-8,
     )
     torch.testing.assert_close(tensors["barycentric_codes"], default_tensors["barycentric_codes"])
     if projection_bandwidth is not None:
         assert not torch.allclose(tensors["conditional_codes"], default_tensors["conditional_codes"])
-
-    # Retrieval uses the same projection bandwidth, evaluated on gallery points.
-    kg = torch.exp(-torch.cdist(gallery.matching_features, target.matching_features).square()
-                   / (2 * (effective_bandwidth * target_scale) ** 2))
-    scores = (kx @ coupling @ kg.T) / ((kx @ a)[:, None] * (kg @ b)[None, :])
-    expected_top = scores.argmax(dim=1).tolist()
-    assert report["conditional_top_ids"] == {
-        sample_id: [gallery.sample_ids[index]]
-        for sample_id, index in zip(query.sample_ids, expected_top)
-    }
 
     decoder_codes, decoder_noise = [], []
 

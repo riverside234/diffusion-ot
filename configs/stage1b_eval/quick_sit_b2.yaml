@@ -9,11 +9,9 @@ data:
   # Eq. (7) is fit on the reference subset and averaged over this larger bank.
   projection_split: train
   query_split: val
-  gallery_split: val
   reference_samples_per_domain: 512
   projection_samples_per_domain: all
   query_samples_per_domain: 256
-  gallery_samples_per_domain: 256
   batch_size: 32
   num_workers: 4
   pin_memory: true
@@ -23,7 +21,7 @@ data:
 #           "coat_color": "black"}.
 # The relative path resolves under project_root, currently
 # /data/not_backed_up/yxu209/diffusion-ot/. The file must exist and contain
-# labels for the sample IDs whose proxy precision or UMAP colors are required.
+# labels for the sample IDs whose UMAP colors are required.
 proxy_labels:
   path: data/proxy_labels/afhq_viewpoint_framing.jsonl
   attributes: [viewpoint, framing, coat_color]
@@ -37,7 +35,7 @@ matching:
   # paper. With the official RMS distance scale above, this also avoids the nearly
   # constant kernels produced by h=1.0 in the Stage 1A baseline.
   bandwidth_multiplier: 0.55
-  # Conditional retrieval and Eq. (7) readouts only. The Stage 1A sweep found
+  # Conditional Eq. (7) projection readouts only. The Stage 1A sweep found
   # 0.10 at the useful knee: about 23-25 effective targets, before the marked
   # norm shrinkage and support growth at 0.15 and above.
   # CLI overrides remain available for sensitivity checks.
@@ -53,10 +51,8 @@ infoot:
   initialization: independent_product
   numerical_epsilon: 0.00000001
 
-retrieval:
-  k: [1, 5, 15]
+projection:
   directions: [cat_to_dog, dog_to_cat]
-  rules: [random, conditional, nn_plan_row, nn_barycentric]
 
 reconstruction:
   enabled: true

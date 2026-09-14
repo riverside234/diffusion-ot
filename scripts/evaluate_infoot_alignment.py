@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-query", type=int, default=None)
     parser.add_argument(
         "--projection-bandwidth", type=float, default=None,
-        help="Override the conditional retrieval/projection bandwidth multiplier; "
+        help="Override the conditional-projection bandwidth multiplier; "
         "the InfoOT fitting bandwidth is unchanged.",
     )
     parser.add_argument(

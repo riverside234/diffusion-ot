@@ -104,7 +104,8 @@ def test_matching_head_learns_conditional_structure_with_fixed_decoder_codes():
 
 def test_banks_reject_changed_matching_geometry_and_keep_raw_distance_controls(tmp_path):
     from diffusion_ot.evaluation.stage1b_eval import (
-        LatentBank, _direction_evaluation, load_latent_bank, save_latent_bank, validate_bank_compatibility,
+        LatentBank, _direction_projection_evaluation, load_latent_bank,
+        save_latent_bank, validate_bank_compatibility,
     )
     raw = torch.eye(3)
     # Different dimensions make mixing matching and raw spaces an immediate error.
@@ -112,16 +113,16 @@ def test_banks_reject_changed_matching_geometry_and_keep_raw_distance_controls(t
     def bank(domain, split):
         return LatentBank(domain, split, raw, geometry, [f"{domain}_{split}_{i}" for i in range(3)],
                           [{}] * 3, f"{domain}_checkpoint", matching_id="head_a")
-    source, query, target, gallery = bank("cat", "train"), bank("cat", "val"), bank("dog", "train"), bank("dog", "val")
+    source, query, target = bank("cat", "train"), bank("cat", "val"), bank("dog", "train")
     changed = deepcopy(query)
     changed.matching_id = "head_b"
     with pytest.raises(ValueError, match="matching heads"):
         validate_bank_compatibility(source, changed)
     save_latent_bank(tmp_path / "bank.pt", target)
     assert load_latent_bank(tmp_path / "bank.pt").matching_id == "head_a"
-    report, tensors = _direction_evaluation(
-        source, target, query, gallery, torch.eye(3)/3, source_scale=1., target_scale=1.,
-        bandwidth=.01, labels={}, attributes=[], ks=[1], seed=2, eps=1e-8,
+    report, tensors = _direction_projection_evaluation(
+        source, target, query, torch.eye(3)/3, source_scale=1., target_scale=1.,
+        bandwidth=.01, eps=1e-8,
     )
     assert report["mean_nearest_target_distance"] < 1e-6
     torch.testing.assert_close(tensors["conditional_codes"], raw)
