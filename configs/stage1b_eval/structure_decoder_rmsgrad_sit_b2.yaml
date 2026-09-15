@@ -1,6 +1,7 @@
+# Evaluation output for the corrected-RMS-only control.
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_structure_decoder_infoot_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg
+output_dir: outputs/stage1b_eval_structure_decoder_infoot_cfg_adaln_all_lora_r64_steps20_rmsgrad
 seed: 20260906
 alignment_device: cuda:0
 

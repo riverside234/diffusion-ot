@@ -1,5 +1,6 @@
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -218,7 +219,10 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
                stage1a={d: {"config": f"{d}.yaml"} for d in originals},
                data={"transport_batch_size": 8, "reconstruction_batch_size": 4, "num_workers": 0,
                      "random_horizontal_flip": 0, "pin_memory": False},
-               matching={"bandwidth_multiplier": .7, "calibration_samples": 8},
+               matching={"bandwidth_multiplier": .7, "calibration_samples": 8,
+                         "distance_scale_gradient": "full"},
+               matching_regularization={"enabled": True, "std_target": .7,
+                                        "variance_weight": .02, "covariance_weight": .001},
                infoot={"variant": "fused", "inner_iterations": 2, "entropy_epsilon": .2},
                semantic_prior={"path": "prior.pt"},
                loss_weights={"semantic_neighborhood": .05, "conditional_structure": .05},
@@ -235,6 +239,49 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
     assert payload["decoded_discriminator_updates"] == 2
     initial_discriminator = deepcopy(payload["decoded_discriminators"])
     validation = [json.loads(row) for row in (tmp_path / "out/logs/validation.jsonl").read_text().splitlines()]
+    training = [json.loads(row) for row in (tmp_path / "out/logs/train.jsonl").read_text().splitlines()]
+    for row in training:
+        assert row["infoot_distance_scale_gradient"] == "full"
+        protection = row["matching_regularization"]
+        assert row["matching_regularization_loss"] == pytest.approx(
+            .02 * protection["variance_loss"] + .001 * protection["covariance_loss"])
+        for domain in ("cat", "dog"):
+            assert protection[domain]["samples"] == row["infoot_reference_counts"][domain] == 6
+            assert protection[domain]["matching_variance"] == pytest.approx(row["matching_feature_variance"][domain])
+        for group in ("encoder", "matching_head"):
+            assert row[f"weighted_matching_regularization_{group}_gradient_norm"] > 0
+        for group in ("encoder", "matching_head", "generator"):
+            assert row[f"weighted_decoded_{group}_gradient_norm"] > 0
+        decoded = row["decoded_translation"]
+        assert decoded["effective_weighted_loss"] == pytest.approx(decoded["weighted_loss"] * decoded["ramp"])
+        assert 0 < decoded["discriminator_clip_scale"] <= 1
+        assert row["feature_geometry"]["cat"]["raw_normalized_variance"] > 0
+    first = training[0]
+    # The protection is included at full configured strength from update 1,
+    # even though the other alignment/image objectives are still warming up.
+    assert first["window_mean"]["auxiliary_objective"] == pytest.approx(
+        first["alignment_weight"] * first["infoot_feature_loss"]
+        + first["semantic_neighborhood_weight"] * first["semantic_neighborhood_loss"]
+        + first["conditional_structure_weight"] * first["conditional_structure_loss"]
+        + first["decoded_translation"]["effective_weighted_loss"]
+        + first["matching_regularization_loss"], abs=1e-6)
+    assert all("feature_geometry" in row["projection_probe"] for row in validation)
+    for row in validation:
+        assert row["matching_regularization_loss"] > 0
+        for domain in ("cat", "dog"):
+            assert row["matching_regularization"][domain]["matching_variance"] == pytest.approx(
+                row["projection_probe"]["matching_feature_variance"][domain])
+        assert "plan_delta_l1" in row["projection_probe"]
+        solver = row["decoded_translation"]["solver"]
+        assert solver["sinkhorn_converged"]
+        assert solver["iterations"] > 0
+        assert solver["plan_delta_l1"] >= 0
+    initial_probe = validation[0]
+    for domain in ("cat", "dog"):
+        for key in ("stage1a_encoder_current_generator_reconstruction",
+                    "current_encoder_stage1a_generator_reconstruction"):
+            assert initial_probe[f"{domain}_{key}"] == pytest.approx(initial_probe[f"{domain}_stage1a_reconstruction"])
+            assert all(math.isfinite(row[f"{domain}_{key}"]) for row in validation)
     for domain in originals:
         current, original = latest[domain].branch, originals[domain].branch
         initial = original.state_dict()
@@ -269,6 +316,11 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
     del broken["generator_ema"]["cat"]
     with pytest.raises(ValueError, match="generator_ema.cat"):
         load_joint_generator(branch(), broken, "cat", weights="ema")
+    cfg["matching_regularization"]["covariance_weight"] = .002
+    path.write_text(yaml.safe_dump(cfg))
+    with pytest.raises(ValueError, match="Resume cannot change matching_regularization"):
+        train.train_joint_infoot(path, max_steps=4, resume_from="latest")
+    cfg["matching_regularization"]["covariance_weight"] = .001
     cfg["decoded_translation"]["structure_weight"] = .2
     path.write_text(yaml.safe_dump(cfg))
     with pytest.raises(ValueError, match="Resume cannot change decoded_translation"):

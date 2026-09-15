@@ -1,6 +1,9 @@
+# Original Experiment D control (log reviewed through step 2600).
+# Omitted distance_scale_gradient retains historical detached-RMS updates and
+# exact config compatibility with checkpoints saved before the RMS correction.
 stage: stage1b_fused_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg
+output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20
 
 stage1a:
   weights: ema
@@ -65,10 +68,6 @@ matching:
   calibration_samples: 256
   # Match InfoOT.compute_kernel: sqrt(mean(pairwise_distance^2) / 2).
   distance_scale: infoot_rms
-  # Differentiate the RMS estimate in neural losses as well as distances.
-  # This changes the update rule: start fresh from Stage 1A in the new folder.
-  # The original run is preserved by structure_decoder_detached_sit_b2.yaml.
-  distance_scale_gradient: full
   bandwidth_multiplier: 0.70
 
 infoot:
@@ -77,14 +76,13 @@ infoot:
   algorithm: official_projected_sinkhorn
   mi_weight: 0.10  # Weaker MI feedback in the inner plan; fixed structure cost remains 1.0.
   entropy_epsilon: 0.05
-  inner_iterations: 300  # Outer update budget; stop early after convergence.
+  inner_iterations: 100
   projection_iterations: 2000
   projection_tolerance: 0.00001
   outer_tolerance: 0.00001
   min_inner_iterations: 5
   outer_patience: 3
   strict_convergence: true
-  require_outer_convergence: true  # Feasible marginals alone are insufficient.
   initialization: independent_product
   numerical_epsilon: 0.00000001
 
@@ -141,17 +139,6 @@ matching_head:
   lr: 0.0002
   grad_clip_norm: 1.0
 
-
-# VICReg-inspired protection of post-L2 OT references, independently per domain.
-# Loss uses sqrt(feature_dim) * m(z), population covariance, and the MEAN
-# squared off-diagonal entry. Active from step 1 without alignment warmup.
-# Compare to structure_decoder_rmsgrad_sit_b2.yaml (no protection).
-matching_regularization:
-  enabled: true
-  std_target: 0.70
-  variance_weight: 0.02
-  covariance_weight: 0.001
-  eps: 0.0001
 
 # Experiment D: freeze pretrained SiT/VAE/null token, adapt all added G layers.
 generator_adaptation:

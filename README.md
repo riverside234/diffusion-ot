@@ -74,6 +74,19 @@ format.
 
 ## Experiment D co-training
 
+The active config now differentiates the feature-dependent InfoOT RMS kernel
+scale (`matching.distance_scale_gradient: full`). The step-2,600 review found
+a reproducible spurious shrinkage gradient when that scale was detached.
+The full validation also exposed an unfinished outer OT solve. Active D now
+requires outer convergence, with a 300-iteration budget and early stopping.
+The active revision also protects matching-feature variance and adds a modest
+covariance penalty from update 1. Start it from Stage 1A in the new
+`_rmsgrad_vicreg` output directory. `structure_decoder_rmsgrad_sit_b2.yaml`
+preserves the corrected-RMS-only comparison; `structure_decoder_detached_sit_b2.yaml`
+preserves the original Experiment D settings and checkpoint compatibility.
+See the [log analysis](docs/analysis/stage1b_experiment_d_2600/review.md) and
+[protection definition and comparison protocol](docs/analysis/stage1b_experiment_d_vicreg.md).
+
 Run an initial 5,000-update checkpoint review. This reaches well beyond the
 2,000-update decoded-loss ramp while avoiding the cost of the full run before
 the first image-quality check.
@@ -91,7 +104,7 @@ weights:
 python3 scripts/evaluate_infoot_alignment.py \
   --alignment-config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
   --eval-config configs/stage1b_eval/structure_decoder_sit_b2.yaml \
-  --checkpoint outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20/checkpoints/latest.pt \
+  --checkpoint outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg/checkpoints/latest.pt \
   --no-require-stage1a-baseline
 ```
 
@@ -117,11 +130,22 @@ The active defaults are:
 | Adapter / LoRA LR | `1e-5` / `5e-6` |
 | InfoOT fit / projection bandwidth | `0.70` / `0.10` |
 | Entropy regularization | `0.05` |
+| Outer OT update budget / tolerance | `300` / `1e-5`, convergence required |
+| Matching variance / covariance weights | `0.02` / `0.001`, from update 1 |
+| Matching scaled standard-deviation floor | `0.70`, on `sqrt(dim) * m(z)` |
 | Same-domain semantic dropout | `0.10` |
 | Decoded sampler steps | `20` |
 | Decoded structure / adversarial weight | `0.10` / `0.01` |
 | Decoded-loss ramp | 2,000 updates |
 | Validation / checkpoint interval | 500 / 1,000 updates |
+
+Matching protection uses the 96 normalized OT references independently per
+domain. Covariance is the mean squared off-diagonal population covariance
+of the scaled features. The floor is a soft penalty, and these initial weights
+still need AFHQ evaluation. Raw decoder codes and projected means are not its
+targets. Training and fixed validation log weighted/unweighted terms, spread,
+and the fraction of coordinates below the floor; training also measures the
+regularizer's encoder/head gradients. Changing these settings requires a fresh run.
 
 These are experiment settings, not demonstrated optima. The training batch uses
 the full shuffled training split over time. Each update draws 128 samples per

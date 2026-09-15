@@ -50,7 +50,8 @@ def test_log_projection_numerical_gradients_and_small_bandwidth_do_not_clip():
         assert features.grad.norm() > 0
 
 
-def test_conditional_structure_updates_both_domains_but_not_teacher_or_plan():
+@pytest.mark.parametrize("differentiate_scale", [False, True])
+def test_conditional_structure_updates_both_domains_but_not_teacher_or_plan(differentiate_scale):
     torch.manual_seed(144)
     references = {d: torch.randn(6, 5, requires_grad=True) for d in ("cat", "dog")}
     queries = {d: torch.randn(3, 5, requires_grad=True) for d in references}
@@ -58,7 +59,8 @@ def test_conditional_structure_updates_both_domains_but_not_teacher_or_plan():
     query_structures = {d: torch.randn(3, 4, requires_grad=True) for d in references}
     plan = (torch.eye(6) * .9 / 6 + torch.ones(6, 6) * .1 / 36).requires_grad_()
     result = conditional_structure_loss(references, queries, structures, query_structures, plan,
-                                        bandwidth=.1, cost_scale=2, teacher_temperature=.1)
+                                        bandwidth=.1, cost_scale=2, teacher_temperature=.1,
+                                        differentiate_distance_scale=differentiate_scale)
     result.loss.backward()
     for d in references:
         for value in (references[d], queries[d]):
@@ -116,6 +118,35 @@ def test_solver_reports_failure_and_only_stops_on_feasible_stable_plans():
     diagnostics = transport_diagnostics(stable.coupling)
     assert diagnostics["normalized_row_entropy"] == pytest.approx(1.0)
     assert diagnostics["mean_row_effective_targets"] == pytest.approx(6.0)
+
+
+def test_outer_convergence_requirement_rejects_feasible_unfinished_plan_and_stops_early():
+    from diffusion_ot.losses.infoot import solver_kwargs
+
+    features = torch.zeros(4, 2, dtype=torch.float64)
+    cost = 1 - torch.eye(4, dtype=torch.float64)
+    settings = solver_kwargs({"strict_convergence": True, "inner_iterations": 1,
+                              "outer_tolerance": 1e-6, "entropy_epsilon": .5})
+    unfinished = solve_infoot(features, features, cross_cost=cost, **settings)
+    assert unfinished.sinkhorn_converged
+    assert not unfinished.outer_converged
+    assert unfinished.plan_delta_l1 > settings["outer_tolerance"]
+    settings.update(solver_kwargs({"require_outer_convergence": True,
+                                   "strict_convergence": True, "inner_iterations": 1,
+                                   "outer_tolerance": 1e-6, "entropy_epsilon": .5}))
+    with pytest.raises(RuntimeError, match="outer updates did not converge after 1 iterations"):
+        solve_infoot(features, features, cross_cost=cost, **settings)
+    settings["inner_iterations"] = 300
+    stable = solve_infoot(features, features, cross_cost=cost, **settings)
+    assert stable.sinkhorn_converged and stable.outer_converged
+    assert stable.iterations == 5
+    torch.testing.assert_close(stable.coupling, unfinished.coupling)
+
+
+def test_requiring_outer_convergence_cannot_disable_its_tolerance():
+    features = torch.zeros(3, 2)
+    with pytest.raises(ValueError, match="positive outer_tolerance"):
+        solve_infoot(features, features, require_outer_convergence=True, outer_tolerance=0)
 
 
 def test_reducing_inner_mi_weight_avoids_assignment_saturation_on_high_dimensional_features():

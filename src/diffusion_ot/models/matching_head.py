@@ -64,6 +64,33 @@ def matching_features(codes: torch.Tensor, head: nn.Module | None = None) -> tor
     return F.normalize(codes.float(), dim=-1) if head is None else head(codes.float())
 
 
+@torch.no_grad()
+def matching_geometry_diagnostics(codes: torch.Tensor, features: torch.Tensor) -> dict[str, float]:
+    """Separate decoder-code spread from matching-head concentration.
+
+    Variance is the trace of the population covariance. Effective rank uses
+    its eigenvalue entropy, computed via the smaller sample Gram matrix.
+    Neither statistic constrains the variance of conditional means.
+    """
+    raw = codes.detach().float()
+    normalized = F.normalize(raw, dim=-1)
+    features = features.detach().float()
+    centered = features - features.mean(0)
+    variance = centered.square().sum(1).mean()
+    raw_variance = normalized.var(0, unbiased=False).sum()
+    eigenvalues = torch.linalg.eigvalsh(centered @ centered.T / len(features)).clamp_min(0)
+    probabilities = eigenvalues / eigenvalues.sum().clamp_min(1e-12)
+    effective_rank = (-(probabilities * probabilities.clamp_min(1e-12).log()).sum()).exp()
+    return {
+        "raw_code_variance": float(raw.var(0, unbiased=False).sum()),
+        "raw_normalized_variance": float(raw_variance),
+        "matching_variance": float(variance),
+        "matching_to_raw_variance_ratio": float(variance / raw_variance.clamp_min(1e-12)),
+        "matching_mean_norm": float(features.mean(0).norm()),
+        "matching_covariance_effective_rank": float(effective_rank) if variance > 1e-12 else 0.0,
+    }
+
+
 def matching_head_id(head: nn.Module | None) -> str:
     if head is None:
         return "l2_raw_v1"

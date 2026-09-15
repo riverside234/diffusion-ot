@@ -1,6 +1,7 @@
+# Control: corrected RMS gradients without variance/covariance protection.
 stage: stage1b_fused_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg
+output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad
 
 stage1a:
   weights: ema
@@ -95,7 +96,7 @@ trainable:
   base_transformers: false
 
 quick_evaluation:
-  config: configs/stage1b_eval/structure_decoder_sit_b2.yaml
+  config: configs/stage1b_eval/structure_decoder_rmsgrad_sit_b2.yaml
   weights: ema
   # Invoke scripts/train_joint_infoot.py with --quick-eval to preserve the
   # Stage 1A baseline before training and compare the final checkpoint to it.
@@ -141,17 +142,6 @@ matching_head:
   lr: 0.0002
   grad_clip_norm: 1.0
 
-
-# VICReg-inspired protection of post-L2 OT references, independently per domain.
-# Loss uses sqrt(feature_dim) * m(z), population covariance, and the MEAN
-# squared off-diagonal entry. Active from step 1 without alignment warmup.
-# Compare to structure_decoder_rmsgrad_sit_b2.yaml (no protection).
-matching_regularization:
-  enabled: true
-  std_target: 0.70
-  variance_weight: 0.02
-  covariance_weight: 0.001
-  eps: 0.0001
 
 # Experiment D: freeze pretrained SiT/VAE/null token, adapt all added G layers.
 generator_adaptation:

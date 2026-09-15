@@ -206,6 +206,21 @@ def _autograd_norm(loss: torch.Tensor, parameters: list[torch.nn.Parameter]) -> 
     return math.sqrt(squared)
 
 
+def _autograd_group_norms(loss: torch.Tensor, groups: dict[str, list[torch.nn.Parameter]]) -> dict[str, float]:
+    """Measure all groups with one graph traversal; do not assign grads."""
+    parameters = [p for group in groups.values() for p in group]
+    gradients = iter(torch.autograd.grad(loss, parameters, retain_graph=True, allow_unused=True))
+    norms = {}
+    for name, group in groups.items():
+        squared = 0.0
+        for _ in group:
+            gradient = next(gradients)
+            if gradient is not None:
+                squared += float(gradient.detach().float().square().sum())
+        norms[name] = math.sqrt(squared)
+    return norms
+
+
 @torch.no_grad()
 def _clip_gradient_norm(parameters: list[torch.nn.Parameter], maximum: float | None) -> float:
     norm = _gradient_norm(parameters)
@@ -441,6 +456,14 @@ def fixed_reconstruction_probe(
                     torch.manual_seed(seed + offset)
                     result[f"{domain}_stage1a_null_reconstruction"] = float(_reconstruction_loss(
                         value, x, reference, force_null=True, generator_parameters=generator_baselines[domain]))
+                    # Paired cross probes locate E/G drift using the same
+                    # latents, flow times and noise as the current/baseline pair.
+                    torch.manual_seed(seed + offset)
+                    result[f"{domain}_stage1a_encoder_current_generator_reconstruction"] = float(
+                        _reconstruction_loss(value, x, reference))
+                    torch.manual_seed(seed + offset)
+                    result[f"{domain}_current_encoder_stage1a_generator_reconstruction"] = float(
+                        _reconstruction_loss(value, x, z, generator_parameters=generator_baselines[domain]))
             finally:
                 encoder.train(was_training)
     return result
@@ -585,11 +608,12 @@ def fixed_conditional_structure_probe(
     anchor_variances: dict[str, float] | None = None,
     projection_support_options: dict[str, Any] | None = None,
     matching_heads: dict[str, torch.nn.Module] | None = None,
+    matching_regularization_options: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Fixed train references / validation queries; no updates or RNG consumption."""
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
     from diffusion_ot.losses.infoot import infoot_distance_scale, solve_infoot, transport_diagnostics
-    from diffusion_ot.models.matching_head import matching_features
+    from diffusion_ot.models.matching_head import matching_features, matching_geometry_diagnostics
 
     states = {domain: value.branch.encoder.training for domain, value in domains.items()}
     references, queries, reference_structure, query_structure, anchor_codes = {}, {}, {}, {}, {}
@@ -642,9 +666,13 @@ def fixed_conditional_structure_probe(
                 "sinkhorn_converged": solution.sinkhorn_converged,
                 "row_residual": solution.row_residual, "column_residual": solution.column_residual,
                 "iterations": solution.iterations, "outer_converged": solution.outer_converged,
+                "plan_delta_l1": solution.plan_delta_l1,
                 "transport": transport_diagnostics(solution.coupling),
                 "matching_feature_variance": {
                     d: float(feature.var(0, unbiased=False).sum()) for d, feature in features.items()
+                },
+                "feature_geometry": {
+                    d: matching_geometry_diagnostics(references[d], feature) for d, feature in features.items()
                 },
             },
         }
@@ -656,6 +684,11 @@ def fixed_conditional_structure_probe(
             )
             metrics["projection_support_loss"] = float(support.loss)
             metrics["projection_support"] = support.metrics
+        if matching_regularization_options is not None:
+            from diffusion_ot.losses.matching_regularization import matching_regularization_loss
+            protection = matching_regularization_loss(features, **matching_regularization_options)
+            metrics["matching_regularization_loss"] = float(protection.loss)
+            metrics["matching_regularization"] = protection.metrics
         return metrics
     finally:
         for domain, value in domains.items():
@@ -701,6 +734,16 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
                 {d: data["reference_latents"] for d, data in inputs.items()},
                 step=0, validation_seed=seed)
             metrics["seed"] = seed
+            # This probe refits its own plan; do not borrow convergence from
+            # the conditional probe, which can encode references in chunks.
+            metrics["solver"] = {
+                "iterations": solution.iterations,
+                "sinkhorn_converged": solution.sinkhorn_converged,
+                "outer_converged": solution.outer_converged,
+                "plan_delta_l1": solution.plan_delta_l1,
+                "row_residual": solution.row_residual,
+                "column_residual": solution.column_residual,
+            }
             metrics["reference_ids"] = {d: data["reference_ids"] for d, data in inputs.items()}
             count = int(decoder_training.options.get("batch_size", 4))
             metrics["query_ids"] = {d: data["query_ids"][:count] for d, data in inputs.items()}
@@ -737,6 +780,9 @@ def train_joint_infoot(
     )
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
     from diffusion_ot.losses.projection_support import projection_support_loss, support_options
+    from diffusion_ot.losses.matching_regularization import (
+        matching_regularization_loss, matching_regularization_options,
+    )
     from diffusion_ot.training.gradient_guard import guarded_backward
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec, matching_features
     from diffusion_ot.models.generator_adaptation import generator_adaptation_enabled
@@ -759,11 +805,18 @@ def train_joint_infoot(
     ema_config = _nested(config, "ema")
     loss_weights = _nested(config, "loss_weights")
     matching_config = _nested(config, "matching")
+    scale_gradient = str(matching_config.get("distance_scale_gradient", "detached"))
+    if scale_gradient not in {"detached", "full"}:
+        raise ValueError("matching.distance_scale_gradient must be detached or full.")
+    differentiate_distance_scale = scale_gradient == "full"
+    if differentiate_distance_scale and matching_config.get("distance_scale", "infoot_rms") != "infoot_rms":
+        raise ValueError("Full distance-scale gradients require matching.distance_scale=infoot_rms.")
     infoot_config = _nested(config, "infoot")
     conditional_config = _nested(config, "conditional_structure")
     conditional_enabled = bool(conditional_config.get("enabled", False))
     head_spec = matching_head_spec(config)
     head_config = _nested(config, "matching_head")
+    matching_protection_options = matching_regularization_options(_nested(config, "matching_regularization"))
     if head_spec["enabled"]:
         if not conditional_enabled:
             raise ValueError("Learned matching heads require conditional structure training.")
@@ -1065,6 +1118,7 @@ def train_joint_infoot(
                 anchors=anchors, anchor_variances=anchor_variances,
                 projection_support_options=support_options(support_config) if support_enabled else None,
                 matching_heads=matching_heads,
+                matching_regularization_options=matching_protection_options,
             ))
         if decoder_training is not None:
             metrics["decoded_translation"] = fixed_decoded_translation_probe(
@@ -1159,6 +1213,11 @@ def train_joint_infoot(
         reference_matching = {
             domain: code[:-query_count] if query_count else code for domain, code in matching_z.items()
         }
+        matching_protection = None
+        matching_protection_loss = torch.zeros((), device=alignment_device)
+        if matching_protection_options is not None:
+            matching_protection = matching_regularization_loss(reference_matching, **matching_protection_options)
+            matching_protection_loss = matching_protection.loss
         cat_features = reference_matching["cat"]
         dog_features = reference_matching["dog"]
         if distance_scale_mode == "infoot_rms":
@@ -1179,13 +1238,19 @@ def train_joint_infoot(
             cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
             **solver_options,
         )
+        # The solve is detached, but the neural objective must differentiate
+        # the RMS estimate as well as distances when full gradients are enabled.
+        feature_distance_scales = ({
+            "cat": infoot_distance_scale(cat_features, detach=False),
+            "dog": infoot_distance_scale(dog_features, detach=False),
+        } if differentiate_distance_scale else solve_distance_scales)
         infoot_loss = plain_infoot_feature_loss(
             cat_features,
             dog_features,
             solution.coupling.detach(),
             bandwidth=bandwidth,
-            distance_scale_x=solve_distance_scales["cat"],
-            distance_scale_y=solve_distance_scales["dog"],
+            distance_scale_x=feature_distance_scales["cat"],
+            distance_scale_y=feature_distance_scales["dog"],
             mi_weight=float(infoot_config.get("mi_weight", 1.0)),
             eps=float(infoot_config.get("numerical_epsilon", 1.0e-8)),
         )
@@ -1203,6 +1268,7 @@ def train_joint_infoot(
                 teacher_temperature=float(conditional_config.get("teacher_temperature", 0.05)),
                 reference_matching=reference_matching,
                 query_matching={domain: code[-query_count:] for domain, code in matching_z.items()},
+                differentiate_distance_scale=differentiate_distance_scale,
             )
             projection_loss = conditional_result.loss
         support_result = None
@@ -1242,6 +1308,8 @@ def train_joint_infoot(
             + conditional_weight * warmup * projection_loss
             + support_weight * warmup * support_loss
             + decoded_loss
+            # Protect the reference geometry from update 1, including warmup.
+            + matching_protection_loss
         )
         total = primary_objective + auxiliary_objective
         if not torch.isfinite(total):
@@ -1279,6 +1347,27 @@ def train_joint_infoot(
             if support_enabled:
                 gradient_diagnostics["weighted_projection_support_gradient_norm"] = _autograd_norm(
                     support_weight * warmup * support_loss, parameters
+                )
+            if matching_protection is not None:
+                protection_norms = _autograd_group_norms(matching_protection_loss, {
+                    "encoder": parameters, "matching_head": head_parameters,
+                })
+                gradient_diagnostics.update({
+                    f"weighted_matching_regularization_{group}_gradient_norm": norm
+                    for group, norm in protection_norms.items()
+                })
+                gradient_diagnostics["matching_regularization_to_reconstruction_encoder_gradient_ratio"] = (
+                    protection_norms["encoder"] / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
+                )
+            if decoder_training is not None and decoded_metrics["active"]:
+                image_norms = _autograd_group_norms(decoded_loss, {
+                    "encoder": parameters, "matching_head": head_parameters, "generator": generator_parameters,
+                })
+                gradient_diagnostics.update({
+                    f"weighted_decoded_{group}_gradient_norm": norm for group, norm in image_norms.items()
+                })
+                gradient_diagnostics["decoded_to_reconstruction_encoder_gradient_ratio"] = (
+                    image_norms["encoder"] / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
                 )
         guard_metrics = {}
         if gradient_guard_enabled:
@@ -1340,6 +1429,10 @@ def train_joint_infoot(
             "auxiliary_objective": float(auxiliary_objective.detach()),
             **({"decoded_translation_loss": float(decoded_loss.detach())} if decoder_training is not None else {}),
             **({"null_preservation_loss": float(null_preservation.detach())} if decoder_training is not None else {}),
+            **({"matching_regularization_loss": float(matching_protection_loss.detach()),
+                "matching_variance_loss": matching_protection.metrics["variance_loss"],
+                "matching_covariance_loss": matching_protection.metrics["covariance_loss"]}
+               if matching_protection is not None else {}),
         })
         if step == initial_step + 1 or step % log_every == 0:
             metrics = {
@@ -1366,6 +1459,7 @@ def train_joint_infoot(
                 "infoot_reference_counts": {domain: len(code) for domain, code in references.items()},
                 "conditional_query_samples_per_domain": query_count,
                 "infoot_distance_scale_mode": distance_scale_mode,
+                "infoot_distance_scale_gradient": scale_gradient,
                 "cat_distance_scale": solve_distance_scales["cat"],
                 "dog_distance_scale": solve_distance_scales["dog"],
                 "alignment_weight": beta,
@@ -1397,6 +1491,9 @@ def train_joint_infoot(
             metrics["projection_support_loss"] = float(support_loss.detach())
             metrics["projection_support_weight"] = support_weight * warmup
             metrics["gradient_guard"] = guard_metrics
+            if matching_protection is not None:
+                metrics["matching_regularization_loss"] = float(matching_protection_loss.detach())
+                metrics["matching_regularization"] = matching_protection.metrics
             if decoder_training is not None:
                 metrics["decoded_translation"] = decoded_metrics
                 metrics["generator_gradient_norm_pre_clip"] = generator_grad_norm
@@ -1404,10 +1501,14 @@ def train_joint_infoot(
                 metrics["reconstruction_diagnostics"] = reconstruction_diagnostics
                 metrics["null_preservation_loss"] = float(null_preservation.detach())
             if matching_heads:
+                from diffusion_ot.models.matching_head import matching_geometry_diagnostics
                 metrics["matching_head_gradient_norm_pre_clip"] = head_grad_norm
                 metrics["matching_head_learning_rate"] = optimizer.param_groups[1]["lr"]
                 metrics["matching_feature_variance"] = {
                     d: float(code.detach().var(0, unbiased=False).sum()) for d, code in reference_matching.items()
+                }
+                metrics["feature_geometry"] = {
+                    d: matching_geometry_diagnostics(references[d], code) for d, code in reference_matching.items()
                 }
             if support_result is not None:
                 metrics["projection_support"] = support_result.metrics

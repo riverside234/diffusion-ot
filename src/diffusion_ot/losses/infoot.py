@@ -187,21 +187,34 @@ def infoot_cross_distance_scale(
     x: torch.Tensor,
     y: torch.Tensor,
     eps: float = 1.0e-8,
+    *,
+    detach: bool = True,
 ) -> torch.Tensor:
-    """Return the official InfoOT scale for a pairwise-distance matrix."""
+    """Return the official RMS scale, optionally differentiating its estimate.
+
+    Fixed-feature OT and historical co-training use the detached default.
+    Neural co-training can include the scale derivative so a uniform change
+    of feature distances does not create a spurious kernel gradient.
+    """
     if x.ndim != 2 or y.ndim != 2:
         raise ValueError("InfoOT distance scaling requires rank-two feature matrices.")
-    mean_squared_distance = pairwise_squared_distances(x, y).detach().mean()
-    return (mean_squared_distance / 2.0).sqrt().clamp_min(eps)
+    mean_squared_distance = pairwise_squared_distances(x, y).mean()
+    if detach:
+        mean_squared_distance = mean_squared_distance.detach()
+    # Clamp before sqrt: sqrt(0)'s infinite derivative otherwise produces NaN
+    # even when a following clamp masks the zero-scale branch.
+    return (mean_squared_distance / 2.0).clamp_min(eps * eps).sqrt()
 
 
-def infoot_distance_scale(features: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
+def infoot_distance_scale(
+    features: torch.Tensor, eps: float = 1.0e-8, *, detach: bool = True,
+) -> torch.Tensor:
     """Return the Gaussian-kernel scale used by the official InfoOT code.
 
     The reference implementation computes ``sqrt(mean(D ** 2) / 2)`` from
     the full within-domain pairwise-distance matrix, including its diagonal.
     """
-    return infoot_cross_distance_scale(features, features, eps=eps)
+    return infoot_cross_distance_scale(features, features, eps=eps, detach=detach)
 
 
 def _log_gaussian_kernel(
@@ -214,7 +227,9 @@ def _log_gaussian_kernel(
 ) -> torch.Tensor:
     scale = torch.as_tensor(distance_scale, device=x.device, dtype=x.dtype)
     width = torch.as_tensor(bandwidth, device=x.device, dtype=x.dtype) * scale
-    width = width.detach().clamp_min(eps)
+    # The caller owns stop-gradient policy. A live RMS scale must retain the
+    # denominator derivative; scalar/detached scales keep historical behavior.
+    width = width.clamp_min(eps)
     return -pairwise_squared_distances(x, y) / (2.0 * width.square())
 
 
@@ -462,6 +477,7 @@ def solve_infoot(
     min_inner_iterations: int = 5,
     outer_patience: int = 3,
     strict_convergence: bool = False,
+    require_outer_convergence: bool = False,
 ) -> InfoOTSolveResult:
     if features_x.ndim != 2 or features_y.ndim != 2:
         raise ValueError("InfoOT expects [batch, dimension] feature matrices.")
@@ -471,6 +487,8 @@ def solve_infoot(
         raise ValueError("InfoOT mi_weight must be finite and nonnegative.")
     if not math.isfinite(outer_tolerance) or outer_tolerance < 0:
         raise ValueError("InfoOT outer_tolerance must be finite and nonnegative.")
+    if require_outer_convergence and outer_tolerance == 0:
+        raise ValueError("Requiring InfoOT outer convergence needs a positive outer_tolerance.")
     if min_inner_iterations < 1 or outer_patience < 1:
         raise ValueError("InfoOT minimum iterations and patience must be positive.")
     n, m = features_x.shape[0], features_y.shape[0]
@@ -542,6 +560,15 @@ def solve_infoot(
             f"InfoOT Sinkhorn marginals did not converge: row={row_residual:.3g}, "
             f"column={column_residual:.3g}, tolerance={projection_tolerance:.3g}. "
             "Increase projection_iterations or reassess the cost/MI/entropy scales."
+        )
+    # Feasible marginals alone do not establish that successive MI/OT updates
+    # have stabilized. Keep the historical marginal-only policy available.
+    if require_outer_convergence and not outer_converged:
+        raise RuntimeError(
+            f"InfoOT outer updates did not converge after {completed_iterations} iterations: "
+            f"plan_delta_l1={plan_delta_l1:.3g}, tolerance={outer_tolerance:.3g}, "
+            f"sinkhorn_converged={sinkhorn_converged}. "
+            "Increase inner_iterations (the outer update budget) or reassess the cost/MI/entropy scales."
         )
     mi = infoot_mutual_information(coupling, kernel_x, kernel_y, a, b, eps=eps)
     entropy = coupling_entropy(coupling, eps=eps)
@@ -863,4 +890,5 @@ def solver_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         "min_inner_iterations": int(config.get("min_inner_iterations", 5)),
         "outer_patience": int(config.get("outer_patience", 3)),
         "strict_convergence": bool(config.get("strict_convergence", False)),
+        "require_outer_convergence": bool(config.get("require_outer_convergence", False)),
     }

@@ -319,6 +319,8 @@ class DecoderTraining:
             self.discriminator_updates += 1
             metrics["discriminator_loss"] = float(discriminator_loss.detach())
             metrics["discriminator_gradient_norm"] = float(norm)
+            metrics["discriminator_clip_scale"] = min(
+                1.0, float(self.options.get("discriminator_grad_clip", 1.0)) / max(float(norm), 1e-12))
         with frozen_discriminator(self.discriminators):
             for target, (fake, real) in pairs.items():
                 fake_score, real_score = self.discriminators[target](fake), self.discriminators[target](real.detach())
@@ -331,6 +333,7 @@ class DecoderTraining:
                  + float(self.options.get("adversarial_weight", .01)) * adversarial)
         metrics.update(structure_loss=float(structure.detach()), adversarial_loss=float(adversarial.detach()),
                        weighted_loss=float(total.detach()), ramp=1.0 if evaluation else self.ramp(step),
+                       effective_weighted_loss=float(total.detach()) * (1.0 if evaluation else self.ramp(step)),
                        discriminator_updates=self.discriminator_updates,
                        num_steps=int(self.options.get("validation_num_steps", 50) if evaluation else self.options.get("num_steps", 50)))
         return total * (1.0 if evaluation else self.ramp(step)), metrics

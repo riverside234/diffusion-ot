@@ -39,12 +39,13 @@ def conditional_structure_loss(
     teacher_temperature: float = 0.1,
     reference_matching: dict[str, torch.Tensor] | None = None,
     query_matching: dict[str, torch.Tensor] | None = None,
+    differentiate_distance_scale: bool = False,
 ) -> ConditionalStructureResult:
     """Average bidirectional KL(teacher || full Eq. 7 conditional readout).
 
     Callers must fit the plan on references only. Queries come from a disjoint
     portion of the training batch (or validation split during fixed probes).
-    Only encoder features receive gradients; the plan and teacher are detached.
+    Only encoder/matching features receive gradients; the plan and teacher are detached.
     Each target bank is its complete reference set, without top-k truncation.
     Optional matching features change the KDE geometry, while references and
     queries remain raw decoder codes. They must retain the same row ordering.
@@ -73,8 +74,10 @@ def conditional_structure_loss(
             source_features, source_references, target_references,
             coupling.detach() if source == "cat" else coupling.detach().T,
             bandwidth=bandwidth,
-            distance_scale_x=infoot_cross_distance_scale(source_features, source_references),
-            distance_scale_y=infoot_distance_scale(target_references),
+            distance_scale_x=infoot_cross_distance_scale(
+                source_features, source_references, detach=not differentiate_distance_scale),
+            distance_scale_y=infoot_distance_scale(
+                target_references, detach=not differentiate_distance_scale),
         )
         costs = torch.cdist(
             query_structure[source].detach().to(source_features),

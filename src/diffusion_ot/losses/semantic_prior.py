@@ -123,7 +123,7 @@ def validate_prior_resume(saved_config: dict[str, Any], current_config: dict[str
     if saved_variant != current_variant or saved != current:
         raise ValueError("Resume cannot change InfoOT variant or semantic-prior bank; start a new run.")
     if any(any((config.get(key) or {}).get("enabled", False) for key in
-               ("conditional_structure", "gradient_guard", "projection_support", "matching_head")) for config in (saved_config, current_config)):
-        for key in ("conditional_structure", "loss_weights", "matching", "infoot", "gradient_guard", "projection_support", "matching_head", "generator_adaptation", "decoded_translation", "trainable"):
+               ("conditional_structure", "gradient_guard", "projection_support", "matching_head", "matching_regularization")) for config in (saved_config, current_config)):
+        for key in ("conditional_structure", "loss_weights", "matching", "infoot", "gradient_guard", "projection_support", "matching_head", "matching_regularization", "generator_adaptation", "decoded_translation", "trainable"):
             if (saved_config.get(key) or {}) != (current_config.get(key) or {}):
                 raise ValueError(f"Resume cannot change {key} for conditional structure training; start a new run.")
