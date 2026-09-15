@@ -134,6 +134,22 @@ def test_default_disabled_and_variance_only_ablation():
     assert options == {"std_target": .7, "variance_weight": .02, "covariance_weight": 0, "eps": .0001}
 
 
+def test_covariance_value_and_gradient_match_sample_covariance_reference_after_rescaling():
+    # Official VICReg / Lightly use sample covariance and sum(offdiag^2)/D.
+    # Our documented population + mean reduction differs by this exact factor.
+    g = torch.Generator().manual_seed(76)
+    x = F.normalize(torch.randn(12, 20, generator=g, dtype=torch.float64), dim=1).requires_grad_()
+    result = matching_regularization_loss({"cat": x}, covariance_weight=.001)
+    sample_cov = torch.cov((x * x.shape[1] ** .5).T)
+    mask = ~torch.eye(x.shape[1], dtype=torch.bool)
+    reference = sample_cov[mask].square().sum() / x.shape[1]
+    reference *= ((len(x) - 1) / len(x)) ** 2 / (x.shape[1] - 1) * .001
+    torch.testing.assert_close(result.weighted_covariance_loss, reference)
+    torch.testing.assert_close(torch.autograd.grad(result.weighted_covariance_loss, x, retain_graph=True)[0],
+                               torch.autograd.grad(reference, x)[0])
+    torch.testing.assert_close(result.loss, result.weighted_variance_loss + result.weighted_covariance_loss)
+
+
 @pytest.mark.parametrize("change", ["enable", "disable", "variance_weight", "covariance_weight", "std_target", "eps"])
 def test_resume_requires_same_protection_objective(change):
     current = {"matching_regularization": {"enabled": True, **matching_regularization_options({"enabled": True})}}
@@ -150,11 +166,11 @@ def test_resume_requires_same_protection_objective(change):
     validate_prior_resume({}, {})
 
 
-def test_active_protection_and_rms_only_control_differ_only_in_regularizer_and_paths():
+def test_cosine_protection_control_differs_from_rms_only_in_regularizer_and_paths():
     root = Path(__file__).resolve().parents[1]
     def read(relative):
         return yaml.safe_load((root / relative).read_text())
-    active = read("configs/stage1b_infoot/structure_decoder_sit_b2.yaml")
+    active = read("configs/stage1b_infoot/structure_decoder_vicreg_cosine_sit_b2.yaml")
     control = read("configs/stage1b_infoot/structure_decoder_rmsgrad_sit_b2.yaml")
     assert active["matching"]["distance_scale_gradient"] == control["matching"]["distance_scale_gradient"] == "full"
     assert matching_regularization_options(active.pop("matching_regularization")) is not None
@@ -162,6 +178,19 @@ def test_active_protection_and_rms_only_control_differ_only_in_regularizer_and_p
     assert active.pop("output_dir") != control.pop("output_dir")
     eval_active = read(active.pop("quick_evaluation")["config"])
     eval_control = read(control.pop("quick_evaluation")["config"])
+    assert active == control
+    assert eval_active.pop("output_dir") != eval_control.pop("output_dir")
+    assert eval_active == eval_control
+
+
+def test_active_relational_config_preserves_vicreg_control_except_neighborhood_and_paths():
+    root = Path(__file__).resolve().parents[1]
+    active = yaml.safe_load((root / "configs/stage1b_infoot/structure_decoder_sit_b2.yaml").read_text())
+    control = yaml.safe_load((root / "configs/stage1b_infoot/structure_decoder_vicreg_cosine_sit_b2.yaml").read_text())
+    assert active["semantic_prior"].pop("neighborhood_geometry") == "rms_distance"
+    assert active.pop("output_dir") != control.pop("output_dir")
+    eval_active = yaml.safe_load((root / active.pop("quick_evaluation")["config"]).read_text())
+    eval_control = yaml.safe_load((root / control.pop("quick_evaluation")["config"]).read_text())
     assert active == control
     assert eval_active.pop("output_dir") != eval_control.pop("output_dir")
     assert eval_active == eval_control

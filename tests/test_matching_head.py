@@ -5,11 +5,29 @@ import torch
 from torch.nn import functional as F
 
 from diffusion_ot.models.matching_head import (
-    ResidualMatchingHead, load_matching_head, make_matching_head, matching_head_id,
+    ResidualMatchingHead, load_matching_head, make_matching_head, matching_head_id, matching_geometry_diagnostics,
 )
 from diffusion_ot.losses.conditional_structure import conditional_structure_loss
 from diffusion_ot.losses.semantic_prior import validate_prior_resume
 from diffusion_ot.losses.infoot import conditional_variance_decomposition
+
+
+def test_spectrum_diagnostics_distinguish_spread_from_dimensional_collapse():
+    raw = torch.cat([torch.eye(4), -torch.eye(4)])
+    rank_one = torch.tensor([[1., 0., 0., 0.], [-1., 0., 0., 0.]]).repeat(4, 1)
+    result = matching_geometry_diagnostics(raw, rank_one)
+    assert result["matching_variance"] == pytest.approx(result["raw_normalized_variance"])
+    for statistic in ("effective_rank", "participation_rank"):
+        assert result[f"raw_normalized_covariance_{statistic}"] == pytest.approx(4)
+        assert result[f"matching_covariance_{statistic}"] == pytest.approx(1)
+    assert result["matching_covariance_top_eigenvalue_fraction"] == pytest.approx(1)
+    assert result["raw_normalized_covariance_top_eigenvalue_fraction"] == pytest.approx(.25)
+    collapsed = matching_geometry_diagnostics(raw, torch.ones_like(raw))
+    assert collapsed["matching_covariance_effective_rank"] == 0
+    assert collapsed["matching_covariance_participation_rank"] == 0
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        mixed = matching_geometry_diagnostics(raw, rank_one)
+    assert mixed == pytest.approx(result)
 
 
 def test_matching_head_starts_at_identity_without_changing_sampling_rng():

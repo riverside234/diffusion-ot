@@ -17,6 +17,8 @@ import torch
 class MatchingRegularizationResult:
     loss: torch.Tensor
     metrics: dict[str, Any]
+    weighted_variance_loss: torch.Tensor
+    weighted_covariance_loss: torch.Tensor
 
 
 def _validate_options(std_target: float, variance_weight: float, covariance_weight: float, eps: float) -> None:
@@ -104,4 +106,4 @@ def matching_regularization_loss(
         "weighted_covariance_loss": float(weighted_covariance.detach()), "weighted_loss": float(loss.detach()),
         **domains,
     }
-    return MatchingRegularizationResult(loss, metrics)
+    return MatchingRegularizationResult(loss, metrics, weighted_variance, weighted_covariance)

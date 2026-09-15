@@ -78,23 +78,34 @@ The active config now differentiates the feature-dependent InfoOT RMS kernel
 scale (`matching.distance_scale_gradient: full`). The step-2,600 review found
 a reproducible spurious shrinkage gradient when that scale was detached.
 The full validation also exposed an unfinished outer OT solve. Active D now
-requires outer convergence, with a 300-iteration budget and early stopping.
-The active revision also protects matching-feature variance and adds a modest
-covariance penalty from update 1. Start it from Stage 1A in the new
-`_rmsgrad_vicreg` output directory. `structure_decoder_rmsgrad_sit_b2.yaml`
-preserves the corrected-RMS-only comparison; `structure_decoder_detached_sit_b2.yaml`
-preserves the original Experiment D settings and checkpoint compatibility.
-See the [log analysis](docs/analysis/stage1b_experiment_d_2600/review.md) and
-[protection definition and comparison protocol](docs/analysis/stage1b_experiment_d_vicreg.md).
+requires outer convergence, with a 1,200-iteration cap and early stopping.
+The cap was raised after a batch exhausted 300 updates while its plan change
+was still `2.01e-5` versus the `1e-5` tolerance. A budget-only increase can
+resume an existing run that already required outer convergence; objective and
+tolerance changes still require a fresh run. See the
+[convergence fix and resume command](docs/analysis/stage1b_experiment_d_outer_budget_fix.md).
+The RMS-only follow-up still loses about 90% of matching-head spread by step
+1,500, while raw encoder spread stays nearly unchanged. The active revision
+protects matching-feature variance and adds a modest covariance penalty from
+update 1, plus distance-normalized neighborhood teaching to remove a remaining
+cosine-logit contraction incentive. Start from Stage 1A in the new
+`_rmsgrad_vicreg_relational` output directory. The protected cosine control is
+`structure_decoder_vicreg_cosine_sit_b2.yaml`; its `_rmsgrad_vicreg` outputs remain
+separate. `structure_decoder_rmsgrad_sit_b2.yaml` preserves RMS only, and
+`structure_decoder_detached_sit_b2.yaml` preserves the original Experiment D.
+Each has a corresponding evaluation YAML. See the
+[new analysis, paper/GitHub audit, and reproduction](docs/analysis/stage1b_rmsgrad_1500/review.md).
+Changing neighborhood geometry or temperature requires a fresh run. CPU checks
+verify the targeted mechanism; improved AFHQ training remains to be tested.
 
-Run an initial 5,000-update checkpoint review. This reaches well beyond the
-2,000-update decoded-loss ramp while avoiding the cost of the full run before
-the first image-quality check.
+Review an initial 1,500-update run, with particular attention to spread at
+200–500 steps. If this comparison succeeds, continue to 5,000 updates to check
+behavior beyond the 2,000-update decoded-loss ramp and review image quality.
 
 ```bash
 python3 scripts/train_joint_infoot.py \
   --config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
-  --max-steps 5000
+  --max-steps 1500 --quick-eval
 ```
 
 Evaluate that checkpoint with paired EMA encoder, matching-head, and generator
@@ -104,7 +115,7 @@ weights:
 python3 scripts/evaluate_infoot_alignment.py \
   --alignment-config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
   --eval-config configs/stage1b_eval/structure_decoder_sit_b2.yaml \
-  --checkpoint outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg/checkpoints/latest.pt \
+  --checkpoint outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg_relational/checkpoints/latest.pt \
   --no-require-stage1a-baseline
 ```
 
@@ -130,7 +141,7 @@ The active defaults are:
 | Adapter / LoRA LR | `1e-5` / `5e-6` |
 | InfoOT fit / projection bandwidth | `0.70` / `0.10` |
 | Entropy regularization | `0.05` |
-| Outer OT update budget / tolerance | `300` / `1e-5`, convergence required |
+| Outer OT update budget / tolerance | `1200` / `1e-5`, convergence required |
 | Matching variance / covariance weights | `0.02` / `0.001`, from update 1 |
 | Matching scaled standard-deviation floor | `0.70`, on `sqrt(dim) * m(z)` |
 | Same-domain semantic dropout | `0.10` |

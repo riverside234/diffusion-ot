@@ -37,16 +37,80 @@ def test_structure_descriptor_is_channel_rotation_invariant_but_spatially_sensit
     assert not torch.allclose(patch_structure_descriptor(tokens[:, torch.randperm(16)]), expected)
 
 
-def test_neighborhood_loss_excludes_self_pairs_and_detaches_teacher():
+@pytest.mark.parametrize("geometry", ["cosine", "rms_distance"])
+def test_neighborhood_loss_excludes_self_pairs_and_detaches_teacher(geometry):
     torch.manual_seed(3)
     teacher = torch.randn(8, 4, requires_grad=True)
     current = torch.randn(8, 5, requires_grad=True)
-    loss = neighborhood_distillation_loss(current, teacher)
+    loss = neighborhood_distillation_loss(current, teacher, geometry=geometry)
     loss.backward()
     assert current.grad.norm() > 0
     assert teacher.grad is None
-    assert abs(float(neighborhood_distillation_loss(teacher.detach(), teacher))) < 1e-6
-    assert float(neighborhood_distillation_loss(teacher.detach().roll(1, 0), teacher)) > .01
+    assert abs(float(neighborhood_distillation_loss(teacher.detach(), teacher, geometry=geometry))) < 1e-6
+    assert float(neighborhood_distillation_loss(teacher.detach().roll(1, 0), teacher, geometry=geometry)) > .01
+
+
+def test_rms_neighborhood_removes_cosine_contraction_shortcut():
+    # A common pole contracts every distance equally; neighbor geometry stays
+    # identical. An orthogonal teacher has a uniform neighbor distribution.
+    g = torch.Generator().manual_seed(23)
+    directions = torch.nn.functional.normalize(torch.randn(96, 32, generator=g, dtype=torch.float64), dim=1)
+    teacher = torch.eye(96, dtype=torch.float64)
+    values = {mode: [] for mode in ("cosine", "rms_distance")}
+    for amount in (1., .5, .1):
+        a = torch.tensor(amount, dtype=torch.float64, requires_grad=True)
+        codes = torch.cat([a * directions, torch.ones(96, 1, dtype=torch.float64)], dim=1)
+        for mode in values:
+            loss = neighborhood_distillation_loss(codes, teacher, geometry=mode)
+            gradient, = torch.autograd.grad(loss, a, retain_graph=True)
+            values[mode].append(float(loss.detach()))
+            if mode == "rms_distance":
+                # This also fails if the student denominator is detached.
+                assert abs(float(gradient)) < 1e-10
+            else:
+                assert gradient > 0  # Gradient descent contracts the cone.
+    assert values["cosine"][-1] < values["cosine"][0] / 100
+    assert values["rms_distance"] == pytest.approx([values["rms_distance"][0]] * 3, abs=1e-12)
+
+
+def test_rms_neighborhood_has_correct_gradients_and_stable_precision():
+    g = torch.Generator().manual_seed(58)
+    current = torch.randn(6, 4, dtype=torch.float64, generator=g, requires_grad=True)
+    teacher = torch.randn(6, 9, dtype=torch.float64, generator=g, requires_grad=True)
+    def objective(x):
+        return neighborhood_distillation_loss(x, teacher, geometry="rms_distance")
+    assert torch.autograd.gradcheck(objective, (current,), atol=1e-5)
+    permutation = torch.tensor([4, 0, 1, 5, 3, 2])
+    torch.testing.assert_close(objective(current), neighborhood_distillation_loss(
+        current[permutation], teacher[permutation], geometry="rms_distance"))
+    fp32 = objective(current.float())
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        torch.testing.assert_close(objective(current.float()), fp32, rtol=0, atol=0)
+    for amount in (0., 1e-5):
+        cone = (torch.ones(6, 4) + amount * current.detach().float()).requires_grad_()
+        loss = objective(cone)
+        loss.backward()
+        assert torch.isfinite(loss) and torch.isfinite(cone.grad).all()
+    assert teacher.grad is None
+
+
+@pytest.mark.parametrize("key,value", [("neighborhood_geometry", "typo"), ("neighborhood_temperature", 0)])
+def test_invalid_neighborhood_options_fail(key, value):
+    from diffusion_ot.losses.semantic_prior import neighborhood_options
+    with pytest.raises(ValueError, match="[Nn]eighborhood"):
+        neighborhood_options({key: value})
+
+
+def test_neighborhood_resume_preserves_defaults_and_rejects_changed_objective():
+    saved = {"infoot": {"variant": "fused"}, "semantic_prior": {"fingerprint": "same", "path": "old.pt"}}
+    current = deepcopy(saved)
+    current["semantic_prior"].update(neighborhood_geometry="cosine", neighborhood_temperature=.2, path="new.pt")
+    validate_prior_resume(saved, current)
+    for key, value in (("neighborhood_geometry", "rms_distance"), ("neighborhood_temperature", .3)):
+        changed = deepcopy(current)
+        changed["semantic_prior"][key] = value
+        with pytest.raises(ValueError, match="Resume cannot change semantic_prior neighborhood"):
+            validate_prior_resume(saved, changed)
 
 
 def test_bank_looks_up_ids_not_row_positions_and_rejects_split_leakage(tmp_path):

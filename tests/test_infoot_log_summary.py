@@ -77,3 +77,19 @@ def test_protection_diagnostics_survive_training_and_validation_summary():
     training = summary_tools["training_row"](row)
     assert training["window_matching_regularization_loss"] == .008
     assert training["matching_regularization_to_reconstruction_encoder_gradient_ratio"] == .4
+
+
+def test_geometry_and_component_gradients_preserve_missing_values():
+    geometry = {"cat": {"matching_covariance_effective_rank": 12, "raw_normalized_variance": .95,
+                       "raw_normalized_covariance_participation_rank": 40}}
+    for kind, field in (("training_row", {"feature_geometry": geometry}),
+                        ("validation_row", {"projection_probe": {"feature_geometry": geometry}})):
+        result = summary_tools[kind]({"step": 500, **field})
+        assert result["cat_matching_covariance_effective_rank"] == 12
+        assert result["cat_raw_normalized_covariance_participation_rank"] == 40
+        assert result["dog_matching_covariance_effective_rank"] is None
+    row = summary_tools["training_row"]({"step": 500, "semantic_neighborhood_geometry": "rms_distance",
+                                        "weighted_matching_covariance_matching_head_gradient_norm": .0001})
+    assert row["semantic_neighborhood_geometry"] == "rms_distance"
+    assert row["weighted_matching_covariance_matching_head_gradient_norm"] == .0001
+    assert row["weighted_matching_variance_matching_head_gradient_norm"] is None

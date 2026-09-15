@@ -223,8 +223,10 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
                          "distance_scale_gradient": "full"},
                matching_regularization={"enabled": True, "std_target": .7,
                                         "variance_weight": .02, "covariance_weight": .001},
-               infoot={"variant": "fused", "inner_iterations": 2, "entropy_epsilon": .2},
-               semantic_prior={"path": "prior.pt"},
+               infoot={"variant": "fused", "inner_iterations": 100, "entropy_epsilon": .2,
+                       "mi_weight": .1, "outer_tolerance": 1e-5,
+                       "strict_convergence": True, "require_outer_convergence": True},
+               semantic_prior={"path": "prior.pt", "neighborhood_geometry": "rms_distance"},
                loss_weights={"semantic_neighborhood": .05, "conditional_structure": .05},
                train={"max_steps": 2, "log_every": 1, "save_every": 1, "validation_every": 1,
                       "validation_samples": 2, "gradient_diagnostics_every": 1, "lr_encoder": .001},
@@ -242,6 +244,9 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
     training = [json.loads(row) for row in (tmp_path / "out/logs/train.jsonl").read_text().splitlines()]
     for row in training:
         assert row["infoot_distance_scale_gradient"] == "full"
+        assert row["semantic_neighborhood_geometry"] == "rms_distance"
+        assert row["infoot_iteration_budget"] == 100
+        assert row["infoot_outer_converged"] and row["infoot_iterations"] < 100
         protection = row["matching_regularization"]
         assert row["matching_regularization_loss"] == pytest.approx(
             .02 * protection["variance_loss"] + .001 * protection["covariance_loss"])
@@ -250,6 +255,10 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
             assert protection[domain]["matching_variance"] == pytest.approx(row["matching_feature_variance"][domain])
         for group in ("encoder", "matching_head"):
             assert row[f"weighted_matching_regularization_{group}_gradient_norm"] > 0
+            for term in ("variance", "covariance"):
+                assert row[f"weighted_matching_{term}_{group}_gradient_norm"] >= 0
+        for term in ("alignment", "neighborhood", "conditional_structure"):
+            assert row[f"weighted_{term}_matching_head_gradient_norm"] > 0
         for group in ("encoder", "matching_head", "generator"):
             assert row[f"weighted_decoded_{group}_gradient_norm"] > 0
         decoded = row["decoded_translation"]
@@ -267,6 +276,8 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
         + first["matching_regularization_loss"], abs=1e-6)
     assert all("feature_geometry" in row["projection_probe"] for row in validation)
     for row in validation:
+        assert row["projection_probe"]["iteration_budget"] == 100
+        assert row["decoded_translation"]["solver"]["iteration_budget"] == 100
         assert row["matching_regularization_loss"] > 0
         for domain in ("cat", "dog"):
             assert row["matching_regularization"][domain]["matching_variance"] == pytest.approx(
@@ -304,8 +315,12 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
         assert payload["matching_heads"][domain]["residual.3.weight"].norm() > 0
     assert all(v["decoded_translation"]["discriminator_updates"] == v["step"] for v in validation)
     # Resume a complete optimizer/D/EMA state and continue, not a new G run.
+    # A larger strict outer cap is numerical headroom, not a new objective.
+    cfg["infoot"]["inner_iterations"] = 1200
+    path.write_text(yaml.safe_dump(cfg))
     resumed = train.train_joint_infoot(path, max_steps=3, resume_from="latest")
     final = train._load_checkpoint(Path(resumed.checkpoint_path))
+    assert final["config"]["infoot"]["inner_iterations"] == 1200
     assert resumed.initial_step == 2
     assert final["decoded_discriminator_updates"] == 3
     assert final["generator_ema_state"]["num_updates"] == final["ema_state"]["num_updates"] == 3

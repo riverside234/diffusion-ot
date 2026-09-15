@@ -36,23 +36,58 @@ def patch_structure_descriptor(tokens: torch.Tensor, grid_size: int = 4) -> torc
     return F.normalize(descriptor, dim=-1)
 
 
-def neighborhood_distillation_loss(
-    codes: torch.Tensor, teacher: torch.Tensor, *, temperature: float = 0.2
-) -> torch.Tensor:
-    """Match within-domain neighbor distributions; self-pairs provide no signal."""
-    if codes.shape[0] != teacher.shape[0] or codes.shape[0] < 3:
-        raise ValueError("Neighborhood distillation needs at least three matched samples.")
+def neighborhood_options(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve legacy defaults as well as the scale-invariant neighborhood loss."""
+    temperature = float(config.get("neighborhood_temperature", .2))
+    geometry = str(config.get("neighborhood_geometry", "cosine"))
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("Neighborhood temperature must be finite and positive.")
-    student = F.normalize(codes.float(), dim=-1)
-    teacher = F.normalize(teacher.detach().to(student), dim=-1)
-    mask = ~torch.eye(len(codes), device=codes.device, dtype=torch.bool)
-    student_logits = (student @ student.T)[mask].view(len(codes), -1) / temperature
-    teacher_logits = (teacher @ teacher.T)[mask].view(len(codes), -1) / temperature
-    return F.kl_div(
-        F.log_softmax(student_logits, dim=-1),
-        F.softmax(teacher_logits, dim=-1), reduction="batchmean",
-    )
+    if geometry not in {"cosine", "rms_distance"}:
+        raise ValueError("semantic_prior.neighborhood_geometry must be cosine or rms_distance.")
+    return {"temperature": temperature, "geometry": geometry}
+
+
+def neighborhood_distillation_loss(
+    codes: torch.Tensor, teacher: torch.Tensor, *, temperature: float = 0.2,
+    geometry: str = "cosine",
+) -> torch.Tensor:
+    """Match within-domain neighbors, excluding self-pairs.
+
+    rms_distance divides squared pair distances by their live off-diagonal
+    mean. Uniform contraction cannot flatten the student distribution, unlike
+    fixed-temperature cosine logits. Teacher distances get their own scale.
+    Inspired by RKD's relative distances (https://arxiv.org/abs/1904.05068),
+    but using squared distances and KL rather than RKD's L2/Huber loss.
+    This removes a scale shortcut; variance protection is still necessary.
+    """
+    if codes.ndim != 2 or teacher.ndim != 2 or codes.shape[0] != teacher.shape[0] or codes.shape[0] < 3:
+        raise ValueError("Neighborhood distillation needs at least three matched samples.")
+    neighborhood_options({"neighborhood_temperature": temperature, "neighborhood_geometry": geometry})
+    # Legacy mode keeps its original precision/autocast behavior for controls.
+    if geometry == "cosine":
+        student = F.normalize(codes.float(), dim=-1)
+        teacher = F.normalize(teacher.detach().to(student), dim=-1)
+        mask = ~torch.eye(len(codes), device=codes.device, dtype=torch.bool)
+        student_logits = (student @ student.T)[mask].view(len(codes), -1) / temperature
+        teacher_logits = (teacher @ teacher.T)[mask].view(len(codes), -1) / temperature
+        return F.kl_div(F.log_softmax(student_logits, dim=-1),
+                        F.softmax(teacher_logits, dim=-1), reduction="batchmean")
+    # Center first to avoid subtracting nearly equal unit-vector dot products
+    # in a narrow cone. Keep float64 for gradient checks, otherwise use fp32.
+    with torch.autocast(device_type=codes.device.type, enabled=False):
+        student = F.normalize(codes if codes.dtype == torch.float64 else codes.float(), dim=-1)
+        teacher = F.normalize(teacher.detach().to(student), dim=-1)
+        mask = ~torch.eye(len(codes), device=codes.device, dtype=torch.bool)
+        def logits(features: torch.Tensor) -> torch.Tensor:
+            centered = features - features.mean(0)
+            norms = centered.square().sum(1)
+            distances = (norms[:, None] + norms[None, :] - 2 * centered @ centered.T).clamp_min(0)
+            distances = distances[mask].view(len(codes), -1)
+            # Do not detach: doing so reintroduces a spurious scale gradient.
+            scale = distances.mean().clamp_min(1e-8)
+            return -distances / (scale * temperature)
+        return F.kl_div(F.log_softmax(logits(student), dim=-1),
+                        F.softmax(logits(teacher), dim=-1), reduction="batchmean")
 
 
 def descriptor_digest(payload: dict[str, Any]) -> str:
@@ -115,6 +150,23 @@ def load_semantic_prior(config: dict[str, Any], root: Path) -> SemanticPriorBank
     return SemanticPriorBank(path)
 
 
+def _compatible_infoot_resume(saved: dict[str, Any], current: dict[str, Any]) -> bool:
+    """A larger cap is safe when every accepted solve already had to converge.
+
+    Only allow more outer iterations; objective, tolerances, initialization,
+    patience and inner Sinkhorn settings must still match. Never mutate either
+    checkpoint config. Truncated (non-strict) runs cannot use this exception.
+    """
+    if saved == current:
+        return True
+    saved, current = dict(saved), dict(current)
+    previous_budget = int(saved.pop("inner_iterations", 50))
+    current_budget = int(current.pop("inner_iterations", 50))
+    return (saved == current and current_budget >= previous_budget
+            and bool(saved.get("require_outer_convergence", False))
+            and float(saved.get("outer_tolerance", 0)) > 0)
+
+
 def validate_prior_resume(saved_config: dict[str, Any], current_config: dict[str, Any]) -> None:
     saved_variant = (saved_config.get("infoot") or {}).get("variant", "plain")
     current_variant = (current_config.get("infoot") or {}).get("variant", "plain")
@@ -122,8 +174,12 @@ def validate_prior_resume(saved_config: dict[str, Any], current_config: dict[str
     current = (current_config.get("semantic_prior") or {}).get("fingerprint")
     if saved_variant != current_variant or saved != current:
         raise ValueError("Resume cannot change InfoOT variant or semantic-prior bank; start a new run.")
+    if saved_variant == "fused" and neighborhood_options(saved_config.get("semantic_prior") or {}) != neighborhood_options(current_config.get("semantic_prior") or {}):
+        raise ValueError("Resume cannot change semantic_prior neighborhood objective; start a new run.")
     if any(any((config.get(key) or {}).get("enabled", False) for key in
                ("conditional_structure", "gradient_guard", "projection_support", "matching_head", "matching_regularization")) for config in (saved_config, current_config)):
         for key in ("conditional_structure", "loss_weights", "matching", "infoot", "gradient_guard", "projection_support", "matching_head", "matching_regularization", "generator_adaptation", "decoded_translation", "trainable"):
+            if key == "infoot" and _compatible_infoot_resume(saved_config.get(key) or {}, current_config.get(key) or {}):
+                continue
             if (saved_config.get(key) or {}) != (current_config.get(key) or {}):
                 raise ValueError(f"Resume cannot change {key} for conditional structure training; start a new run.")

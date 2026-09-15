@@ -78,16 +78,27 @@ def matching_geometry_diagnostics(codes: torch.Tensor, features: torch.Tensor) -
     centered = features - features.mean(0)
     variance = centered.square().sum(1).mean()
     raw_variance = normalized.var(0, unbiased=False).sum()
-    eigenvalues = torch.linalg.eigvalsh(centered @ centered.T / len(features)).clamp_min(0)
-    probabilities = eigenvalues / eigenvalues.sum().clamp_min(1e-12)
-    effective_rank = (-(probabilities * probabilities.clamp_min(1e-12).log()).sum()).exp()
+    def spectrum(values: torch.Tensor) -> dict[str, float]:
+        with torch.autocast(device_type=values.device.type, enabled=False):
+            centered = values - values.mean(0)
+            eigenvalues = torch.linalg.eigvalsh(centered @ centered.T / len(values)).clamp_min(0)
+            trace = eigenvalues.sum()
+            probabilities = eigenvalues / trace.clamp_min(1e-12)
+            entropy_rank = (-(probabilities * probabilities.clamp_min(1e-12).log()).sum()).exp()
+            participation_rank = 1 / probabilities.square().sum().clamp_min(1e-12)
+        return {
+            "covariance_effective_rank": float(entropy_rank) if trace > 1e-12 else 0.,
+            "covariance_participation_rank": float(participation_rank) if trace > 1e-12 else 0.,
+            "covariance_top_eigenvalue_fraction": float(probabilities.max()) if trace > 1e-12 else 0.,
+        }
     return {
         "raw_code_variance": float(raw.var(0, unbiased=False).sum()),
         "raw_normalized_variance": float(raw_variance),
         "matching_variance": float(variance),
         "matching_to_raw_variance_ratio": float(variance / raw_variance.clamp_min(1e-12)),
         "matching_mean_norm": float(features.mean(0).norm()),
-        "matching_covariance_effective_rank": float(effective_rank) if variance > 1e-12 else 0.0,
+        **{f"matching_{key}": value for key, value in spectrum(features).items()},
+        **{f"raw_normalized_{key}": value for key, value in spectrum(normalized).items()},
     }
 
 

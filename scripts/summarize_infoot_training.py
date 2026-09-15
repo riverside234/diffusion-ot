@@ -37,6 +37,15 @@ def matching_regularization_fields(row: dict) -> dict:
     return result
 
 
+def feature_geometry_fields(geometry: dict) -> dict:
+    fields = ("raw_normalized_variance", "matching_mean_norm", "matching_to_raw_variance_ratio",
+              "raw_normalized_covariance_effective_rank", "matching_covariance_effective_rank",
+              "raw_normalized_covariance_participation_rank", "matching_covariance_participation_rank",
+              "raw_normalized_covariance_top_eigenvalue_fraction", "matching_covariance_top_eigenvalue_fraction")
+    return {f"{domain}_{key}": geometry.get(domain, {}).get(key)
+            for domain in ("cat", "dog") for key in fields}
+
+
 def validation_row(row: dict) -> dict:
     probe, decoded = row.get("projection_probe", {}), row.get("decoded_translation", {})
     result = {"step": row["step"], "conditional_kl": row.get("conditional_structure_loss"),
@@ -45,6 +54,7 @@ def validation_row(row: dict) -> dict:
               "outer_converged": probe.get("outer_converged"),
               "sinkhorn_converged": probe.get("sinkhorn_converged"),
               "solver_iterations": probe.get("iterations"),
+              "solver_iteration_budget": probe.get("iteration_budget"),
               "solver_plan_delta_l1": probe.get("plan_delta_l1"),
               "solver_row_residual": probe.get("row_residual"),
               "solver_column_residual": probe.get("column_residual"),
@@ -71,6 +81,7 @@ def validation_row(row: dict) -> dict:
         gap = uniform - teacher if uniform is not None and teacher is not None else 0
         result[f"{direction}.teacher_gain_pct"] = 100 * (uniform-current)/gap if gap > 1e-12 and current is not None else None
     result.update(matching_regularization_fields(row))
+    result.update(feature_geometry_fields(probe.get("feature_geometry", {})))
     return result
 
 
@@ -79,6 +90,8 @@ def training_row(row: dict) -> dict:
     window = row.get("window_mean", {})
     image = row.get("decoded_translation", {})
     result = {"step": row["step"], "window_updates": row.get("window_updates"),
+              "solver_iterations": row.get("infoot_iterations"),
+              "solver_iteration_budget": row.get("infoot_iteration_budget"),
               "window_loss": window.get("loss"),
               "window_conditional_kl": window.get("conditional_structure_loss"),
               "window_mi": window.get("infoot_mutual_information"),
@@ -110,6 +123,15 @@ def training_row(row: dict) -> dict:
             result[f"{direction}.{key}"] = value
         result[f"{direction}.decoded_structure"] = image.get(direction, {}).get("structure_loss")
     result.update(matching_regularization_fields(row))
+    result.update(feature_geometry_fields(row.get("feature_geometry", {})))
+    for key in ("semantic_neighborhood_geometry", "semantic_neighborhood_temperature",
+                "weighted_alignment_matching_head_gradient_norm", "weighted_neighborhood_matching_head_gradient_norm",
+                "weighted_conditional_structure_matching_head_gradient_norm"):
+        result[key] = row.get(key)
+    for term in ("variance", "covariance"):
+        for group in ("encoder", "matching_head"):
+            key = f"weighted_matching_{term}_{group}_gradient_norm"
+            result[key] = row.get(key)
     return result
 
 

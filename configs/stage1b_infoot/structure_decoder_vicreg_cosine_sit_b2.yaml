@@ -1,6 +1,6 @@
 stage: stage1b_fused_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg_relational
+output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg
 
 stage1a:
   weights: ema
@@ -95,7 +95,7 @@ trainable:
   base_transformers: false
 
 quick_evaluation:
-  config: configs/stage1b_eval/structure_decoder_sit_b2.yaml
+  config: configs/stage1b_eval/structure_decoder_vicreg_cosine_sit_b2.yaml
   weights: ema
   # Invoke scripts/train_joint_infoot.py with --quick-eval to preserve the
   # Stage 1A baseline before training and compare the final checkpoint to it.
@@ -103,9 +103,6 @@ quick_evaluation:
 # Frozen DINOv2 pooled patch self-similarity; no proxy labels enter training.
 semantic_prior:
   path: data/semantic_priors/afhq_dinov2_structure.pt
-  # Relative squared distances: contraction cannot flatten neighbor logits.
-  # Pair with variance/covariance protection; start fresh from Stage 1A.
-  neighborhood_geometry: rms_distance
   neighborhood_temperature: 0.20
 
 # Project extension: teach Eq. (7) on queries excluded from the current OT fit.

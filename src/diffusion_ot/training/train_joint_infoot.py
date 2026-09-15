@@ -666,6 +666,7 @@ def fixed_conditional_structure_probe(
                 "sinkhorn_converged": solution.sinkhorn_converged,
                 "row_residual": solution.row_residual, "column_residual": solution.column_residual,
                 "iterations": solution.iterations, "outer_converged": solution.outer_converged,
+                "iteration_budget": solver_options["inner_iterations"],
                 "plan_delta_l1": solution.plan_delta_l1,
                 "transport": transport_diagnostics(solution.coupling),
                 "matching_feature_variance": {
@@ -738,6 +739,7 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
             # the conditional probe, which can encode references in chunks.
             metrics["solver"] = {
                 "iterations": solution.iterations,
+                "iteration_budget": solver_options["inner_iterations"],
                 "sinkhorn_converged": solution.sinkhorn_converged,
                 "outer_converged": solution.outer_converged,
                 "plan_delta_l1": solution.plan_delta_l1,
@@ -776,7 +778,7 @@ def train_joint_infoot(
         transport_diagnostics,
     )
     from diffusion_ot.losses.semantic_prior import (
-        load_semantic_prior, neighborhood_distillation_loss, validate_prior_resume,
+        load_semantic_prior, neighborhood_distillation_loss, neighborhood_options, validate_prior_resume,
     )
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
     from diffusion_ot.losses.projection_support import projection_support_loss, support_options
@@ -1066,7 +1068,7 @@ def train_joint_infoot(
         raise ValueError("semantic_neighborhood weight must be finite and nonnegative.")
     if neighborhood_weight > 0 and prior is None:
         raise ValueError("semantic_neighborhood requires a frozen semantic prior.")
-    prior_temperature = float(_nested(config, "semantic_prior").get("neighborhood_temperature", 0.2))
+    prior_neighborhood_options = neighborhood_options(_nested(config, "semantic_prior"))
     rec_weights = {
         "cat": float(loss_weights.get("cat_reconstruction", 1.0)),
         "dog": float(loss_weights.get("dog_reconstruction", 1.0)),
@@ -1183,7 +1185,7 @@ def train_joint_infoot(
                 ).to(alignment_device)
                 neighborhood_losses[domain] = neighborhood_distillation_loss(
                     matching_z[domain] if matching_heads else z[domain].to(alignment_device), teacher_features[domain],
-                    temperature=prior_temperature,
+                    **prior_neighborhood_options,
                 )
             with torch.no_grad():
                 reference_z[domain] = anchors[domain](x0[domain])
@@ -1333,9 +1335,14 @@ def train_joint_infoot(
                 / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
             )
             if prior is not None:
-                gradient_diagnostics["weighted_neighborhood_gradient_norm"] = _autograd_norm(
-                    neighborhood_weight * warmup * neighborhood_loss, parameters
-                )
+                neighborhood_norms = _autograd_group_norms(neighborhood_weight * warmup * neighborhood_loss, {
+                    "encoder": parameters, "matching_head": head_parameters,
+                })
+                gradient_diagnostics["weighted_neighborhood_gradient_norm"] = neighborhood_norms["encoder"]
+                gradient_diagnostics["weighted_neighborhood_matching_head_gradient_norm"] = neighborhood_norms["matching_head"]
+            if head_parameters:
+                gradient_diagnostics["weighted_alignment_matching_head_gradient_norm"] = _autograd_norm(
+                    beta * infoot_loss, head_parameters)
             if conditional_enabled:
                 gradient_diagnostics["weighted_conditional_structure_gradient_norm"] = _autograd_norm(
                     conditional_weight * warmup * projection_loss, parameters
@@ -1344,6 +1351,9 @@ def train_joint_infoot(
                     gradient_diagnostics["weighted_conditional_structure_gradient_norm"]
                     / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
                 )
+                if head_parameters:
+                    gradient_diagnostics["weighted_conditional_structure_matching_head_gradient_norm"] = _autograd_norm(
+                        conditional_weight * warmup * projection_loss, head_parameters)
             if support_enabled:
                 gradient_diagnostics["weighted_projection_support_gradient_norm"] = _autograd_norm(
                     support_weight * warmup * support_loss, parameters
@@ -1359,6 +1369,13 @@ def train_joint_infoot(
                 gradient_diagnostics["matching_regularization_to_reconstruction_encoder_gradient_ratio"] = (
                     protection_norms["encoder"] / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
                 )
+                # A small aggregate can conceal opposing V/C gradients. Keep
+                # the already weighted components visible before retuning them.
+                for name, objective in (("variance", matching_protection.weighted_variance_loss),
+                                        ("covariance", matching_protection.weighted_covariance_loss)):
+                    norms = _autograd_group_norms(objective, {"encoder": parameters, "matching_head": head_parameters})
+                    gradient_diagnostics.update({f"weighted_matching_{name}_{group}_gradient_norm": norm
+                                                 for group, norm in norms.items()})
             if decoder_training is not None and decoded_metrics["active"]:
                 image_norms = _autograd_group_norms(decoded_loss, {
                     "encoder": parameters, "matching_head": head_parameters, "generator": generator_parameters,
@@ -1456,6 +1473,7 @@ def train_joint_infoot(
                 "infoot_outer_converged": solution.outer_converged,
                 "infoot_plan_delta_l1": solution.plan_delta_l1,
                 "infoot_iterations": solution.iterations,
+                "infoot_iteration_budget": solver_options["inner_iterations"],
                 "infoot_reference_counts": {domain: len(code) for domain, code in references.items()},
                 "conditional_query_samples_per_domain": query_count,
                 "infoot_distance_scale_mode": distance_scale_mode,
@@ -1510,6 +1528,9 @@ def train_joint_infoot(
                 metrics["feature_geometry"] = {
                     d: matching_geometry_diagnostics(references[d], code) for d, code in reference_matching.items()
                 }
+            if prior is not None:
+                metrics["semantic_neighborhood_geometry"] = prior_neighborhood_options["geometry"]
+                metrics["semantic_neighborhood_temperature"] = prior_neighborhood_options["temperature"]
             if support_result is not None:
                 metrics["projection_support"] = support_result.metrics
             if conditional_result is not None:

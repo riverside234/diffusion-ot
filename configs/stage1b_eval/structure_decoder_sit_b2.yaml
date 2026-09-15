@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_structure_decoder_infoot_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg
+output_dir: outputs/stage1b_eval_structure_decoder_infoot_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg_relational
 seed: 20260906
 alignment_device: cuda:0
 
@@ -45,7 +45,7 @@ infoot:
   algorithm: official_projected_sinkhorn
   mi_weight: 0.10
   entropy_epsilon: 0.05
-  inner_iterations: 300  # Match the revised training convergence policy.
+  inner_iterations: 1200  # Match training; retain early stopping and the same tolerance.
   projection_iterations: 2000
   projection_tolerance: 0.00001
   outer_tolerance: 0.00001
