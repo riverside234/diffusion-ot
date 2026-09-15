@@ -34,7 +34,7 @@ matching:
   # Plain InfoOT uses h=0.55 for separately trained embedding spaces in the
   # paper. With the official RMS distance scale above, this also avoids the nearly
   # constant kernels produced by h=1.0 in the Stage 1A baseline.
-  bandwidth_multiplier: 0.55
+  bandwidth_multiplier: 0.70
   # Conditional Eq. (7) projection readouts only. The Stage 1A sweep found
   # 0.10 at the useful knee: about 23-25 effective targets, before the marked
   # norm shrinkage and support growth at 0.15 and above.
