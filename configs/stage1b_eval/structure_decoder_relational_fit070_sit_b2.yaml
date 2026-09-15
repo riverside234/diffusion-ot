@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_d_fit050
+output_dir: outputs/stage1b_eval_structure_decoder_infoot_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg_relational
 seed: 20260906
 alignment_device: cuda:0
 
@@ -32,7 +32,7 @@ matching:
   # Match InfoOT.compute_kernel on the transported reference bank.
   distance_scale: infoot_rms
   # Match the structure-guided fused training pilot.
-  bandwidth_multiplier: 0.50
+  bandwidth_multiplier: 0.70
   # Conditional Eq. (7) projection readouts only. The Stage 1A sweep found
   # 0.10 at the useful knee: about 23-25 effective targets, before the marked
   # norm shrinkage and support growth at 0.15 and above.

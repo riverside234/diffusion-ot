@@ -1,6 +1,6 @@
 stage: stage1b_fused_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_d_fit050
+output_dir: outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg_relational
 
 stage1a:
   weights: ema
@@ -69,7 +69,7 @@ matching:
   # This changes the update rule: start fresh from Stage 1A in the new folder.
   # The original run is preserved by structure_decoder_detached_sit_b2.yaml.
   distance_scale_gradient: full
-  bandwidth_multiplier: 0.50
+  bandwidth_multiplier: 0.70
 
 infoot:
   variant: fused
@@ -95,7 +95,7 @@ trainable:
   base_transformers: false
 
 quick_evaluation:
-  config: configs/stage1b_eval/structure_decoder_sit_b2.yaml
+  config: configs/stage1b_eval/structure_decoder_relational_fit070_sit_b2.yaml
   weights: ema
   # Invoke scripts/train_joint_infoot.py with --quick-eval to preserve the
   # Stage 1A baseline before training and compare the final checkpoint to it.

@@ -183,14 +183,18 @@ def test_cosine_protection_control_differs_from_rms_only_in_regularizer_and_path
     assert eval_active == eval_control
 
 
-def test_active_relational_config_preserves_vicreg_control_except_neighborhood_and_paths():
+def test_active_relational_config_preserves_vicreg_control_except_neighborhood_fit_and_paths():
     root = Path(__file__).resolve().parents[1]
     active = yaml.safe_load((root / "configs/stage1b_infoot/structure_decoder_sit_b2.yaml").read_text())
     control = yaml.safe_load((root / "configs/stage1b_infoot/structure_decoder_vicreg_cosine_sit_b2.yaml").read_text())
     assert active["semantic_prior"].pop("neighborhood_geometry") == "rms_distance"
+    assert active["matching"].pop("bandwidth_multiplier") == .50
+    assert control["matching"].pop("bandwidth_multiplier") == .70
     assert active.pop("output_dir") != control.pop("output_dir")
     eval_active = yaml.safe_load((root / active.pop("quick_evaluation")["config"]).read_text())
     eval_control = yaml.safe_load((root / control.pop("quick_evaluation")["config"]).read_text())
     assert active == control
     assert eval_active.pop("output_dir") != eval_control.pop("output_dir")
+    assert eval_active["matching"].pop("bandwidth_multiplier") == .50
+    assert eval_control["matching"].pop("bandwidth_multiplier") == .70
     assert eval_active == eval_control

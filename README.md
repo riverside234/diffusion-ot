@@ -89,7 +89,7 @@ The RMS-only follow-up still loses about 90% of matching-head spread by step
 protects matching-feature variance and adds a modest covariance penalty from
 update 1, plus distance-normalized neighborhood teaching to remove a remaining
 cosine-logit contraction incentive. Start from Stage 1A in the new
-`_rmsgrad_vicreg_relational` output directory. The protected cosine control is
+`outputs/stage1b_d_fit050` output directory. The protected cosine control is
 `structure_decoder_vicreg_cosine_sit_b2.yaml`; its `_rmsgrad_vicreg` outputs remain
 separate. `structure_decoder_rmsgrad_sit_b2.yaml` preserves RMS only, and
 `structure_decoder_detached_sit_b2.yaml` preserves the original Experiment D.
@@ -97,6 +97,10 @@ Each has a corresponding evaluation YAML. See the
 [new analysis, paper/GitHub audit, and reproduction](docs/analysis/stage1b_rmsgrad_1500/review.md).
 Changing neighborhood geometry or temperature requires a fresh run. CPU checks
 verify the targeted mechanism; improved AFHQ training remains to be tested.
+The active fit bandwidth is now **0.50**, with projection still **0.10**.
+`structure_decoder_relational_fit070_sit_b2.yaml` preserves the otherwise
+identical 0.70 relational control in both train/eval folders. Start the 0.50
+run from Stage 1A; changing fit bandwidth is incompatible with resume.
 
 Review an initial 1,500-update run, with particular attention to spread at
 200–500 steps. If this comparison succeeds, continue to 5,000 updates to check
@@ -115,7 +119,7 @@ weights:
 python3 scripts/evaluate_infoot_alignment.py \
   --alignment-config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
   --eval-config configs/stage1b_eval/structure_decoder_sit_b2.yaml \
-  --checkpoint outputs/stage1b_cat_dog_structure_decoder_infoot_sit_b2_cfg_adaln_all_lora_r64_steps20_rmsgrad_vicreg_relational/checkpoints/latest.pt \
+  --checkpoint outputs/stage1b_d_fit050/checkpoints/latest.pt \
   --no-require-stage1a-baseline
 ```
 
@@ -139,7 +143,7 @@ The active defaults are:
 | Updates | 30,000 |
 | Encoder / matching-head LR | `2e-5` / `2e-4` |
 | Adapter / LoRA LR | `1e-5` / `5e-6` |
-| InfoOT fit / projection bandwidth | `0.70` / `0.10` |
+| InfoOT fit / projection bandwidth | `0.50` / `0.10` |
 | Entropy regularization | `0.05` |
 | Outer OT update budget / tolerance | `1200` / `1e-5`, convergence required |
 | Matching variance / covariance weights | `0.02` / `0.001`, from update 1 |
