@@ -166,7 +166,114 @@ These are experiment settings, not demonstrated optima. The training batch uses
 the full shuffled training split over time. Each update draws 128 samples per
 domain: 96 references for the InfoOT fit and 32 disjoint conditional queries.
 
-## Evaluation output
+## Stage 2–3: Frozen Bank Construction and Global InfoOT Fitting
+
+The combined **Stage 2–3: Offline Alignment** workflow first freezes the selected
+checkpoint and builds complete feature banks (Stage 2), then fits and exports
+**one global fused InfoOT coupling over all training Cats and
+Dogs**, with fit bandwidth **0.55** and frozen projection bandwidth **0.10**.
+It includes paired raw/EMA checkpoint
+restoration, complete-manifest checks, fixed training-reference RMS calibration,
+and resumable global fitting (Stage 3). Matrix tiles are computation chunks, not separate
+OT problems. Unequal domain counts are supported.
+
+Stage 4 translates **every held-out validation source** using that exported
+coupling. It reports FID against real target-domain validation RGB and SSIM
+against each original source RGB, separately in both directions. It saves
+**16 source/translation pairs per direction**, including individual PNGs and
+labeled contact sheets. The full generated corpus is used for FID.
+
+### Linux commands
+
+Run in the existing training environment (Python >=3.11). The configured
+Stage 1A checkpoints, pretrained SiT/VAE snapshot, DINO structure cache,
+canonical train/validation manifests, cached latents, and original AFHQ dataset
+must be available under the project paths. Inception weights download on the
+first Stage 4 metric run and are cached in `outputs/fid_cache`.
+
+```bash
+cd /data/not_backed_up/yxu209/diffusion-ot
+python -m pip install -r requirements-stage4.txt
+
+# Example only: select an existing numbered checkpoint from the run you want.
+CHECKPOINT=outputs/stage1b_d_gt/checkpoints/step_004000.pt
+
+# Stage 2-3: frozen banks and global InfoOT fit, paired EMA weights.
+python scripts/run_offline_alignment.py \
+  --config configs/stage23_offline/full_sit_b2.yaml \
+  --checkpoint "$CHECKPOINT" --weights ema --device cuda:0
+
+# Stage 4: use the completed Stage 2-3 bundle; no refitting.
+python scripts/evaluate_full_infoot.py \
+  --config configs/stage4_eval/fid_ssim_sit_b2.yaml \
+  --bundle outputs/s23_full --device cuda:0
+```
+
+Use `--weights raw` on Stage 2–3 if selecting a raw checkpoint evaluation; Stage 4
+always inherits the same paired model state. Set Stage 2–3 `alignment_config` to
+the configuration matching the checkpoint architecture and Stage 1A provenance.
+The final bundle copies learned E/head/G state; the large frozen model files
+and configuration dependencies remain external and are checked by content hash.
+It requires a format-4 Stage 1B checkpoint and never substitutes Stage 1A outputs
+as image-quality references.
+
+An optional **full-size preflight** measures actual iteration time and GPU
+memory without changing the reference count:
+
+```bash
+python scripts/run_offline_alignment.py \
+  --checkpoint "$CHECKPOINT" --device cuda:0 --max-new-iterations 5
+# Continue that same fit; omit --max-new-iterations to finish it.
+python scripts/run_offline_alignment.py \
+  --checkpoint "$CHECKPOINT" --device cuda:0 --resume
+
+# Resume interrupted evaluation, optionally lowering generation memory use.
+python scripts/evaluate_full_infoot.py \
+  --bundle outputs/s23_full --device cuda:0 --resume --generation-batch-size 2
+```
+
+Run the preflight instead of the initial Stage 2–3 command, or add `--resume`
+when progress already exists. A nonconverged preflight exports no `bundle.json`.
+Reaching the outer cap without convergence exits with status 2. Review
+`solver_log.jsonl` and `checks.json`; numerical/scientific configuration changes
+require a new output directory. Resume validates fingerprints and retains all
+global references. Use `--output-dir` for independent checkpoint/configuration
+comparisons and point Stage 4 `--bundle` at the corresponding directory.
+
+Memory settings are separate from sample counts. Start with encoding batch 32,
+matrix block 512, query projection batch 32, target projection block 512, and
+generation batch 4. The exact fit still needs several dense global matrices and
+cubic matrix products. At 5,000×5,000, one FP32 matrix is about 95.4 MiB; measure
+the full-size preflight on the GPU before estimating runtime. `solver_device`
+can explicitly select CPU; there is no hidden subset fallback. `--device`
+overrides all devices; omit it when using separate encoding/solver devices.
+
+Outputs:
+
+- `outputs/s23_full/bundle.json`, `transport.pt`, `banks/`, `models/`,
+  `calibration.json`, `solver_progress.pt`, `solver_log.jsonl`, `checks.json`.
+- `outputs/s4_eval/metrics.json`, `ssim_per_image.jsonl`,
+  `generation_manifest.jsonl`, `gallery_ids.json`, `report.md`.
+- `outputs/s4_eval/images/{cat_to_dog,dog_to_cat}/`: complete metric corpus.
+- `outputs/s4_eval/real/{cat,dog}/`: original held-out RGB references.
+- `outputs/s4_eval/galleries/{cat_to_dog,dog_to_cat}/contact_sheet.png`:
+  16 pairs per direction, with source IDs and separate source/translation PNGs.
+
+SSIM measures source preservation, not target-domain fidelity: copying the
+source can score highly. FID uses the pinned [Clean-FID implementation](https://github.com/GaParmar/clean-fid)
+in clean Inception mode and custom statistics for the actual real images.
+SSIM uses the [scikit-image Gaussian convention](https://scikit-image.org/docs/stable/api/skimage.metrics.html#skimage.metrics.structural_similarity),
+RGB channel averaging and `data_range=1.0`. Metric versions, Inception weight
+hash, real/generated counts, and protocol identity accompany the results.
+No native reconstruction SSIM or additional quality metrics are computed.
+
+Test the offline mechanism and orchestration with:
+
+```bash
+python -m pytest tests/test_offline_stages.py -q
+```
+
+## Quick Stage 1B evaluation output
 
 The evaluator fits on 512 training references, projects held-out validation
 queries over the full target training bank, and uses `h_proj=0.10` by default.

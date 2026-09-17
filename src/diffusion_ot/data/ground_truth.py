@@ -11,7 +11,7 @@ from diffusion_ot.data.latent_cache import image_to_tensor
 from diffusion_ot.integrations.hf_snapshot import load_yaml_config
 
 
-def load_ground_truth_images(data_config_path: str | Path, records: list[dict[str, Any]]):
+def load_ground_truth_images(data_config_path: str | Path, records: list[dict[str, Any]], *, dataset=None):
     """Return preprocessed original images in [0,1], in the supplied order.
 
     Use exactly the crop/resize used when caching x0. Missing source metadata
@@ -30,7 +30,9 @@ def load_ground_truth_images(data_config_path: str | Path, records: list[dict[st
                              "rebuild the latent bank from the source manifest.")
         if record["dataset_id"] != dataset_id or record["dataset_split"] != split:
             raise ValueError(f"Original-image dataset mismatch for {record['sample_id']}.")
-    dataset = load_afhq_dataset(data_config_path)
+    # Offline evaluation can share one Arrow-backed dataset across image chunks.
+    if dataset is None:
+        dataset = load_afhq_dataset(data_config_path)
     label_column = config.get("label_column", "label")
     label_feature = dataset_label_feature(dataset, label_column)
     domains = [str(d).lower() for d in config.get("domains", [])]

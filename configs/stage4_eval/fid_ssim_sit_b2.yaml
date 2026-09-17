@@ -1,0 +1,23 @@
+stage: stage4_final_eval
+output_dir: outputs/s4_eval
+evaluation_split: val
+source_samples_per_domain: all
+real_samples_per_domain: all
+metrics: [fid, source_ssim]
+seed: 20260906
+image_size: 256
+num_steps: 20
+guidance_scale: 1.0
+gallery_pairs_per_direction: 16
+encoding_batch_size: 32
+projection_device: cuda:0
+projection_batch_size: 32
+projection_target_block_size: 512
+generation_device: cuda:0
+generation_batch_size: 4
+fid_device: cuda:0
+fid_batch_size: 32
+fid_cache_dir: outputs/fid_cache
+num_workers: 4
+# Projection bandwidth and frozen RMS calibration come from the Stage 2-3 bundle.
+# No Stage 4 refit or independent projection-bandwidth override.

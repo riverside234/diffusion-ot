@@ -1,0 +1,25 @@
+stage: stage23_offline_alignment
+alignment_config: configs/stage1b_infoot/structure_decoder_sit_b2.yaml
+output_dir: outputs/s23_full
+reference_split: train
+reference_samples_per_domain: all
+encoding_device: cuda:0
+encoding_batch_size: 32
+solver_device: cuda:0
+solver_dtype: float32
+projection_bandwidth: 0.10
+fit:
+  bandwidth: 0.55
+  mi_weight: 0.10
+  entropy_epsilon: 0.05
+  cross_cost_weight: 1.0
+  outer_iterations: 1200
+  sinkhorn_iterations: 2000
+  absolute_tolerance: 0.0000001
+  relative_tolerance: 0.001
+  outer_tolerance: 0.00001
+  min_outer_iterations: 5
+  patience: 3
+  block_size: 512
+  checkpoint_every: 10
+  numerical_epsilon: 0.00000001
