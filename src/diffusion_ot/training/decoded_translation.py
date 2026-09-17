@@ -49,6 +49,12 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
         value = float(options.get(name, default))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"generator_adaptation.{name} must be finite and positive.")
+    conditioned_weight = float(options.get("conditioned_preservation_weight", 0.0))
+    if not math.isfinite(conditioned_weight) or conditioned_weight < 0:
+        raise ValueError("generator_adaptation.conditioned_preservation_weight must be finite and nonnegative.")
+    count = options.get("conditioned_preservation_samples", 4)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("generator_adaptation.conditioned_preservation_samples must be a positive integer.")
     for name, default in (("structure_weight", 0.1), ("adversarial_weight", 0.01),
                           ("discriminator_lr", 1e-4), ("discriminator_grad_clip", 1.0)):
         value = float(image.get(name, default))
@@ -250,19 +256,41 @@ class DecoderTraining:
         return self.ramp(step) > 0 and step % int(self.options.get("every_steps", 1)) == 0
 
     def null_preservation_loss(self, latents, codes):
+        return self._prediction_preservation_loss(latents, codes, force_null=True)
+
+    def conditioned_preservation_loss(self, latents, baseline_codes):
+        """Protect native G(E_1A(x)) with a fixed teacher; gradients reach G only.
+
+        Same-domain Stage 1A codes keep the reference function fixed while E
+        adapts. Do not apply this teacher to cross-domain conditional means:
+        those are precisely the inputs whose decoding Stage 1B should improve.
+        Zero weight preserves the previous compute cost and RNG sequence.
+        """
+        options = self.config["generator_adaptation"]
+        if float(options.get("conditioned_preservation_weight", 0.0)) == 0:
+            return torch.zeros((), device=self.domains["cat"].device)
+        count = int(options.get("conditioned_preservation_samples", 4))
+        return self._prediction_preservation_loss(
+            {d: x[:count] for d, x in latents.items()},
+            {d: z[:count] for d, z in baseline_codes.items()}, force_null=False,
+        )
+
+    def _prediction_preservation_loss(self, latents, codes, *, force_null):
         from diffusion_ot.losses.pdae_flow import make_linear_flow_target
         losses = []
         for domain, value in self.domains.items():
             flow = value.training_config.get("flow") or {}
-            target = make_linear_flow_target(latents[domain], eps=float(flow.get("time_eps", 1e-5)),
+            target = make_linear_flow_target(latents[domain].detach(), eps=float(flow.get("time_eps", 1e-5)),
                                              direction="noise_to_data")
-            null_z = value.branch.semantic_null_like(codes[domain].detach())
-            labels = make_null_class_labels(value.transformer, len(null_z), value.device,
+            condition = codes[domain].detach()
+            if force_null:
+                condition = value.branch.semantic_null_like(condition)
+            labels = make_null_class_labels(value.transformer, len(condition), value.device,
                                             (value.training_config.get("class_conditioning") or {}).get("null_label"))
             with torch.no_grad():
                 teacher = predict_with_parameters(value.branch, self.baselines[domain],
-                                                   target.x_t, target.t, null_z, labels).sample
-            student = value.branch.predict_with_z(target.x_t, target.t, null_z, class_labels=labels).sample
+                                                   target.x_t, target.t, condition, labels).sample
+            student = value.branch.predict_with_z(target.x_t, target.t, condition, class_labels=labels).sample
             losses.append((student.float() - teacher.float()).square().mean().to(self.domains["cat"].device))
         return torch.stack(losses).mean()
 

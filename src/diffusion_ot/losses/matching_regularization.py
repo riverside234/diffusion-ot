@@ -87,6 +87,11 @@ def matching_regularization_loss(
             domains[domain] = {
                 "samples": count, "feature_dim": dimension,
                 "variance_loss": float(variance), "covariance_loss": float(decorrelation),
+                # Raw off-diagonal energy shrinks with overall feature spread.
+                # This diagnostic removes uniform scaling (it is not Pearson
+                # correlation); the floor keeps a constant bank finite.
+                "relative_covariance_energy": float(
+                    decorrelation / per_dimension_variance.mean().clamp_min(eps).square()),
                 "matching_variance": float(per_dimension_variance.mean()),
                 "scaled_std_mean": float(std.mean()), "scaled_std_min": float(std.min()),
                 "fraction_below_std_target": float((std < std_target).float().mean()),

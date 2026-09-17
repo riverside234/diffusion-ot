@@ -215,6 +215,8 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
     for d in originals:
         (tmp_path / f"{d}.yaml").write_text(yaml.safe_dump({"data_config": "data.yaml"}))
     cfg = config()
+    cfg["generator_adaptation"].update(conditioned_preservation_weight=.05,
+                                      conditioned_preservation_samples=2)
     cfg.update(project_root=str(tmp_path), output_dir="out",
                stage1a={d: {"config": f"{d}.yaml"} for d in originals},
                data={"transport_batch_size": 8, "reconstruction_batch_size": 4, "num_workers": 0,
@@ -261,6 +263,14 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
             assert row[f"weighted_{term}_matching_head_gradient_norm"] > 0
         for group in ("encoder", "matching_head", "generator"):
             assert row[f"weighted_decoded_{group}_gradient_norm"] > 0
+        assert row["reconstruction_generator_gradient_norm"] > 0
+        assert row["weighted_null_preservation_generator_gradient_norm"] >= 0
+        assert row["weighted_conditioned_preservation_generator_gradient_norm"] >= 0
+        assert row["conditioned_preservation_samples"] == 2
+        assert row["conditioned_preservation_weight"] == .05
+        assert row["conditioned_preservation_loss"] >= 0
+        assert row["window_mean"]["weighted_conditioned_preservation_loss"] == pytest.approx(
+            .05 * row["window_mean"]["conditioned_preservation_loss"])
         decoded = row["decoded_translation"]
         assert decoded["effective_weighted_loss"] == pytest.approx(decoded["weighted_loss"] * decoded["ramp"])
         assert 0 < decoded["discriminator_clip_scale"] <= 1
@@ -274,6 +284,9 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
         + first["conditional_structure_weight"] * first["conditional_structure_loss"]
         + first["decoded_translation"]["effective_weighted_loss"]
         + first["matching_regularization_loss"], abs=1e-6)
+    assert first["window_mean"]["primary_objective"] == pytest.approx(
+        first["cat_reconstruction_loss"] + first["dog_reconstruction_loss"]
+        + .1 * first["null_preservation_loss"] + .05 * first["conditioned_preservation_loss"], abs=1e-6)
     assert all("feature_geometry" in row["projection_probe"] for row in validation)
     for row in validation:
         assert row["projection_probe"]["iteration_budget"] == 100
@@ -327,6 +340,12 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
     assert final["matching_head_ema_state"]["num_updates"] == 3
     assert any(not torch.equal(v, initial_discriminator[k]) for k, v in final["decoded_discriminators"].items())
     assert "coupling" not in final and "transport_plan" not in final
+    changed_preservation = deepcopy(cfg)
+    changed_preservation["generator_adaptation"]["conditioned_preservation_weight"] = .1
+    path.write_text(yaml.safe_dump(changed_preservation))
+    with pytest.raises(ValueError, match="Resume cannot change generator_adaptation"):
+        train.train_joint_infoot(path, max_steps=4, resume_from="latest")
+    path.write_text(yaml.safe_dump(cfg))
     broken = deepcopy(final)
     del broken["generator_ema"]["cat"]
     with pytest.raises(ValueError, match="generator_ema.cat"):
@@ -444,3 +463,66 @@ def test_decoder_config_rejects_silent_partial_experiment():
     changed["trainable"]["base_transformers"] = True
     with pytest.raises(ValueError, match="backbone"):
         validate_decoder_config(changed)
+
+
+@pytest.mark.parametrize("key,value", [("conditioned_preservation_weight", -1),
+    ("conditioned_preservation_weight", float("nan")), ("conditioned_preservation_weight", float("inf")),
+    ("conditioned_preservation_samples", 0), ("conditioned_preservation_samples", 1.5),
+    ("conditioned_preservation_samples", True)])
+def test_conditioned_preservation_options_are_validated(key, value):
+    cfg = config()
+    cfg["generator_adaptation"][key] = value
+    with pytest.raises(ValueError, match="generator_adaptation.conditioned_preservation"):
+        validate_decoder_config(cfg)
+
+
+def test_conditioned_preservation_is_g_only_and_restores_a_perturbed_native_function(monkeypatch, tmp_path):
+    import diffusion_ot.training.decoded_translation as decoded
+    torch.manual_seed(81)
+    ctx, cfg = domains(), config()
+    cfg["generator_adaptation"].update(conditioned_preservation_weight=.05, conditioned_preservation_samples=2)
+    monkeypatch.setattr(decoded, "load_image_features", tiny_features)
+    trainer = DecoderTraining(cfg, ctx, None, tmp_path, seed=4)
+    latents = {d: torch.randn(4, 4, 8, 8, requires_grad=True) for d in ctx}
+    codes = {d: v.branch.encoder(latents[d]) for d,v in ctx.items()}
+    torch.manual_seed(18)
+    assert trainer.conditioned_preservation_loss(latents, codes).item() == pytest.approx(0, abs=1e-12)
+    frozen_teacher = deepcopy(trainer.baselines)
+    # A native conditioning-path change should be observable and correctable.
+    with torch.no_grad():
+        for view in trainer.views.values():
+            for p in view["adapters"].parameters():
+                p.add_(.03 * torch.randn_like(p))
+    before = {d: deepcopy(v.branch.semantic_transformer.state_dict()) for d,v in ctx.items()}
+    torch.manual_seed(18)
+    loss = trainer.conditioned_preservation_loss(latents, codes)
+    assert loss > 0
+    loss.backward()
+    for d,v in ctx.items():
+        assert latents[d].grad is None
+        assert all(p.grad is None for p in v.branch.encoder.parameters())
+        assert v.branch.semantic_conditioner.null_token.grad is None
+        assert all(p.grad is None for p in v.branch.semantic_transformer.base.x_embedder.parameters())
+        assert all(torch.equal(x, trainer.baselines[d][k]) for k,x in frozen_teacher[d].items())
+        # Teacher evaluation never changes the live parameters, even during backward.
+        assert all(torch.equal(x, v.branch.semantic_transformer.state_dict()[k]) for k,x in before[d].items())
+    norm = sum(p.grad.square().sum() for p in trainer.parameters if p.grad is not None).sqrt()
+    assert norm > 0
+    with torch.no_grad():
+        for p in trainer.parameters:
+            if p.grad is not None:
+                p.add_(p.grad, alpha=-1e-3)
+    torch.manual_seed(18)
+    assert trainer.conditioned_preservation_loss(latents, codes) < loss
+
+
+def test_disabled_conditioned_preservation_skips_teacher_and_keeps_rng(monkeypatch, tmp_path):
+    import diffusion_ot.training.decoded_translation as decoded
+    monkeypatch.setattr(decoded, "load_image_features", tiny_features)
+    trainer = DecoderTraining(config(), domains(), None, tmp_path, seed=4)
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Disabled preservation must not run a model forward.")
+    monkeypatch.setattr(trainer, "_prediction_preservation_loss", unexpected)
+    rng = torch.get_rng_state().clone()
+    assert trainer.conditioned_preservation_loss({}, {}).item() == 0
+    assert torch.equal(torch.get_rng_state(), rng)

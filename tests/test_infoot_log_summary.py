@@ -65,7 +65,8 @@ def test_protection_diagnostics_survive_training_and_validation_summary():
     row = {"step": 1, "matching_regularization_loss": .007,
            "matching_regularization": {"variance_loss": .3, "covariance_loss": 1,
                "weighted_variance_loss": .006, "weighted_covariance_loss": .001,
-               "cat": {"fraction_below_std_target": .5, "scaled_std_min": .2}},
+               "cat": {"fraction_below_std_target": .5, "scaled_std_min": .2,
+                       "relative_covariance_energy": .06}},
            "window_mean": {"matching_regularization_loss": .008},
            "matching_regularization_to_reconstruction_encoder_gradient_ratio": .4}
     for kind in ("training_row", "validation_row"):
@@ -73,6 +74,8 @@ def test_protection_diagnostics_survive_training_and_validation_summary():
         assert result["matching_regularization_loss"] == .007
         assert result["matching_regularization.weighted_covariance_loss"] == .001
         assert result["matching_regularization.cat.fraction_below_std_target"] == .5
+        assert result["matching_regularization.cat.relative_covariance_energy"] == .06
+        assert result["matching_regularization.dog.relative_covariance_energy"] is None
         assert result["matching_regularization.dog.scaled_std_min"] is None
     training = summary_tools["training_row"](row)
     assert training["window_matching_regularization_loss"] == .008
@@ -93,3 +96,26 @@ def test_geometry_and_component_gradients_preserve_missing_values():
     assert row["semantic_neighborhood_geometry"] == "rms_distance"
     assert row["weighted_matching_covariance_matching_head_gradient_norm"] == .0001
     assert row["weighted_matching_variance_matching_head_gradient_norm"] is None
+
+
+def test_conditioned_preservation_summary_keeps_window_and_step_values_distinct():
+    row = summary_tools["training_row"]({
+        "step": 600, "conditioned_preservation_loss": .04,
+        "conditioned_preservation_weight": .05, "conditioned_preservation_samples": 4,
+        "weighted_conditioned_preservation_generator_gradient_norm": .002,
+        "window_mean": {"conditioned_preservation_loss": .03,
+                        "weighted_conditioned_preservation_loss": .0015},
+    })
+    assert row["conditioned_preservation_loss"] == .04
+    assert row["conditioned_preservation_weight"] == .05
+    assert row["conditioned_preservation_samples"] == 4
+    assert row["weighted_conditioned_preservation_generator_gradient_norm"] == .002
+    assert row["window_conditioned_preservation_loss"] == .03
+    assert row["window_weighted_conditioned_preservation_loss"] == .0015
+    legacy = summary_tools["training_row"]({"step": 600})
+    for key in ("conditioned_preservation_loss", "conditioned_preservation_weight",
+                "conditioned_preservation_samples", "reconstruction_generator_gradient_norm",
+                "weighted_null_preservation_generator_gradient_norm",
+                "weighted_conditioned_preservation_generator_gradient_norm",
+                "window_conditioned_preservation_loss", "window_weighted_conditioned_preservation_loss"):
+        assert legacy[key] is None

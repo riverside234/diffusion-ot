@@ -6,6 +6,18 @@ import pytest
 torch = pytest.importorskip("torch")
 
 
+def test_evaluation_warns_about_fit_mismatch_without_blocking_sensitivity_sweeps():
+    import warnings
+    from diffusion_ot.evaluation.stage1b_eval import _warn_fit_bandwidth_mismatch
+    config = {"matching": {"bandwidth_multiplier": .55}}
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        _warn_fit_bandwidth_mismatch(config, .55)
+    assert not records
+    with pytest.warns(UserWarning, match="Evaluation fit bandwidth 0.5 differs from alignment config 0.55"):
+        _warn_fit_bandwidth_mismatch(config, .50)
+
+
 def test_legacy_alignment_config_uses_non_cfg_stage1a_models():
     from pathlib import Path
 

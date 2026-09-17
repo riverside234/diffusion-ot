@@ -32,7 +32,7 @@ def matching_regularization_fields(row: dict) -> dict:
     for key in ("variance_loss", "covariance_loss", "weighted_variance_loss", "weighted_covariance_loss", "std_target"):
         result[f"matching_regularization.{key}"] = protection.get(key)
     for domain in ("cat", "dog"):
-        for key in ("scaled_std_mean", "scaled_std_min", "fraction_below_std_target", "covariance_loss"):
+        for key in ("scaled_std_mean", "scaled_std_min", "fraction_below_std_target", "covariance_loss", "relative_covariance_energy"):
             result[f"matching_regularization.{domain}.{key}"] = protection.get(domain, {}).get(key)
     return result
 
@@ -100,6 +100,8 @@ def training_row(row: dict) -> dict:
               "window_matching_regularization_loss": window.get("matching_regularization_loss"),
               "window_matching_variance_loss": window.get("matching_variance_loss"),
               "window_matching_covariance_loss": window.get("matching_covariance_loss"),
+              "window_conditioned_preservation_loss": window.get("conditioned_preservation_loss"),
+              "window_weighted_conditioned_preservation_loss": window.get("weighted_conditioned_preservation_loss"),
               "decoded_structure": image.get("structure_loss"),
               "decoded_adversarial": image.get("adversarial_loss"),
               "discriminator_loss": image.get("discriminator_loss"),
@@ -127,6 +129,10 @@ def training_row(row: dict) -> dict:
     for key in ("semantic_neighborhood_geometry", "semantic_neighborhood_temperature",
                 "weighted_alignment_matching_head_gradient_norm", "weighted_neighborhood_matching_head_gradient_norm",
                 "weighted_conditional_structure_matching_head_gradient_norm"):
+        result[key] = row.get(key)
+    for key in ("conditioned_preservation_loss", "conditioned_preservation_weight", "conditioned_preservation_samples",
+                "reconstruction_generator_gradient_norm", "weighted_null_preservation_generator_gradient_norm",
+                "weighted_conditioned_preservation_generator_gradient_norm"):
         result[key] = row.get(key)
     for term in ("variance", "covariance"):
         for group in ("encoder", "matching_head"):

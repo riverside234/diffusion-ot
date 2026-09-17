@@ -1297,12 +1297,19 @@ def train_joint_infoot(
             {d: code[:reconstruction_batch_size] for d, code in z.items()},
         ) if decoder_training is not None else torch.zeros((), device=alignment_device)
         null_preservation_weight = float(_nested(config, "generator_adaptation").get("null_preservation_weight", .1))
+        conditioned_preservation = decoder_training.conditioned_preservation_loss(
+            {d: latent[:reconstruction_batch_size] for d, latent in x0.items()},
+            # Fixed Stage 1A E codes; this is a G-only preservation objective.
+            {d: code[:reconstruction_batch_size] for d, code in reference_z.items()},
+        ) if decoder_training is not None else torch.zeros((), device=alignment_device)
+        conditioned_preservation_weight = float(_nested(config, "generator_adaptation").get("conditioned_preservation_weight", 0.0))
         primary_objective = (
             rec_weights["cat"] * rec_losses["cat"].to(alignment_device)
             + rec_weights["dog"] * rec_losses["dog"].to(alignment_device)
             + anchor_weight
             * (anchor_losses["cat"].to(alignment_device) + anchor_losses["dog"].to(alignment_device))
             + null_preservation_weight * null_preservation
+            + conditioned_preservation_weight * conditioned_preservation
         )
         auxiliary_objective = (
             beta * infoot_loss
@@ -1330,6 +1337,14 @@ def train_joint_infoot(
                     beta * infoot_loss, parameters
                 ),
             }
+            if decoder_training is not None:
+                gradient_diagnostics["reconstruction_generator_gradient_norm"] = _autograd_norm(
+                    reconstruction_objective, generator_parameters)
+                gradient_diagnostics["weighted_null_preservation_generator_gradient_norm"] = _autograd_norm(
+                    null_preservation_weight * null_preservation, generator_parameters)
+                if conditioned_preservation_weight > 0:
+                    gradient_diagnostics["weighted_conditioned_preservation_generator_gradient_norm"] = _autograd_norm(
+                        conditioned_preservation_weight * conditioned_preservation, generator_parameters)
             gradient_diagnostics["alignment_to_reconstruction_gradient_ratio"] = (
                 gradient_diagnostics["weighted_alignment_gradient_norm"]
                 / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
@@ -1446,6 +1461,9 @@ def train_joint_infoot(
             "auxiliary_objective": float(auxiliary_objective.detach()),
             **({"decoded_translation_loss": float(decoded_loss.detach())} if decoder_training is not None else {}),
             **({"null_preservation_loss": float(null_preservation.detach())} if decoder_training is not None else {}),
+            **({"conditioned_preservation_loss": float(conditioned_preservation.detach()),
+                "weighted_conditioned_preservation_loss": float(conditioned_preservation_weight * conditioned_preservation.detach())}
+               if decoder_training is not None else {}),
             **({"matching_regularization_loss": float(matching_protection_loss.detach()),
                 "matching_variance_loss": matching_protection.metrics["variance_loss"],
                 "matching_covariance_loss": matching_protection.metrics["covariance_loss"]}
@@ -1518,6 +1536,11 @@ def train_joint_infoot(
                 metrics["generator_learning_rates"] = {g["name"]: g["lr"] for g in optimizer.param_groups if "name" in g}
                 metrics["reconstruction_diagnostics"] = reconstruction_diagnostics
                 metrics["null_preservation_loss"] = float(null_preservation.detach())
+                metrics["conditioned_preservation_loss"] = float(conditioned_preservation.detach())
+                metrics["conditioned_preservation_weight"] = conditioned_preservation_weight
+                metrics["conditioned_preservation_samples"] = min(
+                    int(_nested(config, "generator_adaptation").get("conditioned_preservation_samples", 4)),
+                    reconstruction_batch_size) if conditioned_preservation_weight > 0 else 0
             if matching_heads:
                 from diffusion_ot.models.matching_head import matching_geometry_diagnostics
                 metrics["matching_head_gradient_norm_pre_clip"] = head_grad_norm

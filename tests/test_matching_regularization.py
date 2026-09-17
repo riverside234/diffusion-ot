@@ -31,18 +31,20 @@ def test_isotropic_and_correlated_unit_banks_have_equal_spread_but_different_cov
     assert redundant.loss == pytest.approx(.001)
 
 
-def test_narrow_cone_gets_expansion_gradient_with_modest_covariance_penalty():
+@pytest.mark.parametrize("variance_weight,covariance_weight", [(0.02, 0.001), (0.05, 0.01)])
+def test_narrow_cone_gets_expansion_gradient_with_modest_covariance_penalty(variance_weight, covariance_weight):
     # Contract all unit vectors toward the first axis while retaining small
     # differences along the others, as in the observed concentration.
     tangent = torch.cat([torch.eye(7), -torch.eye(7)]).double()
     def bank(amount):
         return F.normalize(torch.cat([torch.ones(14, 1), amount * tangent], dim=1), dim=1)
     amount = torch.tensor(.2, dtype=torch.float64, requires_grad=True)
-    before = matching_regularization_loss({"cat": bank(amount)})
+    options = dict(variance_weight=variance_weight, covariance_weight=covariance_weight)
+    before = matching_regularization_loss({"cat": bank(amount)}, **options)
     gradient, = torch.autograd.grad(before.loss, amount)
     assert before.metrics["variance_loss"] > 0
     assert gradient < 0  # Gradient descent expands, not contracts, the cone.
-    after = matching_regularization_loss({"cat": bank(amount.detach() - gradient)})
+    after = matching_regularization_loss({"cat": bank(amount.detach() - gradient)}, **options)
     assert after.loss < before.loss
     assert after.metrics["cat"]["matching_variance"] > before.metrics["cat"]["matching_variance"]
 
@@ -183,18 +185,42 @@ def test_cosine_protection_control_differs_from_rms_only_in_regularizer_and_path
     assert eval_active == eval_control
 
 
-def test_active_relational_config_preserves_vicreg_control_except_neighborhood_fit_and_paths():
+def test_tuned_config_preserves_pilot_geometry_and_uses_matched_evaluation():
     root = Path(__file__).resolve().parents[1]
     active = yaml.safe_load((root / "configs/stage1b_infoot/structure_decoder_sit_b2.yaml").read_text())
-    control = yaml.safe_load((root / "configs/stage1b_infoot/structure_decoder_vicreg_cosine_sit_b2.yaml").read_text())
-    assert active["semantic_prior"].pop("neighborhood_geometry") == "rms_distance"
-    assert active["matching"].pop("bandwidth_multiplier") == .50
-    assert control["matching"].pop("bandwidth_multiplier") == .70
+    control = yaml.safe_load((root / "configs/stage1b_infoot/structure_decoder_fit055_control_sit_b2.yaml").read_text())
+    assert active["semantic_prior"]["neighborhood_geometry"] == "rms_distance"
+    assert active["matching"]["bandwidth_multiplier"] == control["matching"]["bandwidth_multiplier"] == .55
+    assert active["matching"]["distance_scale_gradient"] == "full"
     assert active.pop("output_dir") != control.pop("output_dir")
     eval_active = yaml.safe_load((root / active.pop("quick_evaluation")["config"]).read_text())
     eval_control = yaml.safe_load((root / control.pop("quick_evaluation")["config"]).read_text())
+    for key in ("variance_weight", "covariance_weight"):
+        assert active["matching_regularization"].pop(key) > control["matching_regularization"].pop(key)
+    for key in ("lr_adapter", "lr_lora"):
+        assert active["generator_adaptation"].pop(key) == .5 * control["generator_adaptation"].pop(key)
+    assert active["generator_adaptation"].pop("conditioned_preservation_weight") == .05
+    assert active["generator_adaptation"].pop("conditioned_preservation_samples") == 4
+    assert active["train"]["save_every"] == active["train"]["validation_every"]
+    assert active["train"]["gradient_diagnostics_every"] % active["train"]["log_every"] == 0
+    for key in ("max_steps", "save_every", "log_every", "gradient_diagnostics_every"):
+        active["train"].pop(key)
+        control["train"].pop(key)
     assert active == control
     assert eval_active.pop("output_dir") != eval_control.pop("output_dir")
-    assert eval_active["matching"].pop("bandwidth_multiplier") == .50
-    assert eval_control["matching"].pop("bandwidth_multiplier") == .70
+    assert eval_active["matching"]["bandwidth_multiplier"] == .55
+    assert eval_active["matching"]["projection_bandwidth_multiplier"] == .10
     assert eval_active == eval_control
+
+
+def test_relative_covariance_energy_exposes_redundancy_despite_uniform_contraction():
+    generator = torch.Generator().manual_seed(27)
+    tangent = F.normalize(torch.randn(24, 7, generator=generator, dtype=torch.float64), dim=1)
+    rows = []
+    for scale in (.8, .4):
+        bank = torch.cat([torch.full((24, 1), math.sqrt(1-scale**2)), scale*tangent], dim=1)
+        rows.append(matching_regularization_loss({"cat": bank}).metrics["cat"])
+    assert rows[1]["covariance_loss"] == pytest.approx(rows[0]["covariance_loss"] / 16)
+    assert rows[1]["relative_covariance_energy"] == pytest.approx(rows[0]["relative_covariance_energy"])
+    constant = torch.ones(6, 8) / math.sqrt(8)
+    assert matching_regularization_loss({"cat": constant}).metrics["cat"]["relative_covariance_energy"] == 0

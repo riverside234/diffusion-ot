@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any
+import warnings
 
 import torch
 
@@ -143,6 +144,18 @@ def _evaluation_bandwidths(
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"matching.{name} must be finite and positive.")
     return fit, projection
+
+
+def _warn_fit_bandwidth_mismatch(alignment_config: dict[str, Any], fit: float) -> None:
+    """Keep intentional sensitivity sweeps possible but expose stale defaults."""
+    configured = float(_nested(alignment_config, "matching").get("bandwidth_multiplier", 1.0))
+    if not math.isclose(configured, fit, rel_tol=1e-8, abs_tol=0.0):
+        warnings.warn(
+            f"Evaluation fit bandwidth {fit:g} differs from alignment config {configured:g}. "
+            "Use matching bandwidths for a training-matched comparison; intentional "
+            "bandwidth sweeps evaluate a different fitted transport plan.",
+            UserWarning, stacklevel=2,
+        )
 
 
 def deterministic_indices(length: int, count: int | None, seed: int) -> list[int]:
@@ -1133,6 +1146,7 @@ def run_stage1b_evaluation(
     bandwidth, projection_bandwidth = _evaluation_bandwidths(
         matching_config, projection_bandwidth
     )
+    _warn_fit_bandwidth_mismatch(alignment_config, bandwidth)
     # Store the effective override before hashing the evaluation protocol so
     # each projection bandwidth gets its own outputs and matching baseline.
     matching_config["projection_bandwidth_multiplier"] = projection_bandwidth

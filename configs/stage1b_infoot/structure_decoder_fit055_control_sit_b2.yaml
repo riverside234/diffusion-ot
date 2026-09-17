@@ -1,6 +1,8 @@
+# Preserved 2,750-step pilot: full RMS + relational neighborhoods + V/C .02/.001.
+# Keep its original output path when resuming; the active v2 recipe is separate.
 stage: stage1b_fused_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_d_v2
+output_dir: outputs/stage1b_d_fit050
 
 stage1a:
   weights: ema
@@ -27,16 +29,16 @@ data:
   drop_last: true
 
 train:
-  max_steps: 4000  # Review the pilot after 2,000 steps at full decoded weight.
+  max_steps: 30000
   smoke_steps: 500
   seed: 20260905
   lr_encoder: 0.00002
   weight_decay: 0.0
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
-  log_every: 100
-  gradient_diagnostics_every: 200  # Also a logged step; keep gradients visible.
-  save_every: 500  # Preserve every fixed-validation candidate.
+  log_every: 250
+  gradient_diagnostics_every: 250
+  save_every: 2000
   resume_from: null
   loss_window: 100
   validation_every: 500
@@ -66,7 +68,7 @@ matching:
   # Match InfoOT.compute_kernel: sqrt(mean(pairwise_distance^2) / 2).
   distance_scale: infoot_rms
   # Differentiate the RMS estimate in neural losses as well as distances.
-  # The v2 protection/preservation recipe starts fresh from Stage 1A.
+  # This changes the update rule: start fresh from Stage 1A in the new folder.
   # The original run is preserved by structure_decoder_detached_sit_b2.yaml.
   distance_scale_gradient: full
   bandwidth_multiplier: 0.55
@@ -95,7 +97,7 @@ trainable:
   base_transformers: false
 
 quick_evaluation:
-  config: configs/stage1b_eval/structure_decoder_sit_b2.yaml
+  config: configs/stage1b_eval/structure_decoder_fit055_control_sit_b2.yaml
   weights: ema
   # Invoke scripts/train_joint_infoot.py with --quick-eval to preserve the
   # Stage 1A baseline before training and compare the final checkpoint to it.
@@ -148,26 +150,21 @@ matching_head:
 # VICReg-inspired protection of post-L2 OT references, independently per domain.
 # Loss uses sqrt(feature_dim) * m(z), population covariance, and the MEAN
 # squared off-diagonal entry. Active from step 1 without alignment warmup.
-# The fit-0.55 pilot is preserved as structure_decoder_fit055_control_sit_b2.yaml.
-# Increased strengths address its residual floor violations / head concentration.
+# Compare to structure_decoder_rmsgrad_sit_b2.yaml (no protection).
 matching_regularization:
   enabled: true
   std_target: 0.70
-  variance_weight: 0.05
-  covariance_weight: 0.01
+  variance_weight: 0.02
+  covariance_weight: 0.001
   eps: 0.0001
 
 # Experiment D: freeze pretrained SiT/VAE/null token, adapt all added G layers.
 generator_adaptation:
   enabled: true
-  lr_adapter: 0.000005
-  lr_lora: 0.0000025
+  lr_adapter: 0.00001
+  lr_lora: 0.000005
   grad_clip_norm: 1.0
   null_preservation_weight: 0.10
-  # Same-domain G(E_1A(x)) velocity distillation; no E/head gradients, no
-  # cross-domain mean targets. Small one-step batches limit extra compute.
-  conditioned_preservation_weight: 0.05
-  conditioned_preservation_samples: 4
 
 # Actual translated images enter both objectives. No top-k or sampled-code
 # substitute. DINOv2 weights/revision/processor come from semantic_prior.path.
