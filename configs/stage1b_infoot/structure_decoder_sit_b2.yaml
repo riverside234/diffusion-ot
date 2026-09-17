@@ -1,4 +1,6 @@
 stage: stage1b_fused_infoot
+# Reviewed against logs-revised through train 1,700 / validation 1,500.
+# Recipe rationale: docs/analysis/stage1b_revised_vs_original/config_revision.md.
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
 output_dir: outputs/stage1b_d_gt
 
@@ -27,7 +29,7 @@ data:
   drop_last: true
 
 train:
-  max_steps: 4000  # Review the pilot after 2,000 steps at full decoded weight.
+  max_steps: 4000  # Includes 2,000 updates after the decoded ramp reaches full weight.
   smoke_steps: 500
   seed: 20260905
   lr_encoder: 0.00002
@@ -40,7 +42,9 @@ train:
   resume_from: null
   loss_window: 100
   validation_every: 500
-  validation_samples: 8
+  # Native real-data flow probe only; decoded training/probe batch stays at 4.
+  # Re-evaluate old checkpoints with this panel before comparing native losses.
+  validation_samples: 32
   keep_step_checkpoints: true
 
 ema:
@@ -97,8 +101,8 @@ trainable:
 quick_evaluation:
   config: configs/stage1b_eval/structure_decoder_sit_b2.yaml
   weights: ema
-  # Invoke scripts/train_joint_infoot.py with --quick-eval to preserve the
-  # Stage 1A baseline before training and compare the final checkpoint to it.
+  # --quick-eval measures initialization and final paired EMA weights using
+  # the same 32-image panels. Native image metrics target original dataset RGB.
 
 # Frozen DINOv2 pooled patch self-similarity; no proxy labels enter training.
 semantic_prior:
@@ -149,7 +153,8 @@ matching_head:
 # Loss uses sqrt(feature_dim) * m(z), population covariance, and the MEAN
 # squared off-diagonal entry. Active from step 1 without alignment warmup.
 # The fit-0.55 pilot is preserved as structure_decoder_fit055_control_sit_b2.yaml.
-# Increased strengths address its residual floor violations / head concentration.
+# The revised run improves floor coverage; retain these strengths while testing
+# the teacher-disabled recipe. Rank recovery / decoded quality remain unproven.
 matching_regularization:
   enabled: true
   std_target: 0.70
@@ -160,6 +165,8 @@ matching_regularization:
 # Experiment D: freeze pretrained SiT/VAE/null token, adapt all added G layers.
 generator_adaptation:
   enabled: true
+  # Retain the measured rates: the revised log ends before full image-loss weight
+  # and also changes V/C and native preservation, so it cannot isolate LR effects.
   lr_adapter: 0.000005
   lr_lora: 0.0000025
   grad_clip_norm: 1.0
