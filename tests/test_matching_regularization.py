@@ -199,7 +199,7 @@ def test_tuned_config_preserves_pilot_geometry_and_uses_matched_evaluation():
         assert active["matching_regularization"].pop(key) > control["matching_regularization"].pop(key)
     for key in ("lr_adapter", "lr_lora"):
         assert active["generator_adaptation"].pop(key) == .5 * control["generator_adaptation"].pop(key)
-    assert active["generator_adaptation"].pop("conditioned_preservation_weight") == .05
+    assert active["generator_adaptation"].pop("conditioned_preservation_weight") == 0.0
     assert active["generator_adaptation"].pop("conditioned_preservation_samples") == 4
     assert active["train"]["save_every"] == active["train"]["validation_every"]
     assert active["train"]["gradient_diagnostics_every"] % active["train"]["log_every"] == 0

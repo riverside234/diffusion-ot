@@ -18,6 +18,67 @@ def test_evaluation_warns_about_fit_mismatch_without_blocking_sensitivity_sweeps
         _warn_fit_bandwidth_mismatch(config, .50)
 
 
+@pytest.mark.parametrize("model_value", [.2, .5])
+def test_reconstruction_metrics_target_original_rgb_not_vae_or_stage1a(monkeypatch, tmp_path, model_value):
+    import math
+    import sys
+    from types import SimpleNamespace
+    import diffusion_ot.data.ground_truth as originals
+    import diffusion_ot.evaluation.stage1a_eval as samplers
+    import diffusion_ot.evaluation.stage1b_eval as evaluation
+
+    actual_images = torch.full((2, 3, 4, 4), .2)
+    cached_latents = torch.full_like(actual_images, .5)
+    records = [{"sample_id": "a"}, {"sample_id": "b"}]
+    def load_originals(path, selected):
+        assert selected == records
+        return actual_images
+    monkeypatch.setattr(originals, "load_ground_truth_images", load_originals)
+    monkeypatch.setattr(evaluation, "_load_latents_from_bank", lambda bank, count: cached_latents)
+    monkeypatch.setattr(samplers, "integrate_pdae_flow", lambda *a, **kw: torch.full_like(actual_images, model_value))
+    monkeypatch.setattr(samplers, "decode_vae_latents", lambda vae, x: x)
+    lpips_targets = []
+    def lpips(prediction, target, device):
+        lpips_targets.append(target.clone())
+        return float((prediction-target).square().mean())
+    monkeypatch.setattr(evaluation, "_lpips", lpips)
+    saved_grids = []
+    utils = SimpleNamespace(save_image=lambda images, *a, **kw: saved_grids.append(images.clone()))
+    monkeypatch.setitem(sys.modules, "torchvision", SimpleNamespace(utils=utils))
+    monkeypatch.setitem(sys.modules, "torchvision.utils", utils)
+    context = SimpleNamespace(data_config_path=tmp_path/'data.yaml', device='cpu', dtype=torch.float32,
+                              branch=None, transformer=None, vae=None, training_config={})
+    bank = SimpleNamespace(sample_ids=['a', 'b'], metadata=records, raw_codes=torch.zeros(2, 4))
+    result = evaluation._evaluate_reconstruction(
+        context, bank, count=2, num_steps=2, guidance_scale=1, seed=9,
+        include_lpips=True, output_path=tmp_path/'grid.png')
+    expected = (model_value-.2)**2
+    assert result['pixel_mse'] == pytest.approx(expected, abs=1e-7)
+    assert result['lpips'] == pytest.approx(expected, abs=1e-7)
+    if expected:
+        assert result['pixel_psnr'] == pytest.approx(-10*math.log10(expected))
+    else:
+        assert math.isinf(result['pixel_psnr'])
+    assert result['vae_reconstruction_to_ground_truth']['pixel_mse'] == pytest.approx(.09)
+    assert result['image_reference'] == 'original_dataset_rgb'
+    assert result['grid_rows'] == ['ground_truth', 'vae_reconstruction', 'model_reconstruction']
+    assert all(torch.equal(target, actual_images) for target in lpips_targets)
+    assert len(lpips_targets) == 2
+    torch.testing.assert_close(saved_grids[0][:2], actual_images)
+    torch.testing.assert_close(saved_grids[0][2:4], cached_latents)
+
+
+def test_ground_truth_metric_protocol_does_not_reuse_vae_reference_report_id():
+    import hashlib
+    import json
+    from diffusion_ot.evaluation.stage1b_eval import _protocol_identifier
+    config = {'reconstruction': {'enabled': True}}
+    old_payload = {'evaluation_config': config,
+                   'cli_overrides': {'max_reference': None, 'max_projection': None, 'max_query': None}}
+    old_id = hashlib.sha256(json.dumps(old_payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:8]
+    assert _protocol_identifier(config, max_reference=None, max_projection=None, max_query=None) != old_id
+
+
 def test_legacy_alignment_config_uses_non_cfg_stage1a_models():
     from pathlib import Path
 

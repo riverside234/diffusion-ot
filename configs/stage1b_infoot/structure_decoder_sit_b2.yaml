@@ -1,6 +1,6 @@
 stage: stage1b_fused_infoot
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_d_v2
+output_dir: outputs/stage1b_d_gt
 
 stage1a:
   weights: ema
@@ -66,7 +66,7 @@ matching:
   # Match InfoOT.compute_kernel: sqrt(mean(pairwise_distance^2) / 2).
   distance_scale: infoot_rms
   # Differentiate the RMS estimate in neural losses as well as distances.
-  # The v2 protection/preservation recipe starts fresh from Stage 1A.
+  # The revised protection recipe starts fresh from Stage 1A initialization.
   # The original run is preserved by structure_decoder_detached_sit_b2.yaml.
   distance_scale_gradient: full
   bandwidth_multiplier: 0.55
@@ -164,9 +164,9 @@ generator_adaptation:
   lr_lora: 0.0000025
   grad_clip_norm: 1.0
   null_preservation_weight: 0.10
-  # Same-domain G(E_1A(x)) velocity distillation; no E/head gradients, no
-  # cross-domain mean targets. Small one-step batches limit extra compute.
-  conditioned_preservation_weight: 0.05
+  # Native reconstruction is supervised by real-data flow targets. Stage 1A
+  # predictions are imperfect and are not the target for native synthesis.
+  conditioned_preservation_weight: 0.0
   conditioned_preservation_samples: 4
 
 # Actual translated images enter both objectives. No top-k or sampled-code

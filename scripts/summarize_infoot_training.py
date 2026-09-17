@@ -60,12 +60,11 @@ def validation_row(row: dict) -> dict:
               "solver_column_residual": probe.get("column_residual"),
               "decoded_outer_converged": decoded.get("solver", {}).get("outer_converged")}
     for domain in ("cat", "dog"):
-        current, baseline = row.get(f"{domain}_raw_reconstruction"), row.get(f"{domain}_stage1a_reconstruction")
+        current = row.get(f"{domain}_raw_reconstruction")
         result[f"{domain}_rec"] = current
-        result[f"{domain}_rec_drift_pct"] = 100 * (current / baseline - 1) if baseline and current is not None else None
-        current_null, baseline_null = row.get(f"{domain}_null_reconstruction"), row.get(f"{domain}_stage1a_null_reconstruction")
+        result[f"{domain}_gt_flow_loss"] = current
+        current_null = row.get(f"{domain}_null_reconstruction")
         result[f"{domain}_null_rec"] = current_null
-        result[f"{domain}_null_rec_drift_pct"] = 100 * (current_null / baseline_null - 1) if baseline_null and current_null is not None else None
         result[f"{domain}_matching_variance"] = probe.get("matching_feature_variance", {}).get(domain)
         for key in ("stage1a_encoder_current_generator_reconstruction", "current_encoder_stage1a_generator_reconstruction"):
             result[f"{domain}_{key}"] = row.get(f"{domain}_{key}")
@@ -189,23 +188,23 @@ def summarize(folder: Path | None, warmup_steps: int, *, train_log: Path | None 
 
 def table(summary: dict) -> str:
     if not summary["validation"]:
-        return "No fixed validation log supplied; reconstruction drift and held-out translation quality cannot be inferred.\n"
-    columns = ["step", "cat_rec_drift_pct", "dog_rec_drift_pct", "conditional_kl", "support_loss",
+        return "No fixed validation log supplied; ground-truth reconstruction error and held-out translation quality cannot be inferred.\n"
+    columns = ["step", "cat_gt_flow_loss", "dog_gt_flow_loss", "conditional_kl", "support_loss",
                "cat_to_dog.expected_structure_cost", "dog_to_cat.expected_structure_cost",
                "cat_to_dog.projected_to_target_variance_ratio", "dog_to_cat.projected_to_target_variance_ratio"]
-    labels = ["Step", "Cat rec drift %", "Dog rec drift %", "KL", "Support",
+    labels = ["Step", "Cat GT flow loss", "Dog GT flow loss", "KL", "Support",
               "C2D cost", "D2C cost", "C2D variance ratio", "D2C variance ratio"]
     if any(row["decoded_structure"] is not None for row in summary["validation"]):
-        columns = ["step", "cat_rec_drift_pct", "dog_rec_drift_pct", "conditional_kl",
+        columns = ["step", "cat_gt_flow_loss", "dog_gt_flow_loss", "conditional_kl",
                    "cat_to_dog.decoded_structure", "dog_to_cat.decoded_structure",
                    "cat_to_dog.teacher_gain_pct", "dog_to_cat.teacher_gain_pct", "outer_converged"]
-        labels = ["Step", "Cat rec drift %", "Dog rec drift %", "KL", "C2D decoded structure",
+        labels = ["Step", "Cat GT flow loss", "Dog GT flow loss", "KL", "C2D decoded structure",
                   "D2C decoded structure", "C2D teacher gain %", "D2C teacher gain %", "Outer converged"]
     lines = ["| " + " | ".join(labels) + " |", "| " + " | ".join(["---:"] * len(labels)) + " |"]
     for row in summary["validation"]:
         values = ["n/a" if row[key] is None else str(row[key]) if key in {"step", "outer_converged"} else f"{row[key]:.5f}" for key in columns]
         lines.append("| " + " | ".join(values) + " |")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n\nGT flow loss is absolute SNR-weighted velocity MSE against the real-data latent target; lower is better. It is not an image-space quality metric.\n"
 
 
 def training_table(summary: dict) -> str:
@@ -271,7 +270,7 @@ def plot(summary: dict, folder: Path, output: Path) -> None:
     figure, axes = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
     colors = ("#2563eb", "#db6a1f")
     panels = [
-        ("Fixed reconstruction drift", "% from Stage 1A", [("cat_rec_drift_pct", "Cat"), ("dog_rec_drift_pct", "Dog")]),
+        ("Ground-truth flow reconstruction", "Absolute weighted velocity MSE (lower is better)", [("cat_gt_flow_loss", "Cat"), ("dog_gt_flow_loss", "Dog")]),
         ("Conditional structure KL", "KL (lower is better)", [("conditional_kl", "Bidirectional")]),
         ("Fraction of teacher cost gain", "% of uniform-to-teacher improvement",
          [("cat_to_dog.teacher_gain_pct", "Cat to Dog"), ("dog_to_cat.teacher_gain_pct", "Dog to Cat")]),
@@ -286,8 +285,8 @@ def plot(summary: dict, folder: Path, output: Path) -> None:
              [("cat_to_dog.decoded_structure", "Cat to Dog"), ("dog_to_cat.decoded_structure", "Dog to Cat")]),
             ("Matching-feature spread", "Fixed reference covariance trace",
              [("cat_matching_variance", "Cat"), ("dog_matching_variance", "Dog")]),
-            ("Null reconstruction drift", "% from Stage 1A",
-             [("cat_null_rec_drift_pct", "Cat"), ("dog_null_rec_drift_pct", "Dog")]),
+            ("Null-condition flow loss", "Absolute weighted velocity MSE against real-data target",
+             [("cat_null_rec", "Cat"), ("dog_null_rec", "Dog")]),
         ]
     for ax, (title, ylabel, series) in zip(axes.flat, panels):
         for color, (key, label) in zip(colors, series):

@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_d_v2
+output_dir: outputs/stage1b_eval_d_gt
 seed: 20260906
 alignment_device: cuda:0
 
@@ -61,6 +61,8 @@ projection:
 
 reconstruction:
   enabled: true
+  # Pixel/LPIPS targets are original dataset RGB images after cache preprocessing.
+  # VAE reconstruction error is reported separately; Stage 1A is not the target.
   samples_per_domain: 8
   num_steps: 20
   guidance_scale: 1.0

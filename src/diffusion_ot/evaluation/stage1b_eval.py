@@ -184,6 +184,9 @@ def _protocol_identifier(
 ) -> str:
     payload = {
         "evaluation_config": evaluation_config,
+        # Older reports used VAE-decoded x0 as the pixel target. Never reuse
+        # their protocol ID for metrics against the original dataset image.
+        "reconstruction_metric_protocol": "original_dataset_rgb_v1",
         "cli_overrides": {
             "max_reference": max_reference,
             "max_projection": max_projection,
@@ -669,10 +672,12 @@ def _evaluate_reconstruction(
     include_lpips: bool,
     output_path: Path,
 ) -> dict[str, Any]:
+    from diffusion_ot.data.ground_truth import load_ground_truth_images
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
 
     count = min(int(count), len(bank.sample_ids))
+    original_images = load_ground_truth_images(context.data_config_path, bank.metadata[:count]).to(context.device)
     x0 = _load_latents_from_bank(bank, count).to(context.device, dtype=context.dtype)
     z = bank.raw_codes[:count].to(context.device, dtype=context.dtype)
     generator = torch.Generator(device=context.device).manual_seed(int(seed))
@@ -687,13 +692,16 @@ def _evaluate_reconstruction(
         guidance_scale=guidance_scale,
         null_label=class_config.get("null_label"),
     )
-    original_images = decode_vae_latents(context.vae, x0)
+    vae_images = decode_vae_latents(context.vae, x0)
     reconstructed_images = decode_vae_latents(context.vae, reconstructed)
+    if reconstructed_images.shape != original_images.shape or vae_images.shape != original_images.shape:
+        raise ValueError("Ground-truth image and decoded reconstruction shapes differ; check cache preprocessing.")
     latent_metrics = _mse_psnr(reconstructed, x0)
     pixel_metrics = _mse_psnr(reconstructed_images, original_images)
+    vae_metrics = _mse_psnr(vae_images, original_images)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_image(
-        torch.cat([original_images.cpu(), reconstructed_images.cpu()]),
+        torch.cat([original_images.cpu(), vae_images.cpu(), reconstructed_images.cpu()]),
         str(output_path),
         nrow=count,
         padding=2,
@@ -701,13 +709,20 @@ def _evaluate_reconstruction(
     )
     report: dict[str, Any] = {
         "sample_ids": bank.sample_ids[:count],
+        "image_reference": "original_dataset_rgb",
+        "image_preprocessing": "same_center_crop_and_bicubic_resize_as_latent_cache",
+        "grid_rows": ["ground_truth", "vae_reconstruction", "model_reconstruction"],
         "latent_mse": latent_metrics["mse"],
         "pixel_mse": pixel_metrics["mse"],
         "pixel_psnr": pixel_metrics["psnr"],
         "grid_path": str(output_path),
+        "vae_reconstruction_to_ground_truth": {
+            "pixel_mse": vae_metrics["mse"], "pixel_psnr": vae_metrics["psnr"],
+        },
     }
     if include_lpips:
         report["lpips"] = _lpips(reconstructed_images, original_images, context.device)
+        report["vae_reconstruction_to_ground_truth"]["lpips"] = _lpips(vae_images, original_images, context.device)
     return report
 
 
@@ -1593,6 +1608,7 @@ def run_stage1b_evaluation(
             domain: context.stage1a_architecture for domain, context in contexts.items()
         },
         generation_protocol={
+            "reconstruction_reference": "original_dataset_rgb",
             "fit_bandwidth_multiplier": bandwidth,
             "projection_bandwidth_multiplier": projection_bandwidth,
             "semantic_cfg_enabled": all(

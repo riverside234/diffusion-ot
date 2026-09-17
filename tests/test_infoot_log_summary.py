@@ -38,7 +38,10 @@ def test_resume_duplicates_and_separate_fixed_validation_are_not_extra_replicate
     assert result["sources"]["training"]["duplicate_steps"] == 1
     assert len(result["training"]) == 2
     assert result["training"][-1]["window_loss"] == 7
-    assert result["validation"][0]["cat_rec_drift_pct"] == pytest.approx(10)
+    assert result["validation"][0]["cat_gt_flow_loss"] == pytest.approx(1.1)
+    assert "cat_rec_drift_pct" not in result["validation"][0]
+    assert "Cat GT flow loss" in summary_tools["table"](result)
+    assert "drift" not in summary_tools["table"](result)
 
 
 def test_decoded_validation_preserves_failed_and_missing_solver_status(tmp_path):
@@ -53,7 +56,7 @@ def test_decoded_validation_preserves_failed_and_missing_solver_status(tmp_path)
     assert result["validation_steps_failed_outer_convergence"] == [0]
     assert result["validation_steps_missing_outer_convergence"] == [200]
     assert result["validation_uses_same_ids"] is None
-    assert result["validation"][0]["cat_null_rec_drift_pct"] == pytest.approx(20)
+    assert result["validation"][0]["cat_null_rec"] == pytest.approx(.6)
     assert result["validation"][0]["cat_matching_variance"] == .15
     assert result["validation"][0]["cat_to_dog.decoded_structure"] == .1
     assert result["validation"][0]["decoded_outer_converged"] is None
