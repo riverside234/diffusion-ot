@@ -34,9 +34,9 @@ train:
   weight_decay: 0.0
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
-  log_every: 200
-  gradient_diagnostics_every: 200
-  save_every: 1000
+  log_every: 250
+  gradient_diagnostics_every: 250
+  save_every: 2000
   resume_from: null
   loss_window: 100
   validation_every: 500
@@ -69,7 +69,7 @@ matching:
   # This changes the update rule: start fresh from Stage 1A in the new folder.
   # The original run is preserved by structure_decoder_detached_sit_b2.yaml.
   distance_scale_gradient: full
-  bandwidth_multiplier: 0.50
+  bandwidth_multiplier: 0.55
 
 infoot:
   variant: fused
