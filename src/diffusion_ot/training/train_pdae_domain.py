@@ -595,6 +595,19 @@ def _load_torch_checkpoint(path: Path, device: str):
         return torch.load(path, map_location=device)
 
 
+def _initialize_stage1a_weights(branch, checkpoint, *, domain: str, weights: str):
+    """Warm start E/G only; optimizer, EMA history, step and RNG start fresh."""
+    from diffusion_ot.evaluation.stage1a_eval import _apply_ema_weights
+
+    if checkpoint.get("domain") != domain:
+        raise ValueError("Stage 1A initialization checkpoint domain does not match the recipe.")
+    if weights not in {"raw", "ema"}:
+        raise ValueError("train.initialization_weights must be raw or ema.")
+    branch.load_pdae_state_dict(checkpoint["model"])
+    if weights == "ema":
+        _apply_ema_weights(branch, checkpoint)
+
+
 def _save_checkpoint(
     checkpoint_path: Path,
     *,
@@ -648,8 +661,12 @@ def train_pdae_domain(
         pdae_velocity_gap_loss,
     )
     from diffusion_ot.models.pdae_sit import build_pdae_sit_branch, make_null_class_labels
+    from diffusion_ot.training.stage1a_refinement import (
+        Stage1ARefinement, validate_refinement_config, validate_refinement_resume,
+    )
 
     config, resolved_config_path, root = _load_stage_config(config_path)
+    validate_refinement_config(config)
     train_config = _nested(config, "train")
     dataloader_config = _nested(config, "dataloader")
     flow_config = _nested(config, "flow")
@@ -746,6 +763,26 @@ def train_pdae_domain(
     branch.to(device=device, dtype=model_dtype)
     branch.train()
 
+    initialization = None
+    # --resume takes precedence: initialization is only for a NEW experiment.
+    if resolved_resume_path is None and train_config.get("initialize_from"):
+        init_path = resolve_project_local_path(train_config["initialize_from"], root,
+                                               field_name="train.initialize_from")
+        if init_path.resolve() == checkpoint_path.resolve():
+            raise ValueError("Warm-start refinement needs a new output directory.")
+        init_checkpoint = _load_torch_checkpoint(init_path, device=device)
+        init_weights = str(train_config.get("initialization_weights", "ema"))
+        _initialize_stage1a_weights(branch, init_checkpoint, domain=domain, weights=init_weights)
+        initialization = {"checkpoint": str(init_path), "weights": init_weights,
+                          "source_step": int(init_checkpoint.get("step", 0))}
+        del init_checkpoint
+
+    refinement = (
+        Stage1ARefinement(config, vae=components.vae, data_config_path=data_config_path,
+                         root=root, device=device, seed=seed)
+        if (config.get("refinement") or {}).get("enabled", False) else None
+    )
+
     loader_generator = torch.Generator()
     loader_generator.manual_seed(seed)
     loader = DataLoader(
@@ -786,6 +823,9 @@ def train_pdae_domain(
         if not resolved_resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resolved_resume_path}")
         checkpoint = _load_torch_checkpoint(resolved_resume_path, device=device)
+        validate_refinement_resume(checkpoint.get("config") or {}, config)
+        if checkpoint.get("domain") != domain:
+            raise ValueError("Resume checkpoint domain does not match the recipe.")
         branch.load_pdae_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         _apply_optimizer_hyperparameters(optimizer, train_config)
@@ -796,6 +836,9 @@ def train_pdae_domain(
                 ema.reset(branch)
         initial_step = int(checkpoint.get("step", 0))
         saved_train_state = checkpoint.get("train_state") or {}
+        initialization = saved_train_state.get("initialization")
+        if refinement is not None:
+            refinement.load_state_dict(saved_train_state.get("refinement"))
         loss_ema = saved_train_state.get("loss_ema")
         clip_events = int(saved_train_state.get("clip_events", 0))
         clip_checks = int(saved_train_state.get("clip_checks", 0))
@@ -860,10 +903,18 @@ def train_pdae_domain(
     logs_dir = output_dir / "logs"
     train_metrics_path = logs_dir / "train.jsonl"
     validation_metrics_path = logs_dir / "validation.jsonl"
+
+    def current_train_state():
+        return {"loss_ema": loss_ema, "clip_events": clip_events, "clip_checks": clip_checks,
+                "training_seconds": training_seconds, "initialization": initialization,
+                "refinement": refinement.state_dict() if refinement is not None else None}
+
     if resolved_resume_path is None:
         logs_dir.mkdir(parents=True, exist_ok=True)
         train_metrics_path.write_text("", encoding="utf-8")
         validation_metrics_path.write_text("", encoding="utf-8")
+        if refinement is not None:
+            (logs_dir / "refinement.jsonl").write_text("", encoding="utf-8")
         _save_checkpoint(
             checkpoint_path,
             step=0,
@@ -872,16 +923,18 @@ def train_pdae_domain(
             optimizer=optimizer,
             ema=ema,
             config=config,
-            train_state={
-                "loss_ema": loss_ema,
-                "clip_events": clip_events,
-                "clip_checks": clip_checks,
-                "training_seconds": training_seconds,
-            },
+            train_state=current_train_state(),
             loader_generator=loader_generator,
         )
 
     def run_validation(step: int) -> None:
+        # Loader iterator creation otherwise advances global RNG despite the
+        # probe's private noise generator. Validation must not change training.
+        devices = [torch.device(device)] if torch.device(device).type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            run_validation_impl(step)
+
+    def run_validation_impl(step: int) -> None:
         if validation_loader is None:
             return
         print(json.dumps({"event": "validation_start", "step": step}, sort_keys=True))
@@ -902,6 +955,15 @@ def train_pdae_domain(
             ema=ema,
             use_ema=bool(evaluation_config.get("use_ema", True)),
         )
+        if refinement is not None:
+            parameter_context = (ema.average_parameters(branch)
+                                 if ema is not None and evaluation_config.get("use_ema", True)
+                                 else nullcontext())
+            with parameter_context:
+                metrics["refinement"] = refinement.evaluate(
+                    branch, transformer, validation_loader, device=device, dtype=model_dtype,
+                    step=step, null_label=null_label,
+                    grid_path=output_dir / "validation" / f"native_{step:06d}.png")
         metrics["duration_seconds"] = time.perf_counter() - validation_started
         _append_jsonl(validation_metrics_path, metrics)
         print(
@@ -969,6 +1031,7 @@ def train_pdae_domain(
         loss_sum = None
         weight_mean_sum = None
         diagnostic_sums: dict[str, float] = {}
+        refinement_metrics = None
 
         for _ in range(accumulation_steps):
             batch = next(batch_iter)
@@ -1036,6 +1099,13 @@ def train_pdae_domain(
                 for name, value in diagnostics.items():
                     diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value
 
+        if refinement is not None and refinement.scheduled(step):
+            refinement_metrics = refinement.backward(
+                branch, transformer, batch, x0, step=step, null_label=null_label)
+            # Sparse image steps must be visible even when log_every skips them.
+            _append_jsonl(logs_dir / "refinement.jsonl", {"event": "refinement", "step": step,
+                                                       **refinement_metrics})
+
         encoder_grad_norm = _gradient_norm(encoder_parameters) if should_log else None
         adapter_grad_norm = _gradient_norm(adapter_parameters) if should_log else None
         lora_grad_norm = (
@@ -1047,16 +1117,21 @@ def train_pdae_domain(
             else None
         )
         if grad_clip_norm is not None:
-            total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                trainable_parameters,
-                float(grad_clip_norm),
-                error_if_nonfinite=True,
-            )
+            if refinement is None:
+                total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters, float(grad_clip_norm), error_if_nonfinite=True)
+                clipped = total_grad_norm_tensor.detach() > float(grad_clip_norm)
+            else:
+                # A G-only code gradient must not rescale E's update through
+                # shared global norm clipping. Keep separate E and G caps.
+                group_norms = torch.stack([
+                    torch.nn.utils.clip_grad_norm_(group, float(grad_clip_norm), error_if_nonfinite=True)
+                    for group in (encoder_parameters, adapter_parameters + lora_parameters)])
+                total_grad_norm_tensor = group_norms.square().sum().sqrt()
+                clipped = (group_norms.detach() > float(grad_clip_norm)).any()
             clip_checks += 1
             clip_events_tensor.add_(
-                (total_grad_norm_tensor.detach() > float(grad_clip_norm)).to(
-                    dtype=clip_events_tensor.dtype
-                )
+                clipped.to(dtype=clip_events_tensor.dtype)
             )
         else:
             total_grad_norm_tensor = None
@@ -1112,6 +1187,7 @@ def train_pdae_domain(
                     else None
                 ),
                 "gradient_clip_fraction": clip_events / max(clip_checks, 1),
+                "gradient_clipping": "separate_encoder_generator" if refinement else "global",
                 "ema_decay": ema.effective_decay if ema is not None else None,
                 "training_seconds_total": training_seconds,
                 "optimizer_steps_per_second": logged_steps / max(interval_training_seconds, 1.0e-12),
@@ -1120,6 +1196,13 @@ def train_pdae_domain(
                     / max(interval_training_seconds, 1.0e-12)
                 ),
             }
+            if refinement is not None:
+                # Preserve legacy loss/loss_ema as REAL-DATA FLOW metrics.
+                # Sparse auxiliaries are logged individually on every use.
+                metrics["flow_loss"] = loss_value
+                metrics["refinement"] = refinement_metrics
+                metrics["total_loss"] = loss_value + (refinement_metrics["weighted_loss"]
+                                                       if refinement_metrics else 0.0)
             metrics.update(
                 {
                     name: value / accumulation_steps
@@ -1143,14 +1226,12 @@ def train_pdae_domain(
                 optimizer=optimizer,
                 ema=ema,
                 config=config,
-                train_state={
-                    "loss_ema": loss_ema,
-                    "clip_events": clip_events,
-                    "clip_checks": clip_checks,
-                    "training_seconds": training_seconds,
-                },
+                train_state=current_train_state(),
                 loader_generator=loader_generator,
             )
+            if train_config.get("keep_step_checkpoints", False):
+                from shutil import copyfile
+                copyfile(checkpoint_path, checkpoint_path.with_name(f"step_{step:06d}.pt"))
 
         if evaluation_enabled and evaluation_every > 0 and step % evaluation_every == 0:
             run_validation(step)

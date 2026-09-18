@@ -72,6 +72,24 @@ LoRA, LoRA rank/alpha 64/64, semantic dropout 0.10, and 50,000 updates. Stage 1B
 requires checkpoints with learned null tokens and cannot load the older non-CFG
 format.
 
+### Same-domain Stage 1A refinement
+
+Continue an existing Stage 1A EMA model with real-data flow reconstruction,
+modest original-RGB DINO perceptual/structure supervision, and generator-only
+native-code InfoNCE:
+
+```bash
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_refine.yaml --device cuda:0
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_refine.yaml --device cuda:1
+```
+
+These recipes warm-start E/G weights and run 2,000 new updates with fresh
+optimizers/EMA history, saving to `outputs/stage1a_cat_refine` and
+`outputs/stage1a_dog_refine`. Use `--resume` to continue a refinement run.
+They require the original AFHQ dataset and the pinned DINO structure cache.
+See [Stage 1A refinement](docs/stage1a_refinement.md) for loss routing,
+hyperparameters, validation grids, and checkpoint selection before Stage 1B.
+
 ## Experiment D co-training
 
 The active recipe adds teacher-guided matching contrastive losses, decoded

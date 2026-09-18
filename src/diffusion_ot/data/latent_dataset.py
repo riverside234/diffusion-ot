@@ -175,9 +175,11 @@ class CachedLatentDataset:
                 f"Latent shape mismatch for {record['latent_path']}: "
                 f"expected {expected_shape}, got {list(latent.shape)}"
             )
+        horizontal_flip = False
         if self.random_horizontal_flip > 0.0:
             if self.random_horizontal_flip >= 1.0 or torch.rand(()) < self.random_horizontal_flip:
                 latent = torch.flip(latent, dims=(-1,))
+                horizontal_flip = True
         return {
             "x0_latent": latent,
             "sample_id": record.get("sample_id"),
@@ -185,6 +187,7 @@ class CachedLatentDataset:
             "split": self.split,
             "latent_path": record["latent_path"],
             "metadata": record,
+            "horizontal_flip": horizontal_flip,
         }
 
 
@@ -198,4 +201,5 @@ def collate_latent_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
         "split": [item["split"] for item in items],
         "latent_path": [item["latent_path"] for item in items],
         "metadata": [item["metadata"] for item in items],
+        "horizontal_flip": [item.get("horizontal_flip", False) for item in items],
     }

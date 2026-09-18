@@ -63,7 +63,7 @@ def test_cached_latent_dataset_can_flip_latent_horizontally(tmp_path):
     split_dir.mkdir(parents=True)
 
     sample_id = "cat_000000"
-    latent = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
+    latent = torch.arange(4 * 32 * 32, dtype=torch.float32).reshape(4, 32, 32)
     latent_path = split_dir / f"{sample_id}.pt"
     torch.save({"x0_latent": latent}, latent_path)
     (manifest_dir / "cat_train.jsonl").write_text(
@@ -84,6 +84,12 @@ def test_cached_latent_dataset_can_flip_latent_horizontally(tmp_path):
     )
 
     torch.testing.assert_close(dataset[0]["x0_latent"], torch.flip(latent, dims=(-1,)))
+    assert dataset[0]["horizontal_flip"] is True
+    from diffusion_ot.data.latent_dataset import collate_latent_batch
+    assert collate_latent_batch([dataset[0]])["horizontal_flip"] == [True]
+    dataset.random_horizontal_flip = 0.0
+    assert dataset[0]["horizontal_flip"] is False
+    torch.testing.assert_close(dataset[0]["x0_latent"], latent)
 
 
 def test_latent_cache_selects_configured_posterior_statistic():
