@@ -8,6 +8,7 @@ split: train
 data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
 output_dir: outputs/stage1a_cat_refine
+# Logical index within CUDA_VISIBLE_DEVICES; select the physical GPU in the shell.
 device: cuda:0
 torch_dtype: float32
 dataloader:

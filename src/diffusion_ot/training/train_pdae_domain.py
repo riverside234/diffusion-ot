@@ -643,6 +643,31 @@ def _save_checkpoint(
     temporary_path.replace(checkpoint_path)
 
 
+def _validate_training_device(device: str) -> None:
+    """Reject unavailable logical CUDA indices before loading model weights."""
+    import os
+    import torch
+
+    selected = torch.device(device)
+    if selected.type != "cuda":
+        return
+    visible_count = torch.cuda.device_count()
+    if not torch.cuda.is_available() or visible_count == 0:
+        raise ValueError(
+            f"Requested {device}, but CUDA is unavailable to this process. "
+            "Check CUDA_VISIBLE_DEVICES and the CUDA runtime, or pass --device cpu."
+        )
+    if selected.index is not None and selected.index >= visible_count:
+        mask = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+        raise ValueError(
+            f"Requested {device}, but this process sees {visible_count} CUDA device(s) "
+            f"(CUDA_VISIBLE_DEVICES={mask!r}); valid logical indices are "
+            f"0 through {visible_count - 1}. CUDA_VISIBLE_DEVICES remaps physical GPUs "
+            "to process-local indices. With one visible GPU, pass --device cuda:0 "
+            "on the same command line (or set device: cuda:0 in the YAML)."
+        )
+
+
 def train_pdae_domain(
     config_path: str | Path,
     device: str | None = None,
@@ -697,6 +722,8 @@ def train_pdae_domain(
     seed = int(train_config.get("seed", 20260901))
     torch.manual_seed(seed)
     device = device or config.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
+    if not dry_run:
+        _validate_training_device(device)
     limit = train_config.get("limit")
     random_horizontal_flip = float(dataloader_config.get("random_horizontal_flip", 0.0))
     dataset = CachedLatentDataset(

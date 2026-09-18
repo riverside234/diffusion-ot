@@ -17,7 +17,7 @@ def repo_path(path: str) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train one Stage 1A PDAE domain branch on cached SiT latents.")
     parser.add_argument("--config", required=True, help="Path to a Stage 1A PDAE config.")
-    parser.add_argument("--device", default=None, help="Torch device override, for example cuda or cpu.")
+    parser.add_argument("--device", default=None, help="Torch device override using process-visible indices. With one GPU in CUDA_VISIBLE_DEVICES, use cuda:0; cpu is also supported.")
     parser.add_argument("--max-steps", type=int, default=None, help="Optional optimizer-update limit override.")
     parser.add_argument(
         "--resume",
