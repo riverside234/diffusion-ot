@@ -1,5 +1,5 @@
-# Same-domain refinement pilot; see docs/stage1a_refinement.md.
-# Fresh 2,000-step run initialized from Stage 1A EMA; --resume continues this pilot.
+# Stage 1A training with native image/code losses; see docs/stage1a_refinement.md.
+# Fresh 40,000-step E/conditioning run on pretrained SiT/VAE; no old Stage 1A weights.
 # Keep flow reconstruction at weight 1. Auxiliary weights are unvalidated starting values.
 stage: stage1a_pdae
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
@@ -7,7 +7,7 @@ domain: cat
 split: train
 data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
-output_dir: outputs/stage1a_cat_refine
+output_dir: outputs/stage1a_cat_native40k
 # Logical index within CUDA_VISIBLE_DEVICES; select the physical GPU in the shell.
 device: cuda:0
 torch_dtype: float32
@@ -32,8 +32,7 @@ train:
   grad_clip_norm: 1.0
   log_every: 100
   save_every: 1000
-  initialize_from: outputs/stage1a_cat_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
-  initialization_weights: ema
+  initialize_from: null
   keep_step_checkpoints: true
 ema:
   enabled: true
