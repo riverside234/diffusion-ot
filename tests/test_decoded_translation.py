@@ -17,7 +17,8 @@ from diffusion_ot.models.generator_adaptation import (
     load_joint_generator, predict_with_parameters,
 )
 from diffusion_ot.training.decoded_translation import (
-    DecoderTraining, FrozenImageFeatures, integrate_training_flow, validate_decoder_config,
+    DecoderTraining, FrozenImageFeatures, decoded_structure_contrastive_loss,
+    generated_code_consistency_loss, integrate_training_flow, validate_decoder_config,
 )
 
 
@@ -526,3 +527,169 @@ def test_disabled_conditioned_preservation_skips_teacher_and_keeps_rng(monkeypat
     rng = torch.get_rng_state().clone()
     assert trainer.conditioned_preservation_loss({}, {}).item() == 0
     assert torch.equal(torch.get_rng_state(), rng)
+
+
+def test_decoded_contrastive_uses_reference_bank_detaches_keys_and_masks_duplicates():
+    source = torch.eye(4)[:2].requires_grad_()
+    generated = (source.detach() + .1 * torch.ones_like(source)).requires_grad_()
+    # One near-duplicate of each positive and two genuinely different negatives.
+    bank = torch.eye(4).requires_grad_()
+    loss, metrics = decoded_structure_contrastive_loss(generated, source, bank, temperature=.2)
+    assert metrics["negative_bank_size"] == 4
+    assert metrics["usable_samples"] == 2
+    assert metrics["mean_usable_negatives"] == 3
+    wrong, _ = decoded_structure_contrastive_loss(generated, source.flip(0), bank, temperature=.2)
+    assert wrong > loss
+    loss.backward()
+    assert generated.grad.norm() > 0
+    assert source.grad is None and bank.grad is None
+
+
+@pytest.mark.parametrize("bank_size", [0, 1, 8])
+def test_decoded_contrastive_singleton_duplicate_only_bank_is_finite_zero(bank_size):
+    positive = torch.tensor([[1., 0, 0]])
+    generated = torch.tensor([[.8, .2, 0]], requires_grad=True)
+    bank = positive.repeat(bank_size, 1)
+    loss, metrics = decoded_structure_contrastive_loss(generated, positive, bank,
+                                                      negative_similarity_threshold=1)
+    assert loss.item() == 0
+    assert metrics["usable_samples"] == 0
+    assert metrics["mean_usable_negatives"] == 0
+    loss.backward()
+    torch.testing.assert_close(generated.grad, torch.zeros_like(generated))
+
+
+def test_generated_code_readout_detaches_parameters_and_target_but_not_latent():
+    torch.manual_seed(72)
+    encoder = nn.Sequential(nn.Linear(5, 4), nn.LayerNorm(4))
+    generated = torch.randn(3, 5, requires_grad=True)
+    condition = torch.randn(3, 4, requires_grad=True)
+    loss, metrics = generated_code_consistency_loss(encoder, generated, condition)
+    loss.backward()
+    assert generated.grad.norm() > 0
+    assert condition.grad is None
+    assert all(p.grad is None for p in encoder.parameters())
+    assert metrics["valid_conditions"] == 3
+    assert metrics["matched_minus_shuffled_cosine"] == pytest.approx(
+        metrics["matched_cosine"] - metrics["shuffled_cosine"], abs=1e-6)
+    assert math.isfinite(metrics["recovered_to_condition_norm_ratio"])
+
+
+def test_generated_code_readout_preserves_buffers_and_handles_singleton_and_zero_targets():
+    encoder = nn.Sequential(nn.BatchNorm1d(4), nn.Linear(4, 3))
+    before = deepcopy(encoder.state_dict())
+    generated = torch.randn(2, 4, requires_grad=True)
+    loss, metrics = generated_code_consistency_loss(encoder, generated, torch.zeros(2, 3))
+    assert loss.item() == 0
+    assert metrics["valid_conditions"] == 0
+    assert metrics["matched_cosine"] is None
+    assert metrics["shuffled_cosine"] is None
+    loss.backward()
+    torch.testing.assert_close(generated.grad, torch.zeros_like(generated))
+    for key, value in before.items():
+        torch.testing.assert_close(encoder.state_dict()[key], value, rtol=0, atol=0)
+    assert encoder.training
+    identity = nn.Identity()
+    singleton = torch.tensor([[1., .1, 0]], requires_grad=True)
+    loss, metrics = generated_code_consistency_loss(identity, singleton, torch.tensor([[1., 0, 0]]))
+    assert loss > 0
+    assert metrics["valid_conditions"] == 1
+    assert metrics["shuffled_cosine"] is None and metrics["retrieval_top1"] is None
+
+
+def test_generated_code_retrieval_prefers_correct_condition_and_leaves_scale_unpenalized():
+    identity = nn.Identity()
+    condition = torch.eye(3)
+    recovered = condition * 4
+    loss, metrics = generated_code_consistency_loss(identity, recovered, condition)
+    assert loss.item() == 0
+    assert metrics["retrieval_top1"] == 1
+    assert metrics["matched_minus_shuffled_cosine"] == 1
+    assert metrics["recovered_to_condition_norm_ratio"] == 4
+    wrong, _ = generated_code_consistency_loss(identity, recovered, condition.roll(1, dims=0))
+    assert wrong > loss
+
+
+@pytest.mark.parametrize("code_mode", ["cosine", "contrastive"])
+def test_active_decoded_extensions_keep_frozen_readouts_and_validation_state(monkeypatch, tmp_path, code_mode):
+    import diffusion_ot.training.decoded_translation as module
+    monkeypatch.setattr(module, "load_image_features", tiny_features)
+    torch.manual_seed(29)
+    ctx, cfg = domains(), config()
+    cfg["decoded_translation"].update(structure_contrastive_weight=.01,
+                                      structure_contrastive_temperature=.2,
+                                      code_consistency_weight=.02, code_consistency_mode=code_mode)
+    runtime = DecoderTraining(cfg, ctx, None, tmp_path, seed=18)
+    references = {d: torch.randn(5, 6, requires_grad=True) for d in ctx}
+    weights = {f"{s}_to_{t}": torch.softmax(torch.randn(4, 5), -1)
+               for s, t in (("cat", "dog"), ("dog", "cat"))}
+    latents = {d: torch.randn(4, 4, 8, 8) for d in ctx}
+    # Source keys are cached descriptors in production; synthetic unit vectors
+    # exercise the same bank/query distinction without remote DINO downloads.
+    query_structure = {d: torch.randn(4, 12, requires_grad=True) for d in ctx}
+    reference_structure = {d: torch.randn(7, 12, requires_grad=True) for d in ctx}
+    loss, metrics = runtime.loss(weights, references, latents, latents, step=1,
+                                 source_query_structure=query_structure,
+                                 source_reference_structure=reference_structure)
+    consistency = runtime.code_consistency_objective
+    assert consistency > 0
+    expected = (.1 * metrics["structure_loss"] + .01 * metrics["adversarial_loss"]
+                + .01 * metrics["structure_contrastive_loss"])
+    assert metrics["weighted_loss"] == pytest.approx(expected)
+    assert loss.item() == pytest.approx(expected * .5)
+    assert consistency.item() == pytest.approx(.5 * .02 * metrics["code_consistency_loss"])
+    g_grads = torch.autograd.grad(consistency, runtime.parameters, retain_graph=True, allow_unused=True)
+    assert sum(g.norm().item() for g in g_grads if g is not None) > 0
+    # Generator-only routing does not accumulate gradients on either branch's
+    # encoder or on the target codes. The main image loss still trains codes.
+    assert all(p.grad is None for v in ctx.values() for p in v.branch.encoder.parameters())
+    assert all(v.grad is None for v in references.values())
+    loss.backward()
+    assert all(v.grad is not None and v.grad.norm() > 0 for v in references.values())
+    assert all(v.grad is None for v in (*query_structure.values(), *reference_structure.values()))
+    assert all(p.grad is None for p in runtime.features.parameters())
+    assert all(p.grad is None for p in runtime.discriminators.parameters())
+    for direction in ("cat_to_dog", "dog_to_cat"):
+        assert metrics[direction]["structure_contrastive"]["negative_bank_size"] == 7
+        assert metrics[direction]["code_consistency"]["valid_conditions"] == 2
+        if code_mode == "contrastive":
+            assert metrics[direction]["code_consistency"]["condition_bank_size"] == 4
+    discriminator = deepcopy(runtime.discriminators.state_dict())
+    states = {d: g.get_state().clone() for d, g in runtime.noise_generators.items()}
+    rng = torch.get_rng_state().clone()
+    with torch.no_grad():
+        first = runtime.loss(weights, references, latents, latents, step=2, validation_seed=21,
+                             source_query_structure=query_structure,
+                             source_reference_structure=reference_structure)[1]
+        first_consistency = runtime.code_consistency_objective.item()
+        second = runtime.loss(weights, references, latents, latents, step=2, validation_seed=21,
+                              source_query_structure=query_structure,
+                              source_reference_structure=reference_structure)[1]
+    assert first == second and first_consistency == runtime.code_consistency_objective.item()
+    assert runtime.discriminator_updates == 1
+    assert torch.equal(rng, torch.get_rng_state())
+    for key, value in discriminator.items():
+        torch.testing.assert_close(runtime.discriminators.state_dict()[key], value, rtol=0, atol=0)
+    assert all(torch.equal(states[d], g.get_state()) for d, g in runtime.noise_generators.items())
+    # Disabling extensions must clear any graph left by the previous call.
+    cfg["decoded_translation"].update(structure_contrastive_weight=0, code_consistency_weight=0)
+    with torch.no_grad():
+        _, disabled = runtime.loss(weights, references, latents, latents, step=2, validation_seed=21)
+    assert runtime.code_consistency_objective.item() == 0
+    assert "code_consistency_loss" not in disabled and "structure_contrastive_loss" not in disabled
+
+
+@pytest.mark.parametrize("key,value", [
+    ("structure_contrastive_weight", -1), ("structure_contrastive_weight", float("nan")),
+    ("code_consistency_weight", -1), ("code_consistency_weight", float("inf")),
+    ("structure_contrastive_temperature", 0), ("structure_contrastive_temperature", float("nan")),
+    ("structure_contrastive_negative_similarity_threshold", 1.1),
+    ("code_consistency_mode", "mse"),
+    ("code_consistency_temperature", 0), ("code_consistency_temperature", float("nan")),
+    ("code_consistency_negative_similarity_threshold", 1.1),
+])
+def test_decoded_extension_options_are_validated(key, value):
+    cfg = config()
+    cfg["decoded_translation"][key] = value
+    with pytest.raises(ValueError, match="decoded_translation"):
+        validate_decoder_config(cfg)

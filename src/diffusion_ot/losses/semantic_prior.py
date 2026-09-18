@@ -177,8 +177,8 @@ def validate_prior_resume(saved_config: dict[str, Any], current_config: dict[str
     if saved_variant == "fused" and neighborhood_options(saved_config.get("semantic_prior") or {}) != neighborhood_options(current_config.get("semantic_prior") or {}):
         raise ValueError("Resume cannot change semantic_prior neighborhood objective; start a new run.")
     if any(any((config.get(key) or {}).get("enabled", False) for key in
-               ("conditional_structure", "gradient_guard", "projection_support", "matching_head", "matching_regularization")) for config in (saved_config, current_config)):
-        for key in ("conditional_structure", "loss_weights", "matching", "infoot", "gradient_guard", "projection_support", "matching_head", "matching_regularization", "generator_adaptation", "decoded_translation", "trainable"):
+               ("conditional_structure", "gradient_guard", "projection_support", "matching_head", "matching_regularization", "matching_contrastive", "decoded_encoder_balance")) for config in (saved_config, current_config)):
+        for key in ("conditional_structure", "loss_weights", "matching", "infoot", "gradient_guard", "projection_support", "matching_head", "matching_regularization", "matching_contrastive", "decoded_encoder_balance", "generator_adaptation", "decoded_translation", "trainable"):
             if key == "infoot" and _compatible_infoot_resume(saved_config.get(key) or {}, current_config.get(key) or {}):
                 continue
             if (saved_config.get(key) or {}) != (current_config.get(key) or {}):

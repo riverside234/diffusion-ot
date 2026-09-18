@@ -726,6 +726,14 @@ def _evaluate_reconstruction(
     return report
 
 
+_TRANSLATION_ROW_NAMES = {
+    "conditional_mean": "infoot_conditional_mean",
+    "conditional_map": "selected_target",
+    "conditional_sample": "sampled_target",
+    "structure_teacher_mean": "structure_teacher_mean",
+}
+
+
 @torch.inference_mode()
 def _save_translation_grid(
     source: DomainEvaluationContext,
@@ -742,23 +750,43 @@ def _save_translation_grid(
     output_path: Path,
     teacher_codes: torch.Tensor | None = None,
     image_features: Any | None = None,
+    readouts: list[str] | None = None,
+    include_source: bool = True,
 ) -> dict[str, Any]:
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
 
     count = min(int(count), weights.shape[0])
     weights = weights[:count].float()
-    conditional_mean = weighted_target_codes(weights, target_projection.raw_codes)
-    map_codes = target_projection.raw_codes[weights.argmax(dim=1)]
-    sampling_weights = torch.softmax(weights.clamp_min(1.0e-12).log() / float(temperature), dim=1)
-    sample_generator = torch.Generator().manual_seed(int(seed) + 1)
-    sampled_indices = torch.multinomial(
-        sampling_weights.cpu(), 1, generator=sample_generator
-    ).squeeze(1)
-    sampled_codes = target_projection.raw_codes[sampled_indices]
+    if readouts is None:
+        readouts = ["conditional_mean", "conditional_map", "conditional_sample"]
+        if teacher_codes is not None:
+            readouts.append("structure_teacher_mean")
+    if not readouts or len(set(readouts)) != len(readouts) or any(
+        name not in _TRANSLATION_ROW_NAMES for name in readouts
+    ):
+        raise ValueError("Translation readouts must be a nonempty, unique list of supported readouts.")
+    if "structure_teacher_mean" in readouts and teacher_codes is None:
+        raise ValueError("The structure_teacher_mean readout requires teacher codes.")
+    code_rows = []
+    for name in readouts:
+        if name == "conditional_mean":
+            codes = weighted_target_codes(weights, target_projection.raw_codes)
+        elif name == "conditional_map":
+            codes = target_projection.raw_codes[weights.argmax(dim=1)]
+        elif name == "conditional_sample":
+            sampling_weights = torch.softmax(weights.clamp_min(1.0e-12).log() / float(temperature), dim=1)
+            sample_generator = torch.Generator().manual_seed(int(seed) + 1)
+            indices = torch.multinomial(sampling_weights.cpu(), 1, generator=sample_generator).squeeze(1)
+            codes = target_projection.raw_codes[indices]
+        else:
+            codes = teacher_codes[:count]
+        code_rows.append(codes)
 
     source_x0 = _load_latents_from_bank(source_query, count).to(source.device, dtype=source.dtype)
-    source_images = decode_vae_latents(source.vae, source_x0).cpu()
+    source_images = None
+    if include_source or image_features is not None:
+        source_images = decode_vae_latents(source.vae, source_x0).cpu()
     noise_generator = torch.Generator(device=target.device).manual_seed(int(seed))
     noise = torch.randn(
         (count, *source_x0.shape[1:]),
@@ -767,18 +795,14 @@ def _save_translation_grid(
         dtype=target.dtype,
     )
     class_config = _nested(target.training_config, "class_conditioning")
-    rows = [source_images]
+    rows = [source_images] if include_source else []
     decoded_metrics: dict[str, Any] = {}
     source_structure = None
     if image_features is not None:
         feature_device = next(image_features.parameters()).device
         source_structure, _ = image_features(source_images.to(feature_device))
-    code_rows = [conditional_mean, map_codes, sampled_codes]
-    row_names = ["infoot_conditional_mean", "selected_target", "sampled_target"]
-    if teacher_codes is not None:
-        code_rows.append(teacher_codes[:count])
-        row_names.append("structure_teacher_mean")
-    for row_name, codes in zip(row_names, code_rows):
+    for name, codes in zip(readouts, code_rows):
+        row_name = _TRANSLATION_ROW_NAMES[name]
         latent = integrate_pdae_flow(
             target.branch,
             target.transformer,
@@ -1507,6 +1531,12 @@ def run_stage1b_evaluation(
     translation_paths: dict[str, str] = {}
     translation_config = _nested(evaluation_config, "translation")
     if bool(translation_config.get("enabled", True)):
+        readouts = translation_config.get("readouts")
+        if readouts is None:
+            readouts = ["conditional_mean", "conditional_map", "conditional_sample"]
+            if translation_config.get("include_structure_teacher_mean", False):
+                readouts.append("structure_teacher_mean")
+        include_source = bool(translation_config.get("include_source", True))
         image_features = None
         if translation_config.get("decoded_structure_metrics", False):
             if prior is None:
@@ -1517,7 +1547,7 @@ def run_stage1b_evaluation(
             if name not in direction_tensors:
                 continue
             path = output_root / "translation" / f"{name}_grid.png"
-            teacher_codes = direction_tensors[name].get("structure_teacher_codes") if translation_config.get("include_structure_teacher_mean", False) else None
+            teacher_codes = direction_tensors[name].get("structure_teacher_codes") if "structure_teacher_mean" in readouts else None
             decoded_metrics = _save_translation_grid(
                 contexts[source_domain],
                 contexts[target_domain],
@@ -1531,14 +1561,17 @@ def run_stage1b_evaluation(
                 seed=seed + (30 if name == "cat_to_dog" else 40),
                 output_path=path,
                 teacher_codes=teacher_codes,
+                readouts=readouts,
+                include_source=include_source,
                 **({"image_features": image_features} if image_features is not None else {}),
             )
             if decoded_metrics:
                 projections[name]["decoded_image_diagnostics"] = decoded_metrics
             translation_paths[name] = str(path)
-            projections[name]["translation_grid_rows"] = [
-                "source", "infoot_conditional_mean", "selected_target", "sampled_target",
-            ] + (["structure_teacher_mean"] if teacher_codes is not None else [])
+            projections[name]["translation_grid_rows"] = (
+                (["source"] if include_source else [])
+                + [_TRANSLATION_ROW_NAMES[readout] for readout in readouts]
+            )
         del image_features
 
     visualization_paths: dict[str, str] = {}

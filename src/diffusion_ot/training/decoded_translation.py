@@ -14,9 +14,11 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.func import functional_call
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from diffusion_ot.losses.contrastive import detached_key_contrastive_loss
 from diffusion_ot.losses.semantic_prior import patch_structure_descriptor
 from diffusion_ot.models.generator_adaptation import (
     baseline_parameter_snapshot, configure_generator_adaptation,
@@ -60,6 +62,24 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
         value = float(image.get(name, default))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"decoded_translation.{name} must be finite and positive.")
+    for name in ("structure_contrastive_weight", "code_consistency_weight"):
+        value = float(image.get(name, 0.0))
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"decoded_translation.{name} must be finite and nonnegative.")
+    temperature = float(image.get("structure_contrastive_temperature", .2))
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("decoded_translation.structure_contrastive_temperature must be finite and positive.")
+    similarity = float(image.get("structure_contrastive_negative_similarity_threshold", .95))
+    if not math.isfinite(similarity) or not -1 <= similarity <= 1:
+        raise ValueError("decoded_translation.structure_contrastive_negative_similarity_threshold must be in [-1, 1].")
+    if image.get("code_consistency_mode", "cosine") not in ("cosine", "contrastive"):
+        raise ValueError("decoded_translation.code_consistency_mode must be cosine or contrastive.")
+    code_temperature = float(image.get("code_consistency_temperature", .2))
+    if not math.isfinite(code_temperature) or code_temperature <= 0:
+        raise ValueError("decoded_translation.code_consistency_temperature must be finite and positive.")
+    code_similarity = float(image.get("code_consistency_negative_similarity_threshold", .95))
+    if not math.isfinite(code_similarity) or not -1 <= code_similarity <= 1:
+        raise ValueError("decoded_translation.code_consistency_negative_similarity_threshold must be in [-1, 1].")
     for name, default in (("batch_size", 4), ("num_steps", 50), ("validation_num_steps", 50),
                           ("every_steps", 1), ("warmup_steps", 2000), ("discriminator_hidden_dim", 256)):
         if int(image.get(name, default)) < 1:
@@ -110,6 +130,88 @@ def decode_training_images(vae, latents, *, checkpoint_decode=True):
     pixels = (checkpoint(decode, latents, use_reentrant=False)
               if checkpoint_decode and torch.is_grad_enabled() else decode(latents))
     return ((pixels.float() + 1) / 2).clamp(0, 1)
+
+
+def decoded_structure_contrastive_loss(generated, source, negatives, *, temperature=.2,
+                                        negative_similarity_threshold=.95):
+    """Retrieve the source structure among detached, disjoint reference images.
+
+    The positive is the generated image's own source. Near-duplicate source
+    structures are masked rather than treated as negatives. This deliberately
+    uses the full reference bank, not only the few images decoded this step.
+    No usable negative means no contrastive supervision for that row.
+    """
+    return detached_key_contrastive_loss(
+        generated, source, negatives, temperature=temperature,
+        negative_similarity_threshold=negative_similarity_threshold)
+
+
+def generated_code_consistency_loss(encoder, generated_latents, condition, *, mode="cosine",
+                                    condition_bank=None, temperature=.2,
+                                    negative_similarity_threshold=.95):
+    """Recover a detached full-mean condition through a fixed live readout.
+
+    Detached functional parameters preserve derivatives with respect to the
+    generated latent without training the semantic readout to agree with G.
+    Buffer copies also prevent a stateful readout from mutating training state.
+    The current PDAE encoder uses GroupNorm/LayerNorm and has no stochastic
+    layers. The trainer routes this objective to generator parameters only;
+    callers must not backpropagate it into the conditioning encoder/head path.
+    Contrastive recovery retrieves the supplied condition against other fresh
+    projected query conditions, including queries not decoded this update.
+    The default cosine mode is retained for old configs/checkpoints only.
+    This is latent recovery, not an RGB decode/re-encode or realism metric.
+    """
+    if mode not in ("cosine", "contrastive"):
+        raise ValueError("Code consistency mode must be cosine or contrastive.")
+    parameters = {name: value.detach() for name, value in encoder.named_parameters()}
+    buffers = {name: value.detach().clone() for name, value in encoder.named_buffers()}
+    recovered = functional_call(encoder, (parameters, buffers), (generated_latents,), strict=True).float()
+    target = condition.detach().to(recovered)
+    if recovered.ndim != 2 or recovered.shape != target.shape:
+        raise ValueError("Recovered and conditioning semantic codes must have matching [batch, features] shapes.")
+    if not torch.isfinite(recovered).all() or not torch.isfinite(target).all():
+        raise FloatingPointError("Non-finite generated semantic-code recovery.")
+    target_norm, recovered_norm = target.norm(dim=-1), recovered.norm(dim=-1)
+    valid = target_norm > 1e-6
+    cosine = F.cosine_similarity(recovered, target, dim=-1, eps=1e-6)
+    contrastive_metrics = None
+    if mode == "contrastive":
+        if condition_bank is None:
+            raise ValueError("Contrastive code consistency requires the full projected condition bank.")
+        loss, contrastive_metrics = detached_key_contrastive_loss(
+            recovered, target, condition_bank, temperature=temperature,
+            negative_similarity_threshold=negative_similarity_threshold)
+    else:
+        loss = (1 - cosine[valid]).mean() if valid.any() else recovered.sum() * 0
+    metrics = {"loss": float(loss.detach()), "mode": mode, "samples": len(recovered),
+               "valid_conditions": int(valid.sum()), "readout": "final_diffusion_latent",
+               "matched_cosine": float(cosine[valid].detach().mean()) if valid.any() else None,
+               "recovered_to_condition_norm_ratio": float((recovered_norm[valid] / target_norm[valid]).detach().mean()) if valid.any() else None,
+               "condition_norm": float(target_norm.mean()),
+               "recovered_norm": float(recovered_norm.detach().mean()),
+               "condition_batch_variance": float(target.var(dim=0, unbiased=False).mean()),
+               "recovered_batch_variance": float(recovered.detach().var(dim=0, unbiased=False).mean()),
+               "shuffled_cosine": None, "matched_minus_shuffled_cosine": None,
+               "retrieval_top1": None}
+    # Compare every mismatched condition deterministically. No RNG consumption,
+    # and no retrieval/gap claim for a singleton or invalid-condition batch.
+    with torch.no_grad():
+        if int(valid.sum()) >= 2:
+            similarities = F.normalize(recovered[valid], dim=-1, eps=1e-6) @ F.normalize(target[valid], dim=-1, eps=1e-6).T
+            identity = torch.eye(len(similarities), device=similarities.device, dtype=torch.bool)
+            shuffled = similarities[~identity].mean()
+            metrics.update(shuffled_cosine=float(shuffled),
+                           matched_minus_shuffled_cosine=float(similarities.diag().mean() - shuffled),
+                           retrieval_top1=float((similarities.argmax(-1) == torch.arange(len(similarities), device=similarities.device)).float().mean()))
+    if contrastive_metrics is not None:
+        # Keep the previous small decoded-batch retrieval diagnostic separate.
+        # The primary metric uses the larger masked bank and tie-aware accuracy.
+        metrics["decoded_batch_retrieval_top1"] = metrics["retrieval_top1"]
+        metrics.update(contrastive_metrics)
+        metrics["condition_bank_size"] = len(condition_bank)
+        metrics["negative_source"] = "current_projected_query_conditions"
+    return loss, metrics
 
 
 class FrozenImageFeatures(nn.Module):
@@ -233,6 +335,8 @@ class DecoderTraining:
         self.noise_generators = {d: torch.Generator(device=v.device).manual_seed(seed + 901 + i)
                                  for i, (d, v) in enumerate(domains.items())}
         self.discriminator_updates = 0
+        # This component is returned separately because only G may optimize it.
+        self.code_consistency_objective = torch.zeros((), device=domains["cat"].device)
 
     @staticmethod
     def _cpu_copy(value):
@@ -294,10 +398,19 @@ class DecoderTraining:
             losses.append((student.float() - teacher.float()).square().mean().to(self.domains["cat"].device))
         return torch.stack(losses).mean()
 
-    def loss(self, weights, references, source_latents, real_latents, *, step, validation_seed=None):
+    def loss(self, weights, references, source_latents, real_latents, *, step, validation_seed=None,
+             source_reference_structure=None, source_query_structure=None):
         evaluation = validation_seed is not None
         feature_device = next(self.features.parameters()).device
         structure_losses, adversarial_losses, metrics = [], [], {}
+        contrastive_losses, consistency_losses = [], []
+        contrastive_weight = float(self.options.get("structure_contrastive_weight", 0.0))
+        consistency_weight = float(self.options.get("code_consistency_weight", 0.0))
+        consistency_mode = self.options.get("code_consistency_mode", "cosine")
+        self.code_consistency_objective = torch.zeros((), device=feature_device)
+        if contrastive_weight > 0 and any(bank is None or any(domain not in bank for domain in self.domains)
+                                         for bank in (source_reference_structure, source_query_structure)):
+            raise ValueError("Decoded contrastive supervision requires cached source query and disjoint reference structures for both domains.")
         pairs = {}
         for offset, (source, target) in enumerate((("cat", "dog"), ("dog", "cat"))):
             context = self.domains[target]
@@ -331,6 +444,32 @@ class DecoderTraining:
             pairs[target] = (fake_tokens, real_tokens)
             metrics[f"{source}_to_{target}"] = {"structure_loss": float(structure_loss.detach()),
                                                "samples": count, "reference_targets": references[target].shape[0]}
+            if contrastive_weight > 0:
+                contrastive, contrastive_metrics = decoded_structure_contrastive_loss(
+                    structure, source_query_structure[source][:count], source_reference_structure[source],
+                    temperature=float(self.options.get("structure_contrastive_temperature", .2)),
+                    negative_similarity_threshold=float(self.options.get("structure_contrastive_negative_similarity_threshold", .95)),
+                )
+                contrastive_losses.append(contrastive)
+                metrics[f"{source}_to_{target}"]["structure_contrastive"] = contrastive_metrics
+            if consistency_weight > 0:
+                condition_bank = None
+                if consistency_mode == "contrastive":
+                    # All current query means, not raw target codes or a stale
+                    # queue. Undecoded queries add negatives without rollouts.
+                    with torch.no_grad():
+                        condition_bank = (weights[f"{source}_to_{target}"].detach()
+                                          @ references[target].detach().float()).to(context.device, dtype=context.dtype)
+                        # Exactly the conditions actually supplied to G, even
+                        # if GEMM rounding differs for the larger matrix.
+                        condition_bank[:count] = codes.detach()
+                consistency, consistency_metrics = generated_code_consistency_loss(
+                    context.branch.encoder, generated, codes, mode=consistency_mode,
+                    condition_bank=condition_bank,
+                    temperature=float(self.options.get("code_consistency_temperature", .2)),
+                    negative_similarity_threshold=float(self.options.get("code_consistency_negative_similarity_threshold", .95)))
+                consistency_losses.append(consistency.to(feature_device))
+                metrics[f"{source}_to_{target}"]["code_consistency"] = consistency_metrics
         if not evaluation:
             self.optimizer.zero_grad(set_to_none=True)
             self.discriminators.train().requires_grad_(True)
@@ -359,12 +498,29 @@ class DecoderTraining:
         adversarial = torch.stack(adversarial_losses).mean()
         total = (float(self.options.get("structure_weight", .1)) * structure
                  + float(self.options.get("adversarial_weight", .01)) * adversarial)
+        ramp = 1.0 if evaluation else self.ramp(step)
+        if contrastive_losses:
+            contrastive = torch.stack(contrastive_losses).mean()
+            total = total + contrastive_weight * contrastive
+            metrics.update(structure_contrastive_loss=float(contrastive.detach()),
+                           structure_contrastive_weight=contrastive_weight)
+        if consistency_losses:
+            consistency = torch.stack(consistency_losses).mean()
+            self.code_consistency_objective = ramp * consistency_weight * consistency
+            metrics.update(code_consistency_loss=float(consistency.detach()),
+                           code_consistency_mode=consistency_mode,
+                           code_consistency_weight=consistency_weight,
+                           code_consistency_weighted_loss=float(consistency.detach()) * consistency_weight,
+                           code_consistency_effective_weighted_loss=float(self.code_consistency_objective.detach()),
+                           code_consistency_gradient_routing="generator_only")
         metrics.update(structure_loss=float(structure.detach()), adversarial_loss=float(adversarial.detach()),
-                       weighted_loss=float(total.detach()), ramp=1.0 if evaluation else self.ramp(step),
-                       effective_weighted_loss=float(total.detach()) * (1.0 if evaluation else self.ramp(step)),
+                       weighted_loss=float(total.detach()), ramp=ramp,
+                       effective_weighted_loss=float(total.detach()) * ramp,
                        discriminator_updates=self.discriminator_updates,
                        num_steps=int(self.options.get("validation_num_steps", 50) if evaluation else self.options.get("num_steps", 50)))
-        return total * (1.0 if evaluation else self.ramp(step)), metrics
+        # Main loss reaches encoders, matching heads and G. Code recovery must
+        # be consumed through autograd.grad(..., G_parameters) by the trainer.
+        return total * ramp, metrics
 
     def checkpoint_state(self):
         return {"generators": {d: self._cpu_copy(v.branch.generator_state_dict()) for d, v in self.domains.items()},

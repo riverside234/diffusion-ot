@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_d_gt
+output_dir: outputs/stage1b_eval_d_nce
 seed: 20260906
 alignment_device: cuda:0
 
@@ -44,7 +44,7 @@ infoot:
   cross_cost_weight: 1.0
   algorithm: official_projected_sinkhorn
   mi_weight: 0.10
-  entropy_epsilon: 0.05
+  entropy_epsilon: 0.02
   inner_iterations: 1200  # Match training; retain early stopping and the same tolerance.
   projection_iterations: 2000
   projection_tolerance: 0.00001
@@ -73,14 +73,13 @@ reconstruction:
 translation:
   enabled: true
   decoded_structure_metrics: true
-  # Fifth row: direct structure-teacher mean, using the same target noise.
-  # This diagnostic bypasses InfoOT and is not a ground-truth translation.
-  include_structure_teacher_mean: true
-  # The four-image training probe is a monitor; compare checkpoints on this panel.
-  samples_per_direction: 32
+  # One row of conditional generations per direction, with 16 examples.
+  include_source: false
+  include_structure_teacher_mean: false
+  samples_per_direction: 16
   num_steps: 20
   guidance_scale: 1.0
-  readouts: [conditional_mean, conditional_map, conditional_sample, structure_teacher_mean]
+  readouts: [conditional_mean]
   primary_readout: conditional_mean
   temperature: 1.0
 

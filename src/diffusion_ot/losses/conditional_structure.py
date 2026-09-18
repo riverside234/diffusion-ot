@@ -25,6 +25,7 @@ class ConditionalStructureResult:
     metrics: dict[str, dict[str, float | None]]
     weights: dict[str, torch.Tensor]
     teacher_weights: dict[str, torch.Tensor]
+    log_weights: dict[str, torch.Tensor]
 
 
 def conditional_structure_loss(
@@ -56,7 +57,7 @@ def conditional_structure_loss(
         raise ValueError("Projection teacher temperature must be finite and positive.")
     if (reference_matching is None) != (query_matching is None):
         raise ValueError("Supply both reference and query matching features, or neither.")
-    losses, metrics, weights, teacher_distributions = [], {}, {}, {}
+    losses, metrics, weights, teacher_distributions, log_distributions = [], {}, {}, {}, {}
     for source, target in (("cat", "dog"), ("dog", "cat")):
         if len(queries[source]) < 1 or len(references[target]) < 2:
             raise ValueError("Conditional structure training needs queries and at least two target references.")
@@ -89,6 +90,9 @@ def conditional_structure_loss(
         losses.append(loss)
         direction = f"{source}_to_{target}"
         weights[direction] = log_weights.exp()
+        # Preserve the stable log-space readout for auxiliary contrastive
+        # supervision; taking log(exp(log_weights)) can underflow in fp32.
+        log_distributions[direction] = log_weights
         teacher_distributions[direction] = teacher_weights
         with torch.no_grad():
             probability = weights[direction]
@@ -126,4 +130,5 @@ def conditional_structure_loss(
                 f"teacher_{key}": value for key, value in
                 conditional_variance_decomposition(teacher_weights, references[target]).items()
             })
-    return ConditionalStructureResult(torch.stack(losses).mean(), metrics, weights, teacher_distributions)
+    return ConditionalStructureResult(
+        torch.stack(losses).mean(), metrics, weights, teacher_distributions, log_distributions)

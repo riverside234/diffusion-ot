@@ -20,4 +20,6 @@ fid_batch_size: 32
 fid_cache_dir: outputs/fid_cache
 num_workers: 4
 # Projection bandwidth and frozen RMS calibration come from the Stage 2-3 bundle.
+# Entropy epsilon is inherited through that fitted coupling (active recipe: 0.02).
+# Refit Stage 2-3 to use 0.02; this config cannot change an existing bundle's entropy.
 # No Stage 4 refit or independent projection-bandwidth override.

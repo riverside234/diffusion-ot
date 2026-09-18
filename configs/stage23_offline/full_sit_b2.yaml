@@ -11,7 +11,7 @@ projection_bandwidth: 0.10
 fit:
   bandwidth: 0.55
   mi_weight: 0.10
-  entropy_epsilon: 0.05
+  entropy_epsilon: 0.02
   cross_cost_weight: 1.0
   outer_iterations: 1200
   sinkhorn_iterations: 2000

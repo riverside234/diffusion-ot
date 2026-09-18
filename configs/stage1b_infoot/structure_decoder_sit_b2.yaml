@@ -1,8 +1,8 @@
 stage: stage1b_fused_infoot
-# Reviewed against logs-revised through train 1,700 / validation 1,500.
-# Recipe rationale: docs/analysis/stage1b_revised_vs_original/config_revision.md.
+# Contrastive/code-consistency pilot after the 5,000-step co-training review.
+# Contrastive code recovery: docs/analysis/stage1b_code_infonce/review.md.
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_d_gt
+output_dir: outputs/stage1b_d_nce
 
 stage1a:
   weights: ema
@@ -80,7 +80,7 @@ infoot:
   cross_cost_weight: 1.0
   algorithm: official_projected_sinkhorn
   mi_weight: 0.10  # Weaker MI feedback in the inner plan; fixed structure cost remains 1.0.
-  entropy_epsilon: 0.05
+  entropy_epsilon: 0.02
   inner_iterations: 1200  # Outer cap; slow batches may need >300. Stop early once converged.
   projection_iterations: 2000
   projection_tolerance: 0.00001
@@ -102,7 +102,7 @@ quick_evaluation:
   config: configs/stage1b_eval/structure_decoder_sit_b2.yaml
   weights: ema
   # --quick-eval measures initialization and final paired EMA weights using
-  # the same 32-image panels. Native image metrics target original dataset RGB.
+  # fixed native/translation panels. Native image metrics target original RGB.
 
 # Frozen DINOv2 pooled patch self-similarity; no proxy labels enter training.
 semantic_prior:
@@ -122,12 +122,33 @@ conditional_structure:
   validation_reference_samples: 96
   validation_query_samples: 32
 
-# Experiment D uses weighted-sum updates and separate E/head/G norm clipping.
+# Experiment D uses separate E/head/G norm clipping and a decoded E controller.
 # A moving G makes the old reconstruction-relative 0.25 encoder cap unsuitable.
 gradient_guard:
   enabled: false
   max_auxiliary_ratio: 0.25
   project_conflicts: true
+
+# Translation-first heuristic, not an empirically established optimum.
+# Target the decoded/reconstruction ENCODER gradient norm ratio before clipping.
+# Target follows the decoded warmup (0 -> 2); scaling is bounded and detached.
+# G and matching-head decoded gradients keep their configured weights.
+decoded_encoder_balance:
+  enabled: true
+  target_ratio: 2.0
+  min_scale: 0.25
+  max_scale: 4.0
+  eps: 0.000000000001
+
+# Additional multi-positive contrastive supervision; existing KL remains active.
+# Positives are frozen structure-teacher neighbors, including kth-score ties.
+# Selection changes only this auxiliary loss; full InfoOT projection is intact.
+matching_contrastive:
+  enabled: true
+  neighborhood_weight: 0.01
+  conditional_weight: 0.005
+  positive_count: 8
+  temperature: 0.20  # Within-domain logits; conditional logits retain KDE scale.
 
 # Disabled in this experiment: the 8k run's support divergence increased.
 # The implementation and prior config remain available as controls.
@@ -153,8 +174,8 @@ matching_head:
 # Loss uses sqrt(feature_dim) * m(z), population covariance, and the MEAN
 # squared off-diagonal entry. Active from step 1 without alignment warmup.
 # The fit-0.55 pilot is preserved as structure_decoder_fit055_control_sit_b2.yaml.
-# The revised run improves floor coverage; retain these strengths while testing
-# the teacher-disabled recipe. Rank recovery / decoded quality remain unproven.
+# Retain these strengths while testing contrastive/code-consistency additions.
+# Rank recovery and decoded quality still require a matched AFHQ pilot.
 matching_regularization:
   enabled: true
   std_target: 0.70
@@ -165,8 +186,7 @@ matching_regularization:
 # Experiment D: freeze pretrained SiT/VAE/null token, adapt all added G layers.
 generator_adaptation:
   enabled: true
-  # Retain the measured rates: the revised log ends before full image-loss weight
-  # and also changes V/C and native preservation, so it cannot isolate LR effects.
+  # Hold measured rates fixed to isolate the new objectives and E controller.
   lr_adapter: 0.000005
   lr_lora: 0.0000025
   grad_clip_norm: 1.0
@@ -176,7 +196,7 @@ generator_adaptation:
   conditioned_preservation_weight: 0.0
   conditioned_preservation_samples: 4
 
-# Actual translated images enter both objectives. No top-k or sampled-code
+# Actual translated images enter the image objectives. No top-k or sampled-code
 # substitute. DINOv2 weights/revision/processor come from semantic_prior.path.
 # Target realism uses separate spectral-normalized DINO feature discriminators.
 decoded_translation:
@@ -190,6 +210,18 @@ decoded_translation:
   warmup_steps: 2000
   structure_weight: 0.10
   adversarial_weight: 0.01
+  # InfoNCE: generated DINO structure -> original source cached descriptor,
+  # contrasted against the disjoint source reference bank, not only 3 images.
+  structure_contrastive_weight: 0.01
+  structure_contrastive_temperature: 0.20
+  structure_contrastive_negative_similarity_threshold: 0.95
+  # Re-encode the final diffusion latent and retrieve its own full mean among
+  # all 32 current projected query conditions. No additional image rollouts.
+  # G-only gradients; target keys/readout weights detached, near copies masked.
+  code_consistency_weight: 0.02
+  code_consistency_mode: contrastive
+  code_consistency_temperature: 0.20
+  code_consistency_negative_similarity_threshold: 0.95
   discriminator_lr: 0.0001
   discriminator_hidden_dim: 256
   discriminator_grad_clip: 1.0

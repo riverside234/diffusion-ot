@@ -74,97 +74,77 @@ format.
 
 ## Experiment D co-training
 
-The active config now differentiates the feature-dependent InfoOT RMS kernel
-scale (`matching.distance_scale_gradient: full`). The step-2,600 review found
-a reproducible spurious shrinkage gradient when that scale was detached.
-The full validation also exposed an unfinished outer OT solve. Active D now
-requires outer convergence, with a 1,200-iteration cap and early stopping.
-The cap was raised after a batch exhausted 300 updates while its plan change
-was still `2.01e-5` versus the `1e-5` tolerance. A budget-only increase can
-resume an existing run that already required outer convergence; objective and
-tolerance changes still require a fresh run. See the
-[convergence fix and resume command](docs/analysis/stage1b_experiment_d_outer_budget_fix.md).
-The RMS-only follow-up still loses about 90% of matching-head spread by step
-1,500, while raw encoder spread stays nearly unchanged. The active revision
-protects matching-feature variance and adds a modest covariance penalty from
-update 1, plus distance-normalized neighborhood teaching to remove a remaining
-cosine-logit contraction incentive. Start from Stage 1A in the new
-`outputs/stage1b_d_fit050` output directory. The protected cosine control is
-`structure_decoder_vicreg_cosine_sit_b2.yaml`; its `_rmsgrad_vicreg` outputs remain
-separate. `structure_decoder_rmsgrad_sit_b2.yaml` preserves RMS only, and
-`structure_decoder_detached_sit_b2.yaml` preserves the original Experiment D.
-Each has a corresponding evaluation YAML. See the
-[new analysis, paper/GitHub audit, and reproduction](docs/analysis/stage1b_rmsgrad_1500/review.md).
-Changing neighborhood geometry or temperature requires a fresh run. CPU checks
-verify the targeted mechanism; improved AFHQ training remains to be tested.
-The active fit bandwidth is now **0.50**, with projection still **0.10**.
-`structure_decoder_relational_fit070_sit_b2.yaml` preserves the otherwise
-identical 0.70 relational control in both train/eval folders. Start the 0.50
-run from Stage 1A; changing fit bandwidth is incompatible with resume.
+The active recipe adds teacher-guided matching contrastive losses, decoded
+DINO structure InfoNCE, and contrastive generated-code recovery. It retains real-data flow
+reconstruction, full-distribution KL, corrected RMS gradients, and matching
+variance/covariance protection. The full InfoOT conditional mean still uses
+all target references. See the [implementation and pilot record](docs/analysis/stage1b_contrastive_extension/review.md)
+for equations, gradient routing, research references, diagnostics, and limitations.
 
-Review an initial 1,500-update run, with particular attention to spread at
-200–500 steps. If this comparison succeeds, continue to 5,000 updates to check
-behavior beyond the 2,000-update decoded-loss ramp and review image quality.
+A bounded controller targets a decoded/reconstruction encoder gradient ratio
+of **2.0** at full decoded ramp, with scale bounds 0.25–4.0. This is a
+translation-first pilot setting, not a demonstrated optimum. The controller
+logs the gradient cosine and achieved ratio; it does not project away conflicts.
+Generator-code recovery trains G only, using the detached target condition and
+current target encoder as a differentiable readout with detached parameters.
+It now uses InfoNCE over all 32 current projected query conditions (temperature
+0.20, near-duplicate threshold 0.95), with no extra image rollouts. This replaces
+the cosine-only recovery objective. See the [code InfoNCE research and implementation note](docs/analysis/stage1b_code_infonce/review.md).
+
+Start fresh from Stage 1A; changed objectives cannot resume old checkpoints:
 
 ```bash
 python3 scripts/train_joint_infoot.py \
   --config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
-  --max-steps 1500 --quick-eval
+  --max-steps 4000 --quick-eval
 ```
 
-Evaluate that checkpoint with paired EMA encoder, matching-head, and generator
+Evaluate a saved checkpoint with paired EMA encoder, matching-head, and generator
 weights:
 
 ```bash
 python3 scripts/evaluate_infoot_alignment.py \
   --alignment-config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
   --eval-config configs/stage1b_eval/structure_decoder_sit_b2.yaml \
-  --checkpoint outputs/stage1b_d_fit050/checkpoints/latest.pt \
+  --checkpoint outputs/stage1b_d_nce/checkpoints/latest.pt \
   --no-require-stage1a-baseline
 ```
 
-Continue the accepted run to its configured 30,000 updates:
-
-```bash
-python3 scripts/train_joint_infoot.py \
-  --config configs/stage1b_infoot/structure_decoder_sit_b2.yaml \
-  --resume
-```
-
-Omit `--max-steps` for a fresh full run. `--smoke` runs only 500 updates and is
-an implementation check. Do not resume a frozen-generator or matching-head-only
-checkpoint into Experiment D; checkpoint validation rejects incompatible
-objectives and trainability.
-
-The active defaults are:
+Resume only this same objective using `--resume`. The configured pilot is
+4,000 updates; `--smoke` uses 500. Review checkpoints every 500 updates and
+judge post-ramp translation quality before extending the run. Training writes
+`outputs/stage1b_d_nce`; evaluation writes `outputs/stage1b_eval_d_nce`.
 
 | Setting | Value |
 | --- | ---: |
-| Updates | 30,000 |
+| Pilot updates | 4,000 |
 | Encoder / matching-head LR | `2e-5` / `2e-4` |
-| Adapter / LoRA LR | `1e-5` / `5e-6` |
-| InfoOT fit / projection bandwidth | `0.50` / `0.10` |
-| Entropy regularization | `0.05` |
+| Adapter / LoRA LR | `5e-6` / `2.5e-6` |
+| InfoOT fit / projection bandwidth | `0.55` / `0.10` |
+| Entropy regularization | `0.02` |
 | Outer OT update budget / tolerance | `1200` / `1e-5`, convergence required |
-| Matching variance / covariance weights | `0.02` / `0.001`, from update 1 |
+| Matching variance / covariance weights | `0.05` / `0.01`, from update 1 |
 | Matching scaled standard-deviation floor | `0.70`, on `sqrt(dim) * m(z)` |
-| Same-domain semantic dropout | `0.10` |
-| Decoded sampler steps | `20` |
-| Decoded structure / adversarial weight | `0.10` / `0.01` |
-| Decoded-loss ramp | 2,000 updates |
-| Validation / checkpoint interval | 500 / 1,000 updates |
+| Matching neighborhood / conditional contrastive weights | `0.01` / `0.005` |
+| Matching contrastive positive neighbors | 8, including boundary ties |
+| Decoded structure / adversarial / contrastive weight | `0.10` / `0.01` / `0.01` |
+| Generated-code InfoNCE weight, G only | `0.02` |
+| Encoder decoded/reconstruction target ratio | 2.0 at full ramp |
+| Decoded sampler / ramp | 20 steps / 2,000 updates |
+| Validation / checkpoint interval | 500 / 500 updates |
 
-Matching protection uses the 96 normalized OT references independently per
-domain. Covariance is the mean squared off-diagonal population covariance
-of the scaled features. The floor is a soft penalty, and these initial weights
-still need AFHQ evaluation. Raw decoder codes and projected means are not its
-targets. Training and fixed validation log weighted/unweighted terms, spread,
-and the fraction of coordinates below the floor; training also measures the
-regularizer's encoder/head gradients. Changing these settings requires a fresh run.
+Each update draws 128 samples per domain from the shuffled training split:
+96 references for InfoOT/protection and 32 disjoint conditional queries.
+Four queries per direction enter decoded losses. Matching contrastive losses
+ramp over 1,000 steps; decoded losses and the encoder ratio target ramp over
+2,000. Native image quality is evaluated against original dataset RGB, not
+Stage 1A outputs. Native conditioned Stage 1A preservation stays disabled.
 
-These are experiment settings, not demonstrated optima. The training batch uses
-the full shuffled training split over time. Each update draws 128 samples per
-domain: 96 references for the InfoOT fit and 32 disjoint conditional queries.
+The prior [5,000-step run](docs/analysis/stage1b_gt_5000/review.md) used entropy
+0.05. The active 0.02 user setting is retained; a matched baseline rerun is
+needed to isolate the new objectives. Pre-extension config snapshots are saved
+with the new report. Earlier detached-RMS, RMS-only, VICReg/cosine, and fit-0.55
+control YAMLs remain available for their original experiments.
 
 ## Stage 2–3: Frozen Bank Construction and Global InfoOT Fitting
 
@@ -196,7 +176,7 @@ cd /data/not_backed_up/yxu209/diffusion-ot
 python -m pip install -r requirements-stage4.txt
 
 # Example only: select an existing numbered checkpoint from the run you want.
-CHECKPOINT=outputs/stage1b_d_gt/checkpoints/step_004000.pt
+CHECKPOINT=outputs/stage1b_d_nce/checkpoints/step_004000.pt
 
 # Stage 2-3: frozen banks and global InfoOT fit, paired EMA weights.
 python scripts/run_offline_alignment.py \
