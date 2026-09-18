@@ -22,7 +22,7 @@ stage1a:
 data:
   split: train
   transport_batch_size: 128
-  reconstruction_batch_size: 16
+  reconstruction_batch_size: 32
   random_horizontal_flip: 0.0  # Matches the unflipped structure cache.
   num_workers: 4
   pin_memory: true
@@ -201,7 +201,7 @@ generator_adaptation:
 # Target realism uses separate spectral-normalized DINO feature discriminators.
 decoded_translation:
   enabled: true
-  batch_size: 4  # Per direction, from the disjoint queries.
+  batch_size: 32  # Per direction, from the disjoint queries.
   num_steps: 20
   validation_num_steps: 20
   guidance_scale: 1.0
