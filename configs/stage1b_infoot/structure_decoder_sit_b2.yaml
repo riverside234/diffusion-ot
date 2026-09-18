@@ -22,7 +22,7 @@ stage1a:
 data:
   split: train
   transport_batch_size: 128
-  reconstruction_batch_size: 32
+  reconstruction_batch_size: 64
   random_horizontal_flip: 0.0  # Matches the unflipped structure cache.
   num_workers: 4
   pin_memory: true
