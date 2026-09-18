@@ -42,7 +42,7 @@ train:
   resume_from: null
   loss_window: 100
   validation_every: 500
-  # Native real-data flow probe only; decoded training/probe batch stays at 4.
+  # Native real-data flow probe count; decoded training/probe uses batch_size below (32).
   # Re-evaluate old checkpoints with this panel before comparing native losses.
   validation_samples: 32
   keep_step_checkpoints: true
@@ -211,7 +211,7 @@ decoded_translation:
   structure_weight: 0.10
   adversarial_weight: 0.01
   # InfoNCE: generated DINO structure -> original source cached descriptor,
-  # contrasted against the disjoint source reference bank, not only 3 images.
+  # contrasted against the 96 disjoint source references.
   structure_contrastive_weight: 0.01
   structure_contrastive_temperature: 0.20
   structure_contrastive_negative_similarity_threshold: 0.95
