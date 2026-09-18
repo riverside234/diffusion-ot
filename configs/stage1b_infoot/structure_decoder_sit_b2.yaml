@@ -22,6 +22,7 @@ stage1a:
 data:
   split: train
   transport_batch_size: 128
+  # Native flow loss is batch-averaged; this need not match decoded batch_size.
   reconstruction_batch_size: 64
   random_horizontal_flip: 0.0  # Matches the unflipped structure cache.
   num_workers: 4
@@ -186,9 +187,10 @@ matching_regularization:
 # Experiment D: freeze pretrained SiT/VAE/null token, adapt all added G layers.
 generator_adaptation:
   enabled: true
-  # Hold measured rates fixed to isolate the new objectives and E controller.
+  # Modest LoRA-only LR trial; compare against 2.5e-6 at the same 64/32 batches.
+  # Mixed objective batch sizes do not imply a global Adam LR multiplier.
   lr_adapter: 0.000005
-  lr_lora: 0.0000025
+  lr_lora: 0.00000375
   grad_clip_norm: 1.0
   null_preservation_weight: 0.10
   # Native reconstruction is supervised by real-data flow targets. Stage 1A
@@ -201,7 +203,9 @@ generator_adaptation:
 # Target realism uses separate spectral-normalized DINO feature discriminators.
 decoded_translation:
   enabled: true
-  batch_size: 32  # Per direction, from the disjoint queries.
+  # Decode all 32 disjoint queries; independent of the native reconstruction batch.
+  # A 64-query trial needs transport_batch_size=160 to retain 96 fit references.
+  batch_size: 32
   num_steps: 20
   validation_num_steps: 20
   guidance_scale: 1.0
