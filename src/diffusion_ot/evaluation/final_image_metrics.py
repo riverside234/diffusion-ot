@@ -13,7 +13,7 @@ from diffusion_ot.evaluation.offline_artifacts import file_hash, fingerprint
 
 
 def metric_versions():
-    required = {"clean-fid": "0.1.35", "scikit-image": "0.26.0", "scipy": "1.16.3"}
+    required = {"clean-fid": "0.1.35", "scikit-image": "0.25.2", "scipy": "1.15.3"}
     for name, expected in required.items():
         actual = version(name)
         if actual != expected:

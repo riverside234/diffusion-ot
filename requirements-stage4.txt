@@ -1,5 +1,5 @@
-# Install after requirements.txt. Fixed metric protocol (Python >=3.11).
+# Install after requirements.txt. Fixed metric protocol supporting Python 3.10.
 clean-fid==0.1.35
-scikit-image==0.26.0
+scikit-image==0.25.2
 # Clean-FID 0.1.35 uses scipy.linalg.sqrtm(..., disp=False).
-scipy==1.16.3
+scipy==1.15.3

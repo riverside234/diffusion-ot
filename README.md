@@ -183,7 +183,7 @@ labeled contact sheets. The full generated corpus is used for FID.
 
 ### Linux commands
 
-Run in the existing training environment (Python >=3.11). The configured
+Run in the existing training environment (Python 3.10 supported). The configured
 Stage 1A checkpoints, pretrained SiT/VAE snapshot, DINO structure cache,
 canonical train/validation manifests, cached latents, and original AFHQ dataset
 must be available under the project paths. Inception weights download on the
