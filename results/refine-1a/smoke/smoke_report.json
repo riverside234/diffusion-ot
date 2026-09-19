@@ -1,0 +1,112 @@
+{
+  "protocol": "fixed_noise_smoke",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae/cat_sit_b2_refine.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/sit_b2_256.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_native40k/checkpoints/latest.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_native40k/stage1a_eval/step_031000/ema/smoke",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 31000,
+  "weights": "ema",
+  "semantic_cfg_enabled": true,
+  "attention_lora": {
+    "enabled": true,
+    "rank": 64,
+    "alpha": 64.0,
+    "dropout": 0.0,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "targets": [
+      "qkv",
+      "proj"
+    ]
+  },
+  "seed": 20260902,
+  "num_samples": 8,
+  "num_steps": 50,
+  "guidance_scales": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "correct_z_cfg_0",
+    "shuffled_z_cfg_0",
+    "correct_z_cfg_1",
+    "shuffled_z_cfg_1",
+    "correct_z_cfg_1.5",
+    "shuffled_z_cfg_1.5",
+    "correct_z_cfg_2",
+    "shuffled_z_cfg_2"
+  ],
+  "metrics": {
+    "correct_z_cfg_0": {
+      "latent_mse": 1.1929320096969604,
+      "pixel_mse": 0.11834542453289032,
+      "pixel_psnr": 9.268485280900313
+    },
+    "shuffled_z_cfg_0": {
+      "latent_mse": 1.1929320096969604,
+      "pixel_mse": 0.11834542453289032,
+      "pixel_psnr": 9.268485280900313
+    },
+    "correct_z_cfg_1": {
+      "latent_mse": 0.7467090487480164,
+      "pixel_mse": 0.04700896143913269,
+      "pixel_psnr": 13.278193434987532
+    },
+    "shuffled_z_cfg_1": {
+      "latent_mse": 1.083207368850708,
+      "pixel_mse": 0.09884875267744064,
+      "pixel_psnr": 10.050288064587804
+    },
+    "correct_z_cfg_1.5": {
+      "latent_mse": 0.7428386211395264,
+      "pixel_mse": 0.04612717777490616,
+      "pixel_psnr": 13.36043116262746
+    },
+    "shuffled_z_cfg_1.5": {
+      "latent_mse": 1.1428455114364624,
+      "pixel_mse": 0.10677527636289597,
+      "pixel_psnr": 9.715292958297228
+    },
+    "correct_z_cfg_2": {
+      "latent_mse": 0.7533812522888184,
+      "pixel_mse": 0.046591680496931076,
+      "pixel_psnr": 13.316916248730523
+    },
+    "shuffled_z_cfg_2": {
+      "latent_mse": 1.1867985725402832,
+      "pixel_mse": 0.11007851362228394,
+      "pixel_psnr": 9.582974432982288
+    }
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_native40k/stage1a_eval/step_031000/ema/smoke/reconstruction_grid.png",
+  "extra_reports": {
+    "inferred_noise_roundtrip": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_native40k/stage1a_eval/step_031000/ema/roundtrip/roundtrip_report.json"
+  }
+}
