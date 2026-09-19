@@ -115,8 +115,10 @@ class Stage1ARefinement:
         ramp = 1.0 if validation else min(1.0, step / int(options.get("warmup_steps", 500)))
         generator = (torch.Generator(device=x0.device).manual_seed(self.validation_seed)
                      if validation else self.generator)
+        code_weight = float(options.get("code_contrastive_weight", .01))
         # Full native minibatch supplies negatives; only a small prefix needs
-        # expensive image rollouts. No semantic dropout for these conditions.
+        # expensive image rollouts. With zero code weight, no code recovery or
+        # retrieval is computed. No semantic dropout for these conditions.
         bank = branch.encode(x0)
         condition = bank[:count]
         noise = torch.randn(x0[:count].shape, device=x0.device, dtype=x0.dtype, generator=generator)
@@ -140,14 +142,16 @@ class Stage1ARefinement:
         # same-domain reconstruction (unlike a cross-domain appearance target).
         token_distance = 1 - F.cosine_similarity(tokens, target_tokens, dim=-1)
         perceptual_loss = .5 * (token_distance[:, 0].mean() + token_distance[:, 1:].mean())
-        code_loss, code_metrics = generated_code_consistency_loss(
-            branch.encoder, generated, condition, mode="contrastive", condition_bank=bank,
-            temperature=float(options.get("code_temperature", .2)),
-            negative_similarity_threshold=float(options.get("negative_similarity_threshold", .95)))
-        code_metrics.update(negative_source="current_same_domain_native_codes")
         image_loss = ramp * (float(options.get("perceptual_weight", .05)) * perceptual_loss
                             + float(options.get("structure_weight", .025)) * structure_loss)
-        code_weighted = ramp * float(options.get("code_contrastive_weight", .01)) * code_loss
+        code_weighted, code_metrics = image_loss.new_zeros(()), None
+        if code_weight > 0:
+            code_loss, code_metrics = generated_code_consistency_loss(
+                branch.encoder, generated, condition, mode="contrastive", condition_bank=bank,
+                temperature=float(options.get("code_temperature", .2)),
+                negative_similarity_threshold=float(options.get("negative_similarity_threshold", .95)))
+            code_metrics.update(negative_source="current_same_domain_native_codes")
+            code_weighted = ramp * code_weight * code_loss
         if not bool(torch.isfinite(image_loss) & torch.isfinite(code_weighted)):
             raise FloatingPointError("Non-finite Stage 1A refinement loss.")
         with torch.no_grad():
@@ -165,7 +169,7 @@ class Stage1ARefinement:
                        "rgb_psnr": float((-10 * mse.clamp_min(1e-12).log10()).mean()),
                        "native_latent_mse": float((generated - x0[:count]).square().mean()),
                        "code_contrastive": code_metrics,
-                       "code_gradient_routing": "generator_only",
+                       "code_gradient_routing": "generator_only" if code_weight > 0 else "disabled",
                        "image_gradient_routing": "encoder_and_generator",
                        "interpretation": "DINO and code retrieval are training proxies; RGB metrics target original inputs."}
         return image_loss, code_weighted, metrics, (originals, images)
@@ -179,8 +183,9 @@ class Stage1ARefinement:
         with deterministic_branch(branch):
             image_loss, code_loss, metrics, _ = self.losses(
                 branch, transformer, batch, x0, step=step, null_label=null_label)
-            code_grads = torch.autograd.grad(code_loss, generator_parameters,
-                                            retain_graph=True, allow_unused=True)
+            code_grads = (torch.autograd.grad(code_loss, generator_parameters,
+                                             retain_graph=True, allow_unused=True)
+                          if code_loss.requires_grad else [])
             image_loss.backward()
             for parameter, gradient in zip(generator_parameters, code_grads):
                 if gradient is not None:

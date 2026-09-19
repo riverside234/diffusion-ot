@@ -1,0 +1,135 @@
+# Stage 1A: flow + original-image DINO losses; native-code InfoNCE disabled.
+# Recipe and evidence: docs/analysis/stage1a_dino_recipe/review.md.
+# Fresh 40,000-step E/conditioning run on pretrained SiT/VAE; no old Stage 1A weights.
+# Original fresh-training learning rates; conservative auxiliary weights are pilot values.
+stage: stage1a_pdae
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+domain: cat
+split: train
+data_config: configs/data/afhq_huggan.yaml
+model_config: configs/model/sit_b2_256.yaml
+output_dir: outputs/stage1a_cat_dino
+# Logical index within CUDA_VISIBLE_DEVICES; select the physical GPU in the shell.
+device: cuda:0
+torch_dtype: float32
+dataloader:
+  batch_size: 64
+  gradient_accumulation_steps: 1
+  random_horizontal_flip: 0.5
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+train:
+  max_steps: 40000
+  resume_from: null
+  seed: 20260901
+  lr_encoder: 1.0e-04
+  lr_adapter: 1.0e-04
+  lr_lora: 2.5e-05
+  weight_decay: 0.0
+  betas:
+  - 0.9
+  - 0.999
+  grad_clip_norm: 1.0
+  log_every: 100
+  save_every: 1000
+  initialize_from: null
+  keep_step_checkpoints: true
+ema:
+  enabled: true
+  decay: 0.995
+  warmup_steps: 200
+  update_every: 1
+evaluation:
+  enabled: true
+  split: val
+  # Decode all 32 requested validation images; retain 64 flow examples.
+  batch_size: 32
+  num_batches: 2
+  num_time_bins: 10
+  every_steps: 500
+  evaluate_at_start: true
+  use_ema: true
+  seed: 20260902
+flow:
+  direction: noise_to_data
+  time_eps: 1.0e-05
+class_conditioning:
+  mode: null
+  null_label: 1000
+semantic_cfg:
+  enabled: true
+  dropout_probability: 0.1
+  drop_granularity: sample
+  null_condition: learned_token
+encoder:
+  input_channels: 4
+  channels:
+  - 64
+  - 128
+  - 256
+  spatial_size: 4
+  z_dim: 512
+  num_groups: 32
+  normalize_z: true
+adapter:
+  freeze_base: true
+  injection_layers:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  bottleneck_dim: 64
+  lora: true
+  lora_rank: 64
+  lora_alpha: 64
+  lora_dropout: 0.0
+  lora_layers:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+loss_weighting:
+  type: pdae_flow_snr
+  gamma: 0.1
+  normalization_mode: fixed_uniform
+  normalization_samples: 65536
+  normalize_mean_to: 1.0
+  clamp_min: 0.001
+  clamp_max: null
+refinement:
+  enabled: true
+  feature_prior_path: data/semantic_priors/afhq_dinov2_structure.pt
+  batch_size: 32
+  num_steps: 20
+  every_steps: 4
+  # Slower image-loss ramp while fresh conditions learn at restored LRs.
+  warmup_steps: 2000
+  # Emphasize appearance: retain perceptual strength and reduce structure pressure.
+  perceptual_weight: 0.05
+  structure_weight: 0.01
+  code_contrastive_weight: 0.0  # Skip native-code recovery and its backward pass.
+  code_temperature: 0.2
+  negative_similarity_threshold: 0.95
+  validation_batch_size: 32
+  validation_num_steps: 50
+  validation_seed: 20260918
+  checkpoint_steps: true
+  checkpoint_decode: true
+  checkpoint_features: true

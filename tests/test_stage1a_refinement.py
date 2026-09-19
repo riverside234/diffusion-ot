@@ -155,6 +155,37 @@ def test_code_recovery_changes_only_generator_updates_even_with_clipping(setup):
     assert different(after, before)
 
 
+def test_fresh_dino_only_training_skips_code_recovery_and_resumes(setup, monkeypatch):
+    import diffusion_ot.training.stage1a_refinement as module
+    run, _, _, _, _, _, _ = setup
+    def unexpected_recovery(*args, **kwargs):
+        raise AssertionError("Zero code weight must skip native-code recovery, including validation.")
+    monkeypatch.setattr(module, 'generated_code_consistency_loss', unexpected_recovery)
+    def dino_only(cfg):
+        cfg['train'].update(initialize_from=None, lr_encoder=1e-4, lr_adapter=1e-4, lr_lora=2.5e-5)
+        cfg['refinement'].update(perceptual_weight=.05, structure_weight=.01, code_contrastive_weight=0.)
+    first, _, report = run('dino_only', steps=1, modify=dino_only)
+    assert report.initial_step == 0
+    assert first['train_state']['initialization'] is None
+    resumed, logs, report = run('dino_only', steps=3, resume=True, modify=dino_only)
+    assert report.initial_step == 1 and report.final_step == 3
+    assert [r['step'] for r in logs['refinement']] == [1, 3]
+    for row in logs['refinement'] + [r['refinement'] for r in logs['validation']]:
+        assert row['code_contrastive'] is None
+        assert row['code_gradient_routing'] == 'disabled'
+        assert row['weighted_code_loss'] == 0
+        assert row['weighted_loss'] == row['weighted_image_loss']
+        assert row['weighted_image_loss'] == pytest.approx(
+            row['ramp'] * (.05 * row['perceptual_loss'] + .01 * row['structure_loss']))
+    for row in logs['refinement']:
+        assert row['code_generator_grad_norm'] == row['applied_code_encoder_grad_norm'] == 0
+    assert any(row['encoder_grad_norm_pre_clip'] > 0 for row in logs['train'])
+    assert any(row['adapter_grad_norm_pre_clip'] > 0 for row in logs['train'])
+    assert resumed['ema']['num_updates'] == 3
+    assert not torch.equal(first['train_state']['refinement']['noise_state'],
+                           resumed['train_state']['refinement']['noise_state'])
+
+
 def test_resume_rejects_changed_loss_and_warm_start_checks_domain_and_ema(setup):
     run, _, latest, root, _, _, _ = setup
     run('guard', steps=1)
