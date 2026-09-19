@@ -26,11 +26,13 @@ from diffusion_ot.models.generator_adaptation import (
     predict_with_parameters,
 )
 from diffusion_ot.models.pdae_sit import make_null_class_labels
+from diffusion_ot.training.diffaugment import diffaugment_options, random_translation
 
 
 def validate_decoder_config(config: dict[str, Any]) -> None:
     adapted = generator_adaptation_enabled(config)
     image = config.get("decoded_translation") or {}
+    diffaugment_options(image.get("diffaugment"))
     enabled = bool(image.get("enabled", False))
     trainable = config.get("trainable") or {}
     if trainable.get("base_transformers", False):
@@ -305,6 +307,7 @@ class DecoderTraining:
     def __init__(self, config, domains, prior, root, *, seed):
         from diffusion_ot.training.train_joint_infoot import EncoderEMA
         self.config, self.options, self.domains = config, config["decoded_translation"], domains
+        self.diffaugment = diffaugment_options(self.options.get("diffaugment"))
         self.views = {d: configure_generator_adaptation(v.branch) for d, v in domains.items()}
         self.parameters = [p for view in self.views.values() for p in view.parameters()]
         self.baselines = {d: baseline_parameter_snapshot(v.branch, self.views[d]) for d, v in domains.items()}
@@ -334,6 +337,12 @@ class DecoderTraining:
         # reconstruction noise and prevent fixed-noise translation overfitting.
         self.noise_generators = {d: torch.Generator(device=v.device).manual_seed(seed + 901 + i)
                                  for i, (d, v) in enumerate(domains.items())}
+        # Augmentation runs where DINO lives, including for a remote domain's
+        # decoded images. It must not consume diffusion/global RNG streams.
+        self.augmentation_generators = {
+            d: torch.Generator(device=domains["cat"].device).manual_seed(seed + 1001 + i)
+            for i, d in enumerate(domains)
+        }
         self.discriminator_updates = 0
         # This component is returned separately because only G may optimize it.
         self.code_consistency_objective = torch.zeros((), device=domains["cat"].device)
@@ -401,8 +410,10 @@ class DecoderTraining:
     def loss(self, weights, references, source_latents, real_latents, *, step, validation_seed=None,
              source_reference_structure=None, source_query_structure=None):
         evaluation = validation_seed is not None
+        augment = self.diffaugment["enabled"] and not evaluation and self.diffaugment["translation_ratio"] > 0
         feature_device = next(self.features.parameters()).device
         structure_losses, adversarial_losses, metrics = [], [], {}
+        metrics["adversarial_augmentation"] = {**self.diffaugment, "applied": augment}
         contrastive_losses, consistency_losses = [], []
         contrastive_weight = float(self.options.get("structure_contrastive_weight", 0.0))
         consistency_weight = float(self.options.get("code_consistency_weight", 0.0))
@@ -431,6 +442,13 @@ class DecoderTraining:
             )
             images = decode_training_images(context.vae, generated).to(feature_device)
             structure, fake_tokens = self.features(images)
+            if augment:
+                # Structure objectives retain the original image coordinates.
+                # Draw once outside DINO checkpoints; reuse these live tokens
+                # for G and detached tokens for D with identical fake offsets.
+                _, fake_tokens = self.features(random_translation(
+                    images, ratio=self.diffaugment["translation_ratio"],
+                    generator=self.augmentation_generators[target]))
             with torch.no_grad():
                 source_context = self.domains[source]
                 source_images = decode_training_images(source_context.vae, source_latents[source][:count].to(
@@ -438,6 +456,12 @@ class DecoderTraining:
                 source_structure, _ = self.features(source_images)
                 real_images = decode_training_images(context.vae, real_latents[target][:count].to(
                     context.device, dtype=context.dtype)).to(feature_device)
+                if augment:
+                    # Real and fake images use the same distribution, with
+                    # independent per-image offsets (fake draws precede real).
+                    real_images = random_translation(
+                        real_images, ratio=self.diffaugment["translation_ratio"],
+                        generator=self.augmentation_generators[target])
                 _, real_tokens = self.features(real_images)
             structure_loss = (1 - F.cosine_similarity(structure, source_structure.detach(), dim=-1)).mean()
             structure_losses.append(structure_loss)
@@ -523,7 +547,7 @@ class DecoderTraining:
         return total * ramp, metrics
 
     def checkpoint_state(self):
-        return {"generators": {d: self._cpu_copy(v.branch.generator_state_dict()) for d, v in self.domains.items()},
+        state = {"generators": {d: self._cpu_copy(v.branch.generator_state_dict()) for d, v in self.domains.items()},
                 "fixed_generators": self.fixed_generators,
                 "generator_baseline_parameters": self.baselines,
                 "generator_ema": self.ema.export() if self.ema else None,
@@ -532,8 +556,16 @@ class DecoderTraining:
                 "decoded_discriminator_optimizer": self.optimizer.state_dict(),
                 "decoded_discriminator_updates": self.discriminator_updates,
                 "decoded_noise_states": {d: gen.get_state().cpu() for d, gen in self.noise_generators.items()}}
+        if self.diffaugment["enabled"]:
+            state["decoded_augmentation_states"] = {
+                d: gen.get_state().cpu() for d, gen in self.augmentation_generators.items()}
+        return state
 
     def load_checkpoint(self, payload):
+        if self.diffaugment["enabled"]:
+            states = payload.get("decoded_augmentation_states")
+            if not isinstance(states, dict) or set(states) != set(self.augmentation_generators):
+                raise ValueError("DiffAugment resume requires per-domain decoded_augmentation_states; start a fresh run for a changed objective.")
         for domain, value in self.domains.items():
             load_joint_generator(value.branch, payload, domain, weights="raw")
         self.fixed_generators = payload["fixed_generators"]
@@ -551,3 +583,6 @@ class DecoderTraining:
         self.discriminator_updates = int(payload["decoded_discriminator_updates"])
         for d, gen in self.noise_generators.items():
             gen.set_state(payload["decoded_noise_states"][d].cpu())
+        if self.diffaugment["enabled"]:
+            for d, gen in self.augmentation_generators.items():
+                gen.set_state(payload["decoded_augmentation_states"][d].cpu())

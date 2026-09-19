@@ -1,8 +1,9 @@
 stage: stage1b_fused_infoot
-# Contrastive/code-consistency pilot after the 5,000-step co-training review.
+# DiffAugment adversarial pilot on the contrastive/code-consistency recipe.
 # Contrastive code recovery: docs/analysis/stage1b_code_infonce/review.md.
+# DiffAugment contract: docs/analysis/stage1b_diffaugment/review.md.
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_d_nce
+output_dir: outputs/stage1b_d_aug
 
 stage1a:
   weights: ema
@@ -229,5 +230,11 @@ decoded_translation:
   discriminator_lr: 0.0001
   discriminator_hidden_dim: 256
   discriminator_grad_clip: 1.0
+  # Image-space DiffAugment on real/fake adversarial inputs before frozen DINO.
+  # Independent integer shifts, zero fill; no color changes. Validation is unaugmented.
+  diffaugment:
+    enabled: true
+    policy: translation
+    translation_ratio: 0.0625
   checkpoint_sampler: true
   checkpoint_features: true

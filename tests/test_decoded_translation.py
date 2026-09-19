@@ -180,8 +180,8 @@ def test_image_loss_updates_decoder_weights_and_codes_without_teacher_or_d_gradi
     assert runtime.discriminator_updates == 1
 
 
-@pytest.mark.parametrize("guarded", [False, True])
-def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_path, guarded):
+@pytest.mark.parametrize("guarded,augmented", [(False, False), (True, False), (False, True)])
+def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_path, guarded, augmented):
     import yaml
     import diffusion_ot.data.latent_dataset as data
     import diffusion_ot.training.train_joint_infoot as train
@@ -216,6 +216,8 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
     for d in originals:
         (tmp_path / f"{d}.yaml").write_text(yaml.safe_dump({"data_config": "data.yaml"}))
     cfg = config()
+    if augmented:
+        cfg["decoded_translation"]["diffaugment"] = {"enabled": True, "translation_ratio": .125}
     cfg["generator_adaptation"].update(conditioned_preservation_weight=.05,
                                       conditioned_preservation_samples=2)
     cfg.update(project_root=str(tmp_path), output_dir="out",
@@ -242,6 +244,7 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
     assert payload["format_version"] == 4
     assert len(payload["optimizer"]["param_groups"]) == 4
     assert payload["decoded_discriminator_updates"] == 2
+    assert ("decoded_augmentation_states" in payload) == augmented
     initial_discriminator = deepcopy(payload["decoded_discriminators"])
     validation = [json.loads(row) for row in (tmp_path / "out/logs/validation.jsonl").read_text().splitlines()]
     training = [json.loads(row) for row in (tmp_path / "out/logs/train.jsonl").read_text().splitlines()]
@@ -273,6 +276,7 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
         assert row["window_mean"]["weighted_conditioned_preservation_loss"] == pytest.approx(
             .05 * row["window_mean"]["conditioned_preservation_loss"])
         decoded = row["decoded_translation"]
+        assert decoded["adversarial_augmentation"]["applied"] == augmented
         assert decoded["effective_weighted_loss"] == pytest.approx(decoded["weighted_loss"] * decoded["ramp"])
         assert 0 < decoded["discriminator_clip_scale"] <= 1
         assert row["feature_geometry"]["cat"]["raw_normalized_variance"] > 0
@@ -290,6 +294,7 @@ def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_pa
         + .1 * first["null_preservation_loss"] + .05 * first["conditioned_preservation_loss"], abs=1e-6)
     assert all("feature_geometry" in row["projection_probe"] for row in validation)
     for row in validation:
+        assert not row["decoded_translation"]["adversarial_augmentation"]["applied"]
         assert row["projection_probe"]["iteration_budget"] == 100
         assert row["decoded_translation"]["solver"]["iteration_budget"] == 100
         assert row["matching_regularization_loss"] > 0
