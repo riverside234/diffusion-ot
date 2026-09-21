@@ -6,18 +6,19 @@ project_root: /data/not_backed_up/yxu209/diffusion-ot/
 output_dir: outputs/stage1b_d_aug
 
 stage1a:
+  # Initialize from the current Flow + DINO Stage 1A runs.
   weights: ema
   require_semantic_cfg: true
   require_attention_lora: true
   require_attention_lora_rank: 64
   require_attention_lora_alpha: 64
   cat:
-    config: configs/stage1a_pdae/cat_sit_b2_lora.yaml
-    checkpoint: outputs/stage1a_cat_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+    config: configs/stage1a_pdae/cat_sit_b2_dino.yaml
+    checkpoint: outputs/stage1a_cat_dino/checkpoints/latest.pt
     device: cuda:0  # Experiment D keeps both branches on one GPU.
   dog:
-    config: configs/stage1a_pdae/dog_sit_b2_lora.yaml
-    checkpoint: outputs/stage1a_dog_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+    config: configs/stage1a_pdae/dog_sit_b2_dino.yaml
+    checkpoint: outputs/stage1a_dog_dino/checkpoints/latest.pt
     device: cuda:0
 
 data:
