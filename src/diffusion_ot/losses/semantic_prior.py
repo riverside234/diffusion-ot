@@ -168,6 +168,13 @@ def _compatible_infoot_resume(saved: dict[str, Any], current: dict[str, Any]) ->
 
 
 def validate_prior_resume(saved_config: dict[str, Any], current_config: dict[str, Any]) -> None:
+    from diffusion_ot.training.pcgrad import PCGradConfig
+    saved_pcgrad = PCGradConfig.from_mapping(saved_config.get("pcgrad"))
+    current_pcgrad = PCGradConfig.from_mapping(current_config.get("pcgrad"))
+    if saved_pcgrad != current_pcgrad:
+        raise ValueError("Resume cannot change pcgrad; start a new run.")
+    if current_pcgrad.enabled and (saved_config.get("train") or {}).get("seed", 20260905) != (current_config.get("train") or {}).get("seed", 20260905):
+        raise ValueError("Resume cannot change train.seed with PCGrad's per-step random ordering.")
     saved_variant = (saved_config.get("infoot") or {}).get("variant", "plain")
     current_variant = (current_config.get("infoot") or {}).get("variant", "plain")
     saved = (saved_config.get("semantic_prior") or {}).get("fingerprint")

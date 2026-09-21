@@ -180,6 +180,61 @@ def test_image_loss_updates_decoder_weights_and_codes_without_teacher_or_d_gradi
     assert runtime.discriminator_updates == 1
 
 
+def test_perceptual_uses_original_rgb_tokens_and_keeps_live_generated_gradients(monkeypatch, tmp_path):
+    import diffusion_ot.training.decoded_translation as module
+    monkeypatch.setattr(module, "load_image_features", tiny_features)
+    torch.manual_seed(12)
+    cfg = config()
+    cfg["decoded_translation"]["perceptual_weight"] = .05
+    runtime = DecoderTraining(cfg, domains(), None, tmp_path, seed=12)
+    originals = {d: torch.rand(2, 3, 8, 8, requires_grad=True) for d in runtime.domains}
+    metadata = {d: [{"sample_id": f"{d}_{i}"} for i in range(2)] for d in originals}
+    def original_source(domain, records):
+        assert records == metadata[domain]
+        return originals[domain]
+    monkeypatch.setattr(runtime, "original_source_images", original_source)
+    references = {d: torch.randn(5, 6, requires_grad=True) for d in originals}
+    logits = {f"{s}_to_{t}": torch.randn(2, 5, requires_grad=True)
+              for s, t in (("cat", "dog"), ("dog", "cat"))}
+    weights = {d: F.softmax(v, -1) for d, v in logits.items()}
+    latents = {d: torch.randn(2, 4, 8, 8) for d in originals}
+    with pytest.raises(ValueError, match="original source query metadata"):
+        runtime.loss(weights, references, latents, latents, step=2)
+    captured = []
+    hook = runtime.features.register_forward_hook(lambda m, args, result: captured.append(result[1].detach()))
+    _, metrics = runtime.loss(weights, references, latents, latents, step=2,
+                              validation_seed=100, source_query_metadata=metadata)
+    hook.remove()
+    expected = []
+    # Four feature forwards per direction: generated, original, VAE source, real.
+    for i in (0, 4):
+        distance = 1 - F.cosine_similarity(captured[i], captured[i + 1], dim=-1)
+        expected.append(.5 * (distance[:, 0].mean() + distance[:, 1:].mean()))
+    assert metrics["perceptual_loss"] == pytest.approx(float(torch.stack(expected).mean()))
+    runtime.image_objectives["perceptual"].backward()
+    assert all(v.grad is not None and v.grad.norm() > 0 for v in references.values())
+    assert all(v.grad is not None and v.grad.norm() > 0 for v in logits.values())
+    assert any(p.grad is not None and p.grad.norm() > 0 for p in runtime.parameters)
+    assert all(v.grad is None for v in originals.values())
+    assert all(p.grad is None for p in runtime.features.parameters())
+    # Weight zero must skip loading original RGB entirely for legacy configs.
+    cfg["decoded_translation"]["perceptual_weight"] = 0.
+    monkeypatch.setattr(runtime, "original_source_images", lambda *args: pytest.fail("disabled original RGB load"))
+    with torch.no_grad():
+        _, disabled = runtime.loss(weights, references, latents, latents, step=2, validation_seed=100)
+    assert "perceptual_loss" not in disabled
+    for key in ("structure_loss", "adversarial_loss"):
+        assert metrics[key] == disabled[key]
+
+
+@pytest.mark.parametrize("weight", [-.1, float("nan"), float("inf")])
+def test_invalid_perceptual_weight_rejected(weight):
+    cfg = config()
+    cfg["decoded_translation"]["perceptual_weight"] = weight
+    with pytest.raises(ValueError, match="perceptual_weight"):
+        validate_decoder_config(cfg)
+
+
 @pytest.mark.parametrize("guarded,augmented", [(False, False), (True, False), (False, True)])
 def test_experiment_d_training_resume_fixed_baseline_and_ema(monkeypatch, tmp_path, guarded, augmented):
     import yaml
@@ -460,7 +515,11 @@ def test_reconstruction_semantic_dropout_and_null_code_are_used():
 def test_decoder_config_rejects_silent_partial_experiment():
     cfg = config()
     validate_decoder_config(cfg)
-    for field, value in (("structure_weight", 0), ("num_steps", 0), ("batch_size", 5)):
+    cfg["decoded_translation"]["structure_weight"] = 0.
+    validate_decoder_config(cfg)
+    for field, value in (("structure_weight", -1), ("num_steps", 0), ("batch_size", 5),
+                         ("perceptual_mode", "unknown"), ("perceptual_temperature", 0),
+                         ("perceptual_negative_similarity_threshold", 1.1)):
         changed = deepcopy(cfg)
         changed["decoded_translation"][field] = value
         with pytest.raises(ValueError):
@@ -522,15 +581,19 @@ def test_conditioned_preservation_is_g_only_and_restores_a_perturbed_native_func
     assert trainer.conditioned_preservation_loss(latents, codes) < loss
 
 
-def test_disabled_conditioned_preservation_skips_teacher_and_keeps_rng(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mode", ["conditioned", "null"])
+def test_disabled_conditioned_preservation_skips_teacher_and_keeps_rng(monkeypatch, tmp_path, mode):
     import diffusion_ot.training.decoded_translation as decoded
     monkeypatch.setattr(decoded, "load_image_features", tiny_features)
-    trainer = DecoderTraining(config(), domains(), None, tmp_path, seed=4)
+    cfg = config()
+    cfg["generator_adaptation"][f"{mode}_preservation_weight"] = 0.
+    validate_decoder_config(cfg)
+    trainer = DecoderTraining(cfg, domains(), None, tmp_path, seed=4)
     def unexpected(*args, **kwargs):
         raise AssertionError("Disabled preservation must not run a model forward.")
     monkeypatch.setattr(trainer, "_prediction_preservation_loss", unexpected)
     rng = torch.get_rng_state().clone()
-    assert trainer.conditioned_preservation_loss({}, {}).item() == 0
+    assert getattr(trainer, f"{mode}_preservation_loss")({}, {}).item() == 0
     assert torch.equal(torch.get_rng_state(), rng)
 
 

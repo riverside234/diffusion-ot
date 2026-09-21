@@ -1,10 +1,11 @@
 stage: stage1b_fused_infoot
-# Simplified translation recipe with conflict-only PCGrad.
-# Rationale and task definitions: docs/analysis/stage1b_minimal_pcgrad/review.md.
-# Previous full recipe: structure_decoder_full_sit_b2.yaml.
+# Source-perceptual InfoNCE pilot; both decoded cosine objectives are disabled.
+# Perceptual contract: docs/analysis/stage1b_perceptual_infonce/review.md.
+# Gradient diagnostics: docs/analysis/stage1b_perceptual_pcgrad/review.md.
+# Contrastive code recovery: docs/analysis/stage1b_code_infonce/review.md.
 # DiffAugment contract: docs/analysis/stage1b_diffaugment/review.md.
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_pcgrad
+output_dir: outputs/stage1b_d_aug
 
 stage1a:
   # Initialize from the current Flow + DINO Stage 1A runs.
@@ -42,7 +43,7 @@ train:
   grad_clip_norm: 1.0
   log_every: 100
   gradient_diagnostics_every: 200  # Also a logged step; keep gradients visible.
-  gradient_conflicts: true  # Per-domain diagnostics before PCGrad; surgery also reports actual changes.
+  gradient_conflicts: true  # Per-domain objective conflicts; diagnostics only, no PCGrad.
   save_every: 500  # Preserve every fixed-validation candidate.
   resume_from: null
   loss_window: 100
@@ -63,8 +64,8 @@ loss_weights:
   dog_reconstruction: 1.0
   # Keep the coefficient on -MI at 0.02: outer 0.20 * inner lambda 0.10.
   infoot_alignment: 0.20
-  latent_anchor: 0.0  # Native flow uses real data; no initial-code teacher constraint.
-  semantic_neighborhood: 0.0  # Retain direct conditional supervision instead.
+  latent_anchor: 0.01
+  semantic_neighborhood: 0.10
   conditional_structure: 0.02
   projection_support: 0.0
   alignment_warmup_steps: 1000
@@ -127,22 +128,33 @@ conditional_structure:
   validation_reference_samples: 96
   validation_query_samples: 32
 
-# PCGrad treats weighted tasks symmetrically, separately on E / matching H / G.
-# Random ordering is reproducible from train.seed and step; no model RNG draws.
-# Sum reduction preserves the existing weighted-sum scale when there is no conflict.
-pcgrad:
-  enabled: true
-  eps: 0.000000000001
-
-# Superseded by PCGrad; no reconstruction-priority cap or norm-ratio controller.
+# Experiment D uses separate E/head/G norm clipping and a decoded E controller.
+# A moving G makes the old reconstruction-relative 0.25 encoder cap unsuitable.
 gradient_guard:
   enabled: false
-decoded_encoder_balance:
-  enabled: false
+  max_auxiliary_ratio: 0.25
+  project_conflicts: true
 
-# Extra matching contrasts disabled; conditional KL retains the full teacher.
+# Translation-first heuristic, not an empirically established optimum.
+# Target the decoded/reconstruction ENCODER gradient norm ratio before clipping.
+# Target follows the decoded warmup (0 -> 2); scaling is bounded and detached.
+# G and matching-head decoded gradients keep their configured weights.
+decoded_encoder_balance:
+  enabled: true
+  target_ratio: 2.0
+  min_scale: 0.25
+  max_scale: 4.0
+  eps: 0.000000000001
+
+# Additional multi-positive contrastive supervision; existing KL remains active.
+# Positives are frozen structure-teacher neighbors, including kth-score ties.
+# Selection changes only this auxiliary loss; full InfoOT projection is intact.
 matching_contrastive:
-  enabled: false
+  enabled: true
+  neighborhood_weight: 0.01
+  conditional_weight: 0.005
+  positive_count: 8
+  temperature: 0.20  # Within-domain logits; conditional logits retain KDE scale.
 
 # Disabled in this experiment: the 8k run's support divergence increased.
 # The implementation and prior config remain available as controls.
@@ -168,7 +180,7 @@ matching_head:
 # Loss uses sqrt(feature_dim) * m(z), population covariance, and the MEAN
 # squared off-diagonal entry. Active from step 1 without alignment warmup.
 # The fit-0.55 pilot is preserved as structure_decoder_fit055_control_sit_b2.yaml.
-# Retain these strengths: previous logs still show incomplete floor coverage.
+# Retain these strengths while testing contrastive/code-consistency additions.
 # Rank recovery and decoded quality still require a matched AFHQ pilot.
 matching_regularization:
   enabled: true
@@ -185,7 +197,7 @@ generator_adaptation:
   lr_adapter: 0.000005
   lr_lora: 0.00000375
   grad_clip_norm: 1.0
-  null_preservation_weight: 0.0  # Native flow with semantic dropout still trains the null path.
+  null_preservation_weight: 0.10
   # Native reconstruction is supervised by real-data flow targets. Stage 1A
   # predictions are imperfect and are not the target for native synthesis.
   conditioned_preservation_weight: 0.0
@@ -205,7 +217,7 @@ decoded_translation:
   every_steps: 1
   start_step: 0
   warmup_steps: 2000
-  structure_weight: 0.0  # Structure cosine is diagnostic only.
+  structure_weight: 0.0  # Structure InfoNCE remains; cosine is diagnostic only.
   # Retrieve the original source among the current 32 source query images.
   # Similarity: half CLS + half mean corresponding-patch cosine. Keys detached.
   # InfoNCE replaces perceptual cosine; neither is a direct RGB-color constraint.
@@ -215,10 +227,18 @@ decoded_translation:
   perceptual_temperature: 0.20
   perceptual_negative_similarity_threshold: 0.95
   adversarial_weight: 0.01
-  # One source-image objective: perceptual InfoNCE already includes spatial tokens.
-  structure_contrastive_weight: 0.0
-  # No established Stage 1B quality gain from the extra code-retrieval objective.
-  code_consistency_weight: 0.0
+  # InfoNCE: generated DINO structure -> original source cached descriptor,
+  # contrasted against the 96 disjoint source references.
+  structure_contrastive_weight: 0.01
+  structure_contrastive_temperature: 0.20
+  structure_contrastive_negative_similarity_threshold: 0.95
+  # Re-encode the final diffusion latent and retrieve its own full mean among
+  # all 32 current projected query conditions. No additional image rollouts.
+  # G-only gradients; target keys/readout weights detached, near copies masked.
+  code_consistency_weight: 0.02
+  code_consistency_mode: contrastive
+  code_consistency_temperature: 0.20
+  code_consistency_negative_similarity_threshold: 0.95
   discriminator_lr: 0.0001
   discriminator_hidden_dim: 256
   discriminator_grad_clip: 1.0

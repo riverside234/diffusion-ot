@@ -48,26 +48,34 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
     if not (config.get("matching_head") or {}).get("enabled", False):
         raise ValueError("Experiment D requires matching heads.")
     options = config["generator_adaptation"]
-    for name, default in (("lr_adapter", 1e-5), ("lr_lora", 5e-6), ("grad_clip_norm", 1.0),
-                          ("null_preservation_weight", .1)):
+    for name, default in (("lr_adapter", 1e-5), ("lr_lora", 5e-6), ("grad_clip_norm", 1.0)):
         value = float(options.get(name, default))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"generator_adaptation.{name} must be finite and positive.")
-    conditioned_weight = float(options.get("conditioned_preservation_weight", 0.0))
-    if not math.isfinite(conditioned_weight) or conditioned_weight < 0:
-        raise ValueError("generator_adaptation.conditioned_preservation_weight must be finite and nonnegative.")
+    for name, default in (("null_preservation_weight", .1), ("conditioned_preservation_weight", 0.0)):
+        value = float(options.get(name, default))
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"generator_adaptation.{name} must be finite and nonnegative.")
     count = options.get("conditioned_preservation_samples", 4)
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ValueError("generator_adaptation.conditioned_preservation_samples must be a positive integer.")
-    for name, default in (("structure_weight", 0.1), ("adversarial_weight", 0.01),
+    for name, default in (("adversarial_weight", 0.01),
                           ("discriminator_lr", 1e-4), ("discriminator_grad_clip", 1.0)):
         value = float(image.get(name, default))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"decoded_translation.{name} must be finite and positive.")
-    for name in ("structure_contrastive_weight", "code_consistency_weight"):
-        value = float(image.get(name, 0.0))
+    for name in ("structure_weight", "perceptual_weight", "structure_contrastive_weight", "code_consistency_weight"):
+        value = float(image.get(name, 0.1 if name == "structure_weight" else 0.0))
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"decoded_translation.{name} must be finite and nonnegative.")
+    if image.get("perceptual_mode", "cosine") not in ("cosine", "contrastive"):
+        raise ValueError("decoded_translation.perceptual_mode must be cosine or contrastive.")
+    perceptual_temperature = float(image.get("perceptual_temperature", .2))
+    if not math.isfinite(perceptual_temperature) or perceptual_temperature <= 0:
+        raise ValueError("decoded_translation.perceptual_temperature must be finite and positive.")
+    perceptual_similarity = float(image.get("perceptual_negative_similarity_threshold", .95))
+    if not math.isfinite(perceptual_similarity) or not -1 <= perceptual_similarity <= 1:
+        raise ValueError("decoded_translation.perceptual_negative_similarity_threshold must be in [-1, 1].")
     temperature = float(image.get("structure_contrastive_temperature", .2))
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("decoded_translation.structure_contrastive_temperature must be finite and positive.")
@@ -146,6 +154,34 @@ def decoded_structure_contrastive_loss(generated, source, negatives, *, temperat
     return detached_key_contrastive_loss(
         generated, source, negatives, temperature=temperature,
         negative_similarity_threshold=negative_similarity_threshold)
+
+
+def decoded_perceptual_contrastive_loss(generated_tokens, source_tokens, *, temperature=.2,
+                                       negative_similarity_threshold=.95):
+    """Retrieve each original source using half CLS / half spatial appearance.
+
+    The composite descriptor's dot product is exactly half the CLS cosine
+    plus half the mean corresponding-patch cosine (for nonzero tokens).
+    InfoNCE contrasts this score against other source images in this decoded
+    batch, not other patches within the same image. This is not CUT PatchNCE.
+    Detached keys, duplicate masking and empty-negative handling are shared
+    with the existing structure/code contrastive objectives.
+    """
+    if (generated_tokens.ndim != 3 or source_tokens.shape != generated_tokens.shape
+            or generated_tokens.shape[1] < 2 or not generated_tokens.shape[0]
+            or not generated_tokens.shape[2]):
+        raise ValueError("Perceptual InfoNCE requires matching [batch, CLS + patches, features] tokens.")
+    def descriptor(tokens):
+        values = F.normalize(tokens.float(), dim=-1, eps=1e-6)
+        patches = values.shape[1] - 1
+        return torch.cat((values[:, 0] / math.sqrt(2),
+                          values[:, 1:].flatten(1) / math.sqrt(2 * patches)), dim=1)
+    query, keys = descriptor(generated_tokens), descriptor(source_tokens.detach())
+    loss, metrics = detached_key_contrastive_loss(
+        query, keys, keys, temperature=temperature,
+        negative_similarity_threshold=negative_similarity_threshold)
+    return loss, {**metrics, "negative_source": "current_original_source_query_batch",
+                  "similarity": "half_cls_half_corresponding_patch_cosine"}
 
 
 def generated_code_consistency_loss(encoder, generated_latents, condition, *, mode="cosine",
@@ -346,6 +382,18 @@ class DecoderTraining:
         self.discriminator_updates = 0
         # This component is returned separately because only G may optimize it.
         self.code_consistency_objective = torch.zeros((), device=domains["cat"].device)
+        self.image_objectives = {}
+        self.original_datasets = {}
+
+    def original_source_images(self, domain, records):
+        """Load original RGB in query order; never substitute a VAE reconstruction."""
+        from diffusion_ot.data.afhq import load_afhq_dataset
+        from diffusion_ot.data.ground_truth import load_ground_truth_images
+        path = self.domains[domain].data_config_path
+        key = str(path)
+        if key not in self.original_datasets:
+            self.original_datasets[key] = load_afhq_dataset(path)
+        return load_ground_truth_images(path, records, dataset=self.original_datasets[key])
 
     @staticmethod
     def _cpu_copy(value):
@@ -369,6 +417,8 @@ class DecoderTraining:
         return self.ramp(step) > 0 and step % int(self.options.get("every_steps", 1)) == 0
 
     def null_preservation_loss(self, latents, codes):
+        if float(self.config["generator_adaptation"].get("null_preservation_weight", .1)) == 0:
+            return torch.zeros((), device=self.domains["cat"].device)
         return self._prediction_preservation_loss(latents, codes, force_null=True)
 
     def conditioned_preservation_loss(self, latents, baseline_codes):
@@ -408,17 +458,25 @@ class DecoderTraining:
         return torch.stack(losses).mean()
 
     def loss(self, weights, references, source_latents, real_latents, *, step, validation_seed=None,
-             source_reference_structure=None, source_query_structure=None):
+             source_reference_structure=None, source_query_structure=None, source_query_metadata=None):
         evaluation = validation_seed is not None
         augment = self.diffaugment["enabled"] and not evaluation and self.diffaugment["translation_ratio"] > 0
         feature_device = next(self.features.parameters()).device
         structure_losses, adversarial_losses, metrics = [], [], {}
         metrics["adversarial_augmentation"] = {**self.diffaugment, "applied": augment}
         contrastive_losses, consistency_losses = [], []
+        perceptual_losses = []
+        perceptual_diagnostics = []
+        perceptual_weight = float(self.options.get("perceptual_weight", 0.0))
+        perceptual_mode = self.options.get("perceptual_mode", "cosine")
         contrastive_weight = float(self.options.get("structure_contrastive_weight", 0.0))
         consistency_weight = float(self.options.get("code_consistency_weight", 0.0))
         consistency_mode = self.options.get("code_consistency_mode", "cosine")
         self.code_consistency_objective = torch.zeros((), device=feature_device)
+        self.image_objectives = {}
+        if perceptual_weight > 0 and (source_query_metadata is None or
+                any(domain not in source_query_metadata for domain in self.domains)):
+            raise ValueError("Decoded perceptual supervision requires original source query metadata for both domains.")
         if contrastive_weight > 0 and any(bank is None or any(domain not in bank for domain in self.domains)
                                          for bank in (source_reference_structure, source_query_structure)):
             raise ValueError("Decoded contrastive supervision requires cached source query and disjoint reference structures for both domains.")
@@ -442,6 +500,31 @@ class DecoderTraining:
             )
             images = decode_training_images(context.vae, generated).to(feature_device)
             structure, fake_tokens = self.features(images)
+            if perceptual_weight > 0:
+                records = source_query_metadata[source][:count]
+                if len(records) != count:
+                    raise ValueError("Original source metadata must match the decoded query count.")
+                with torch.no_grad():
+                    originals = self.original_source_images(source, records).to(images)
+                    if originals.shape != images.shape:
+                        raise ValueError("Decoded and original source RGB shapes differ; check cache preprocessing.")
+                    _, source_tokens = self.features(originals)
+                # Keep absolute similarity as a diagnostic after switching to
+                # relative retrieval. No extra cosine objective in InfoNCE mode.
+                with torch.no_grad():
+                    distances = 1 - F.cosine_similarity(fake_tokens, source_tokens, dim=-1)
+                    perceptual_distance = .5 * (distances[:, 0].mean() + distances[:, 1:].mean())
+                if perceptual_mode == "contrastive":
+                    perceptual, perceptual_metrics = decoded_perceptual_contrastive_loss(
+                        fake_tokens, source_tokens,
+                        temperature=float(self.options.get("perceptual_temperature", .2)),
+                        negative_similarity_threshold=float(self.options.get("perceptual_negative_similarity_threshold", .95)))
+                else:
+                    distances = 1 - F.cosine_similarity(fake_tokens, source_tokens.detach(), dim=-1)
+                    perceptual = .5 * (distances[:, 0].mean() + distances[:, 1:].mean())
+                    perceptual_metrics = None
+                perceptual_diagnostics.append((float(perceptual_distance), perceptual_metrics))
+                perceptual_losses.append(perceptual)
             if augment:
                 # Structure objectives retain the original image coordinates.
                 # Draw once outside DINO checkpoints; reuse these live tokens
@@ -520,7 +603,8 @@ class DecoderTraining:
                 metrics[f"{target}_fake_score"] = float(fake_score.detach().mean())
         structure = torch.stack(structure_losses).mean()
         adversarial = torch.stack(adversarial_losses).mean()
-        total = (float(self.options.get("structure_weight", .1)) * structure
+        structure_weight = float(self.options.get("structure_weight", .1))
+        total = (structure_weight * (structure if structure_weight > 0 else structure.detach())
                  + float(self.options.get("adversarial_weight", .01)) * adversarial)
         ramp = 1.0 if evaluation else self.ramp(step)
         if contrastive_losses:
@@ -528,6 +612,27 @@ class DecoderTraining:
             total = total + contrastive_weight * contrastive
             metrics.update(structure_contrastive_loss=float(contrastive.detach()),
                            structure_contrastive_weight=contrastive_weight)
+        if perceptual_losses:
+            perceptual = torch.stack(perceptual_losses).mean()
+            total = total + perceptual_weight * perceptual
+            self.image_objectives["perceptual"] = ramp * perceptual_weight * perceptual
+            metrics.update(perceptual_loss=float(perceptual.detach()),
+                           perceptual_mode=perceptual_mode,
+                           perceptual_cosine_distance=sum(d[0] for d in perceptual_diagnostics) / len(perceptual_diagnostics),
+                           perceptual_weight=perceptual_weight,
+                           perceptual_effective_weighted_loss=float((ramp * perceptual_weight * perceptual).detach()),
+                           perceptual_target="original_source_rgb")
+            for direction, loss, (distance, retrieval) in zip(
+                    ("cat_to_dog", "dog_to_cat"), perceptual_losses, perceptual_diagnostics):
+                metrics[direction]["perceptual_loss"] = float(loss.detach())
+                metrics[direction]["perceptual_cosine_distance"] = distance
+                if retrieval is not None:
+                    metrics[direction]["perceptual_contrastive"] = retrieval
+        self.image_objectives["adversarial"] = ramp * float(self.options.get("adversarial_weight", .01)) * adversarial
+        self.image_objectives["structure"] = ramp * structure_weight * (
+            structure if structure_weight > 0 else structure.detach())
+        if contrastive_losses:
+            self.image_objectives["structure"] = self.image_objectives["structure"] + ramp * contrastive_weight * contrastive
         if consistency_losses:
             consistency = torch.stack(consistency_losses).mean()
             self.code_consistency_objective = ramp * consistency_weight * consistency
@@ -537,7 +642,9 @@ class DecoderTraining:
                            code_consistency_weighted_loss=float(consistency.detach()) * consistency_weight,
                            code_consistency_effective_weighted_loss=float(self.code_consistency_objective.detach()),
                            code_consistency_gradient_routing="generator_only")
-        metrics.update(structure_loss=float(structure.detach()), adversarial_loss=float(adversarial.detach()),
+        metrics.update(structure_loss=float(structure.detach()), structure_weight=structure_weight,
+                       structure_effective_weighted_loss=float(structure.detach()) * structure_weight * ramp,
+                       adversarial_loss=float(adversarial.detach()),
                        weighted_loss=float(total.detach()), ramp=ramp,
                        effective_weighted_loss=float(total.detach()) * ramp,
                        discriminator_updates=self.discriminator_updates,

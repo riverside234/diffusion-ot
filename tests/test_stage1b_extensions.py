@@ -27,6 +27,14 @@ def experiment(monkeypatch, tmp_path):
     latest = {}
     monkeypatch.setattr(decoded, "load_image_features", lambda *a, **kw: deepcopy(features))
 
+    def original_source_images(self, domain, records):
+        # Original RGB fixture deliberately differs from the VAE reconstruction.
+        assert all(r["sample_id"].startswith(domain + "_") for r in records)
+        return torch.stack([torch.rand(3, 8, 8, generator=torch.Generator().manual_seed(
+            200 + int(r["sample_id"].rsplit("_", 1)[1]))) for r in records])
+
+    monkeypatch.setattr(decoded.DecoderTraining, "original_source_images", original_source_images)
+
     class Dataset:
         def __init__(self, path, domain, split="train", **kwargs):
             self.domain, self.split = domain, split
@@ -60,7 +68,9 @@ def experiment(monkeypatch, tmp_path):
     for domain in originals:
         (tmp_path / f"{domain}.yaml").write_text(yaml.safe_dump({"data_config": "data.yaml"}))
     cfg = config()
-    cfg["decoded_translation"].update(structure_contrastive_weight=.01,
+    cfg["decoded_translation"].update(perceptual_weight=.10, perceptual_mode="contrastive",
+                                      perceptual_negative_similarity_threshold=1., structure_weight=0.,
+                                      structure_contrastive_weight=.01,
                                       structure_contrastive_temperature=.2,
                                       code_consistency_weight=.02, code_consistency_mode="contrastive",
                                       # The tiny fixture uses only two nearly
@@ -84,7 +94,7 @@ def experiment(monkeypatch, tmp_path):
         semantic_prior={"path": "prior.pt", "neighborhood_geometry": "rms_distance"},
         loss_weights={"semantic_neighborhood": .05, "conditional_structure": .05},
         train={"max_steps": 2, "log_every": 1, "save_every": 1, "validation_every": 1,
-               "validation_samples": 2, "gradient_diagnostics_every": 1, "lr_encoder": .001},
+               "validation_samples": 2, "gradient_diagnostics_every": 1, "gradient_conflicts": True, "lr_encoder": .001},
         gradient_guard={"enabled": False},
     )
 
@@ -149,6 +159,13 @@ def test_actual_training_extensions_validate_full_support_and_resume_compatibly(
         assert row["applied_code_consistency_encoder_gradient_norm"] == 0
         assert row["applied_code_consistency_matching_head_gradient_norm"] == 0
         decoded = row["decoded_translation"]
+        assert decoded["perceptual_target"] == "original_source_rgb"
+        assert decoded["perceptual_loss"] > 0
+        assert decoded["perceptual_mode"] == "contrastive"
+        assert decoded["structure_weight"] == decoded["structure_effective_weighted_loss"] == 0.
+        assert decoded["weighted_loss"] == pytest.approx(
+            .1 * decoded["perceptual_loss"]
+            + .01 * decoded["structure_contrastive_loss"] + .01 * decoded["adversarial_loss"])
         assert decoded["structure_contrastive_loss"] > 0
         assert decoded["code_consistency_loss"] > 0
         assert decoded["code_consistency_mode"] == "contrastive"
@@ -160,7 +177,16 @@ def test_actual_training_extensions_validate_full_support_and_resume_compatibly(
         requested = balance["effective_target_ratio"] / balance["prebalanced_ratio"]
         assert balance["scale"] == pytest.approx(min(4., max(.25, requested)))
         assert balance["effective_ratio"] == pytest.approx(balance["prebalanced_ratio"] * balance["scale"])
+        conflicts = row["gradient_conflicts"]
+        assert conflicts["encoder_decoded_scale"] == balance["scale"]
+        assert conflicts["code_routing"] == "generator_only"
+        assert conflicts["groups"]["encoder.all"]["translation_vs_reconstruction"]["cosine"] == pytest.approx(balance["cosine"], abs=1e-6)
+        for group in ("encoder.cat", "encoder.dog", "generator.cat", "generator.dog", "matching_head.cat"):
+            assert conflicts["groups"][group]["perceptual_vs_adversarial"]["valid"]
         for direction in ("cat_to_dog", "dog_to_cat"):
+            perceptual = decoded[direction]["perceptual_contrastive"]
+            assert perceptual["negative_bank_size"] == 2 and perceptual["usable_samples"] == 2
+            assert decoded[direction]["perceptual_cosine_distance"] >= 0.
             assert contrastive["conditional"][direction]["valid_candidates"] == 6
             assert decoded[direction]["reference_targets"] == 6
             assert decoded[direction]["code_consistency"]["valid_conditions"] == 2
@@ -172,6 +198,10 @@ def test_actual_training_extensions_validate_full_support_and_resume_compatibly(
             assert row["matching_regularization"][domain]["samples"] == 6
     for row in logs["validation"]:
         assert_finite_numbers(row)
+        assert row["decoded_translation"]["perceptual_target"] == "original_source_rgb"
+        assert row["decoded_translation"]["perceptual_loss"] > 0
+        assert row["decoded_translation"]["perceptual_mode"] == "contrastive"
+        assert row["decoded_translation"]["cat_to_dog"]["perceptual_contrastive"]["negative_bank_size"] == 2
         assert row["matching_contrastive"]["conditional"]["cat_to_dog"]["valid_candidates"] == 6
         assert row["decoded_translation"]["cat_to_dog"]["reference_targets"] == 6
         assert row["decoded_translation"]["cat_to_dog"]["code_consistency"]["valid_conditions"] == 2
@@ -219,6 +249,11 @@ def test_resume_rejects_changed_new_objectives_and_tiny_reference_banks(experime
     run, _, _ = experiment
     run("resume_guard", steps=1)
     for key, change in (("matching_contrastive", {"neighborhood_weight": .02}),
+                        ("decoded_translation", {"perceptual_weight": .05}),
+                        ("decoded_translation", {"perceptual_mode": "cosine"}),
+                        ("decoded_translation", {"perceptual_temperature": .1}),
+                        ("decoded_translation", {"perceptual_negative_similarity_threshold": .95}),
+                        ("decoded_translation", {"structure_weight": .1}),
                         ("decoded_encoder_balance", {"target_ratio": 1.5}),
                         ("decoded_translation", {"code_consistency_weight": .04}),
                         ("decoded_translation", {"code_consistency_mode": "cosine"}),
@@ -228,5 +263,103 @@ def test_resume_rejects_changed_new_objectives_and_tiny_reference_banks(experime
             run("resume_guard", resume=True, modify=lambda cfg: cfg[key].update(change))
     # Six references leave five non-self candidates: k=5 supplies no negatives.
     with pytest.raises(ValueError, match="enough OT references"):
-        run("too_few_negatives", steps=1,
-            modify=lambda cfg: cfg["matching_contrastive"].update(positive_count=5))
+            run("too_few_negatives", steps=1,
+                modify=lambda cfg: cfg["matching_contrastive"].update(positive_count=5))
+
+
+def test_gradient_conflict_measurements_preserve_updates_and_rng(experiment):
+    run, _, _ = experiment
+    def options(cfg, enabled):
+        cfg["train"].update(gradient_conflicts=enabled, log_every=3)
+        cfg["decoded_translation"]["diffaugment"] = {"enabled": True, "policy": "translation", "translation_ratio": .125}
+    measured, logs = run("measured", modify=lambda cfg: options(cfg, True))
+    control, _ = run("control", modify=lambda cfg: options(cfg, False))
+    # Step 2 is a diagnostic step but not a normal logging step.
+    assert [row["step"] for row in logs["train"]] == [1, 2]
+    assert all("gradient_conflicts" in row for row in logs["train"])
+    for key in ("encoders", "matching_heads", "generators", "optimizer", "decoded_discriminators",
+                "decoded_discriminator_optimizer", "decoded_noise_states", "decoded_augmentation_states", "rng_state"):
+        assert_tensor_tree_equal(measured[key], control[key])
+
+
+def minimal_pcgrad_recipe(cfg):
+    cfg["pcgrad"] = {"enabled": True}
+    cfg["decoded_encoder_balance"] = {"enabled": False}
+    cfg["loss_weights"].update(latent_anchor=0., semantic_neighborhood=0.)
+    cfg["matching_contrastive"] = {"enabled": False}
+    cfg["generator_adaptation"].update(null_preservation_weight=0., conditioned_preservation_weight=0.)
+    cfg["decoded_translation"].update(structure_weight=0., structure_contrastive_weight=0., code_consistency_weight=0.)
+
+
+def test_simplified_pcgrad_trains_validates_and_resumes(experiment, monkeypatch):
+    from diffusion_ot.training.decoded_translation import DecoderTraining
+    import diffusion_ot.losses.semantic_prior as semantic
+    import diffusion_ot.training.decoded_translation as decoded
+
+    def disabled(*args, **kwargs):
+        raise AssertionError("A disabled auxiliary loss performed training computation.")
+    monkeypatch.setattr(DecoderTraining, "_prediction_preservation_loss", disabled)
+    monkeypatch.setattr(semantic, "neighborhood_distillation_loss", disabled)
+    monkeypatch.setattr(decoded, "decoded_structure_contrastive_loss", disabled)
+    monkeypatch.setattr(decoded, "generated_code_consistency_loss", disabled)
+    run, _, _ = experiment
+    complete, logs = run("minimal", modify=minimal_pcgrad_recipe)
+    expected = {
+        "encoder": {"native", "transport", "protection", "perceptual", "adversarial"},
+        "matching_head": {"transport", "protection", "perceptual", "adversarial"},
+        "generator": {"native", "perceptual", "adversarial"},
+    }
+    for row in logs["train"]:
+        assert row["optimizer_gradient_mode"] == "pcgrad"
+        assert row["cat_anchor_loss"] == row["dog_anchor_loss"] == row["latent_anchor_weight"] == 0
+        assert row["null_preservation_loss"] == row["semantic_neighborhood_loss"] == row["code_consistency_loss"] == 0
+        decoded_metrics = row["decoded_translation"]
+        assert decoded_metrics["weighted_loss"] == pytest.approx(
+            .1 * decoded_metrics["perceptual_loss"] + .01 * decoded_metrics["adversarial_loss"])
+        assert row["gradient_conflicts"]["pcgrad_applied_after_measurement"]
+        assert all(not group["perceptual_vs_structure"]["valid"]
+                   for group in row["gradient_conflicts"]["groups"].values())
+        assert "decoded_encoder_balance" not in row
+        for group, tasks in expected.items():
+            assert set(row["pcgrad"]["groups"][group]["active_tasks"]) == tasks
+        assert_finite_numbers(row)
+    assert any(v["projection_count"] > 0 for row in logs["train"] for v in row["pcgrad"]["groups"].values())
+    for row in logs["validation"]:
+        assert row["decoded_translation"]["perceptual_mode"] == "contrastive"
+        assert row["decoded_translation"]["structure_effective_weighted_loss"] == 0.
+    run("minimal_resume", steps=1, modify=minimal_pcgrad_recipe)
+    resumed, resumed_logs = run("minimal_resume", resume=True, modify=minimal_pcgrad_recipe)
+    assert resumed["step"] == complete["step"] == 2
+    assert resumed_logs["train"][-1]["pcgrad"]["order"] == "private_seed_and_step"
+    for key in ("decoded_noise_states", "rng_state"):
+        assert_tensor_tree_equal(complete[key], resumed[key])
+
+
+def test_pcgrad_diagnostics_do_not_change_optimizer_updates(experiment):
+    run, _, _ = experiment
+    measured, _ = run("pcgrad_measured", modify=minimal_pcgrad_recipe)
+    def no_diagnostics(cfg):
+        minimal_pcgrad_recipe(cfg)
+        cfg["train"].update(gradient_conflicts=False, gradient_diagnostics_every=0)
+    control, _ = run("pcgrad_control", modify=no_diagnostics)
+    for key in ("encoders", "matching_heads", "generators", "optimizer", "rng_state", "decoded_noise_states"):
+        assert_tensor_tree_equal(measured[key], control[key])
+
+
+def test_pcgrad_resume_and_controller_contract(experiment):
+    run, _, _ = experiment
+    run("pcgrad_resume_guard", steps=1, modify=minimal_pcgrad_recipe)
+    def change_pcgrad(cfg):
+        minimal_pcgrad_recipe(cfg)
+        cfg["pcgrad"] = {"enabled": False}
+    with pytest.raises(ValueError, match="Resume cannot change pcgrad"):
+        run("pcgrad_resume_guard", resume=True, modify=change_pcgrad)
+    def change_seed(cfg):
+        minimal_pcgrad_recipe(cfg)
+        cfg["train"]["seed"] = 10
+    with pytest.raises(ValueError, match="train.seed"):
+        run("pcgrad_resume_guard", resume=True, modify=change_seed)
+    def both(cfg):
+        cfg["pcgrad"] = {"enabled": True}
+    with pytest.raises(ValueError, match="cannot be combined"):
+        run("pcgrad_both", steps=1, modify=both)

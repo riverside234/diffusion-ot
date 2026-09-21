@@ -193,6 +193,8 @@ def _gradient_norm(parameters: list[torch.nn.Parameter]) -> float:
 
 
 def _autograd_norm(loss: torch.Tensor, parameters: list[torch.nn.Parameter]) -> float:
+    if not parameters or not loss.requires_grad:
+        return 0.0
     gradients = torch.autograd.grad(
         loss,
         parameters,
@@ -209,6 +211,8 @@ def _autograd_norm(loss: torch.Tensor, parameters: list[torch.nn.Parameter]) -> 
 def _autograd_group_norms(loss: torch.Tensor, groups: dict[str, list[torch.nn.Parameter]]) -> dict[str, float]:
     """Measure all groups with one graph traversal; do not assign grads."""
     parameters = [p for group in groups.values() for p in group]
+    if not parameters or not loss.requires_grad:
+        return {name: 0.0 for name in groups}
     gradients = iter(torch.autograd.grad(loss, parameters, retain_graph=True, allow_unused=True))
     norms = {}
     for name, group in groups.items():
@@ -743,7 +747,8 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
                 {d: data["reference_latents"] for d, data in inputs.items()},
                 step=0, validation_seed=seed,
                 source_reference_structure=reference_structure,
-                source_query_structure=query_structure)
+                source_query_structure=query_structure,
+                source_query_metadata={d: data.get("query_metadata", []) for d, data in inputs.items()})
             metrics["seed"] = seed
             # This probe refits its own plan; do not borrow convergence from
             # the conditional probe, which can encode references in chunks.
@@ -762,7 +767,7 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
             if (decoder_training.options.get("code_consistency_mode", "cosine") == "contrastive"
                     and float(decoder_training.options.get("code_consistency_weight", 0.0)) > 0):
                 metrics["code_condition_bank_ids"] = {d: data["query_ids"] for d, data in inputs.items()}
-            metrics["interpretation"] = "Decoded DINO structure and code recovery are training signals, not independent semantic validation. Discriminator scores are not calibrated across checkpoints."
+            metrics["interpretation"] = "Decoded DINO structure, source perceptual similarity and code recovery are training signals, not independent semantic validation. Discriminator scores are not calibrated across checkpoints."
             return metrics
         finally:
             for domain, value in domains.items():
@@ -803,6 +808,8 @@ def train_joint_infoot(
     from diffusion_ot.training.gradient_balance import (
         DecodedEncoderBalanceConfig, decoded_encoder_gradient_correction,
     )
+    from diffusion_ot.training.gradient_diagnostics import GradientConflictMonitor, training_gradient_conflicts
+    from diffusion_ot.training.pcgrad import PCGradConfig, pcgrad_backward
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec, matching_features
     from diffusion_ot.models.generator_adaptation import generator_adaptation_enabled
     from diffusion_ot.training.decoded_translation import DecoderTraining, validate_decoder_config
@@ -821,6 +828,9 @@ def train_joint_infoot(
     )
     data_config = _nested(config, "data")
     train_config = _nested(config, "train")
+    conflict_diagnostics_enabled = train_config.get("gradient_conflicts", False)
+    if not isinstance(conflict_diagnostics_enabled, bool):
+        raise ValueError("train.gradient_conflicts must be a boolean.")
     ema_config = _nested(config, "ema")
     loss_weights = _nested(config, "loss_weights")
     matching_config = _nested(config, "matching")
@@ -838,6 +848,7 @@ def train_joint_infoot(
     matching_protection_options = matching_regularization_options(_nested(config, "matching_regularization"))
     contrastive_options = matching_contrastive_options(_nested(config, "matching_contrastive"))
     balance_config = DecodedEncoderBalanceConfig.from_mapping(_nested(config, "decoded_encoder_balance"))
+    pcgrad_config = PCGradConfig.from_mapping(_nested(config, "pcgrad"))
     if head_spec["enabled"]:
         if not conditional_enabled:
             raise ValueError("Learned matching heads require conditional structure training.")
@@ -849,6 +860,8 @@ def train_joint_infoot(
     support_enabled = bool(support_config.get("enabled", False))
     gradient_guard_config = _nested(config, "gradient_guard")
     gradient_guard_enabled = bool(gradient_guard_config.get("enabled", False))
+    if pcgrad_config.enabled and (balance_config.enabled or gradient_guard_enabled):
+        raise ValueError("PCGrad cannot be combined with decoded encoder balance or the legacy gradient guard.")
     if balance_config.enabled:
         if gradient_guard_enabled:
             raise ValueError("Decoded encoder balance cannot be combined with the legacy gradient guard.")
@@ -1016,6 +1029,11 @@ def train_joint_infoot(
     decoder_training = DecoderTraining(config, domains, prior, root, seed=seed) if generator_adaptation_enabled(config) else None
     generator_parameters = decoder_training.parameters if decoder_training is not None else []
     parameters = [parameter for encoder in encoders.values() for parameter in encoder.parameters()]
+    conflict_monitor = GradientConflictMonitor()
+    diagnostic_groups = {f"encoder.{d}": list(encoder.parameters()) for d, encoder in encoders.items()}
+    diagnostic_groups.update({f"matching_head.{d}": list(head.parameters()) for d, head in matching_heads.items()})
+    if decoder_training is not None:
+        diagnostic_groups.update({f"generator.{d}": list(view.parameters()) for d, view in decoder_training.views.items()})
     parameter_groups = [{"params": parameters}]
     if head_parameters:
         parameter_groups.append({"params": head_parameters, "lr": float(head_config.get("lr", 2e-4))})
@@ -1098,6 +1116,10 @@ def train_joint_infoot(
     alignment_weight = float(loss_weights.get("infoot_alignment", 0.02))
     warmup_steps = int(loss_weights.get("alignment_warmup_steps", 1000))
     anchor_weight = float(loss_weights.get("latent_anchor", 0.01))
+    if not math.isfinite(anchor_weight) or anchor_weight < 0:
+        raise ValueError("latent_anchor weight must be finite and nonnegative.")
+    needs_anchor_codes = anchor_weight > 0 or support_enabled or float(
+        _nested(config, "generator_adaptation").get("conditioned_preservation_weight", 0.0)) > 0
     neighborhood_weight = float(loss_weights.get("semantic_neighborhood", 0.0))
     if not math.isfinite(neighborhood_weight) or neighborhood_weight < 0:
         raise ValueError("semantic_neighborhood weight must be finite and nonnegative.")
@@ -1140,6 +1162,7 @@ def train_joint_infoot(
                         raise ValueError("Projection validation needs at least three train references and one validation query.")
                     ids = [row["sample_id"] for row in rows]
                     projection_probe_inputs[domain][f"{kind}_ids"] = ids
+                    projection_probe_inputs[domain][f"{kind}_metadata"] = [row.get("metadata", {}) for row in rows]
                     projection_probe_inputs[domain][f"{kind}_latents"] = torch.stack([row["x0_latent"] for row in rows])
                     projection_probe_inputs[domain][f"{kind}_structure"] = prior.lookup(ids, domain, "train" if kind == "reference" else "val")
 
@@ -1208,8 +1231,11 @@ def train_joint_infoot(
         neighborhood_losses: dict[str, torch.Tensor] = {}
         matching_z: dict[str, torch.Tensor] = {}
         reconstruction_diagnostics: dict[str, dict[str, float]] = {}
+        query_metadata = {}
         for domain, value in domains.items():
             batch = next(loaders[domain])
+            if query_count:
+                query_metadata[domain] = batch["metadata"][-query_count:]
             x0[domain] = batch["x0_latent"].to(
                 value.device, dtype=value.dtype, non_blocking=True
             )
@@ -1222,9 +1248,10 @@ def train_joint_infoot(
                 neighborhood_losses[domain] = neighborhood_distillation_loss(
                     matching_z[domain] if matching_heads else z[domain].to(alignment_device), teacher_features[domain],
                     **prior_neighborhood_options,
-                )
-            with torch.no_grad():
-                reference_z[domain] = anchors[domain](x0[domain])
+                ) if neighborhood_weight > 0 else torch.zeros((), device=alignment_device)
+            if needs_anchor_codes:
+                with torch.no_grad():
+                    reference_z[domain] = anchors[domain](x0[domain])
             reconstruction_diagnostics[domain] = {}
             reconstruction_args = ({"semantic_dropout": True, "diagnostics": reconstruction_diagnostics[domain]}
                                    if decoder_training is not None else {})
@@ -1234,7 +1261,7 @@ def train_joint_infoot(
             )
             anchor_losses[domain] = encoder_anchor_loss(
                 z[domain], reference_z[domain], anchor_variances[domain]
-            )
+            ) if anchor_weight > 0 else torch.zeros((), device=value.device)
 
         # DataLoaders shuffle each domain independently. Reserve the last Q
         # examples as queries; they must never enter this update's OT fit.
@@ -1335,6 +1362,7 @@ def train_joint_infoot(
                 {d: latent[:-query_count] for d, latent in x0.items()}, step=step,
                 source_reference_structure=reference_structure,
                 source_query_structure={d: teacher[-query_count:] for d, teacher in teacher_features.items()},
+                source_query_metadata=query_metadata,
             )
             code_consistency_loss = decoder_training.code_consistency_objective
             decoded_metrics["active"] = True
@@ -1360,16 +1388,16 @@ def train_joint_infoot(
             + null_preservation_weight * null_preservation
             + conditioned_preservation_weight * conditioned_preservation
         )
-        auxiliary_objective = (
+        transport_objective = (
             beta * infoot_loss
             + neighborhood_weight * warmup * neighborhood_loss
             + conditional_weight * warmup * projection_loss
             + warmup * contrastive_loss
             + support_weight * warmup * support_loss
-            + decoded_loss
-            # Protect the reference geometry from update 1, including warmup.
-            + matching_protection_loss
         )
+        # Keep protection a separate PCGrad task: it addresses the observed
+        # spread/rank failure independently of relational transport fitting.
+        auxiliary_objective = transport_objective + decoded_loss + matching_protection_loss
         total = primary_objective + auxiliary_objective
         # Code recovery is an additional generator-only objective. Its scalar
         # contributes to reporting, while selective autograd below prevents
@@ -1392,19 +1420,39 @@ def train_joint_infoot(
         code_consistency_loss = code_consistency_loss.detach()
         if decoder_training is not None:
             decoder_training.code_consistency_objective = code_consistency_loss
-        gradient_diagnostics: dict[str, float | None] = {}
-        if gradient_diagnostics_every > 0 and step % gradient_diagnostics_every == 0:
+        gradient_diagnostics: dict[str, Any] = {}
+        diagnostics_due = gradient_diagnostics_every > 0 and step % gradient_diagnostics_every == 0
+        conflict_report, conflict_norms = None, None
+        if diagnostics_due and conflict_diagnostics_enabled and decoder_training is not None and decoded_metrics["active"]:
+            conflict_monitor.set_phase("full_weight" if warmup >= 1 and decoder_training.ramp(step) >= 1 else "warmup")
+            conflict_report, conflict_norms = training_gradient_conflicts(
+                {
+                    "reconstruction": reconstruction_objective,
+                    "decoded": decoded_loss,
+                    "perceptual": decoder_training.image_objectives.get("perceptual", decoded_loss.new_zeros(())),
+                    "adversarial": decoder_training.image_objectives["adversarial"],
+                    "structure": decoder_training.image_objectives["structure"],
+                    "matching": (beta * infoot_loss + neighborhood_weight * warmup * neighborhood_loss
+                                 + conditional_weight * warmup * projection_loss + warmup * contrastive_loss
+                                 + support_weight * warmup * support_loss + matching_protection_loss),
+                }, diagnostic_groups,
+                code_gradients={id(p): g for p, g in zip(generator_parameters, code_generator_gradients)},
+                encoder_scale=float(balance_metrics.get("scale", 1.0)), monitor=conflict_monitor)
+            conflict_report["encoder_guard_applied_after_measurement"] = gradient_guard_enabled
+            conflict_report["pcgrad_applied_after_measurement"] = pcgrad_config.enabled
+        if diagnostics_due:
             gradient_diagnostics = {
-                "reconstruction_gradient_norm": _autograd_norm(
+                "reconstruction_gradient_norm": (conflict_norms["reconstruction"]["encoder.all"] if conflict_norms else _autograd_norm(
                     reconstruction_objective, parameters
-                ),
+                )),
                 "weighted_alignment_gradient_norm": _autograd_norm(
                     beta * infoot_loss, parameters
                 ),
             }
             if decoder_training is not None:
-                gradient_diagnostics["reconstruction_generator_gradient_norm"] = _autograd_norm(
-                    reconstruction_objective, generator_parameters)
+                gradient_diagnostics["reconstruction_generator_gradient_norm"] = (
+                    conflict_norms["reconstruction"]["generator.all"] if conflict_norms else
+                    _autograd_norm(reconstruction_objective, generator_parameters))
                 gradient_diagnostics["weighted_null_preservation_generator_gradient_norm"] = _autograd_norm(
                     null_preservation_weight * null_preservation, generator_parameters)
                 if conditioned_preservation_weight > 0:
@@ -1457,9 +1505,11 @@ def train_joint_infoot(
                     gradient_diagnostics.update({f"weighted_matching_{name}_{group}_gradient_norm": norm
                                                  for group, norm in norms.items()})
             if decoder_training is not None and decoded_metrics["active"]:
-                image_norms = _autograd_group_norms(decoded_loss, {
+                image_norms = ({group: conflict_norms["decoded"][f"{group}.all"]
+                                for group in ("encoder", "matching_head", "generator")} if conflict_norms else
+                              _autograd_group_norms(decoded_loss, {
                     "encoder": parameters, "matching_head": head_parameters, "generator": generator_parameters,
-                })
+                }))
                 gradient_diagnostics.update({
                     f"weighted_decoded_{group}_gradient_norm": norm for group, norm in image_norms.items()
                 })
@@ -1477,6 +1527,8 @@ def train_joint_infoot(
                     sum(float(g.float().square().sum()) for g in code_generator_gradients if g is not None))
                 gradient_diagnostics["applied_code_consistency_encoder_gradient_norm"] = 0.0
                 gradient_diagnostics["applied_code_consistency_matching_head_gradient_norm"] = 0.0
+            if conflict_report is not None:
+                gradient_diagnostics["gradient_conflicts"] = conflict_report
         if balance_metrics:
             # Keep the familiar ratio key equal to the applied decoded encoder
             # contribution, and retain explicit before/after values for audit.
@@ -1488,8 +1540,19 @@ def train_joint_infoot(
                 "decoded_to_reconstruction_encoder_gradient_ratio": balance_metrics["effective_ratio"],
                 "decoded_reconstruction_encoder_gradient_cosine": balance_metrics["cosine"],
             })
-        guard_metrics = {}
-        if gradient_guard_enabled:
+        guard_metrics, pcgrad_metrics = {}, None
+        if pcgrad_config.enabled:
+            tasks = {"native": primary_objective, "transport": transport_objective,
+                     "protection": matching_protection_loss}
+            if decoder_training is not None and decoded_metrics["active"]:
+                tasks.update(decoder_training.image_objectives)
+            routed = ({"code": {id(p): g for p, g in zip(generator_parameters, code_generator_gradients)}}
+                      if code_generator_gradients else None)
+            pcgrad_metrics = pcgrad_backward(
+                tasks, {"encoder": parameters, "matching_head": head_parameters,
+                        "generator": generator_parameters}, seed=seed, step=step,
+                eps=pcgrad_config.eps, routed_gradients=routed)
+        elif gradient_guard_enabled:
             if generator_parameters:
                 generator_gradients = torch.autograd.grad(total, generator_parameters, retain_graph=True, allow_unused=True)
                 for parameter, gradient in zip(generator_parameters, generator_gradients):
@@ -1516,13 +1579,19 @@ def train_joint_infoot(
                         parameter.grad = correction.clone()
                     else:
                         parameter.grad.add_(correction)
-            for parameter, gradient in zip(generator_parameters, code_generator_gradients):
+            for parameter, gradient in zip(generator_parameters, () if pcgrad_config.enabled else code_generator_gradients):
                 if gradient is not None:
                     if parameter.grad is None:
                         parameter.grad = gradient.clone()
                     else:
                         parameter.grad.add_(gradient)
         del encoder_correction, code_generator_gradients
+        if pcgrad_config.enabled:
+            del tasks, routed
+        if decoder_training is not None:
+            # Diagnostics have consumed these live losses; do not retain their
+            # graphs into the next image rollout.
+            decoder_training.image_objectives = {}
         grad_norms = {
             domain: _gradient_norm(list(encoder.parameters()))
             for domain, encoder in encoders.items()
@@ -1572,17 +1641,19 @@ def train_joint_infoot(
                 "matching_covariance_loss": matching_protection.metrics["covariance_loss"]}
                if matching_protection is not None else {}),
         })
-        if step == initial_step + 1 or step % log_every == 0:
+        if step == initial_step + 1 or step % log_every == 0 or diagnostics_due:
             metrics = {
                 "event": "train",
-                "optimizer_gradient_mode": ("primary_guarded" if gradient_guard_enabled else
+                "optimizer_gradient_mode": ("pcgrad" if pcgrad_config.enabled else "primary_guarded" if gradient_guard_enabled else
                                             "decoded_encoder_balanced" if balance_config.enabled else "weighted_sum"),
+                **({"pcgrad": pcgrad_metrics} if pcgrad_metrics is not None else {}),
                 "step": step,
                 "loss": float(reported_total.cpu()),
                 "cat_reconstruction_loss": float(rec_losses["cat"].detach().cpu()),
                 "dog_reconstruction_loss": float(rec_losses["dog"].detach().cpu()),
                 "cat_anchor_loss": float(anchor_losses["cat"].detach().cpu()),
                 "dog_anchor_loss": float(anchor_losses["dog"].detach().cpu()),
+                "latent_anchor_weight": anchor_weight,
                 "infoot_feature_loss": float(infoot_loss.detach().cpu()),
                 "infoot_mutual_information": solution.mutual_information,
                 "infoot_entropy": solution.entropy,
@@ -1680,6 +1751,14 @@ def train_joint_infoot(
             metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
             print(json.dumps(metrics, sort_keys=True))
             _append_jsonl(log_path, metrics)
+
+        if pcgrad_config.enabled:
+            # Earlier task traversals retained their private forward branches.
+            # Drop loss roots before validation/the next expensive rollout.
+            del total, primary_objective, auxiliary_objective, reconstruction_objective
+            del transport_objective, decoded_loss, null_preservation, conditioned_preservation
+            rec_losses.clear()
+            anchor_losses.clear()
 
         if probe_every > 0 and (step % probe_every == 0 or step == final_step):
             _append_jsonl(output_dir / "logs" / "validation.jsonl", {
