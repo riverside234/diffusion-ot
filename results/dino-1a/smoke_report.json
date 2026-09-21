@@ -1,0 +1,112 @@
+{
+  "protocol": "fixed_noise_smoke",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae/cat_sit_b2_dino.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/sit_b2_256.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_dino/checkpoints/latest.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_dino/stage1a_eval/step_040000/ema/smoke",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 40000,
+  "weights": "ema",
+  "semantic_cfg_enabled": true,
+  "attention_lora": {
+    "enabled": true,
+    "rank": 64,
+    "alpha": 64.0,
+    "dropout": 0.0,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "targets": [
+      "qkv",
+      "proj"
+    ]
+  },
+  "seed": 20260902,
+  "num_samples": 8,
+  "num_steps": 50,
+  "guidance_scales": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "correct_z_cfg_0",
+    "shuffled_z_cfg_0",
+    "correct_z_cfg_1",
+    "shuffled_z_cfg_1",
+    "correct_z_cfg_1.5",
+    "shuffled_z_cfg_1.5",
+    "correct_z_cfg_2",
+    "shuffled_z_cfg_2"
+  ],
+  "metrics": {
+    "correct_z_cfg_0": {
+      "latent_mse": 1.1794486045837402,
+      "pixel_mse": 0.11692464351654053,
+      "pixel_psnr": 9.320939455078513
+    },
+    "shuffled_z_cfg_0": {
+      "latent_mse": 1.1794486045837402,
+      "pixel_mse": 0.11692464351654053,
+      "pixel_psnr": 9.320939455078513
+    },
+    "correct_z_cfg_1": {
+      "latent_mse": 0.5890951156616211,
+      "pixel_mse": 0.026664039120078087,
+      "pixel_psnr": 15.740740621729996
+    },
+    "shuffled_z_cfg_1": {
+      "latent_mse": 1.064740538597107,
+      "pixel_mse": 0.10156004130840302,
+      "pixel_psnr": 9.9327713115389
+    },
+    "correct_z_cfg_1.5": {
+      "latent_mse": 0.6000960469245911,
+      "pixel_mse": 0.02765069529414177,
+      "pixel_psnr": 15.58293943613803
+    },
+    "shuffled_z_cfg_1.5": {
+      "latent_mse": 1.1060353517532349,
+      "pixel_mse": 0.10741464793682098,
+      "pixel_psnr": 9.689364906629187
+    },
+    "correct_z_cfg_2": {
+      "latent_mse": 0.6212329268455505,
+      "pixel_mse": 0.029221460223197937,
+      "pixel_psnr": 15.342980857654457
+    },
+    "shuffled_z_cfg_2": {
+      "latent_mse": 1.1334058046340942,
+      "pixel_mse": 0.11051445454359055,
+      "pixel_psnr": 9.565809154813795
+    }
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_dino/stage1a_eval/step_040000/ema/smoke/reconstruction_grid.png",
+  "extra_reports": {
+    "inferred_noise_roundtrip": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_dino/stage1a_eval/step_040000/ema/roundtrip/roundtrip_report.json"
+  }
+}
