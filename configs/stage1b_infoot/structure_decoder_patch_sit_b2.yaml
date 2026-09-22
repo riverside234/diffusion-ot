@@ -1,11 +1,11 @@
 stage: stage1b_fused_infoot
-# RGB PatchGAN + HistoGAN source palette; all other objectives and rates unchanged.
+# RGB PatchGAN control; HistoGAN histogram is validation-only.
 # Experiment / controls: docs/analysis/stage1b_patchgan_histogan/review.md.
 # Rationale and task definitions: docs/analysis/stage1b_minimal_pcgrad/review.md.
 # Previous full recipe: structure_decoder_full_sit_b2.yaml.
 # DiffAugment contract: docs/analysis/stage1b_diffaugment/review.md.
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_patch_color
+output_dir: outputs/stage1b_patch
 
 stage1a:
   # Initialize from the current Flow + DINO Stage 1A runs.
@@ -219,7 +219,7 @@ decoded_translation:
   # HistoGAN RGB-uv / inverse-quadratic kernel; source is original whole-image RGB.
   # Same 2,000-step decoded ramp. Weight-zero controls still log validation distance.
   color_histogram:
-    weight: 0.02
+    weight: 0.0
     bins: 64
     input_size: 128
     sigma: 0.02

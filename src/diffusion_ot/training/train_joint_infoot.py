@@ -711,7 +711,7 @@ def fixed_conditional_structure_probe(
 @torch.no_grad()
 def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, inputs, *,
                                     prior, bandwidth, projection_bandwidth, teacher_temperature,
-                                    solver_options, seed, cross_cost_weight=1.0):
+                                    solver_options, seed, cross_cost_weight=1.0, image_dir=None):
     """Held-out decoded images; fixed noise, train-only OT references, no D update."""
     from diffusion_ot.losses.infoot import infoot_distance_scale, solve_infoot
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
@@ -748,7 +748,8 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
                 step=0, validation_seed=seed,
                 source_reference_structure=reference_structure,
                 source_query_structure=query_structure,
-                source_query_metadata={d: data.get("query_metadata", []) for d, data in inputs.items()})
+                source_query_metadata={d: data.get("query_metadata", []) for d, data in inputs.items()},
+                **({"validation_image_dir": image_dir} if image_dir is not None else {}))
             metrics["seed"] = seed
             # This probe refits its own plan; do not borrow convergence from
             # the conditional probe, which can encode references in chunks.
@@ -767,7 +768,7 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
             if (decoder_training.options.get("code_consistency_mode", "cosine") == "contrastive"
                     and float(decoder_training.options.get("code_consistency_weight", 0.0)) > 0):
                 metrics["code_condition_bank_ids"] = {d: data["query_ids"] for d, data in inputs.items()}
-            metrics["interpretation"] = "Decoded DINO structure, source perceptual similarity and code recovery are training signals, not independent semantic validation. Discriminator scores are not calibrated across checkpoints."
+            metrics["interpretation"] = "Decoded DINO, source-palette and optional code-recovery metrics are training signals, not independent semantic validation. RGB-uv measures whole-image palette, not spatial markings or exposure. Discriminator scores are not calibrated across checkpoints or critic kinds."
             return metrics
         finally:
             for domain, value in domains.items():
@@ -1166,7 +1167,7 @@ def train_joint_infoot(
                     projection_probe_inputs[domain][f"{kind}_latents"] = torch.stack([row["x0_latent"] for row in rows])
                     projection_probe_inputs[domain][f"{kind}_structure"] = prior.lookup(ids, domain, "train" if kind == "reference" else "val")
 
-    def validation_metrics() -> dict[str, Any]:
+    def validation_metrics(validation_step) -> dict[str, Any]:
         metrics = fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000,
                                              generator_baselines=decoder_training.baselines if decoder_training else None)
         if conditional_enabled:
@@ -1189,13 +1190,15 @@ def train_joint_infoot(
                 teacher_temperature=float(conditional_config.get("teacher_temperature", .05)),
                 solver_options=solver_options, seed=seed + 11000,
                 cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
+                image_dir=(output_dir / "validation" / f"step_{validation_step:06d}"
+                           if decoder_training.options.get("save_validation_images", False) else None),
             )
         return metrics
 
     if probe_every > 0:
         _append_jsonl(output_dir / "logs" / "validation.jsonl", {
             "step": initial_step, "weights": "raw", "seed": seed + 10000,
-            **validation_metrics(),
+            **validation_metrics(initial_step),
         })
 
     if resume_path is None:
@@ -1432,6 +1435,7 @@ def train_joint_infoot(
                     "perceptual": decoder_training.image_objectives.get("perceptual", decoded_loss.new_zeros(())),
                     "adversarial": decoder_training.image_objectives["adversarial"],
                     "structure": decoder_training.image_objectives["structure"],
+                    "color": decoder_training.image_objectives.get("color", decoded_loss.new_zeros(())),
                     "matching": (beta * infoot_loss + neighborhood_weight * warmup * neighborhood_loss
                                  + conditional_weight * warmup * projection_loss + warmup * contrastive_loss
                                  + support_weight * warmup * support_loss + matching_protection_loss),
@@ -1763,7 +1767,7 @@ def train_joint_infoot(
         if probe_every > 0 and (step % probe_every == 0 or step == final_step):
             _append_jsonl(output_dir / "logs" / "validation.jsonl", {
                 "step": step, "weights": "raw", "seed": seed + 10000,
-                **validation_metrics(),
+                **validation_metrics(step),
             })
         if step % save_every == 0 or step == final_step:
             _save_checkpoint(

@@ -1,11 +1,10 @@
 stage: stage1b_fused_infoot
-# RGB PatchGAN + HistoGAN source palette; all other objectives and rates unchanged.
-# Experiment / controls: docs/analysis/stage1b_patchgan_histogan/review.md.
+# DINO-feature GAN control; histogram is validation-only. Same seeds/panels as PatchGAN.
 # Rationale and task definitions: docs/analysis/stage1b_minimal_pcgrad/review.md.
 # Previous full recipe: structure_decoder_full_sit_b2.yaml.
 # DiffAugment contract: docs/analysis/stage1b_diffaugment/review.md.
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_patch_color
+output_dir: outputs/stage1b_dino_control
 
 stage1a:
   # Initialize from the current Flow + DINO Stage 1A runs.
@@ -194,7 +193,7 @@ generator_adaptation:
 
 # Actual translated images enter the image objectives. No top-k or sampled-code
 # substitute. DINOv2 weights/revision/processor come from semantic_prior.path.
-# Target realism uses separate RGB PatchGANs; real inputs remain VAE reconstructions.
+# Target realism uses separate spectral-normalized DINO feature discriminators.
 decoded_translation:
   enabled: true
   # Decode all 32 disjoint queries; independent of the native reconstruction batch.
@@ -209,7 +208,7 @@ decoded_translation:
   structure_weight: 0.0  # Structure cosine is diagnostic only.
   # Retrieve the original source among the current 32 source query images.
   # Similarity: half CLS + half mean corresponding-patch cosine. Keys detached.
-  # Perceptual InfoNCE retains structure/content; the histogram below teaches palette.
+  # InfoNCE replaces perceptual cosine; neither is a direct RGB-color constraint.
   # Retain the requested 0.10 as a pilot; cosine and InfoNCE scales differ.
   perceptual_weight: 0.10
   perceptual_mode: contrastive
@@ -219,20 +218,19 @@ decoded_translation:
   # HistoGAN RGB-uv / inverse-quadratic kernel; source is original whole-image RGB.
   # Same 2,000-step decoded ramp. Weight-zero controls still log validation distance.
   color_histogram:
-    weight: 0.02
+    weight: 0.0
     bins: 64
     input_size: 128
     sigma: 0.02
   save_validation_images: true
-  # One DINO source-image objective: perceptual InfoNCE includes spatial tokens.
+  # One source-image objective: perceptual InfoNCE already includes spatial tokens.
   structure_contrastive_weight: 0.0
   # No established Stage 1B quality gain from the extra code-retrieval objective.
   code_consistency_weight: 0.0
   discriminator_lr: 0.0001
-  discriminator_kind: rgb_patchgan
-  discriminator_base_channels: 32  # 70x70 receptive field; spectral norm, no instance norm.
+  discriminator_hidden_dim: 256
   discriminator_grad_clip: 1.0
-  # Image-space DiffAugment on real/fake RGB adversarial inputs only.
+  # Image-space DiffAugment on real/fake adversarial inputs before frozen DINO.
   # Independent integer shifts, zero fill; no color changes. Validation is unaugmented.
   diffaugment:
     enabled: true

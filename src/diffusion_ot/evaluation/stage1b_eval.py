@@ -752,6 +752,7 @@ def _save_translation_grid(
     image_features: Any | None = None,
     readouts: list[str] | None = None,
     include_source: bool = True,
+    color_histogram: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
@@ -798,6 +799,19 @@ def _save_translation_grid(
     rows = [source_images] if include_source else []
     decoded_metrics: dict[str, Any] = {}
     source_structure = None
+    original_images = None
+    if color_histogram is not None:
+        from diffusion_ot.data.ground_truth import load_ground_truth_images
+        from diffusion_ot.losses.color_histogram import COLOR_PROTOCOL, color_histogram_options, histogan_color_distance
+        color_options = color_histogram_options(color_histogram)
+        color_parameters = {k: v for k, v in color_options.items() if k != "weight"}
+        original_images = load_ground_truth_images(source.data_config_path, source_query.metadata[:count]).cpu()
+        decoded_metrics["color_histogram_protocol"] = COLOR_PROTOCOL
+        decoded_metrics["color_histogram_parameters"] = color_parameters
+        decoded_metrics["color_histogram_target"] = "original_source_rgb_whole_image"
+        decoded_metrics["color_histogram_interpretation"] = "Whole-image RGB-uv palette distance; background included, not spatial markings, exposure or independent realism."
+        decoded_metrics["source_query_ids"] = source_query.sample_ids[:count]
+        decoded_metrics["seed"] = seed
     if image_features is not None:
         feature_device = next(image_features.parameters()).device
         source_structure, _ = image_features(source_images.to(feature_device))
@@ -819,8 +833,22 @@ def _save_translation_grid(
             per_image = 1 - torch.nn.functional.cosine_similarity(structure, source_structure, dim=-1)
             decoded_metrics[row_name] = {"structure_loss": float(per_image.mean()),
                                          "per_image_structure_loss": per_image.cpu().tolist(), "samples": count}
+        if original_images is not None:
+            distances = histogan_color_distance(decoded_images, original_images, **color_parameters)
+            decoded_metrics.setdefault(row_name, {"samples": count}).update(
+                color_histogram_loss=float(distances.mean()),
+                per_image_color_histogram_loss=distances.tolist())
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_image(torch.cat(rows), str(output_path), nrow=count, padding=2, pad_value=1.0)
+    if original_images is not None:
+        # Preserve the existing grid; also save originals beside the same
+        # conditional-mean images, without an additional rollout or RNG draw.
+        target_row = rows[int(include_source) + readouts.index("conditional_mean")] if "conditional_mean" in readouts else rows[int(include_source)]
+        paired_path = output_path.with_name(output_path.stem + "_source_pairs.png")
+        save_image(torch.stack((original_images, target_row), 1).flatten(0, 1),
+                   str(paired_path), nrow=8, padding=2, pad_value=1.)
+        decoded_metrics["source_pair_grid"] = str(paired_path)
+        decoded_metrics["source_pair_readout"] = "conditional_mean" if "conditional_mean" in readouts else readouts[0]
     if image_features is not None:
         decoded_metrics["interpretation"] = "Decoded DINO structure against source; uses the training feature prior, not independent proxy labels or a calibrated realism score."
     return decoded_metrics
@@ -1564,6 +1592,8 @@ def run_stage1b_evaluation(
                 readouts=readouts,
                 include_source=include_source,
                 **({"image_features": image_features} if image_features is not None else {}),
+                **({"color_histogram": translation_config["color_histogram"]}
+                   if translation_config.get("color_histogram") is not None else {}),
             )
             if decoded_metrics:
                 projections[name]["decoded_image_diagnostics"] = decoded_metrics

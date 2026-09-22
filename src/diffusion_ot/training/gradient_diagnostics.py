@@ -123,17 +123,23 @@ def training_gradient_conflicts(losses, groups, *, code_gradients, encoder_scale
         decoded = combine_gradients((scale, grads["decoded"]))
         perceptual = combine_gradients((scale, grads["perceptual"]))
         adversarial = combine_gradients((scale, grads["adversarial"]))
-        dino = combine_gradients((1., decoded), (-1., adversarial))
+        color = combine_gradients((scale, grads.get("color", zero)))
         # An explicitly disabled structure objective must stay exactly zero;
         # subtracting large gradient sums can leave spurious roundoff conflicts.
         structure = (combine_gradients((scale, grads["structure"])) if "structure" in grads else
-                     combine_gradients((1., dino), (-1., perceptual)))
+                     combine_gradients((1., decoded), (-1., adversarial), (-1., color), (-1., perceptual)))
+        dino = combine_gradients((1., perceptual), (1., structure))
         translation = combine_gradients((1., decoded), (1., grads["code"]))
         pairs = {
             "dino_vs_adversarial": (dino, adversarial),
             "perceptual_vs_adversarial": (perceptual, adversarial),
             "perceptual_vs_structure": (perceptual, structure),
         }
+        if "color" in grads:
+            pairs["color_vs_adversarial"] = (color, adversarial)
+            pairs["color_vs_perceptual"] = (color, perceptual)
+            if kind != "matching_head":
+                pairs["color_vs_reconstruction"] = (color, grads["reconstruction"])
         if kind != "matching_head":
             pairs["translation_vs_reconstruction"] = (translation, grads["reconstruction"])
         if kind != "generator":

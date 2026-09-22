@@ -1,7 +1,7 @@
 """Experiment D: differentiable full-mean decoding and image supervision.
 
-The frozen DINOv2 network supplies spatial structure and patch/global features
-for two small trainable discriminators. These are project extensions, not
+Frozen DINOv2 supplies structure/perceptual supervision. Target-domain critics
+can use RGB PatchGAN or legacy DINO features. These are project extensions, not
 objectives from the official InfoOT implementation. No paired target is assumed.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from diffusion_ot.losses.contrastive import detached_key_contrastive_loss
+from diffusion_ot.losses.color_histogram import COLOR_PROTOCOL, color_histogram_options, histogan_color_distance
 from diffusion_ot.losses.semantic_prior import patch_structure_descriptor
 from diffusion_ot.models.generator_adaptation import (
     baseline_parameter_snapshot, configure_generator_adaptation,
@@ -26,6 +27,7 @@ from diffusion_ot.models.generator_adaptation import (
     predict_with_parameters,
 )
 from diffusion_ot.models.pdae_sit import make_null_class_labels
+from diffusion_ot.models.patch_discriminator import RGBPatchDiscriminator
 from diffusion_ot.training.diffaugment import diffaugment_options, random_translation
 
 
@@ -33,6 +35,14 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
     adapted = generator_adaptation_enabled(config)
     image = config.get("decoded_translation") or {}
     diffaugment_options(image.get("diffaugment"))
+    color_histogram_options(image.get("color_histogram"))
+    if image.get("discriminator_kind", "dino_feature") not in ("dino_feature", "rgb_patchgan"):
+        raise ValueError("decoded_translation.discriminator_kind must be dino_feature or rgb_patchgan.")
+    width = image.get("discriminator_base_channels", 32)
+    if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+        raise ValueError("decoded_translation.discriminator_base_channels must be a positive integer.")
+    if not isinstance(image.get("save_validation_images", False), bool):
+        raise ValueError("decoded_translation.save_validation_images must be a boolean.")
     enabled = bool(image.get("enabled", False))
     trainable = config.get("trainable") or {}
     if trainable.get("base_transformers", False):
@@ -344,6 +354,8 @@ class DecoderTraining:
         from diffusion_ot.training.train_joint_infoot import EncoderEMA
         self.config, self.options, self.domains = config, config["decoded_translation"], domains
         self.diffaugment = diffaugment_options(self.options.get("diffaugment"))
+        self.discriminator_kind = self.options.get("discriminator_kind", "dino_feature")
+        self.color_options = color_histogram_options(self.options.get("color_histogram"))
         self.views = {d: configure_generator_adaptation(v.branch) for d, v in domains.items()}
         self.parameters = [p for view in self.views.values() for p in view.parameters()]
         self.baselines = {d: baseline_parameter_snapshot(v.branch, self.views[d]) for d, v in domains.items()}
@@ -360,8 +372,12 @@ class DecoderTraining:
                 raise ValueError("Experiment D preserves semantic dropout_probability=0.1.")
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(seed + 801)
-            self.discriminators = nn.ModuleDict({d: FeatureDiscriminator(
-                self.features.feature_dim, int(self.options.get("discriminator_hidden_dim", 256))) for d in domains})
+            if self.discriminator_kind == "rgb_patchgan":
+                self.discriminators = nn.ModuleDict({d: RGBPatchDiscriminator(
+                    self.options.get("discriminator_base_channels", 32)) for d in domains})
+            else:
+                self.discriminators = nn.ModuleDict({d: FeatureDiscriminator(
+                    self.features.feature_dim, int(self.options.get("discriminator_hidden_dim", 256))) for d in domains})
         self.discriminators.to(domains["cat"].device)
         self.optimizer = torch.optim.AdamW(self.discriminators.parameters(),
                                            lr=float(self.options.get("discriminator_lr", 1e-4)),
@@ -458,13 +474,22 @@ class DecoderTraining:
         return torch.stack(losses).mean()
 
     def loss(self, weights, references, source_latents, real_latents, *, step, validation_seed=None,
-             source_reference_structure=None, source_query_structure=None, source_query_metadata=None):
+             source_reference_structure=None, source_query_structure=None, source_query_metadata=None,
+             validation_image_dir=None):
         evaluation = validation_seed is not None
         augment = self.diffaugment["enabled"] and not evaluation and self.diffaugment["translation_ratio"] > 0
         feature_device = next(self.features.parameters()).device
         structure_losses, adversarial_losses, metrics = [], [], {}
         metrics["adversarial_augmentation"] = {**self.diffaugment, "applied": augment}
+        metrics["discriminator_kind"] = self.discriminator_kind
+        metrics["adversarial_real_reference"] = "vae_decoded_target_data"
         contrastive_losses, consistency_losses = [], []
+        color_losses = []
+        color_weight = self.color_options["weight"]
+        color_parameters = {k: v for k, v in self.color_options.items() if k != "weight"}
+        # A weight-zero control still measures the same histogram on validation.
+        color_active = color_weight > 0 or (evaluation and "color_histogram" in self.options)
+        save_images = evaluation and validation_image_dir is not None
         perceptual_losses = []
         perceptual_diagnostics = []
         perceptual_weight = float(self.options.get("perceptual_weight", 0.0))
@@ -474,9 +499,9 @@ class DecoderTraining:
         consistency_mode = self.options.get("code_consistency_mode", "cosine")
         self.code_consistency_objective = torch.zeros((), device=feature_device)
         self.image_objectives = {}
-        if perceptual_weight > 0 and (source_query_metadata is None or
+        if (perceptual_weight > 0 or color_active or save_images) and (source_query_metadata is None or
                 any(domain not in source_query_metadata for domain in self.domains)):
-            raise ValueError("Decoded perceptual supervision requires original source query metadata for both domains.")
+            raise ValueError("Decoded appearance supervision requires original source query metadata for both domains.")
         if contrastive_weight > 0 and any(bank is None or any(domain not in bank for domain in self.domains)
                                          for bank in (source_reference_structure, source_query_structure)):
             raise ValueError("Decoded contrastive supervision requires cached source query and disjoint reference structures for both domains.")
@@ -500,7 +525,8 @@ class DecoderTraining:
             )
             images = decode_training_images(context.vae, generated).to(feature_device)
             structure, fake_tokens = self.features(images)
-            if perceptual_weight > 0:
+            originals = None
+            if perceptual_weight > 0 or color_active or save_images:
                 records = source_query_metadata[source][:count]
                 if len(records) != count:
                     raise ValueError("Original source metadata must match the decoded query count.")
@@ -508,6 +534,8 @@ class DecoderTraining:
                     originals = self.original_source_images(source, records).to(images)
                     if originals.shape != images.shape:
                         raise ValueError("Decoded and original source RGB shapes differ; check cache preprocessing.")
+            if perceptual_weight > 0:
+                with torch.no_grad():
                     _, source_tokens = self.features(originals)
                 # Keep absolute similarity as a diagnostic after switching to
                 # relative retrieval. No extra cosine objective in InfoNCE mode.
@@ -525,13 +553,18 @@ class DecoderTraining:
                     perceptual_metrics = None
                 perceptual_diagnostics.append((float(perceptual_distance), perceptual_metrics))
                 perceptual_losses.append(perceptual)
+            fake_input = images if self.discriminator_kind == "rgb_patchgan" else fake_tokens
             if augment:
                 # Structure objectives retain the original image coordinates.
-                # Draw once outside DINO checkpoints; reuse these live tokens
-                # for G and detached tokens for D with identical fake offsets.
-                _, fake_tokens = self.features(random_translation(
+                # Draw once outside checkpoints; reuse live inputs for G and
+                # detached inputs for D with identical fake offsets.
+                augmented = random_translation(
                     images, ratio=self.diffaugment["translation_ratio"],
-                    generator=self.augmentation_generators[target]))
+                    generator=self.augmentation_generators[target])
+                if self.discriminator_kind == "rgb_patchgan":
+                    fake_input = augmented
+                else:
+                    _, fake_input = self.features(augmented)
             with torch.no_grad():
                 source_context = self.domains[source]
                 source_images = decode_training_images(source_context.vae, source_latents[source][:count].to(
@@ -545,12 +578,29 @@ class DecoderTraining:
                     real_images = random_translation(
                         real_images, ratio=self.diffaugment["translation_ratio"],
                         generator=self.augmentation_generators[target])
-                _, real_tokens = self.features(real_images)
+                if self.discriminator_kind == "rgb_patchgan":
+                    real_input = real_images
+                else:
+                    _, real_input = self.features(real_images)
             structure_loss = (1 - F.cosine_similarity(structure, source_structure.detach(), dim=-1)).mean()
             structure_losses.append(structure_loss)
-            pairs[target] = (fake_tokens, real_tokens)
+            pairs[target] = (fake_input, real_input)
             metrics[f"{source}_to_{target}"] = {"structure_loss": float(structure_loss.detach()),
                                                "samples": count, "reference_targets": references[target].shape[0]}
+            if color_active:
+                per_image = histogan_color_distance(images, originals, **color_parameters)
+                color_losses.append(per_image.mean())
+                metrics[f"{source}_to_{target}"]["color_histogram_loss"] = float(per_image.detach().mean())
+                if evaluation:
+                    metrics[f"{source}_to_{target}"]["per_image_color_histogram_loss"] = per_image.cpu().tolist()
+            if save_images:
+                from torchvision.utils import save_image
+                path = Path(validation_image_dir) / f"{source}_to_{target}.png"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                pairs_rgb = torch.stack((originals.detach().cpu(), images.detach().cpu()), dim=1).flatten(0, 1)
+                save_image(pairs_rgb, str(path), nrow=8, padding=2, pad_value=1.)
+                metrics[f"{source}_to_{target}"]["validation_grid"] = str(path)
+                metrics[f"{source}_to_{target}"]["validation_grid_layout"] = "original_source,generated_target pairs; four pairs per row"
             if contrastive_weight > 0:
                 contrastive, contrastive_metrics = decoded_structure_contrastive_loss(
                     structure, source_query_structure[source][:count], source_reference_structure[source],
@@ -607,6 +657,17 @@ class DecoderTraining:
         total = (structure_weight * (structure if structure_weight > 0 else structure.detach())
                  + float(self.options.get("adversarial_weight", .01)) * adversarial)
         ramp = 1.0 if evaluation else self.ramp(step)
+        if color_losses:
+            color = torch.stack(color_losses).mean()
+            total = total + color_weight * color
+            if color_weight > 0:
+                self.image_objectives["color"] = ramp * color_weight * color
+            metrics.update(color_histogram_loss=float(color.detach()),
+                           color_histogram_protocol=COLOR_PROTOCOL,
+                           color_histogram_parameters=color_parameters,
+                           color_histogram_target="original_source_rgb_whole_image",
+                           color_histogram_weight=color_weight,
+                           color_histogram_effective_weighted_loss=float(color.detach()) * color_weight * ramp)
         if contrastive_losses:
             contrastive = torch.stack(contrastive_losses).mean()
             total = total + contrastive_weight * contrastive
@@ -648,6 +709,7 @@ class DecoderTraining:
                        weighted_loss=float(total.detach()), ramp=ramp,
                        effective_weighted_loss=float(total.detach()) * ramp,
                        discriminator_updates=self.discriminator_updates,
+                       guidance_scale=float(self.options.get("guidance_scale", 1.0)),
                        num_steps=int(self.options.get("validation_num_steps", 50) if evaluation else self.options.get("num_steps", 50)))
         # Main loss reaches encoders, matching heads and G. Code recovery must
         # be consumed through autograd.grad(..., G_parameters) by the trainer.
@@ -660,6 +722,7 @@ class DecoderTraining:
                 "generator_ema": self.ema.export() if self.ema else None,
                 "generator_ema_state": self.ema.state_dict() if self.ema else None,
                 "decoded_discriminators": self._cpu_copy(self.discriminators.state_dict()),
+                "decoded_discriminator_kind": self.discriminator_kind,
                 "decoded_discriminator_optimizer": self.optimizer.state_dict(),
                 "decoded_discriminator_updates": self.discriminator_updates,
                 "decoded_noise_states": {d: gen.get_state().cpu() for d, gen in self.noise_generators.items()}}
@@ -669,6 +732,8 @@ class DecoderTraining:
         return state
 
     def load_checkpoint(self, payload):
+        if payload.get("decoded_discriminator_kind", "dino_feature") != self.discriminator_kind:
+            raise ValueError("Cannot resume with a different discriminator kind; start a fresh Stage 1B run.")
         if self.diffaugment["enabled"]:
             states = payload.get("decoded_augmentation_states")
             if not isinstance(states, dict) or set(states) != set(self.augmentation_generators):

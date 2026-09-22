@@ -1,6 +1,6 @@
 stage: stage1b_eval_quick
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
-output_dir: outputs/stage1b_eval_pcgrad
+output_dir: outputs/stage1b_eval_patch_color
 seed: 20260906
 alignment_device: cuda:0
 
@@ -73,6 +73,11 @@ reconstruction:
 translation:
   enabled: true
   decoded_structure_metrics: true
+  # Always compare the same original RGB / generated rows, including old controls.
+  color_histogram:
+    bins: 64
+    input_size: 128
+    sigma: 0.02
   # One row of conditional generations per direction, with 16 examples.
   include_source: false
   include_structure_teacher_mean: false
