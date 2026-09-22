@@ -43,3 +43,27 @@ def test_comparison_uses_paired_examples_and_rejects_changed_protocol(tmp_path):
             b.write_text(json.dumps(changed) + "\n")
             with pytest.raises(ValueError, match=key):
                 module.compare_validation_logs(a, b)
+
+
+def test_comparison_reads_diagnostic_only_control_and_legacy_active_color(tmp_path):
+    baseline, candidate = record([.3, .5]), record([.2, .4])
+    baseline["log_schema_version"] = 2
+    for direction in ("cat_to_dog", "dog_to_cat"):
+        control = baseline["decoded_translation"][direction]
+        control["diagnostics"] = {
+            "per_image_color_histogram_distance": control.pop("per_image_color_histogram_loss"),
+            "structure_cosine_distance": .3,
+        }
+        candidate["decoded_translation"][direction]["structure_loss"] = .25
+    a, b = tmp_path / "baseline.jsonl", tmp_path / "candidate.jsonl"
+    a.write_text(json.dumps(baseline), encoding="utf-8")
+    b.write_text(json.dumps(candidate), encoding="utf-8")
+    result = module.compare_validation_logs(a, b)
+    for row in result["directions"].values():
+        assert row["paired_mean_delta"] == pytest.approx(-.1)
+        assert row["baseline_structure"] == .3
+        assert row["candidate_structure"] == .25
+    baseline["decoded_translation"]["cat_to_dog"]["diagnostics"].pop("per_image_color_histogram_distance")
+    a.write_text(json.dumps(baseline), encoding="utf-8")
+    with pytest.raises(ValueError, match="Missing per-image color metrics"):
+        module.compare_validation_logs(a, b)

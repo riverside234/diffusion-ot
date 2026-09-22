@@ -46,11 +46,16 @@ def feature_geometry_fields(geometry: dict) -> dict:
             for domain in ("cat", "dog") for key in fields}
 
 
+def decoded_structure_distance(metrics: dict):
+    """Schema 1 called this a loss even when its training weight was zero."""
+    return metrics.get("structure_loss", metrics.get("diagnostics", {}).get("structure_cosine_distance"))
+
+
 def validation_row(row: dict) -> dict:
     probe, decoded = row.get("projection_probe", {}), row.get("decoded_translation", {})
     result = {"step": row["step"], "conditional_kl": row.get("conditional_structure_loss"),
               "support_loss": row.get("projection_support_loss"),
-              "decoded_structure": decoded.get("structure_loss"),
+              "decoded_structure": decoded_structure_distance(decoded),
               "outer_converged": probe.get("outer_converged"),
               "sinkhorn_converged": probe.get("sinkhorn_converged"),
               "solver_iterations": probe.get("iterations"),
@@ -72,9 +77,16 @@ def validation_row(row: dict) -> dict:
         metrics = row.get("conditional_structure", {}).get(direction, {})
         for field in ("kl", "expected_structure_cost", "projected_to_target_variance_ratio",
                       "projected_to_target_norm_ratio", "effective_targets", "teacher_effective_targets",
-                      "teacher_projected_to_target_variance_ratio", "teacher_conditional_variance_fraction"):
+                      "teacher_projected_to_target_variance_ratio", "teacher_conditional_variance_fraction",
+                      "uniform_kl", "query_independent_kl", "kl_gain_over_query_independent",
+                      "query_independent_structure_cost", "structure_cost_gain_over_query_independent",
+                      "query_information_nats", "query_count", "reference_targets"):
             result[f"{direction}.{field}"] = metrics.get(field)
-        result[f"{direction}.decoded_structure"] = decoded.get(direction, {}).get("structure_loss")
+        image = decoded.get(direction, {})
+        result[f"{direction}.decoded_structure"] = decoded_structure_distance(image)
+        result[f"{direction}.decoded_perceptual"] = image.get("perceptual_loss")
+        result[f"{direction}.decoded_color"] = image.get("color_histogram_loss",
+            image.get("diagnostics", {}).get("color_histogram_distance"))
         uniform, teacher, current = (metrics.get(k) for k in
                                      ("uniform_structure_cost", "teacher_structure_cost", "expected_structure_cost"))
         gap = uniform - teacher if uniform is not None and teacher is not None else 0
@@ -101,7 +113,7 @@ def training_row(row: dict) -> dict:
               "window_matching_covariance_loss": window.get("matching_covariance_loss"),
               "window_conditioned_preservation_loss": window.get("conditioned_preservation_loss"),
               "window_weighted_conditioned_preservation_loss": window.get("weighted_conditioned_preservation_loss"),
-              "decoded_structure": image.get("structure_loss"),
+              "decoded_structure": decoded_structure_distance(image),
               "decoded_adversarial": image.get("adversarial_loss"),
               "discriminator_loss": image.get("discriminator_loss"),
               "discriminator_gradient_norm": image.get("discriminator_gradient_norm"),
@@ -122,7 +134,7 @@ def training_row(row: dict) -> dict:
     for direction in ("cat_to_dog", "dog_to_cat"):
         for key, value in row.get("conditional_structure", {}).get(direction, {}).items():
             result[f"{direction}.{key}"] = value
-        result[f"{direction}.decoded_structure"] = image.get(direction, {}).get("structure_loss")
+        result[f"{direction}.decoded_structure"] = decoded_structure_distance(image.get(direction, {}))
     result.update(matching_regularization_fields(row))
     result.update(feature_geometry_fields(row.get("feature_geometry", {})))
     for key in ("semantic_neighborhood_geometry", "semantic_neighborhood_temperature",
@@ -137,7 +149,88 @@ def training_row(row: dict) -> dict:
         for group in ("encoder", "matching_head"):
             key = f"weighted_matching_{term}_{group}_gradient_norm"
             result[key] = row.get(key)
+    result["weighted_conditional_structure_loss"] = row.get("weighted_conditional_structure_loss")
+    result["window_weighted_conditional_structure_loss"] = window.get("weighted_conditional_structure_loss")
+    conflicts = row.get("gradient_conflicts", {})
+    result["gradient_phase"] = conflicts.get("phase", "unspecified")
+    result["conditional_kl_gradients"] = {
+        group: {pair: value for pair, value in pairs.items() if pair.startswith("conditional_vs_")}
+        for group, pairs in conflicts.get("groups", {}).items()
+        if any(pair.startswith("conditional_vs_") for pair in pairs)
+    }
     return result
+
+
+def conditional_kl_report(summary: dict) -> str:
+    """Assess KL-specific evidence without presenting correlation as an ablation."""
+    def number(value):
+        return "n/a" if value is None else f"{value:.5f}"
+
+    lines = ["# Conditional KL diagnostics", "",
+        "These are teacher-agreement and gradient diagnostics, not proof that KL improves images. "
+        "A matched KL-on/KL-off training comparison is needed for causal attribution. "
+        "The query-independent baseline averages the current student's target probabilities over queries; "
+        "it is not a model trained without KL.", "",
+        "## Fixed validation", "",
+        "Positive KL/cost gain over the query-independent baseline means source-query matching adds useful "
+        "teacher agreement beyond generic target preferences. Query information measures specificity; "
+        "high specificity with negative gain can mean confidently wrong matching. "
+        "Check both directions and solver convergence. Missing historical fields remain n/a.", "",
+        "| Step | Direction | KL | Uniform KL | KL gain vs average | Cost gain vs average | Query information (nats) | Teacher cost gain % | Outer converged |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
+    for row in summary["validation"]:
+        for direction in ("cat_to_dog", "dog_to_cat"):
+            fields = ("kl", "uniform_kl", "kl_gain_over_query_independent",
+                      "structure_cost_gain_over_query_independent", "query_information_nats", "teacher_gain_pct")
+            cells = [str(row["step"]), direction] + [number(row.get(f"{direction}.{key}")) for key in fields]
+            cells.append(str(row["outer_converged"]) if row["outer_converged"] is not None else "n/a")
+            lines.append("| " + " | ".join(cells) + " |")
+    if not summary["validation"]:
+        lines += ["", "No fixed validation supplied; held-out behavior is unknown."]
+    lines += ["", "## Decoded outcomes on the fixed panel", "",
+        "Read alongside ground-truth native flow in validation.md and saved images. "
+        "DINO is also a training teacher; improved DINO scores alone do not establish perceptual quality. "
+        "Perceptual cosine and InfoNCE values from different recipes are not interchangeable.", "",
+        "| Step | Direction | Decoded structure distance | Perceptual objective | Color distance |",
+        "| ---: | --- | ---: | ---: | ---: |"]
+    for row in summary["validation"]:
+        for direction in ("cat_to_dog", "dog_to_cat"):
+            cells = [str(row["step"]), direction] + [number(row.get(f"{direction}.{key}"))
+                for key in ("decoded_structure", "decoded_perceptual", "decoded_color")]
+            lines.append("| " + " | ".join(cells) + " |")
+    observations = {}
+    for row in summary["training"]:
+        for group, pairs in row.get("conditional_kl_gradients", {}).items():
+            if group not in ("encoder.all", "matching_head.all"):
+                continue
+            for pair, metrics in pairs.items():
+                observations.setdefault((row["gradient_phase"], group, pair), []).append(metrics)
+    lines += ["", "## Isolated weighted KL gradients", "",
+        "Sampled before PCGrad, clipping and Adam. Positive cosine supports local agreement; "
+        "negative cosine shows a tradeoff, not automatic harm. PCGrad currently groups KL inside "
+        "the transport task, so its aggregate projection does not guarantee KL-specific descent. "
+        "The ratio is KL gradient norm / comparator norm. Windows below use each logged probe once "
+        "and separate warmup from full-weight probes.", ""]
+    if not observations:
+        lines += ["No isolated KL gradient pairs recorded. Update the trainer and enable "
+                  "train.gradient_conflicts with a positive gradient_diagnostics_every (already enabled in the active config)."]
+    else:
+        lines += ["| Phase | Group | Pair | Valid / probes | Mean cosine | Conflict fraction | Mean norm ratio |",
+                  "| --- | --- | --- | ---: | ---: | ---: | ---: |"]
+        for (phase, group, pair), values in sorted(observations.items()):
+            valid = [v for v in values if v.get("valid") and v.get("cosine") is not None]
+            ratios = [v["first_to_second_norm_ratio"] for v in valid if v.get("first_to_second_norm_ratio") is not None]
+            cells = [phase, group, pair, f"{len(valid)} / {len(values)}",
+                     number(mean(v["cosine"] for v in valid) if valid else None),
+                     number(mean(v["cosine"] < 0 for v in valid) if valid else None),
+                     number(mean(ratios) if ratios else None)]
+            lines.append("| " + " | ".join(cells) + " |")
+    lines += ["", "## Decision guide", "",
+        "- Evidence for useful conditioning: positive and improving query-specific gains, with stable feature spread/rank and improving fixed-image outcomes.",
+        "- Evidence to investigate: KL decreases but query-specific gains or decoded outcomes deteriorate; KL repeatedly dominates and opposes translation gradients.",
+        "- Near-zero KL gradients suggest little current optimization influence; missing/invalid diagnostics are not zero gradients.",
+        "- Inspect the saved translation pairs for target realism, source fidelity and color. Do not select a checkpoint on KL alone.", ""]
+    return "\n".join(lines)
 
 
 def summarize(folder: Path | None, warmup_steps: int, *, train_log: Path | None = None,
@@ -232,12 +325,12 @@ def plot_training(summary: dict, output: Path) -> None:
         ("Conditional structure KL", "Window mean", [("window_conditional_kl", "Bidirectional")]),
         ("Matching-feature spread", "Population covariance trace",
          [("cat_matching_variance", "Cat"), ("dog_matching_variance", "Dog")]),
-        ("Decoded DINO structure", "Rotating batch (4 images / direction)",
+        ("Decoded DINO structure diagnostic", "Rotating decoded batch",
          [("cat_to_dog.decoded_structure", "Cat to Dog"), ("dog_to_cat.decoded_structure", "Dog to Cat")]),
         ("Encoder gradient magnitudes", "Weighted objective / reconstruction",
          [("conditional_structure_to_reconstruction_gradient_ratio", "Conditional KL"),
           ("alignment_to_reconstruction_gradient_ratio", "InfoOT")]),
-        ("Feature discriminator", "Hinge loss (not a quality score)", [("discriminator_loss", "Both domains")]),
+        ("Target discriminator", "Hinge loss (not a quality score)", [("discriminator_loss", "Both domains")]),
     ]
     for ax, (title, ylabel, series) in zip(axes.flat, panels):
         for color, (key, label) in zip(("#2563eb", "#d97706"), series):
@@ -281,7 +374,7 @@ def plot(summary: dict, folder: Path, output: Path) -> None:
     decoded_run = any(r["decoded_structure"] is not None for r in rows)
     if decoded_run:
         panels[3:] = [
-            ("Decoded DINO structure", "4 fixed images / direction; training feature prior",
+            ("Decoded DINO structure", "Fixed image panel; training feature prior",
              [("cat_to_dog.decoded_structure", "Cat to Dog"), ("dog_to_cat.decoded_structure", "Dog to Cat")]),
             ("Matching-feature spread", "Fixed reference covariance trace",
              [("cat_matching_variance", "Cat"), ("dog_matching_variance", "Dog")]),
@@ -346,6 +439,7 @@ def main() -> None:
         (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         (args.output_dir / "validation.md").write_text(table(summary), encoding="utf-8")
         (args.output_dir / "training.md").write_text(training_table(summary), encoding="utf-8")
+        (args.output_dir / "conditional_kl.md").write_text(conditional_kl_report(summary), encoding="utf-8")
         if args.plot:
             plot(summary, args.log_dir, args.output_dir / "trends.png")
             if summary["validation"]:

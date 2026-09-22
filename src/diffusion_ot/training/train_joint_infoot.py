@@ -668,6 +668,7 @@ def fixed_conditional_structure_probe(
                 "reference_split": "train", "query_split": "val",
                 "sample_ids": {domain: {kind: inputs[domain][f"{kind}_ids"] for kind in ("reference", "query")} for domain in domains},
                 "fit_bandwidth": bandwidth, "projection_bandwidth": projection_bandwidth,
+                "teacher_temperature": teacher_temperature, "structure_cost_scale": cost_scale,
                 "sinkhorn_converged": solution.sinkhorn_converged,
                 "row_residual": solution.row_residual, "column_residual": solution.column_residual,
                 "iterations": solution.iterations, "outer_converged": solution.outer_converged,
@@ -814,6 +815,7 @@ def train_joint_infoot(
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec, matching_features
     from diffusion_ot.models.generator_adaptation import generator_adaptation_enabled
     from diffusion_ot.training.decoded_translation import DecoderTraining, validate_decoder_config
+    from diffusion_ot.training.stage1b_logging import Stage1BLogFormatter
 
     resolved_config_path = Path(config_path).resolve()
     config = load_yaml_config(resolved_config_path)
@@ -1131,6 +1133,7 @@ def train_joint_infoot(
         "cat": float(loss_weights.get("cat_reconstruction", 1.0)),
         "dog": float(loss_weights.get("dog_reconstruction", 1.0)),
     }
+    log_formatter = Stage1BLogFormatter(config)
     log_every = int(train_config.get("log_every", 20))
     gradient_diagnostics_every = int(train_config.get("gradient_diagnostics_every", 200))
     save_every = int(train_config.get("save_every", 500))
@@ -1182,6 +1185,9 @@ def train_joint_infoot(
                 matching_regularization_options=matching_protection_options,
                 matching_contrastive_options=contrastive_options,
             ))
+            # Fixed validation uses the full coefficient, independent of warmup.
+            metrics["conditional_structure_weight"] = conditional_weight
+            metrics["weighted_conditional_structure_loss"] = conditional_weight * metrics["conditional_structure_loss"]
         if decoder_training is not None:
             metrics["decoded_translation"] = fixed_decoded_translation_probe(
                 decoder_training, domains, matching_heads, projection_probe_inputs,
@@ -1193,7 +1199,7 @@ def train_joint_infoot(
                 image_dir=(output_dir / "validation" / f"step_{validation_step:06d}"
                            if decoder_training.options.get("save_validation_images", False) else None),
             )
-        return metrics
+        return log_formatter.format(metrics)
 
     if probe_every > 0:
         _append_jsonl(output_dir / "logs" / "validation.jsonl", {
@@ -1439,6 +1445,9 @@ def train_joint_infoot(
                     "matching": (beta * infoot_loss + neighborhood_weight * warmup * neighborhood_loss
                                  + conditional_weight * warmup * projection_loss + warmup * contrastive_loss
                                  + support_weight * warmup * support_loss + matching_protection_loss),
+                    **({"conditional": conditional_weight * warmup * projection_loss,
+                        "infoot": beta * infoot_loss, "protection": matching_protection_loss}
+                       if conditional_enabled else {}),
                 }, diagnostic_groups,
                 code_gradients={id(p): g for p, g in zip(generator_parameters, code_generator_gradients)},
                 encoder_scale=float(balance_metrics.get("scale", 1.0)), monitor=conflict_monitor)
@@ -1449,9 +1458,9 @@ def train_joint_infoot(
                 "reconstruction_gradient_norm": (conflict_norms["reconstruction"]["encoder.all"] if conflict_norms else _autograd_norm(
                     reconstruction_objective, parameters
                 )),
-                "weighted_alignment_gradient_norm": _autograd_norm(
+                "weighted_alignment_gradient_norm": (conflict_norms["infoot"]["encoder.all"] if conflict_norms and "infoot" in conflict_norms else _autograd_norm(
                     beta * infoot_loss, parameters
-                ),
+                )),
             }
             if decoder_training is not None:
                 gradient_diagnostics["reconstruction_generator_gradient_norm"] = (
@@ -1473,27 +1482,31 @@ def train_joint_infoot(
                 gradient_diagnostics["weighted_neighborhood_gradient_norm"] = neighborhood_norms["encoder"]
                 gradient_diagnostics["weighted_neighborhood_matching_head_gradient_norm"] = neighborhood_norms["matching_head"]
             if head_parameters:
-                gradient_diagnostics["weighted_alignment_matching_head_gradient_norm"] = _autograd_norm(
-                    beta * infoot_loss, head_parameters)
+                gradient_diagnostics["weighted_alignment_matching_head_gradient_norm"] = (
+                    conflict_norms["infoot"]["matching_head.all"] if conflict_norms and "infoot" in conflict_norms else
+                    _autograd_norm(beta * infoot_loss, head_parameters))
             if conditional_enabled:
-                gradient_diagnostics["weighted_conditional_structure_gradient_norm"] = _autograd_norm(
-                    conditional_weight * warmup * projection_loss, parameters
-                )
+                gradient_diagnostics["weighted_conditional_structure_gradient_norm"] = (
+                    conflict_norms["conditional"]["encoder.all"] if conflict_norms else
+                    _autograd_norm(conditional_weight * warmup * projection_loss, parameters))
                 gradient_diagnostics["conditional_structure_to_reconstruction_gradient_ratio"] = (
                     gradient_diagnostics["weighted_conditional_structure_gradient_norm"]
                     / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
                 )
                 if head_parameters:
-                    gradient_diagnostics["weighted_conditional_structure_matching_head_gradient_norm"] = _autograd_norm(
-                        conditional_weight * warmup * projection_loss, head_parameters)
+                    gradient_diagnostics["weighted_conditional_structure_matching_head_gradient_norm"] = (
+                        conflict_norms["conditional"]["matching_head.all"] if conflict_norms else
+                        _autograd_norm(conditional_weight * warmup * projection_loss, head_parameters))
             if support_enabled:
                 gradient_diagnostics["weighted_projection_support_gradient_norm"] = _autograd_norm(
                     support_weight * warmup * support_loss, parameters
                 )
             if matching_protection is not None:
-                protection_norms = _autograd_group_norms(matching_protection_loss, {
+                protection_norms = ({group: conflict_norms["protection"][f"{group}.all"]
+                                    for group in ("encoder", "matching_head")}
+                                   if conflict_norms and "protection" in conflict_norms else _autograd_group_norms(matching_protection_loss, {
                     "encoder": parameters, "matching_head": head_parameters,
-                })
+                }))
                 gradient_diagnostics.update({
                     f"weighted_matching_regularization_{group}_gradient_norm": norm
                     for group, norm in protection_norms.items()
@@ -1630,6 +1643,7 @@ def train_joint_infoot(
             "infoot_mutual_information": solution.mutual_information,
             "semantic_neighborhood_loss": float(neighborhood_loss.detach()),
             "conditional_structure_loss": float(projection_loss.detach()),
+            "weighted_conditional_structure_loss": float(conditional_weight * warmup * projection_loss.detach()),
             "projection_support_loss": float(support_loss.detach()),
             "primary_objective": float(primary_objective.detach()),
             "auxiliary_objective": float(auxiliary_objective.detach()),
@@ -1703,6 +1717,7 @@ def train_joint_infoot(
             metrics["semantic_neighborhood_weight"] = neighborhood_weight * warmup
             metrics["conditional_structure_loss"] = float(projection_loss.detach())
             metrics["conditional_structure_weight"] = conditional_weight * warmup
+            metrics["weighted_conditional_structure_loss"] = float(conditional_weight * warmup * projection_loss.detach())
             metrics["projection_support_loss"] = float(support_loss.detach())
             metrics["projection_support_weight"] = support_weight * warmup
             metrics["gradient_guard"] = guard_metrics
@@ -1753,6 +1768,7 @@ def train_joint_infoot(
                 metrics["transport_structure_cost"] = float((solution.coupling * cross_cost).sum())
                 metrics["independent_structure_cost"] = float(cross_cost.mean())
             metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
+            metrics = log_formatter.format(metrics)
             print(json.dumps(metrics, sort_keys=True))
             _append_jsonl(log_path, metrics)
 

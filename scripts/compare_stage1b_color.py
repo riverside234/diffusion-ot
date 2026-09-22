@@ -40,7 +40,12 @@ def compare_validation_logs(baseline_path, candidate_path, *, step=None):
     report = {"step": step, "weights": left["weights"], "protocol": a["color_histogram_protocol"],
               "baseline": str(baseline_path), "candidate": str(candidate_path), "directions": {}}
     for direction, source in (("cat_to_dog", "cat"), ("dog_to_cat", "dog")):
-        x, y = a[direction]["per_image_color_histogram_loss"], b[direction]["per_image_color_histogram_loss"]
+        # Schema 2 names weight-zero control measurements as diagnostics.
+        x, y = [row[direction].get("per_image_color_histogram_loss",
+                   row[direction].get("diagnostics", {}).get("per_image_color_histogram_distance"))
+                for row in (a, b)]
+        if x is None or y is None:
+            raise ValueError(f"Missing per-image color metrics for {direction}.")
         if not x or len(x) != len(y) or len(x) != len(a["query_ids"][source]):
             raise ValueError(f"Per-image metrics/IDs do not match for {direction}.")
         if not all(math.isfinite(v) and 0 <= v <= 1.00001 for v in x + y):
@@ -49,8 +54,8 @@ def compare_validation_logs(baseline_path, candidate_path, *, step=None):
             "samples": len(x), "baseline_mean": mean(x), "candidate_mean": mean(y),
             "paired_mean_delta": mean(v - u for u, v in zip(x, y)),
             "fraction_improved": mean(v < u for u, v in zip(x, y)),
-            "baseline_structure": a[direction].get("structure_loss"),
-            "candidate_structure": b[direction].get("structure_loss"),
+            "baseline_structure": a[direction].get("structure_loss", a[direction].get("diagnostics", {}).get("structure_cosine_distance")),
+            "candidate_structure": b[direction].get("structure_loss", b[direction].get("diagnostics", {}).get("structure_cosine_distance")),
             "baseline_grid": a[direction].get("validation_grid"),
             "candidate_grid": b[direction].get("validation_grid"),
         }

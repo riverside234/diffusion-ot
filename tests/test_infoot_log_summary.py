@@ -122,3 +122,21 @@ def test_conditioned_preservation_summary_keeps_window_and_step_values_distinct(
                 "weighted_conditioned_preservation_generator_gradient_norm",
                 "window_conditioned_preservation_loss", "window_weighted_conditioned_preservation_loss"):
         assert legacy[key] is None
+
+
+def test_summary_reads_mixed_schema_resume_logs_without_losing_diagnostic_distances(tmp_path):
+    old = {"step": 200, "decoded_translation": {
+        "structure_loss": .3, "cat_to_dog": {"structure_loss": .2},
+        "dog_to_cat": {"structure_loss": .4}}}
+    new = {"step": 400, "log_schema_version": 2, "decoded_translation": {
+        "diagnostics": {"structure_cosine_distance": .25},
+        "cat_to_dog": {"diagnostics": {"structure_cosine_distance": .15}},
+        "dog_to_cat": {"diagnostics": {"structure_cosine_distance": .35}}}}
+    for filename in ("train.jsonl", "validation.jsonl"):
+        (tmp_path / filename).write_text('\n'.join(map(json.dumps, [old, new, new])), encoding="utf-8")
+    result = summary_tools["summarize"](tmp_path, 1000)
+    for kind in ("training", "validation"):
+        assert result["sources"][kind]["duplicate_steps"] == 1
+        assert [row["decoded_structure"] for row in result[kind]] == [.3, .25]
+        assert [row["cat_to_dog.decoded_structure"] for row in result[kind]] == [.2, .15]
+        assert [row["dog_to_cat.decoded_structure"] for row in result[kind]] == [.4, .35]

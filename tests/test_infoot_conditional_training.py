@@ -4,12 +4,44 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from diffusion_ot.losses.conditional_structure import conditional_structure_loss
+from diffusion_ot.losses.conditional_structure import conditional_structure_loss, conditional_query_diagnostics
 from diffusion_ot.losses.infoot import (
     conditional_reference_log_weights, conditional_reference_weights,
     infoot_distance_scale, solve_infoot, transport_diagnostics,
 )
 from diffusion_ot.losses.semantic_prior import validate_prior_resume
+
+
+def test_query_diagnostics_distinguish_useful_wrong_and_query_independent_matching():
+    teacher = torch.tensor([[.9, .1], [.1, .9]])
+    costs = torch.tensor([[0., 1.], [1., 0.]])
+    rng = torch.get_rng_state().clone()
+    good = conditional_query_diagnostics(teacher.log().requires_grad_(), teacher, costs)
+    wrong = conditional_query_diagnostics(teacher.flip(0).log(), teacher, costs)
+    collapsed = conditional_query_diagnostics(torch.tensor([[.7, .3], [.7, .3]]).log(), teacher, costs)
+    assert good["kl_gain_over_query_independent"] == pytest.approx(good["uniform_kl"])
+    assert good["structure_cost_gain_over_query_independent"] == pytest.approx(.4)
+    assert wrong["kl_gain_over_query_independent"] < 0
+    assert wrong["structure_cost_gain_over_query_independent"] == pytest.approx(-.4)
+    assert good["query_information_nats"] == pytest.approx(wrong["query_information_nats"])
+    assert good["query_information_nats"] > 0
+    for key in ("kl_gain_over_query_independent", "structure_cost_gain_over_query_independent", "query_information_nats"):
+        assert collapsed[key] == pytest.approx(0., abs=1e-7)
+    assert good["query_count"] == good["reference_targets"] == 2
+    torch.testing.assert_close(torch.get_rng_state(), rng)
+
+
+def test_query_diagnostics_handle_single_query_and_underflow():
+    logits = torch.tensor([[0., -2000., -1000.], [-2000., 0., -1000.]])
+    log_weights = logits.log_softmax(1)
+    teacher = torch.ones_like(log_weights) / 3
+    costs = -logits
+    for rows in (slice(None), slice(1)):
+        metrics = conditional_query_diagnostics(log_weights[rows], teacher[rows], costs[rows])
+        assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+        if metrics["query_count"] == 1:
+            assert metrics["query_information_nats"] == pytest.approx(0.)
+            assert metrics["kl_gain_over_query_independent"] == pytest.approx(0.)
 
 
 @pytest.mark.parametrize("bandwidth", [0.1, 0.7])

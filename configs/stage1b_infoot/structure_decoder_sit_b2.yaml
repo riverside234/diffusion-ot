@@ -44,6 +44,8 @@ train:
   log_every: 100
   gradient_diagnostics_every: 200  # Also a logged step; keep gradients visible.
   gradient_conflicts: true  # Per-domain diagnostics before PCGrad; surgery also reports actual changes.
+  # Includes isolated conditional KL vs translation / native flow / MI / protection.
+  # Fixed validation also measures KL gains over query-independent matching.
   save_every: 500  # Preserve every fixed-validation candidate.
   resume_from: null
   loss_window: 100

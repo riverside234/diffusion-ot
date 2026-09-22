@@ -162,7 +162,9 @@ def test_actual_training_extensions_validate_full_support_and_resume_compatibly(
         assert decoded["perceptual_target"] == "original_source_rgb"
         assert decoded["perceptual_loss"] > 0
         assert decoded["perceptual_mode"] == "contrastive"
-        assert decoded["structure_weight"] == decoded["structure_effective_weighted_loss"] == 0.
+        assert "structure_weight" not in decoded and "structure_effective_weighted_loss" not in decoded
+        assert "structure_loss" not in decoded
+        assert decoded["diagnostics"]["structure_cosine_distance"] >= 0.
         assert decoded["weighted_loss"] == pytest.approx(
             .1 * decoded["perceptual_loss"]
             + .01 * decoded["structure_contrastive_loss"] + .01 * decoded["adversarial_loss"])
@@ -186,7 +188,7 @@ def test_actual_training_extensions_validate_full_support_and_resume_compatibly(
         for direction in ("cat_to_dog", "dog_to_cat"):
             perceptual = decoded[direction]["perceptual_contrastive"]
             assert perceptual["negative_bank_size"] == 2 and perceptual["usable_samples"] == 2
-            assert decoded[direction]["perceptual_cosine_distance"] >= 0.
+            assert decoded[direction]["diagnostics"]["perceptual_cosine_distance"] >= 0.
             assert contrastive["conditional"][direction]["valid_candidates"] == 6
             assert decoded[direction]["reference_targets"] == 6
             assert decoded[direction]["code_consistency"]["valid_conditions"] == 2
@@ -311,13 +313,16 @@ def test_simplified_pcgrad_trains_validates_and_resumes(experiment, monkeypatch)
     }
     for row in logs["train"]:
         assert row["optimizer_gradient_mode"] == "pcgrad"
-        assert row["cat_anchor_loss"] == row["dog_anchor_loss"] == row["latent_anchor_weight"] == 0
-        assert row["null_preservation_loss"] == row["semantic_neighborhood_loss"] == row["code_consistency_loss"] == 0
+        inactive = {"cat_anchor_loss", "dog_anchor_loss", "latent_anchor_weight", "null_preservation_loss",
+                    "conditioned_preservation_loss", "semantic_neighborhood_loss", "code_consistency_loss", "projection_support_loss"}
+        assert not inactive.intersection(row)
+        assert not inactive.intersection(row["window_mean"])
+        assert row["log_schema_version"] == 2
         decoded_metrics = row["decoded_translation"]
         assert decoded_metrics["weighted_loss"] == pytest.approx(
             .1 * decoded_metrics["perceptual_loss"] + .01 * decoded_metrics["adversarial_loss"])
         assert row["gradient_conflicts"]["pcgrad_applied_after_measurement"]
-        assert all(not group["perceptual_vs_structure"]["valid"]
+        assert all("perceptual_vs_structure" not in group and "code_vs_decoded" not in group
                    for group in row["gradient_conflicts"]["groups"].values())
         assert "decoded_encoder_balance" not in row
         for group, tasks in expected.items():
@@ -326,7 +331,10 @@ def test_simplified_pcgrad_trains_validates_and_resumes(experiment, monkeypatch)
     assert any(v["projection_count"] > 0 for row in logs["train"] for v in row["pcgrad"]["groups"].values())
     for row in logs["validation"]:
         assert row["decoded_translation"]["perceptual_mode"] == "contrastive"
-        assert row["decoded_translation"]["structure_effective_weighted_loss"] == 0.
+        assert "structure_effective_weighted_loss" not in row["decoded_translation"]
+        assert "structure_loss" not in row["decoded_translation"]
+        assert row["decoded_translation"]["diagnostics"]["structure_cosine_distance"] >= 0
+        assert not any("stage1a" in key for key in row)
     run("minimal_resume", steps=1, modify=minimal_pcgrad_recipe)
     resumed, resumed_logs = run("minimal_resume", resume=True, modify=minimal_pcgrad_recipe)
     assert resumed["step"] == complete["step"] == 2

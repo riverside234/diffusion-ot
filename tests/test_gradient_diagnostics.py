@@ -69,3 +69,26 @@ def test_routing_scaling_domain_conflicts_and_read_only_autograd():
     # The original graph remains usable, including the gradients at conflict.
     grads = torch.autograd.grad(reconstruction + decoded, (cat, dog, gen))
     assert [float(g) for g in grads] == [2., 3., 1.]
+
+
+def test_isolated_conditional_pairs_do_not_include_kl_in_the_comparator():
+    encoder, head, generator = [torch.nn.Parameter(torch.tensor(1.)) for _ in range(3)]
+    kl = 10 * (encoder + head)
+    mi = -encoder - head
+    decoded = -2 * encoder - 2 * head + generator
+    losses = {"conditional": kl, "infoot": mi, "protection": encoder + head,
+              "matching": kl + mi, "decoded": decoded, "perceptual": decoded,
+              "adversarial": 0 * decoded, "reconstruction": encoder + generator}
+    report, norms = training_gradient_conflicts(losses,
+        {"encoder.cat": [encoder], "matching_head.cat": [head], "generator.cat": [generator]},
+        code_gradients={}, encoder_scale=1., monitor=GradientConflictMonitor())
+    for group in ("encoder.cat", "encoder.all", "matching_head.cat", "matching_head.all"):
+        pairs = report["groups"][group]
+        assert pairs["conditional_vs_infoot"]["cosine"] == -1.
+        assert pairs["conditional_vs_translation"]["first_to_second_norm_ratio"] == 5.
+        assert pairs["conditional_vs_protection"]["cosine"] == 1.
+        assert norms["conditional"][group] == 10.
+    assert "conditional_vs_reconstruction" not in report["groups"]["matching_head.all"]
+    assert report["groups"]["encoder.all"]["conditional_vs_reconstruction"]["cosine"] == 1.
+    assert not any(key.startswith("conditional_") for key in report["groups"]["generator.all"])
+    assert encoder.grad is head.grad is generator.grad is None

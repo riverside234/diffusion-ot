@@ -28,6 +28,35 @@ class ConditionalStructureResult:
     log_weights: dict[str, torch.Tensor]
 
 
+@torch.no_grad()
+def conditional_query_diagnostics(log_weights, teacher_weights, costs):
+    """Compare query-specific matching with the same bank's average readout.
+
+    The baseline preserves the student's aggregate target preferences but
+    removes its source-query correspondence. This is a diagnostic comparison,
+    not a model trained without KL and not independent semantic validation.
+    Log-space averaging remains finite with narrow, underflowing kernels.
+    """
+    queries, targets = log_weights.shape
+    probability = log_weights.exp()
+    average_log = torch.logsumexp(log_weights, dim=0, keepdim=True) - math.log(queries)
+    independent_kl = F.kl_div(average_log.expand_as(log_weights), teacher_weights, reduction="batchmean")
+    current_kl = F.kl_div(log_weights, teacher_weights, reduction="batchmean")
+    independent_cost = (average_log.exp() * costs).sum(1).mean()
+    current_cost = (probability * costs).sum(1).mean()
+    return {
+        "query_count": queries,
+        "reference_targets": targets,
+        "uniform_kl": float(F.kl_div(torch.full_like(log_weights, -math.log(targets)),
+                                      teacher_weights, reduction="batchmean")),
+        "query_independent_kl": float(independent_kl),
+        "kl_gain_over_query_independent": float(independent_kl - current_kl),
+        "query_independent_structure_cost": float(independent_cost),
+        "structure_cost_gain_over_query_independent": float(independent_cost - current_cost),
+        "query_information_nats": float((probability * (log_weights - average_log)).sum(1).mean()),
+    }
+
+
 def conditional_structure_loss(
     references: dict[str, torch.Tensor],
     queries: dict[str, torch.Tensor],
@@ -130,5 +159,6 @@ def conditional_structure_loss(
                 f"teacher_{key}": value for key, value in
                 conditional_variance_decomposition(teacher_weights, references[target]).items()
             })
+            metrics[direction].update(conditional_query_diagnostics(log_weights, teacher_weights, costs))
     return ConditionalStructureResult(
         torch.stack(losses).mean(), metrics, weights, teacher_distributions, log_distributions)
