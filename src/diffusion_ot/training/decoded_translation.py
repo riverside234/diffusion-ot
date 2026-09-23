@@ -31,9 +31,28 @@ from diffusion_ot.models.patch_discriminator import RGBPatchDiscriminator
 from diffusion_ot.training.diffaugment import diffaugment_options, random_translation
 
 
+def validate_flow_only_stage1a(config, stage1a_config, checkpoint=None):
+    """Reject known refined initializers for the flow-only control experiment.
+
+    Legacy checkpoints may omit recipe metadata; their configured recipe and
+    recorded checkpoint provenance remain the available evidence.
+    """
+    if (config.get("decoded_translation") or {}).get("supervision") != "self_supervised":
+        return
+    for recipe in (stage1a_config, (checkpoint or {}).get("config") or {}):
+        if (recipe.get("refinement") or {}).get("enabled", False):
+            raise ValueError("Self-supervised Stage 1B requires the original flow-only Stage 1A checkpoint, not a refined/DINO initializer.")
+    if ((checkpoint or {}).get("train_state") or {}).get("refinement"):
+        raise ValueError("Self-supervised Stage 1B cannot initialize from a refinement checkpoint.")
+
+
 def validate_decoder_config(config: dict[str, Any]) -> None:
     adapted = generator_adaptation_enabled(config)
     image = config.get("decoded_translation") or {}
+    supervision = image.get("supervision", "external")
+    if supervision not in {"external", "self_supervised"}:
+        raise ValueError("decoded_translation.supervision must be external or self_supervised.")
+    self_supervised = supervision == "self_supervised"
     diffaugment_options(image.get("diffaugment"))
     color_histogram_options(image.get("color_histogram"))
     if image.get("discriminator_kind", "dino_feature") not in ("dino_feature", "rgb_patchgan"):
@@ -53,8 +72,9 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
         return
     if not all(trainable.get(k, False) for k in ("encoders", "adapters", "attention_lora")):
         raise ValueError("Experiment D requires trainable encoders, adapters, and attention_lora.")
-    if not enabled or not (config.get("conditional_structure") or {}).get("enabled", False):
-        raise ValueError("Experiment D requires decoded_translation and conditional_structure.")
+    readout_key = "conditional_projection" if self_supervised else "conditional_structure"
+    if not enabled or not (config.get(readout_key) or {}).get("enabled", False):
+        raise ValueError(f"Decoded training requires decoded_translation and {readout_key}.")
     if not (config.get("matching_head") or {}).get("enabled", False):
         raise ValueError("Experiment D requires matching heads.")
     options = config["generator_adaptation"]
@@ -69,8 +89,48 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
     count = options.get("conditioned_preservation_samples", 4)
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ValueError("generator_adaptation.conditioned_preservation_samples must be a positive integer.")
-    for name, default in (("adversarial_weight", 0.01),
-                          ("discriminator_lr", 1e-4), ("discriminator_grad_clip", 1.0)):
+    if self_supervised:
+        if ((config.get("infoot") or {}).get("variant") != "fused"
+                or (config.get("infoot") or {}).get("cross_cost_source") != "encoder"
+                or float((config.get("infoot") or {}).get("cross_cost_weight", 1.)) <= 0):
+            raise ValueError("Self-supervised translation requires a positive encoder cross cost (fused InfoOT).")
+        if config.get("semantic_prior") or (config.get("conditional_structure") or {}).get("enabled", False):
+            raise ValueError("Self-supervised translation cannot use a DINO prior or conditional structure teacher.")
+        if (config.get("matching_contrastive") or {}).get("enabled", False):
+            raise ValueError("Self-supervised translation cannot use teacher-based matching contrastive losses.")
+        for name, default in (("adversarial_weight", .01), ("structure_weight", .1),
+                              ("perceptual_weight", 0.), ("structure_contrastive_weight", 0.),
+                              ("code_consistency_weight", 0.)):
+            if float(image.get(name, default)) != 0:
+                raise ValueError(f"Self-supervised translation requires decoded_translation.{name}=0.")
+        for name in ("latent_anchor", "semantic_neighborhood", "conditional_structure", "projection_support"):
+            if float((config.get("loss_weights") or {}).get(name, .01 if name == "latent_anchor" else 0)) != 0:
+                raise ValueError(f"Self-supervised translation requires loss_weights.{name}=0.")
+        if any(float(options.get(name, default)) != 0 for name, default in
+               (("null_preservation_weight", .1), ("conditioned_preservation_weight", 0.))):
+            raise ValueError("Self-supervised translation disables Stage 1A teacher preservation losses.")
+        if float((image.get("color_histogram") or {}).get("weight", 0.)) != 0 or (image.get("color_histogram") or {}).get("validation_enabled", False):
+            raise ValueError("Self-supervised translation disables color histogram supervision and diagnostics.")
+        if (image.get("diffaugment") or {}).get("enabled", False):
+            raise ValueError("Self-supervised translation has no adversarial DiffAugment path.")
+        for name, default in (("source_contrastive_weight", .1), ("source_contrastive_temperature", .2)):
+            value = float(image.get(name, default))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"decoded_translation.{name} must be finite and positive.")
+        similarity = float(image.get("source_contrastive_negative_similarity_threshold", .95))
+        if not math.isfinite(similarity) or not -1 <= similarity <= 1:
+            raise ValueError("Source contrastive negative similarity threshold must be in [-1, 1].")
+        if image.get("source_contrastive_readout", "target") not in {"target", "source"}:
+            raise ValueError("Source contrastive readout must be target or source.")
+        diagnostics = config.get("self_supervised_diagnostics") or {}
+        if not isinstance(diagnostics.get("enabled", False), bool):
+            raise ValueError("self_supervised_diagnostics.enabled must be a boolean.")
+        for name, default, minimum in (("image_samples", 32, 1), ("pooled_size", 16, 2)):
+            value = diagnostics.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"self_supervised_diagnostics.{name} must be an integer >= {minimum}.")
+    for name, default in (() if self_supervised else (("adversarial_weight", 0.01),
+                          ("discriminator_lr", 1e-4), ("discriminator_grad_clip", 1.0))):
         value = float(image.get(name, default))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"decoded_translation.{name} must be finite and positive.")
@@ -108,7 +168,7 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
         raise ValueError("decoded_translation.start_step must be nonnegative.")
     if not math.isfinite(float(image.get("guidance_scale", 1.0))):
         raise ValueError("decoded_translation.guidance_scale must be finite.")
-    count = int((config.get("conditional_structure") or {}).get("query_samples_per_domain", 32))
+    count = int((config.get(readout_key) or {}).get("query_samples_per_domain", 32))
     if int(image.get("batch_size", 4)) > count:
         raise ValueError("Decoded batch_size cannot exceed the disjoint conditional query count.")
     if (config.get("projection_support") or {}).get("enabled", False):

@@ -146,6 +146,14 @@ def training_gradient_conflicts(losses, groups, *, code_gradients, encoder_scale
             pairs["matching_vs_translation"] = (grads["matching"], translation)
         if kind == "encoder":
             pairs["matching_vs_reconstruction"] = (grads["matching"], grads["reconstruction"])
+        if kind != "generator" and "infoot" in grads:
+            # The matching aggregate also contains anti-collapse protection.
+            # Isolate MI before considering a change to its outer coefficient.
+            pairs["infoot_vs_translation"] = (grads["infoot"], translation)
+            if kind == "encoder":
+                pairs["infoot_vs_reconstruction"] = (grads["infoot"], grads["reconstruction"])
+            if "protection" in grads:
+                pairs["infoot_vs_protection"] = (grads["infoot"], grads["protection"])
         if kind != "generator" and "conditional" in grads:
             # Isolate KL: comparing it with the aggregate matching objective
             # would include its own gradient and bias the cosine upward.

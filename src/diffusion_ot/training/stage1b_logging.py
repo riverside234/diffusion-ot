@@ -1,6 +1,7 @@
 """Config-aware Stage 1B JSONL presentation; never changes training tensors.
 
-Schema 2 keeps active loss names compatible with old logs. Diagnostic-only
+Schema 2 keeps active loss names compatible with old logs; the PDAE-only
+experiment uses schema 3 with no legacy teacher/critic fields. Diagnostic-only
 image distances live under ``diagnostics`` instead of masquerading as losses.
 Filtering uses configured weights, never measured values: an enabled loss
 that reaches zero (or has a zero warmup coefficient) must remain visible.
@@ -22,6 +23,7 @@ class Stage1BLogFormatter:
         protection = config.get("matching_regularization") or {}
         contrast = config.get("matching_contrastive") or {}
         self.decoder = bool(generator.get("enabled", False) and image.get("enabled", False))
+        self.self_supervised = image.get("supervision", "external") == "self_supervised"
         self.enabled = {
             **{f"{d}_reconstruction": _positive(weights, f"{d}_reconstruction", 1.) for d in ("cat", "dog")},
             "infoot_alignment": _positive(weights, "infoot_alignment", .02)
@@ -42,6 +44,7 @@ class Stage1BLogFormatter:
                for part, default in (("structure", .1), ("structure_contrastive", 0.),
                                      ("perceptual", 0.), ("adversarial", .01), ("code_consistency", 0.))},
             "color_histogram": self.decoder and _positive(image.get("color_histogram") or {}, "weight"),
+            "source_contrastive": self.decoder and self.self_supervised and _positive(image, "source_contrastive_weight", .1),
         }
         self.guard = bool((config.get("gradient_guard") or {}).get("enabled", False))
         self.stage1a_probes = any(self.enabled[k] for k in
@@ -81,6 +84,8 @@ class Stage1BLogFormatter:
             values.setdefault("diagnostics", {})[new] = values.pop(old)
 
     def _decoded(self, decoded):
+        if self.self_supervised:
+            return  # No external diagnostics are retained for this experiment.
         blocks = [decoded] + [decoded[d] for d in ("cat_to_dog", "dog_to_cat") if d in decoded]
         for block in blocks:
             self._diagnostic(block, "perceptual_cosine_distance", "perceptual_cosine_distance")
@@ -124,6 +129,27 @@ class Stage1BLogFormatter:
         if not e["code_consistency"]:
             report.pop("code_routing", None)
 
+    def _clean_self_supervised(self, values):
+        """Drop inactive legacy placeholders, including nested/window fields.
+
+        Keep retrieval, original-RGB checks, geometry, PCGrad and solver health:
+        they remain useful even though they are not additional objectives.
+        """
+        prefixes = ("perceptual_", "structure_", "adversarial_", "discriminator_", "dino_", "teacher_",
+                    "decoded_discriminator_", "color_histogram", "code_consistency",
+                    "conditional_structure", "semantic_neighborhood", "projection_support",
+                    "null_preservation", "conditioned_preservation", "matching_contrastive")
+        unused = {"primary_objective", "auxiliary_objective", "infoot_restart", "code_routing",
+                  "cat_fake_score", "cat_real_score", "dog_fake_score", "dog_real_score"}
+        for key in list(values):
+            objective_key = key.removeprefix("weighted_").removeprefix("applied_")
+            if objective_key.startswith(prefixes) or key in unused:
+                del values[key]
+            elif isinstance(values[key], dict):
+                self._clean_self_supervised(values[key])
+                if not values[key]:
+                    del values[key]
+
     def format(self, metrics):
         """Copy a completed train/validation record, preserving measured numbers."""
         result = deepcopy(metrics)
@@ -152,6 +178,8 @@ class Stage1BLogFormatter:
                 for key in list(contrast):
                     if key.startswith((part, f"weighted_{part}")):
                         del contrast[key]
-        result["log_schema_version"] = 2
+        if self.self_supervised:
+            self._clean_self_supervised(result)
+        result["log_schema_version"] = 3 if self.self_supervised else 2
         result["enabled_losses"] = [name for name, enabled in self.enabled.items() if enabled]
         return result

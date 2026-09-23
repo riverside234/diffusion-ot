@@ -242,6 +242,23 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
+def _solve_infoot_logged(*args, failure_log=None, phase=None, step=None, **kwargs):
+    """Persist failed solves before re-raising; never relax solver acceptance."""
+    from diffusion_ot.losses.infoot import solve_infoot
+
+    try:
+        return solve_infoot(*args, **kwargs)
+    except RuntimeError as error:
+        if failure_log is not None:
+            _append_jsonl(Path(failure_log), {
+                "event": "solver_failure", "phase": phase, "step": step,
+                "error": str(error), "reference_counts": [len(value) for value in args[:2]],
+                "settings": {key: value for key, value in kwargs.items()
+                             if isinstance(value, (str, int, float, bool))},
+            })
+        raise
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -307,6 +324,8 @@ def _load_training_domain(
         domain_config["checkpoint"], root, field_name=f"stage1a.{domain}.checkpoint"
     )
     checkpoint = _load_checkpoint(checkpoint_path)
+    from diffusion_ot.training.decoded_translation import validate_flow_only_stage1a
+    validate_flow_only_stage1a(config, train_config, checkpoint)
     branch.load_pdae_state_dict(checkpoint["model"])
     if str(stage1a_config.get("weights", "ema")) == "ema":
         _apply_ema_weights(branch, checkpoint)
@@ -434,6 +453,7 @@ def fixed_reconstruction_probe(
     inputs: dict[str, torch.Tensor],
     *, seed: int,
     generator_baselines: dict[str, dict[str, torch.Tensor]] | None = None,
+    include_stage1a_baseline: bool = True,
 ) -> dict[str, float]:
     """Fixed validation images/noise/times; preserve the training RNG stream."""
     result = {}
@@ -446,9 +466,13 @@ def fixed_reconstruction_probe(
                 encoder.eval()
                 x = inputs[domain].to(device=value.device, dtype=value.dtype)
                 z = encoder(x)
-                reference = anchors[domain](x)
                 torch.manual_seed(seed + offset)
                 result[f"{domain}_raw_reconstruction"] = float(_reconstruction_loss(value, x, z))
+                if not include_stage1a_baseline:
+                    torch.manual_seed(seed + offset)
+                    result[f"{domain}_null_reconstruction"] = float(_reconstruction_loss(value, x, z, force_null=True))
+                    continue
+                reference = anchors[domain](x)
                 torch.manual_seed(seed + offset)
                 if generator_baselines is None:
                     result[f"{domain}_stage1a_reconstruction"] = float(_reconstruction_loss(value, x, reference))
@@ -614,11 +638,15 @@ def fixed_conditional_structure_probe(
     matching_heads: dict[str, torch.nn.Module] | None = None,
     matching_regularization_options: dict[str, float] | None = None,
     matching_contrastive_options: dict[str, Any] | None = None,
+    cross_cost_source: str = "dino",
+    solver_failure_log=None,
+    validation_step=None,
 ) -> dict[str, Any]:
     """Fixed train references / validation queries; no updates or RNG consumption."""
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
-    from diffusion_ot.losses.infoot import infoot_distance_scale, solve_infoot, transport_diagnostics
+    from diffusion_ot.losses.infoot import infoot_distance_scale, plain_infoot_feature_loss, transport_diagnostics
     from diffusion_ot.models.matching_head import matching_features, matching_geometry_diagnostics
+    from diffusion_ot.losses.encoder_transport import encoder_transport_cost, encoder_conditional_readout
 
     states = {domain: value.branch.encoder.training for domain, value in domains.items()}
     references, queries, reference_structure, query_structure, anchor_codes = {}, {}, {}, {}, {}
@@ -635,8 +663,9 @@ def fixed_conditional_structure_probe(
                     value.branch.encoder(part.to(value.device, dtype=value.dtype)).float().to(alignment_device)
                     for part in latents.split(32)
                 ])
-            reference_structure[domain] = batch["reference_structure"].to(alignment_device)
-            query_structure[domain] = batch["query_structure"].to(alignment_device)
+            if cross_cost_source == "dino":
+                reference_structure[domain] = batch["reference_structure"].to(alignment_device)
+                query_structure[domain] = batch["query_structure"].to(alignment_device)
             if projection_support_options is not None:
                 if anchors is None or anchor_variances is None:
                     raise ValueError("Projection-support validation requires fixed Stage 1A anchors.")
@@ -649,26 +678,35 @@ def fixed_conditional_structure_probe(
             head = (matching_heads or {}).get(domain)
             features[domain] = matching_features(references[domain].to(value.device), head).to(alignment_device)
             query_features[domain] = matching_features(queries[domain].to(value.device), head).to(alignment_device)
-        solution = solve_infoot(
+        solution = _solve_infoot_logged(
             features["cat"], features["dog"], bandwidth=bandwidth,
+            failure_log=solver_failure_log, phase="validation_projection", step=validation_step,
             distance_scale_x=infoot_distance_scale(features["cat"]),
             distance_scale_y=infoot_distance_scale(features["dog"]),
-            cross_cost=torch.cdist(reference_structure["cat"], reference_structure["dog"]) / cost_scale,
+            cross_cost=(encoder_transport_cost(features["cat"], features["dog"]) if cross_cost_source == "encoder"
+                        else torch.cdist(reference_structure["cat"], reference_structure["dog"]) / cost_scale),
             cross_cost_weight=cross_cost_weight, **solver_options,
         )
-        result = conditional_structure_loss(
-            references, queries, reference_structure, query_structure, solution.coupling,
-            bandwidth=projection_bandwidth, cost_scale=cost_scale, teacher_temperature=teacher_temperature,
-            reference_matching=features, query_matching=query_features,
-        )
+        if cross_cost_source == "encoder":
+            result = encoder_conditional_readout(
+                references, queries, solution.coupling, bandwidth=projection_bandwidth,
+                reference_matching=features, query_matching=query_features)
+        else:
+            result = conditional_structure_loss(
+                references, queries, reference_structure, query_structure, solution.coupling,
+                bandwidth=projection_bandwidth, cost_scale=cost_scale, teacher_temperature=teacher_temperature,
+                reference_matching=features, query_matching=query_features,
+            )
         metrics = {
-            "conditional_structure_loss": float(result.loss),
-            "conditional_structure": result.metrics,
+            **({"conditional_projection": result.metrics} if cross_cost_source == "encoder" else
+               {"conditional_structure_loss": float(result.loss), "conditional_structure": result.metrics}),
             "projection_probe": {
                 "reference_split": "train", "query_split": "val",
                 "sample_ids": {domain: {kind: inputs[domain][f"{kind}_ids"] for kind in ("reference", "query")} for domain in domains},
                 "fit_bandwidth": bandwidth, "projection_bandwidth": projection_bandwidth,
-                "teacher_temperature": teacher_temperature, "structure_cost_scale": cost_scale,
+                "cross_cost_source": cross_cost_source,
+                **({"teacher_temperature": teacher_temperature, "structure_cost_scale": cost_scale}
+                   if cross_cost_source == "dino" else {}),
                 "sinkhorn_converged": solution.sinkhorn_converged,
                 "row_residual": solution.row_residual, "column_residual": solution.column_residual,
                 "iterations": solution.iterations, "outer_converged": solution.outer_converged,
@@ -688,6 +726,18 @@ def fixed_conditional_structure_probe(
                 },
             },
         }
+        if cross_cost_source == "encoder":
+            from diffusion_ot.training.self_supervised_diagnostics import solver_health
+            metrics["projection_probe"]["solver_health"] = solver_health(solution, solver_options)
+            cost = encoder_transport_cost(features["cat"], features["dog"])
+            metrics["projection_probe"]["encoder_cost_gain_over_independent"] = float(
+                cost.mean() - (solution.coupling * cost).sum())
+            metrics["projection_probe"]["infoot_mutual_information"] = solution.mutual_information
+            metrics["infoot_feature_loss"] = float(plain_infoot_feature_loss(
+                features["cat"], features["dog"], solution.coupling,
+                bandwidth=bandwidth, distance_scale_x=infoot_distance_scale(features["cat"]),
+                distance_scale_y=infoot_distance_scale(features["dog"]),
+                mi_weight=solver_options["mi_weight"], eps=solver_options["eps"]))
         if projection_support_options is not None:
             from diffusion_ot.losses.projection_support import projection_support_loss
             support = projection_support_loss(
@@ -717,11 +767,14 @@ def fixed_conditional_structure_probe(
 @torch.no_grad()
 def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, inputs, *,
                                     prior, bandwidth, projection_bandwidth, teacher_temperature,
-                                    solver_options, seed, cross_cost_weight=1.0, image_dir=None):
+                                    solver_options, seed, cross_cost_weight=1.0, image_dir=None,
+                                    solver_failure_log=None, validation_step=None):
     """Held-out decoded images; fixed noise, train-only OT references, no D update."""
-    from diffusion_ot.losses.infoot import infoot_distance_scale, solve_infoot
+    from diffusion_ot.losses.infoot import infoot_distance_scale
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
     from diffusion_ot.models.matching_head import matching_features
+    from diffusion_ot.losses.encoder_transport import encoder_transport_cost, encoder_conditional_readout
+    self_supervised = decoder_training.options.get("supervision", "external") == "self_supervised"
     devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     modes = {d: v.branch.encoder.training for d, v in domains.items()}
     target_device = domains["cat"].device
@@ -736,17 +789,25 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
                 queries[domain] = value.branch.encoder(data["query_latents"].to(value.device, dtype=value.dtype)).float().to(target_device)
                 ref_matching[domain] = matching_features(references[domain].to(value.device), matching_heads[domain]).to(target_device)
                 query_matching[domain] = matching_features(queries[domain].to(value.device), matching_heads[domain]).to(target_device)
-                reference_structure[domain] = data["reference_structure"].to(target_device)
-                query_structure[domain] = data["query_structure"].to(target_device)
-            solution = solve_infoot(ref_matching["cat"], ref_matching["dog"], bandwidth=bandwidth,
+                if not self_supervised:
+                    reference_structure[domain] = data["reference_structure"].to(target_device)
+                    query_structure[domain] = data["query_structure"].to(target_device)
+            solution = _solve_infoot_logged(ref_matching["cat"], ref_matching["dog"], bandwidth=bandwidth,
+                                    failure_log=solver_failure_log, phase="validation_decoded", step=validation_step,
                                     distance_scale_x=float(infoot_distance_scale(ref_matching["cat"])),
                                     distance_scale_y=float(infoot_distance_scale(ref_matching["dog"])),
-                                    cross_cost=prior.cost(reference_structure["cat"], reference_structure["dog"]),
+                                    cross_cost=(encoder_transport_cost(ref_matching["cat"], ref_matching["dog"]) if self_supervised else
+                                                prior.cost(reference_structure["cat"], reference_structure["dog"])),
                                     cross_cost_weight=cross_cost_weight, **solver_options)
-            conditional = conditional_structure_loss(
-                references, queries, reference_structure, query_structure, solution.coupling,
-                cost_scale=prior.cost_scale, bandwidth=projection_bandwidth, teacher_temperature=teacher_temperature,
-                reference_matching=ref_matching, query_matching=query_matching)
+            if self_supervised:
+                conditional = encoder_conditional_readout(
+                    references, queries, solution.coupling, bandwidth=projection_bandwidth,
+                    reference_matching=ref_matching, query_matching=query_matching)
+            else:
+                conditional = conditional_structure_loss(
+                    references, queries, reference_structure, query_structure, solution.coupling,
+                    cost_scale=prior.cost_scale, bandwidth=projection_bandwidth, teacher_temperature=teacher_temperature,
+                    reference_matching=ref_matching, query_matching=query_matching)
             _, metrics = decoder_training.loss(
                 conditional.weights, references,
                 {d: data["query_latents"] for d, data in inputs.items()},
@@ -755,6 +816,7 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
                 source_reference_structure=reference_structure,
                 source_query_structure=query_structure,
                 source_query_metadata={d: data.get("query_metadata", []) for d, data in inputs.items()},
+                **({"source_query_codes": queries} if self_supervised else {}),
                 **({"validation_image_dir": image_dir} if image_dir is not None else {}))
             metrics["seed"] = seed
             # This probe refits its own plan; do not borrow convergence from
@@ -779,7 +841,16 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
             if (decoder_training.options.get("code_consistency_mode", "cosine") == "contrastive"
                     and float(decoder_training.options.get("code_consistency_weight", 0.0)) > 0):
                 metrics["code_condition_bank_ids"] = {d: data["query_ids"] for d, data in inputs.items()}
-            metrics["interpretation"] = "Decoded DINO, source-palette and optional code-recovery metrics are training signals, not independent semantic validation. RGB-uv measures whole-image palette, not spatial markings or exposure. Discriminator scores are not calibrated across checkpoints or critic kinds."
+            if self_supervised:
+                from diffusion_ot.training.self_supervised_diagnostics import solver_health
+                metrics["solver"]["health"] = solver_health(solution, solver_options)
+                for domain, native in metrics.get("native_reconstruction", {}).items():
+                    native["query_ids"] = inputs[domain]["query_ids"][:native["samples"]]
+                metrics["source_negative_bank_ids"] = {
+                    d: data["query_ids"] + data["reference_ids"] for d, data in inputs.items()}
+                metrics["interpretation"] = "Own-encoder source retrieval after RGB decode/re-encode; a training signal, not independent target realism or semantic validation."
+            else:
+                metrics["interpretation"] = "Decoded DINO, source-palette and optional code-recovery metrics are training signals, not independent semantic validation. RGB-uv measures whole-image palette, not spatial markings or exposure. Discriminator scores are not calibrated across checkpoints or critic kinds."
             return metrics
         finally:
             for domain, value in domains.items():
@@ -803,7 +874,6 @@ def train_joint_infoot(
         kernel_offdiagonal_stats,
         normalize_matching_features,
         plain_infoot_feature_loss,
-        solve_infoot,
         solver_kwargs,
         transport_diagnostics,
     )
@@ -825,6 +895,8 @@ def train_joint_infoot(
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec, matching_features
     from diffusion_ot.models.generator_adaptation import generator_adaptation_enabled
     from diffusion_ot.training.decoded_translation import DecoderTraining, validate_decoder_config
+    from diffusion_ot.training.self_supervised_translation import SelfSupervisedDecoderTraining
+    from diffusion_ot.losses.encoder_transport import encoder_transport_cost, encoder_conditional_readout
     from diffusion_ot.training.stage1b_logging import Stage1BLogFormatter
 
     resolved_config_path = Path(config_path).resolve()
@@ -854,8 +926,10 @@ def train_joint_infoot(
     if differentiate_distance_scale and matching_config.get("distance_scale", "infoot_rms") != "infoot_rms":
         raise ValueError("Full distance-scale gradients require matching.distance_scale=infoot_rms.")
     infoot_config = _nested(config, "infoot")
-    conditional_config = _nested(config, "conditional_structure")
-    conditional_enabled = bool(conditional_config.get("enabled", False))
+    self_supervised = _nested(config, "decoded_translation").get("supervision", "external") == "self_supervised"
+    conditional_enabled = bool(_nested(config, "conditional_structure").get("enabled", False))
+    conditional_config = _nested(config, "conditional_projection" if self_supervised else "conditional_structure")
+    projection_enabled = bool(conditional_config.get("enabled", False))
     head_spec = matching_head_spec(config)
     head_config = _nested(config, "matching_head")
     matching_protection_options = matching_regularization_options(_nested(config, "matching_regularization"))
@@ -863,8 +937,8 @@ def train_joint_infoot(
     balance_config = DecodedEncoderBalanceConfig.from_mapping(_nested(config, "decoded_encoder_balance"))
     pcgrad_config = PCGradConfig.from_mapping(_nested(config, "pcgrad"))
     if head_spec["enabled"]:
-        if not conditional_enabled:
-            raise ValueError("Learned matching heads require conditional structure training.")
+        if not projection_enabled:
+            raise ValueError("Learned matching heads require a conditional projection readout.")
         if matching_config.get("distance_scale", "infoot_rms") != "infoot_rms":
             raise ValueError("Learned matching heads require matching.distance_scale=infoot_rms.")
         if not math.isfinite(float(head_config.get("lr", 2e-4))) or float(head_config.get("lr", 2e-4)) <= 0:
@@ -905,7 +979,10 @@ def train_joint_infoot(
     torch.manual_seed(seed)
     transport_batch_size = int(data_config.get("transport_batch_size", 64))
     reconstruction_batch_size = int(data_config.get("reconstruction_batch_size", 8))
-    query_count = int(conditional_config.get("query_samples_per_domain", 32)) if conditional_enabled else 0
+    query_count = int(conditional_config.get("query_samples_per_domain", 32)) if projection_enabled else 0
+    if projection_enabled and (not 1 <= query_count <= transport_batch_size - 3
+                               or str(data_config.get("split", "train")) != "train"):
+        raise ValueError("Conditional projection needs disjoint train queries and at least three OT references.")
     if contrastive_options is not None:
         positives = contrastive_options["positive_count"]
         minimum_references = positives + (2 if contrastive_options["neighborhood_weight"] > 0 else 1)
@@ -955,6 +1032,8 @@ def train_joint_infoot(
                 domain_stage1a["config"], root, field_name=f"stage1a.{domain}.config"
             )
         )
+        from diffusion_ot.training.decoded_translation import validate_flow_only_stage1a
+        validate_flow_only_stage1a(config, domain_train)
         data_paths[domain] = resolve_project_local_path(
             domain_train["data_config"], root, field_name=f"stage1a.{domain}.data_config"
         )
@@ -1039,7 +1118,8 @@ def train_joint_infoot(
         for index, (domain, value) in enumerate(domains.items())
     } if head_spec["enabled"] else {}
     head_parameters = [p for head in matching_heads.values() for p in head.parameters()]
-    decoder_training = DecoderTraining(config, domains, prior, root, seed=seed) if generator_adaptation_enabled(config) else None
+    decoder_class = SelfSupervisedDecoderTraining if self_supervised else DecoderTraining
+    decoder_training = decoder_class(config, domains, prior, root, seed=seed) if generator_adaptation_enabled(config) else None
     generator_parameters = decoder_training.parameters if decoder_training is not None else []
     parameters = [parameter for encoder in encoders.values() for parameter in encoder.parameters()]
     conflict_monitor = GradientConflictMonitor()
@@ -1164,7 +1244,7 @@ def train_joint_infoot(
                 raise ValueError("Fixed validation needs nonempty validation samples.")
             indices = torch.randperm(len(validation), generator=torch.Generator().manual_seed(seed + 19))[:count]
             probe_inputs[domain] = torch.stack([validation[int(i)]["x0_latent"] for i in indices])
-            if conditional_enabled:
+            if projection_enabled:
                 projection_probe_inputs[domain] = {}
                 for kind, dataset, requested in (
                     ("reference", datasets[domain], int(conditional_config.get("validation_reference_samples", 96))),
@@ -1178,14 +1258,16 @@ def train_joint_infoot(
                     projection_probe_inputs[domain][f"{kind}_ids"] = ids
                     projection_probe_inputs[domain][f"{kind}_metadata"] = [row.get("metadata", {}) for row in rows]
                     projection_probe_inputs[domain][f"{kind}_latents"] = torch.stack([row["x0_latent"] for row in rows])
-                    projection_probe_inputs[domain][f"{kind}_structure"] = prior.lookup(ids, domain, "train" if kind == "reference" else "val")
+                    if prior is not None:
+                        projection_probe_inputs[domain][f"{kind}_structure"] = prior.lookup(ids, domain, "train" if kind == "reference" else "val")
 
     def validation_metrics(validation_step) -> dict[str, Any]:
         metrics = fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000,
-                                             generator_baselines=decoder_training.baselines if decoder_training else None)
-        if conditional_enabled:
+                                             generator_baselines=decoder_training.baselines if decoder_training else None,
+                                             include_stage1a_baseline=not self_supervised)
+        if projection_enabled:
             metrics.update(fixed_conditional_structure_probe(
-                domains, projection_probe_inputs, cost_scale=prior.cost_scale, bandwidth=bandwidth,
+                domains, projection_probe_inputs, cost_scale=prior.cost_scale if prior else 1., bandwidth=bandwidth,
                 projection_bandwidth=float(conditional_config.get("bandwidth_multiplier", 0.1)),
                 teacher_temperature=float(conditional_config.get("teacher_temperature", 0.05)),
                 solver_options=solver_options, cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
@@ -1194,10 +1276,13 @@ def train_joint_infoot(
                 matching_heads=matching_heads,
                 matching_regularization_options=matching_protection_options,
                 matching_contrastive_options=contrastive_options,
+                cross_cost_source=str(infoot_config.get("cross_cost_source", "dino")),
+                solver_failure_log=output_dir / "logs" / "solver_failures.jsonl", validation_step=validation_step,
             ))
             # Fixed validation uses the full coefficient, independent of warmup.
-            metrics["conditional_structure_weight"] = conditional_weight
-            metrics["weighted_conditional_structure_loss"] = conditional_weight * metrics["conditional_structure_loss"]
+            if conditional_enabled:
+                metrics["conditional_structure_weight"] = conditional_weight
+                metrics["weighted_conditional_structure_loss"] = conditional_weight * metrics["conditional_structure_loss"]
         if decoder_training is not None:
             metrics["decoded_translation"] = fixed_decoded_translation_probe(
                 decoder_training, domains, matching_heads, projection_probe_inputs,
@@ -1208,7 +1293,16 @@ def train_joint_infoot(
                 cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
                 image_dir=(output_dir / "validation" / f"step_{validation_step:06d}"
                            if decoder_training.options.get("save_validation_images", False) else None),
+                solver_failure_log=output_dir / "logs" / "solver_failures.jsonl", validation_step=validation_step,
             )
+        if self_supervised:
+            metrics["alignment_weight"] = alignment_weight
+            metrics["weighted_infoot_alignment_loss"] = alignment_weight * metrics["infoot_feature_loss"]
+            metrics["loss"] = (
+                sum(rec_weights[d] * metrics[f"{d}_raw_reconstruction"] for d in domains)
+                + metrics["weighted_infoot_alignment_loss"] + metrics.get("matching_regularization_loss", 0.)
+                + metrics["decoded_translation"]["weighted_loss"])
+            metrics["loss_measurement"] = "fixed_raw_weights_full_coefficients_without_semantic_dropout"
         return log_formatter.format(metrics)
 
     if probe_every > 0:
@@ -1288,7 +1382,7 @@ def train_joint_infoot(
             domain: (code[:-query_count] if query_count else code).float().to(alignment_device)
             for domain, code in z.items()
         }
-        if conditional_enabled and any(len(code) < 3 for code in references.values()):
+        if projection_enabled and any(len(code) < 3 for code in references.values()):
             raise ValueError("Short training batch leaves too few OT references; enable drop_last.")
         reference_structure = {
             domain: teacher[:-query_count] if query_count else teacher
@@ -1312,9 +1406,12 @@ def train_joint_infoot(
         else:
             solve_distance_scales = distance_scales
         cross_cost = prior.cost(reference_structure["cat"], reference_structure["dog"]) if prior is not None else None
-        solution = solve_infoot(
+        if infoot_config.get("cross_cost_source", "dino") == "encoder":
+            cross_cost = encoder_transport_cost(cat_features, dog_features)
+        solution = _solve_infoot_logged(
             cat_features.detach(),
             dog_features.detach(),
+            failure_log=output_dir / "logs" / "solver_failures.jsonl", phase="train", step=step,
             bandwidth=bandwidth,
             distance_scale_x=solve_distance_scales["cat"],
             distance_scale_y=solve_distance_scales["dog"],
@@ -1355,6 +1452,14 @@ def train_joint_infoot(
                 differentiate_distance_scale=differentiate_distance_scale,
             )
             projection_loss = conditional_result.loss
+        elif self_supervised:
+            conditional_result = encoder_conditional_readout(
+                references, {domain: code[-query_count:].float().to(alignment_device) for domain, code in z.items()},
+                solution.coupling, bandwidth=float(conditional_config.get("bandwidth_multiplier", .1)),
+                reference_matching=reference_matching,
+                query_matching={domain: code[-query_count:] for domain, code in matching_z.items()},
+                differentiate_distance_scale=differentiate_distance_scale,
+            )
         contrastive_loss = torch.zeros((), device=alignment_device)
         contrastive_metrics = None
         if contrastive_options is not None:
@@ -1382,6 +1487,7 @@ def train_joint_infoot(
                 source_reference_structure=reference_structure,
                 source_query_structure={d: teacher[-query_count:] for d, teacher in teacher_features.items()},
                 source_query_metadata=query_metadata,
+                **({"source_query_codes": {d: code[-query_count:] for d, code in z.items()}} if self_supervised else {}),
             )
             code_consistency_loss = decoder_training.code_consistency_objective
             decoded_metrics["active"] = True
@@ -1449,15 +1555,15 @@ def train_joint_infoot(
                     "reconstruction": reconstruction_objective,
                     "decoded": decoded_loss,
                     "perceptual": decoder_training.image_objectives.get("perceptual", decoded_loss.new_zeros(())),
-                    "adversarial": decoder_training.image_objectives["adversarial"],
-                    "structure": decoder_training.image_objectives["structure"],
+                    "adversarial": decoder_training.image_objectives.get("adversarial", decoded_loss.new_zeros(())),
+                    "structure": decoder_training.image_objectives.get("structure", decoded_loss.new_zeros(())),
                     "color": decoder_training.image_objectives.get("color", decoded_loss.new_zeros(())),
                     "matching": (beta * infoot_loss + neighborhood_weight * warmup * neighborhood_loss
                                  + conditional_weight * warmup * projection_loss + warmup * contrastive_loss
                                  + support_weight * warmup * support_loss + matching_protection_loss),
                     **({"conditional": conditional_weight * warmup * projection_loss,
                         "infoot": beta * infoot_loss, "protection": matching_protection_loss}
-                       if conditional_enabled else {}),
+                       if projection_enabled else {}),
                 }, diagnostic_groups,
                 code_gradients={id(p): g for p, g in zip(generator_parameters, code_generator_gradients)},
                 encoder_scale=float(balance_metrics.get("scale", 1.0)), monitor=conflict_monitor)
@@ -1543,6 +1649,9 @@ def train_joint_infoot(
                 gradient_diagnostics["decoded_to_reconstruction_encoder_gradient_ratio"] = (
                     image_norms["encoder"] / max(gradient_diagnostics["reconstruction_gradient_norm"], 1e-12)
                 )
+                native_generator_norm = gradient_diagnostics["reconstruction_generator_gradient_norm"]
+                gradient_diagnostics["decoded_to_reconstruction_generator_gradient_ratio"] = (
+                    image_norms["generator"] / native_generator_norm if native_generator_norm > 1e-12 else None)
             if contrastive_options is not None:
                 norms = _autograd_group_norms(warmup * contrastive_loss, {
                     "encoder": parameters, "matching_head": head_parameters})
@@ -1646,6 +1755,9 @@ def train_joint_infoot(
 
         elapsed = time.perf_counter() - started
         training_seconds += elapsed
+        if self_supervised:
+            from diffusion_ot.training.self_supervised_diagnostics import solver_health
+            health = solver_health(solution, solver_options)
         loss_window.append({
             "loss": float(reported_total),
             "infoot_iterations": solution.iterations,
@@ -1654,6 +1766,13 @@ def train_joint_infoot(
             "cat_reconstruction_loss": float(rec_losses["cat"].detach()),
             "dog_reconstruction_loss": float(rec_losses["dog"].detach()),
             "infoot_mutual_information": solution.mutual_information,
+            **({"infoot_outer_delta_to_tolerance": health["outer_delta_to_tolerance"],
+                "infoot_marginal_residual_to_tolerance": health["marginal_residual_to_tolerance"],
+                "infoot_outer_total_budget_fraction": health["outer_total_budget_fraction"],
+                "source_contrastive_loss": decoded_metrics.get("source_contrastive_loss", 0.),
+                "source_contrastive_active": float(decoded_metrics["active"]),
+                "weighted_infoot_alignment_loss": float(beta * infoot_loss.detach())}
+               if self_supervised else {}),
             "semantic_neighborhood_loss": float(neighborhood_loss.detach()),
             "conditional_structure_loss": float(projection_loss.detach()),
             "weighted_conditional_structure_loss": float(conditional_weight * warmup * projection_loss.detach()),
@@ -1776,15 +1895,25 @@ def train_joint_infoot(
             if support_result is not None:
                 metrics["projection_support"] = support_result.metrics
             if conditional_result is not None:
-                metrics["conditional_structure"] = conditional_result.metrics
-            metrics["window_mean"] = {
-                key: sum(row[key] for row in loss_window) / len(loss_window)
-                for key in loss_window[-1]
-            }
+                metrics["conditional_projection" if self_supervised else "conditional_structure"] = conditional_result.metrics
+            metrics["window_mean"] = {}
+            for key in loss_window[-1]:
+                values = [row[key] for row in loss_window if row[key] is not None
+                          and (key != "source_contrastive_loss" or row["source_contrastive_active"])]
+                metrics["window_mean"][key] = sum(values) / len(values) if values else None
             metrics["window_updates"] = len(loss_window)
             if cross_cost is not None:
-                metrics["transport_structure_cost"] = float((solution.coupling * cross_cost).sum())
-                metrics["independent_structure_cost"] = float(cross_cost.mean())
+                cost_name = "encoder_cost" if self_supervised else "structure_cost"
+                metrics["infoot_cross_cost_source"] = str(infoot_config.get("cross_cost_source", "dino"))
+                metrics[f"transport_{cost_name}"] = float((solution.coupling * cross_cost).sum())
+                metrics[f"independent_{cost_name}"] = float(cross_cost.mean())
+                if self_supervised:
+                    metrics["encoder_cost_gain_over_independent"] = float(cross_cost.mean() - (solution.coupling * cross_cost).sum())
+            if self_supervised:
+                metrics["solver_health"] = health
+                metrics["solver_window_max"] = {key: max((row[key] for row in loss_window if row[key] is not None), default=None) for key in (
+                    "infoot_iterations", "infoot_recovery_iterations", "infoot_outer_delta_to_tolerance",
+                    "infoot_marginal_residual_to_tolerance")}
             metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
             metrics = log_formatter.format(metrics)
             print(json.dumps(metrics, sort_keys=True))

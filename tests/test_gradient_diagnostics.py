@@ -87,8 +87,12 @@ def test_isolated_conditional_pairs_do_not_include_kl_in_the_comparator():
         assert pairs["conditional_vs_infoot"]["cosine"] == -1.
         assert pairs["conditional_vs_translation"]["first_to_second_norm_ratio"] == 5.
         assert pairs["conditional_vs_protection"]["cosine"] == 1.
+        assert pairs["infoot_vs_translation"]["cosine"] == 1.
+        assert pairs["infoot_vs_translation"]["first_to_second_norm_ratio"] == .5
+        assert pairs["infoot_vs_protection"]["cosine"] == -1.
         assert norms["conditional"][group] == 10.
     assert "conditional_vs_reconstruction" not in report["groups"]["matching_head.all"]
     assert report["groups"]["encoder.all"]["conditional_vs_reconstruction"]["cosine"] == 1.
+    assert report["groups"]["encoder.all"]["infoot_vs_reconstruction"]["cosine"] == -1.
     assert not any(key.startswith("conditional_") for key in report["groups"]["generator.all"])
     assert encoder.grad is head.grad is generator.grad is None

@@ -123,6 +123,22 @@ class Stage1BEvaluationReport:
         return asdict(self)
 
 
+def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
+    """Do not label weights trained with external losses as the new control."""
+    saved = checkpoint.get("config") or {}
+    current_image, saved_image = (config.get("decoded_translation") or {} for config in (alignment_config, saved))
+    current_mode, saved_mode = (image.get("supervision", "external") for image in (current_image, saved_image))
+    if "self_supervised" not in (current_mode, saved_mode):
+        return
+    if current_mode != saved_mode:
+        raise ValueError("Alignment config and checkpoint decoded supervision disagree.")
+    if current_image.get("source_contrastive_readout", "target") != saved_image.get("source_contrastive_readout", "target"):
+        raise ValueError("Alignment config and checkpoint source contrastive readout disagree.")
+    for field, default in (("variant", "plain"), ("cross_cost_source", "dino")):
+        if (alignment_config.get("infoot") or {}).get(field, default) != (saved.get("infoot") or {}).get(field, default):
+            raise ValueError(f"Alignment config and checkpoint infoot.{field} disagree.")
+
+
 def _nested(config: dict[str, Any], key: str) -> dict[str, Any]:
     value = config.get(key) or {}
     if not isinstance(value, dict):
@@ -532,6 +548,8 @@ def _load_domain_context(
         domain_config["checkpoint"], root, field_name=f"stage1a.{domain}.checkpoint"
     )
     stage1a_checkpoint = _load_checkpoint(stage1a_checkpoint_path)
+    from diffusion_ot.training.decoded_translation import validate_flow_only_stage1a
+    validate_flow_only_stage1a(alignment_config, train_config, stage1a_checkpoint)
     branch.load_pdae_state_dict(stage1a_checkpoint["model"])
     initial_weights = str(_nested(alignment_config, "stage1a").get("weights", "ema"))
     if initial_weights == "ema":
@@ -544,6 +562,7 @@ def _load_domain_context(
     selected_path = stage1a_checkpoint_path
     if checkpoint_path is not None:
         joint = _load_joint_checkpoint(checkpoint_path)
+        _validate_self_supervised_checkpoint(alignment_config, joint)
         provenance = (joint.get("stage1a_provenance") or {}).get(domain)
         if not isinstance(provenance, dict):
             raise ValueError(f"Joint checkpoint has no stage1a_provenance.{domain} record.")
@@ -1236,7 +1255,12 @@ def run_stage1b_evaluation(
     # participates in the protocol hash, including the actual descriptor bytes.
     eval_variant = str(_nested(evaluation_config, "infoot").get("variant", "plain"))
     prior_config = dict(alignment_config)
-    prior_config["infoot"] = {"variant": eval_variant}
+    prior_config["infoot"] = dict(_nested(evaluation_config, "infoot"))
+    prior_config["infoot"]["variant"] = eval_variant
+    eval_cost_source = str(prior_config["infoot"].get("cross_cost_source", "dino"))
+    training_cost_source = str(_nested(alignment_config, "infoot").get("cross_cost_source", "dino"))
+    if eval_cost_source != training_cost_source:
+        raise ValueError("Evaluation must match the training infoot.cross_cost_source.")
     prior = load_semantic_prior(prior_config, root)
     if prior is not None:
         evaluation_config["semantic_prior"] = {
@@ -1420,6 +1444,9 @@ def run_stage1b_evaluation(
         if reference_split != "train":
             raise ValueError("Fused prior fitting is restricted to training references.")
         cross_cost = prior.cost(descriptors["cat"], descriptors["dog"])
+    elif eval_variant == "fused" and eval_cost_source == "encoder":
+        from diffusion_ot.losses.encoder_transport import encoder_transport_cost
+        cross_cost = encoder_transport_cost(cat_features, dog_features)
     solution = solve_infoot(
         cat_features,
         dog_features,
@@ -1439,6 +1466,7 @@ def run_stage1b_evaluation(
         {
             "coupling": solution.coupling.cpu(),
             "variant": eval_variant,
+            "cross_cost_source": eval_cost_source if eval_variant == "fused" else None,
             "semantic_prior_fingerprint": prior.fingerprint if prior is not None else None,
             "cross_cost_weight": float(infoot_config.get("cross_cost_weight", 1.0)),
             "cat_reference_ids": banks["cat"]["reference"].sample_ids,
@@ -1704,10 +1732,13 @@ def run_stage1b_evaluation(
         distance_scales=scales,
         solver={
             "variant": eval_variant,
+            "cross_cost_source": eval_cost_source if eval_variant == "fused" else None,
             "semantic_prior_fingerprint": prior.fingerprint if prior is not None else None,
             "transport": transport_diagnostics(solution.coupling),
-            "transport_structure_cost": float((solution.coupling * cross_cost).sum()) if cross_cost is not None else None,
-            "independent_structure_cost": float(cross_cost.mean()) if cross_cost is not None else None,
+            **({"transport_encoder_cost": float((solution.coupling * cross_cost).sum()),
+                "independent_encoder_cost": float(cross_cost.mean())} if eval_variant == "fused" and eval_cost_source == "encoder" else
+               {"transport_structure_cost": float((solution.coupling * cross_cost).sum()) if cross_cost is not None else None,
+                "independent_structure_cost": float(cross_cost.mean()) if cross_cost is not None else None}),
             "fit_bandwidth_multiplier": bandwidth,
             "algorithm": str(
                 infoot_config.get("algorithm", "official_projected_sinkhorn")

@@ -122,3 +122,28 @@ def test_log_cleanup_does_not_change_training_or_validation_numbers(experiment, 
         assert measured["decoded_translation"]["query_ids"] == original["decoded_translation"]["query_ids"]
         assert measured["decoded_translation"]["perceptual_loss"] == original["decoded_translation"]["perceptual_loss"]
         assert measured["decoded_translation"]["diagnostics"]["structure_cosine_distance"] == original["decoded_translation"]["structure_loss"]
+
+
+def test_self_supervised_logs_keep_only_active_losses_and_applicable_diagnostics():
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[1] /
+        "configs/stage1b_infoot/self_supervised_sit_b2.yaml").read_text())
+    formatter = Stage1BLogFormatter(cfg)
+    obsolete = {"perceptual_loss": 17., "weighted_adversarial_loss": 8., "structure_loss": .3,
+                "color_histogram_loss": .2, "cat_fake_score": .4, "teacher_structure_cost": 1.,
+                "code_consistency_loss": .8, "discriminator_updates": 99, "conditional_structure_loss": .5}
+    active = {"source_contrastive_loss": 0., "source_contrastive_weight": .15,
+              "effective_weighted_loss": 0., "source_correspondence": {"edge_correlation": None}}
+    row = {**obsolete, "cat_reconstruction_loss": 0., "infoot_feature_loss": 0.,
+           "matching_variance_loss": 0., "matching_covariance_loss": 0., "infoot_restart": 0,
+           "decoded_translation": {**obsolete, **active, "cat_to_dog": {**obsolete, **active},
+                                   "diagnostics": {"structure_cosine_distance": .1}},
+           "window_mean": {**obsolete, "source_contrastive_loss": 0., "primary_objective": 1., "auxiliary_objective": 2.}}
+    original = deepcopy(row)
+    result = formatter.format(row)
+    assert row == original and formatter.format(result) == result
+    assert result["log_schema_version"] == 3
+    assert not set(obsolete).intersection(result)
+    assert result["window_mean"] == {"source_contrastive_loss": 0.}
+    assert result["decoded_translation"] == {**active, "cat_to_dog": active}
+    assert set(result["enabled_losses"]) == {"cat_reconstruction", "dog_reconstruction", "infoot_alignment",
+                                           "matching_variance", "matching_covariance", "source_contrastive"}
