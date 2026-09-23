@@ -22,6 +22,8 @@ class InfoOTSolveResult:
     unconverged_inner_steps: int = 0
     outer_converged: bool = False
     plan_delta_l1: float = 0.0
+    recovery_iterations: int = 0
+    effective_projection_tolerance: float = 0.0
 
 
 @dataclass
@@ -478,6 +480,7 @@ def solve_infoot(
     outer_patience: int = 3,
     strict_convergence: bool = False,
     require_outer_convergence: bool = False,
+    recovery_iterations: int = 0,
 ) -> InfoOTSolveResult:
     if features_x.ndim != 2 or features_y.ndim != 2:
         raise ValueError("InfoOT expects [batch, dimension] feature matrices.")
@@ -491,6 +494,12 @@ def solve_infoot(
         raise ValueError("Requiring InfoOT outer convergence needs a positive outer_tolerance.")
     if min_inner_iterations < 1 or outer_patience < 1:
         raise ValueError("InfoOT minimum iterations and patience must be positive.")
+    if recovery_iterations < 0:
+        raise ValueError("InfoOT recovery_iterations must be nonnegative.")
+    if recovery_iterations and not (
+        inner_iterations > 0 and strict_convergence and require_outer_convergence
+    ):
+        raise ValueError("InfoOT recovery requires a positive outer budget and both strict convergence policies.")
     n, m = features_x.shape[0], features_y.shape[0]
     if a is None or b is None:
         default_a, default_b = uniform_marginals(n, m, device=features_x.device, dtype=features_x.dtype)
@@ -522,7 +531,32 @@ def solve_infoot(
     stable_iterations = 0
     outer_converged = False
     plan_delta_l1 = 0.0
-    for iteration in range(max(int(inner_iterations), 0)):
+    recovery_steps = 0
+    effective_projection_tolerance = projection_tolerance
+    output_dtype = coupling.dtype
+    output_a, output_b = a, b
+    delta_tail: list[float] = []
+    outer_budget = max(int(inner_iterations), 0)
+    for iteration in range(outer_budget + int(recovery_iterations)):
+        if iteration == outer_budget:
+            # Continue the SAME fixed-point problem, only after the normal cap
+            # fails. Preserve the already constructed kernels/cost and current
+            # plan; do not restart, damp updates, change entropy, or accept a
+            # merely feasible plan. FP64 reduces roundoff; stricter subproblem
+            # accuracy reduces discontinuities from Sinkhorn early stopping.
+            coupling, kernel_x, kernel_y, fixed_cost, a, b = (
+                value.double() for value in (coupling, kernel_x, kernel_y, fixed_cost, a, b)
+            )
+            # The outer criterion sums over the plan, while the inner criterion
+            # is a per-marginal maximum. Give accumulated marginal error a
+            # smaller budget than outer L1 change. This is an accuracy heuristic,
+            # not an upper bound on distance to the exact subproblem solution.
+            effective_projection_tolerance = min(
+                projection_tolerance, outer_tolerance / (10 * max(n, m))
+            )
+            stable_iterations = 0
+            delta_tail.clear()
+        recovery_steps += int(iteration >= outer_budget)
         mi_gradient = infoot_plan_gradient(
             coupling, kernel_x, kernel_y, a, b, eps=eps
         )
@@ -533,16 +567,24 @@ def solve_infoot(
             b,
             regularization=entropy_epsilon,
             max_iterations=projection_iterations,
-            tolerance=projection_tolerance,
+            tolerance=effective_projection_tolerance,
         )
         completed_iterations = iteration + 1
         residual = max(
             float((coupling.sum(1) - a).abs().max()),
             float((coupling.sum(0) - b).abs().max()),
         )
-        inner_converged = residual <= projection_tolerance
+        inner_converged = residual <= effective_projection_tolerance
         unconverged_inner_steps += int(not inner_converged)
         plan_delta_l1 = float((coupling - previous_coupling).abs().sum())
+        if recovery_steps:
+            # Downstream neural losses expect the input dtype. Check stability
+            # in that dtype as well before declaring the recovered plan usable.
+            output_delta = float((coupling.to(output_dtype) - previous_coupling.to(output_dtype)).abs().sum())
+            plan_delta_l1 = max(plan_delta_l1, output_delta)
+        delta_tail.append(plan_delta_l1)
+        if len(delta_tail) > 20:
+            delta_tail.pop(0)
         stable_iterations = (
             stable_iterations + 1
             if outer_tolerance > 0 and inner_converged and plan_delta_l1 <= outer_tolerance
@@ -552,8 +594,9 @@ def solve_infoot(
             outer_converged = True
             break
 
-    row_residual = float((coupling.sum(dim=1) - a).abs().max().cpu())
-    column_residual = float((coupling.sum(dim=0) - b).abs().max().cpu())
+    output_coupling = coupling.to(output_dtype)
+    row_residual = float((output_coupling.sum(dim=1) - output_a).abs().max().cpu())
+    column_residual = float((output_coupling.sum(dim=0) - output_b).abs().max().cpu())
     sinkhorn_converged = max(row_residual, column_residual) <= projection_tolerance
     if strict_convergence and not sinkhorn_converged:
         raise RuntimeError(
@@ -571,13 +614,19 @@ def solve_infoot(
             f"InfoOT outer updates did not converge after {completed_iterations} iterations: "
             f"plan_delta_l1={plan_delta_l1:.3g}, tolerance={outer_tolerance:.3g}, "
             f"sinkhorn_converged={sinkhorn_converged}. "
-            "Increase inner_iterations (the outer update budget) or reassess the cost/MI/entropy scales."
+            f"recovery_updates={recovery_steps}/{recovery_iterations}, "
+            f"solve_dtype={coupling.dtype}, effective_projection_tolerance={effective_projection_tolerance:.3g}, "
+            f"last_inner_residual={residual if completed_iterations else max(row_residual, column_residual):.3g}, "
+            f"last_{len(delta_tail)}_delta_range=[{min(delta_tail, default=0.):.3g}, "
+            f"{max(delta_tail, default=0.):.3g}]. "
+            "Review the residual trend and cost/MI/entropy scales. inner_iterations is the normal outer "
+            "budget; recovery_iterations enables bounded FP64 continuation with stricter Sinkhorn accuracy."
         )
     mi = infoot_mutual_information(coupling, kernel_x, kernel_y, a, b, eps=eps)
     entropy = coupling_entropy(coupling, eps=eps)
     objective = (coupling * fixed_cost).sum() - float(mi_weight) * mi - float(entropy_epsilon) * entropy
     return InfoOTSolveResult(
-        coupling=coupling,
+        coupling=output_coupling,
         objective=float(objective.cpu()),
         mutual_information=float(mi.cpu()),
         entropy=float(entropy.cpu()),
@@ -589,6 +638,8 @@ def solve_infoot(
         unconverged_inner_steps=unconverged_inner_steps,
         outer_converged=outer_converged,
         plan_delta_l1=plan_delta_l1,
+        recovery_iterations=recovery_steps,
+        effective_projection_tolerance=effective_projection_tolerance,
     )
 
 
@@ -886,6 +937,7 @@ def solver_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         "mi_weight": float(config.get("mi_weight", 1.0)),
         "entropy_epsilon": float(config.get("entropy_epsilon", 0.05)),
         "inner_iterations": int(config.get("inner_iterations", 50)),
+        "recovery_iterations": int(config.get("recovery_iterations", 0)),
         "projection_iterations": int(config.get("projection_iterations", 200)),
         "projection_tolerance": float(config.get("projection_tolerance", 1.0e-5)),
         "eps": float(config.get("numerical_epsilon", 1.0e-8)),

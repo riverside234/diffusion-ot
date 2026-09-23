@@ -8,6 +8,24 @@ import pytest
 summary_tools = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/summarize_infoot_training.py"))
 
 
+def test_solver_recovery_is_visible_in_train_and_validation_summaries():
+    train = summary_tools["training_row"]({"step": 100,
+        "infoot_iteration_budget": 1200, "infoot_recovery_iteration_budget": 4800,
+        "infoot_iterations": 1296, "infoot_recovery_iterations": 96,
+        "infoot_effective_projection_tolerance": 1e-8,
+        "window_mean": {"infoot_recovery_used": .02, "infoot_recovery_iterations": 1.92}})
+    validation = summary_tools["validation_row"]({"step": 100, "projection_probe": {
+        "iteration_budget": 1200, "recovery_iteration_budget": 4800,
+        "iterations": 1296, "recovery_iterations": 96, "effective_projection_tolerance": 1e-8}})
+    for row in (train, validation):
+        assert row["solver_iterations"] == 1296
+        assert row["solver_recovery_iteration_budget"] == 4800
+        assert row["solver_recovery_iterations"] == 96
+        assert row["solver_effective_projection_tolerance"] == 1e-8
+    assert train["window_solver_recovery_fraction"] == .02
+    assert train["window_solver_recovery_iterations"] == 1.92
+
+
 def test_training_only_paste_keeps_missing_validation_and_missing_metrics_explicit(tmp_path):
     log = tmp_path / "paste.txt"
     log.write_text(json.dumps({"step": 200, "event": "train", "window_mean": {

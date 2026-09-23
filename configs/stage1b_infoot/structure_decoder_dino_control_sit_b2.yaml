@@ -87,6 +87,7 @@ infoot:
   mi_weight: 0.10  # Weaker MI feedback in the inner plan; fixed structure cost remains 1.0.
   entropy_epsilon: 0.02
   inner_iterations: 1200  # Outer cap; slow batches may need >300. Stop early once converged.
+  recovery_iterations: 4800  # Match active training's bounded FP64 recovery after the normal cap.
   projection_iterations: 10000  # Match active training's Sinkhorn cap and strict marginal tolerance.
   projection_tolerance: 0.00001
   outer_tolerance: 0.00001
