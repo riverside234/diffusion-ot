@@ -153,16 +153,21 @@ def load_semantic_prior(config: dict[str, Any], root: Path) -> SemanticPriorBank
 def _compatible_infoot_resume(saved: dict[str, Any], current: dict[str, Any]) -> bool:
     """A larger cap is safe when every accepted solve already had to converge.
 
-    Only allow more outer iterations; objective, tolerances, initialization,
-    patience and inner Sinkhorn settings must still match. Never mutate either
-    checkpoint config. Truncated (non-strict) runs cannot use this exception.
+    Allow more outer iterations and (for strict solves) more Sinkhorn iterations.
+    Objective, tolerances, initialization and patience must still match. Never
+    mutate either checkpoint config. Truncated runs cannot use this exception.
     """
     if saved == current:
         return True
     saved, current = dict(saved), dict(current)
     previous_budget = int(saved.pop("inner_iterations", 50))
     current_budget = int(current.pop("inner_iterations", 50))
+    previous_projection_budget = int(saved.pop("projection_iterations", 200))
+    current_projection_budget = int(current.pop("projection_iterations", 200))
     return (saved == current and current_budget >= previous_budget
+            and current_projection_budget >= previous_projection_budget
+            and (current_projection_budget == previous_projection_budget
+                 or bool(saved.get("strict_convergence", False)))
             and bool(saved.get("require_outer_convergence", False))
             and float(saved.get("outer_tolerance", 0)) > 0)
 

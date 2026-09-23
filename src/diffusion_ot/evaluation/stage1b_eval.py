@@ -1723,6 +1723,8 @@ def run_stage1b_evaluation(
             "column_residual": solution.column_residual,
             "iterations": solution.iterations,
             "iteration_budget": int(infoot_config.get("inner_iterations", 50)),
+            "projection_iteration_budget": int(infoot_config.get("projection_iterations", 200)),
+            "projection_tolerance": float(infoot_config.get("projection_tolerance", 1.0e-5)),
             "restart": solution.restart,
             "sinkhorn_converged": solution.sinkhorn_converged,
             "unconverged_inner_steps": solution.unconverged_inner_steps,

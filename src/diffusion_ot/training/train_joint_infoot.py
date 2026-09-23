@@ -673,6 +673,8 @@ def fixed_conditional_structure_probe(
                 "row_residual": solution.row_residual, "column_residual": solution.column_residual,
                 "iterations": solution.iterations, "outer_converged": solution.outer_converged,
                 "iteration_budget": solver_options["inner_iterations"],
+                "projection_iteration_budget": solver_options["projection_iterations"],
+                "projection_tolerance": solver_options["projection_tolerance"],
                 "plan_delta_l1": solution.plan_delta_l1,
                 "transport": transport_diagnostics(solution.coupling),
                 "matching_feature_variance": {
@@ -757,6 +759,8 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
             metrics["solver"] = {
                 "iterations": solution.iterations,
                 "iteration_budget": solver_options["inner_iterations"],
+                "projection_iteration_budget": solver_options["projection_iterations"],
+                "projection_tolerance": solver_options["projection_tolerance"],
                 "sinkhorn_converged": solution.sinkhorn_converged,
                 "outer_converged": solution.outer_converged,
                 "plan_delta_l1": solution.plan_delta_l1,
@@ -1685,6 +1689,8 @@ def train_joint_infoot(
                 "infoot_plan_delta_l1": solution.plan_delta_l1,
                 "infoot_iterations": solution.iterations,
                 "infoot_iteration_budget": solver_options["inner_iterations"],
+                "infoot_projection_iteration_budget": solver_options["projection_iterations"],
+                "infoot_projection_tolerance": solver_options["projection_tolerance"],
                 "infoot_reference_counts": {domain: len(code) for domain, code in references.items()},
                 "conditional_query_samples_per_domain": query_count,
                 "infoot_distance_scale_mode": distance_scale_mode,

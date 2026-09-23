@@ -559,7 +559,10 @@ def solve_infoot(
         raise RuntimeError(
             f"InfoOT Sinkhorn marginals did not converge: row={row_residual:.3g}, "
             f"column={column_residual:.3g}, tolerance={projection_tolerance:.3g}. "
-            "Increase projection_iterations or reassess the cost/MI/entropy scales."
+            f"Sinkhorn exhausted projection_iterations={projection_iterations} per outer update "
+            f"(completed outer updates={completed_iterations}). "
+            "Increase infoot.projection_iterations or reassess the cost/MI/entropy scales; "
+            "infoot.inner_iterations controls the separate outer update budget."
         )
     # Feasible marginals alone do not establish that successive MI/OT updates
     # have stabilized. Keep the historical marginal-only policy available.

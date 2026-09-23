@@ -5,8 +5,9 @@ import pytest
 import torch
 import yaml
 
-from diffusion_ot.losses.infoot import solve_infoot, solver_kwargs
+from diffusion_ot.losses.infoot import solve_infoot, solver_kwargs, sinkhorn_transport_from_cost
 from diffusion_ot.losses.semantic_prior import validate_prior_resume
+from test_stage1b_extensions import experiment, minimal_pcgrad_recipe
 
 
 def test_slow_feasible_plan_converges_with_larger_cap_at_same_tolerance():
@@ -92,3 +93,95 @@ def test_active_and_rms_only_train_eval_use_same_larger_cap_and_strict_tolerance
             assert options["outer_tolerance"] == options["projection_tolerance"] == 1e-5
             assert options["outer_patience"] == 3
             assert options["strict_convergence"] and options["require_outer_convergence"]
+
+
+def test_slow_sinkhorn_recovers_without_relaxing_marginal_or_outer_tolerance():
+    # Nearly disconnected triangular support: column normalization is accurate
+    # while rows converge slowly. FP32 reproduces the user's type of failure.
+    features = torch.zeros(8, 2)
+    cost = torch.zeros(8, 8)
+    cost[4:, 4:] = 1.
+    options = dict(cross_cost=cost, mi_weight=0., entropy_epsilon=.02,
+                   inner_iterations=5, projection_tolerance=1e-5, outer_tolerance=1e-5,
+                   strict_convergence=True, require_outer_convergence=True)
+    with pytest.raises(RuntimeError, match="projection_iterations=2000"):
+        solve_infoot(features, features, projection_iterations=2000, **options)
+    result = solve_infoot(features, features, projection_iterations=10000, **options)
+    assert result.sinkhorn_converged and result.outer_converged
+    assert result.row_residual <= 1e-5 and result.column_residual <= 1e-5
+    assert result.unconverged_inner_steps == 0
+    assert result.plan_delta_l1 <= 1e-5
+
+
+def test_larger_sinkhorn_cap_preserves_fast_solve_work_and_rng(monkeypatch):
+    cost = 1 - torch.eye(8)
+    marginal = torch.full((8,), 1/8)
+    original_logsumexp = torch.logsumexp
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original_logsumexp(*args, **kwargs)
+    monkeypatch.setattr(torch, "logsumexp", counted)
+    rng = torch.get_rng_state().clone()
+    before = sinkhorn_transport_from_cost(cost, marginal, marginal, regularization=.02,
+                                          max_iterations=2000, tolerance=1e-5)
+    before_count = len(calls)
+    calls.clear()
+    after = sinkhorn_transport_from_cost(cost, marginal, marginal, regularization=.02,
+                                         max_iterations=10000, tolerance=1e-5)
+    assert before_count == len(calls) == 2  # Early exit at the first row/column update.
+    torch.testing.assert_close(before, after, rtol=0, atol=0)
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("explicit_old_budget", [False, True])
+def test_resume_allows_larger_sinkhorn_cap_only_under_unchanged_strict_policy(explicit_old_budget):
+    saved = _strict_config()
+    if explicit_old_budget:
+        saved["infoot"]["projection_iterations"] = 2000
+    current = deepcopy(saved)
+    current["infoot"]["projection_iterations"] = 10000
+    before = deepcopy(saved)
+    validate_prior_resume(saved, current)
+    assert saved == before
+    for field, value in (("projection_iterations", 100), ("projection_tolerance", 2e-5),
+                         ("mi_weight", .2), ("entropy_epsilon", .05), ("inner_iterations", 299)):
+        changed = deepcopy(current)
+        changed["infoot"][field] = value
+        with pytest.raises(ValueError, match="Resume cannot change infoot"):
+            validate_prior_resume(saved, changed)
+    for policy in ("strict_convergence", "require_outer_convergence"):
+        old = deepcopy(saved)
+        new = deepcopy(current)
+        old["infoot"][policy] = new["infoot"][policy] = False
+        with pytest.raises(ValueError, match="Resume cannot change infoot"):
+            validate_prior_resume(old, new)
+
+
+def test_active_train_controls_and_eval_share_sinkhorn_cap():
+    root = Path(__file__).resolve().parents[1] / "configs"
+    paths = [root / "stage1b_infoot" / name for name in (
+        "structure_decoder_sit_b2.yaml", "structure_decoder_patch_sit_b2.yaml",
+        "structure_decoder_dino_control_sit_b2.yaml")]
+    paths.append(root / "stage1b_eval/structure_decoder_sit_b2.yaml")
+    for path in paths:
+        options = solver_kwargs(yaml.safe_load(path.read_text())["infoot"])
+        assert options["projection_iterations"] == 10000
+        assert options["projection_tolerance"] == options["outer_tolerance"] == 1e-5
+        assert options["strict_convergence"] and options["require_outer_convergence"]
+
+
+def test_training_resumes_with_sinkhorn_budget_increase_and_logs_new_cap(experiment):
+    run, _, _ = experiment
+    first, logs = run("sinkhorn_resume", steps=1, modify=minimal_pcgrad_recipe)
+    old_cap = first["config"]["infoot"].get("projection_iterations", 200)
+    assert logs["train"][-1]["infoot_projection_iteration_budget"] == old_cap
+    def increase(config):
+        minimal_pcgrad_recipe(config)
+        config["infoot"]["projection_iterations"] = old_cap * 2
+    resumed, logs = run("sinkhorn_resume", resume=True, modify=increase)
+    assert resumed["step"] == 2
+    assert logs["train"][-1]["infoot_projection_iteration_budget"] == old_cap * 2
+    assert logs["train"][-1]["infoot_projection_tolerance"] == 1e-5
+    assert logs["validation"][-1]["projection_probe"]["projection_iteration_budget"] == old_cap * 2
+    assert logs["validation"][-1]["decoded_translation"]["solver"]["projection_iteration_budget"] == old_cap * 2
