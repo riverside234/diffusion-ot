@@ -25,16 +25,16 @@ stage1a:
 
 data:
   split: train
-  transport_batch_size: 128
+  transport_batch_size: 256
   # Native flow loss is batch-averaged; this need not match decoded batch_size.
-  reconstruction_batch_size: 64
+  reconstruction_batch_size: 32
   random_horizontal_flip: 0.0  # Matches the unflipped structure cache.
-  num_workers: 4
+  num_workers: 16
   pin_memory: true
   drop_last: true
 
 train:
-  max_steps: 4000  # Includes 2,000 updates after the decoded ramp reaches full weight.
+  max_steps: 5000  # Includes 2,000 updates after the decoded ramp reaches full weight.
   smoke_steps: 500
   seed: 20260905
   lr_encoder: 0.00002
