@@ -35,6 +35,9 @@ from diffusion_ot.losses.infoot import (
 from diffusion_ot.models.matching_head import (
     load_matching_head, matching_features, matching_head_id, matching_head_spec,
 )
+from diffusion_ot.losses.projection_rms import (
+    checkpoint_projection_rms, projection_rms_options, reference_variances, validate_projection_scales,
+)
 
 
 @dataclass
@@ -94,6 +97,7 @@ class DomainEvaluationContext:
     stage1a_weights: str
     stage1a_architecture: dict[str, Any]
     matching_head: Any | None = None
+    projection_rms: Any | None = None
 
 
 @dataclass
@@ -404,6 +408,7 @@ def _direction_projection_evaluation(
     eps: float,
     distance_scale_mode: str = "fixed_stage1a_median",
     projection_bandwidth: float | None = None,
+    projection_scales: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     bandwidth, projection_bandwidth = _evaluation_bandwidths(
         {"bandwidth_multiplier": bandwidth}, projection_bandwidth
@@ -416,7 +421,13 @@ def _direction_projection_evaluation(
     target_ref_features = target_reference.matching_features.to(device)
     source_query_features = source_query.matching_features.to(device)
     target_projection_features = target_projection.matching_features.to(device)
-    if distance_scale_mode == "infoot_rms":
+    if projection_scales is not None:
+        if distance_scale_mode != "infoot_rms":
+            raise ValueError("Explicit projection RMS requires infoot_rms matching.")
+        projection_scales = validate_projection_scales(projection_scales)
+        query_source_scale = projection_scales[source_reference.domain]
+        projection_target_scale = projection_scales[target_reference.domain]
+    elif distance_scale_mode == "infoot_rms":
         query_source_scale = float(
             infoot_cross_distance_scale(source_query_features, source_ref_features)
         )
@@ -488,6 +499,7 @@ def _direction_projection_evaluation(
             "query_source": query_source_scale,
             "projection_target": projection_target_scale,
         },
+        "conditional_scale_mode": "reference_ema" if projection_scales is not None else distance_scale_mode,
     }
     tensors = {
         "conditional_weights": conditional_weights.detach().cpu(),
@@ -641,10 +653,12 @@ def _load_domain_context(
         selected_path = checkpoint_path
 
     matching_head = None
+    projection_rms = None
     if checkpoint_path is not None:
         if matching_head_spec(joint.get("config") or {}) != matching_head_spec(alignment_config):
             raise ValueError("Alignment config and checkpoint matching_head architectures disagree.")
         matching_head = load_matching_head(joint, domain, weights=joint_weights, device=device)
+        projection_rms = checkpoint_projection_rms(joint, alignment_config, weights=joint_weights)
     branch.eval()
     components.vae.eval()
     return DomainEvaluationContext(
@@ -664,6 +678,7 @@ def _load_domain_context(
         stage1a_weights=initial_weights,
         stage1a_architecture=stage1a_architecture,
         matching_head=matching_head,
+        projection_rms=projection_rms,
     )
 
 
@@ -1260,6 +1275,9 @@ def run_stage1b_evaluation(
     evaluation_path = Path(evaluation_config_path).resolve()
     alignment_config = load_yaml_config(alignment_path)
     evaluation_config = load_yaml_config(evaluation_path)
+    rms_options = projection_rms_options(alignment_config)
+    if projection_rms_options(evaluation_config) != rms_options:
+        raise ValueError("Evaluation must match the training projection_rms protocol.")
     matching_config = dict(_nested(evaluation_config, "matching"))
     bandwidth, projection_bandwidth = _evaluation_bandwidths(
         matching_config, projection_bandwidth
@@ -1376,6 +1394,8 @@ def run_stage1b_evaluation(
     query_split = str(data_config.get("query_split", "val"))
     if reference_split == query_split:
         raise ValueError("Train-only evaluation requires different reference and query splits.")
+    if rms_options is not None and (reference_split != "train" or projection_split != "train"):
+        raise ValueError("Reference-EMA projection uses training reference and projection banks only.")
     seed = int(evaluation_config.get("seed", 20260906))
     batch_size = int(data_config.get("batch_size", 32))
     reference_count = int(max_reference or data_config.get("reference_samples_per_domain", 512))
@@ -1464,6 +1484,24 @@ def run_stage1b_evaluation(
             "'fixed_stage1a_median'."
         )
     alignment_device = str(evaluation_config.get("alignment_device", device_cat or "cpu"))
+    projection_scales, rms_report = None, None
+    if rms_options is not None:
+        if distance_scale_mode != "infoot_rms":
+            raise ValueError("Reference-EMA projection requires matching.distance_scale=infoot_rms.")
+        if resolved_checkpoint is not None:
+            trackers = [contexts[d].projection_rms for d in ("cat", "dog")]
+            if any(t is None for t in trackers) or trackers[0].state_dict() != trackers[1].state_dict():
+                raise ValueError("Evaluation needs matching checkpoint projection RMS states for both domains.")
+            projection_scales = trackers[0].scales()
+            rms_report = {**trackers[0].diagnostics(bandwidth=projection_bandwidth),
+                          "weights": weights, "source": "checkpoint", "frozen": True}
+        else:
+            # Offline Stage 1A baseline has no training history to restore.
+            # Calibrate once on its own training references, never its queries.
+            variances = reference_variances({d: banks[d]["reference"].matching_features for d in banks})
+            projection_scales = {d: math.sqrt(max(v, rms_options["eps"] ** 2)) for d, v in variances.items()}
+            rms_report = {**rms_options, "scales": projection_scales, "num_updates": 0,
+                          "source": "stage1a_training_references", "frozen": True}
     cat_features = banks["cat"]["reference"].matching_features.to(alignment_device)
     dog_features = banks["dog"]["reference"].matching_features.to(alignment_device)
     infoot_config = _nested(evaluation_config, "infoot")
@@ -1511,6 +1549,7 @@ def run_stage1b_evaluation(
             "distance_scale_mode": distance_scale_mode,
             "bandwidth": bandwidth,
             "projection_bandwidth": projection_bandwidth,
+            **({"projection_rms": rms_report} if rms_report is not None else {}),
             "solver_algorithm": str(
                 infoot_config.get("algorithm", "official_projected_sinkhorn")
             ),
@@ -1556,6 +1595,7 @@ def run_stage1b_evaluation(
             eps=float(infoot_config.get("numerical_epsilon", 1.0e-8)),
             distance_scale_mode=distance_scale_mode,
             projection_bandwidth=projection_bandwidth,
+            projection_scales=projection_scales,
         )
         projections[str(name)] = direction_report
         direction_tensors[str(name)] = tensors
@@ -1734,6 +1774,7 @@ def run_stage1b_evaluation(
             "reconstruction_reference": "original_dataset_rgb",
             "fit_bandwidth_multiplier": bandwidth,
             "projection_bandwidth_multiplier": projection_bandwidth,
+            **({"projection_rms": rms_report} if rms_report is not None else {}),
             "semantic_cfg_enabled": all(
                 context.stage1a_architecture["semantic_cfg_enabled"]
                 for context in contexts.values()

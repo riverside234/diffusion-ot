@@ -67,6 +67,7 @@ def encoder_conditional_readout(
     reference_matching: dict[str, torch.Tensor] | None = None,
     query_matching: dict[str, torch.Tensor] | None = None,
     differentiate_distance_scale: bool = False,
+    projection_scales: dict[str, float] | None = None,
 ) -> EncoderConditionalReadoutResult:
     """Bidirectional Eq. 7 probabilities without a teacher or a KL objective.
 
@@ -75,9 +76,15 @@ def encoder_conditional_readout(
     the detached coupling. Raw target codes stay unchanged for the caller's
     weighted decoder condition. Diagnostics measure query dependence and code
     spread; none is an independent estimate of translation quality.
+    Explicit projection_scales are frozen reference-EMA statistics. They replace
+    only this readout's bandwidth calibration, including target density; the
+    fitting/MI kernel and its live RMS derivative are managed by the caller.
     """
     if not math.isfinite(bandwidth) or bandwidth <= 0:
         raise ValueError("Projection bandwidth must be finite and positive.")
+    if projection_scales is not None:
+        from diffusion_ot.losses.projection_rms import validate_projection_scales
+        projection_scales = validate_projection_scales(projection_scales)
     if (reference_matching is None) != (query_matching is None):
         raise ValueError("Supply both reference and query matching features, or neither.")
     match_ref = references if reference_matching is None else reference_matching
@@ -115,10 +122,11 @@ def encoder_conditional_readout(
                 source_features, source_references, target_references,
                 plan if source == "cat" else plan.T,
                 bandwidth=bandwidth,
-                distance_scale_x=infoot_cross_distance_scale(
-                    source_features, source_references, detach=not differentiate_distance_scale),
-                distance_scale_y=infoot_distance_scale(
-                    target_references, detach=not differentiate_distance_scale),
+                distance_scale_x=(projection_scales[source] if projection_scales is not None else
+                    infoot_cross_distance_scale(source_features, source_references,
+                                               detach=not differentiate_distance_scale)),
+                distance_scale_y=(projection_scales[target] if projection_scales is not None else
+                    infoot_distance_scale(target_references, detach=not differentiate_distance_scale)),
             )
             direction = f"{source}_to_{target}"
             log_distributions[direction] = log_weights

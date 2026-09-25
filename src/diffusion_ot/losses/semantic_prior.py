@@ -185,6 +185,12 @@ def _compatible_infoot_resume(saved: dict[str, Any], current: dict[str, Any]) ->
 
 
 def validate_prior_resume(saved_config: dict[str, Any], current_config: dict[str, Any]) -> None:
+    from diffusion_ot.losses.projection_rms import projection_rms_options
+    if projection_rms_options(saved_config) != projection_rms_options(current_config):
+        raise ValueError("Resume cannot change projection_rms; start a new run.")
+    if (projection_rms_options(current_config) is not None
+            and (saved_config.get("ema") or {}) != (current_config.get("ema") or {})):
+        raise ValueError("Resume cannot change ema with paired projection RMS statistics; start a new run.")
     from diffusion_ot.training.pcgrad import PCGradConfig
     saved_pcgrad = PCGradConfig.from_mapping(saved_config.get("pcgrad"))
     current_pcgrad = PCGradConfig.from_mapping(current_config.get("pcgrad"))

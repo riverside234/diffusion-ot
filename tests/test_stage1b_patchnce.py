@@ -143,7 +143,9 @@ def test_patchnce_resume_restores_next_patches_and_diffusion_noise(tmp_path):
         assert_tensor_tree_equal(runtime.checkpoint_state()[key], restored.checkpoint_state()[key])
 
 
-def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_logs(patchnce_training, monkeypatch):
+@pytest.mark.parametrize("rms_enabled", [False, True])
+def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_logs(
+        patchnce_training, monkeypatch, rms_enabled):
     import diffusion_ot.training.self_supervised_translation as translation
 
     def forbidden(*args, **kwargs):
@@ -151,8 +153,14 @@ def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_log
 
     monkeypatch.setattr(translation, "source_code_contrastive_loss", forbidden)
     run, originals, latest, encode_calls = patchnce_training
-    complete, logs = run("patchnce_complete", modify=patchnce_recipe)
+    def recipe(config):
+        patchnce_recipe(config)
+        if rms_enabled:
+            config["projection_rms"] = {"mode": "reference_ema", "decay": .99, "eps": 1e-8}
+    complete, logs = run("patchnce_complete", modify=recipe)
     assert complete["step"] == 2
+    if rms_enabled:
+        assert all(s["num_updates"] == 2 for s in complete["projection_rms_state"].values())
     assert encode_calls
     expected_tasks = {
         "encoder": {"native", "transport", "protection", "patchnce"},
@@ -170,6 +178,8 @@ def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_log
         assert decoded["patchnce_loss"] > 0
         assert decoded["weighted_loss"] == pytest.approx(.15 * decoded["patchnce_loss"])
         assert "conditional_projection" in row
+        if rms_enabled:
+            assert row["projection_rms"]["num_updates"] == row["step"]
     for row in logs["train"]:
         for group, tasks in expected_tasks.items():
             assert set(row["pcgrad"]["groups"][group]["active_tasks"]) == tasks

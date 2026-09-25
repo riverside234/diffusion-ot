@@ -235,19 +235,30 @@ def test_self_supervised_configs_match_and_link_original_flow_only_checkpoints()
     validate_decoder_config(train)
 
 
-def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(own_encoder_run, monkeypatch, tmp_path):
+@pytest.mark.parametrize("rms_enabled", [False, True])
+@pytest.mark.parametrize("weights", ["raw", "ema"])
+def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
+        own_encoder_run, monkeypatch, tmp_path, rms_enabled, weights):
     import diffusion_ot.data.ground_truth as ground_truth
     import diffusion_ot.evaluation.stage1b_eval as evaluation
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec
+    from diffusion_ot.models.generator_adaptation import load_joint_generator
+    from diffusion_ot.losses.projection_rms import checkpoint_projection_rms
 
     run, _, latest, _ = own_encoder_run
-    checkpoint, _ = run("self_eval_training", steps=1, modify=self_supervised_recipe)
+    def recipe(cfg):
+        self_supervised_recipe(cfg)
+        if rms_enabled:
+            cfg["projection_rms"] = {"mode": "reference_ema", "decay": .99, "eps": 1e-8}
+    checkpoint, _ = run("self_eval_training", steps=1, modify=recipe)
     config = checkpoint["config"]
     checkpoint_path = tmp_path / "self_eval_training/checkpoints/latest.pt"
     root = Path(__file__).resolve().parents[1]
     eval_config = yaml.safe_load((root / "configs/stage1b_eval/self_supervised_sit_b2.yaml").read_text())
     eval_config.update(project_root=str(tmp_path), output_dir="eval", alignment_device="cpu")
     eval_config["infoot"] = dict(config["infoot"])
+    if rms_enabled:
+        eval_config["projection_rms"] = dict(config["projection_rms"])
     eval_config["matching"]["projection_bandwidth_multiplier"] = config["conditional_projection"]["bandwidth_multiplier"]
     eval_config["data"].update(reference_samples_per_domain=6, projection_samples_per_domain=8,
                                query_samples_per_domain=2, batch_size=4, num_workers=0)
@@ -282,9 +293,12 @@ def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
         value.stage1a_weights = "ema"
         value.checkpoint_path = checkpoint_path
         value.checkpoint_step = 1
-        value.weights = "raw"
+        value.weights = weights
+        value.branch.encoder.load_state_dict(checkpoint["encoder_ema" if weights == "ema" else "encoders"][domain])
+        load_joint_generator(value.branch, checkpoint, domain, weights=weights)
         value.matching_head = make_matching_head(matching_head_spec(config), device="cpu")
-        value.matching_head.load_state_dict(checkpoint["matching_heads"][domain])
+        value.matching_head.load_state_dict(checkpoint["matching_head_ema" if weights == "ema" else "matching_heads"][domain])
+        value.projection_rms = checkpoint_projection_rms(checkpoint, config, weights=weights)
         value.branch.eval()
         value.matching_head.eval()
         return value
@@ -299,7 +313,7 @@ def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
         raise AssertionError("The PDAE-only evaluator loaded external image features.")
     monkeypatch.setattr(evaluation, "_lpips", forbidden)
     report = evaluation.run_stage1b_evaluation(
-        tmp_path / "self_eval_training.yaml", eval_path, checkpoint_path=checkpoint_path, weights="raw")
+        tmp_path / "self_eval_training.yaml", eval_path, checkpoint_path=checkpoint_path, weights=weights)
     assert report.solver["cross_cost_source"] == "encoder"
     assert report.solver["semantic_prior_fingerprint"] is None
     assert report.solver["sinkhorn_converged"] and report.solver["outer_converged"]
@@ -315,6 +329,22 @@ def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
         assert report.projections[direction]["projection_target_count"] == 8
         assert "structure_prior_diagnostics" not in report.projections[direction]
     assert (Path(report.output_dir) / "evaluation_report.json").is_file()
+    if rms_enabled:
+        rms = report.generation_protocol["projection_rms"]
+        tracker = checkpoint_projection_rms(checkpoint, config, weights=weights)
+        assert rms["weights"] == weights and rms["frozen"] and rms["source"] == "checkpoint"
+        assert rms["scales"] == tracker.scales()
+        for source, target in (("cat", "dog"), ("dog", "cat")):
+            direction = report.projections[f"{source}_to_{target}"]
+            assert direction["conditional_distance_scales"] == {
+                "query_source": rms["scales"][source], "projection_target": rms["scales"][target]}
+        # An old standalone YAML must not silently reinstate query-batch RMS.
+        eval_config.pop("projection_rms")
+        eval_path.write_text(yaml.safe_dump(eval_config))
+        with pytest.raises(ValueError, match="match the training projection_rms"):
+            evaluation.run_stage1b_evaluation(tmp_path / "self_eval_training.yaml", eval_path,
+                                              checkpoint_path=checkpoint_path, weights=weights)
+        eval_config["projection_rms"] = dict(config["projection_rms"])
     eval_config["infoot"]["cross_cost_source"] = "dino"
     eval_path.write_text(yaml.safe_dump(eval_config))
     with pytest.raises(ValueError, match="match the training infoot.cross_cost_source"):

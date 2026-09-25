@@ -389,6 +389,43 @@ def _calibrate_encoder(
     return variance, distance_scale
 
 
+@torch.no_grad()
+def _projection_reference_features(domains, latents, matching_heads, *, ema=None, matching_ema=None):
+    """Measure raw or model-EMA reference geometry without changing model state.
+
+    Used for initialization and the separate model-EMA RMS tracker. The raw
+    training tracker reuses the existing forward's reference features. Extra
+    EMA forwards have no autograd graph and are chunked to bound peak memory.
+    """
+    from torch.func import functional_call
+    from diffusion_ot.models.matching_head import matching_features
+
+    features = {}
+    for domain, value in domains.items():
+        encoder = value.branch.encoder
+        head = matching_heads.get(domain)
+        modules = [encoder] + ([head] if head is not None else [])
+        modes = {m: m.training for module in modules for m in module.modules()}
+        try:
+            for module in modules:
+                module.eval()
+            pieces = []
+            for part in latents[domain].split(64):
+                part = part.to(device=value.device, dtype=value.dtype)
+                code = (encoder(part) if ema is None else
+                        functional_call(encoder, ema.shadow[domain], (part,), strict=True))
+                if head is not None and matching_ema is not None:
+                    feature = functional_call(head, matching_ema.shadow[domain], (code.float(),), strict=True)
+                else:
+                    feature = matching_features(code, head)
+                pieces.append(feature.float())
+            features[domain] = torch.cat(pieces)
+        finally:
+            for module, mode in modes.items():
+                module.training = mode
+    return features
+
+
 def _reconstruction_loss(
     domain: LoadedTrainingDomain,
     x0: torch.Tensor,
@@ -515,6 +552,7 @@ def _build_checkpoint_payload(
     matching_heads: dict[str, torch.nn.Module] | None = None,
     matching_ema: EncoderEMA | None = None,
     decoder_training: Any | None = None,
+    projection_rms: dict | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "format_version": 3 if matching_heads else 2,
@@ -555,6 +593,8 @@ def _build_checkpoint_payload(
     if decoder_training is not None:
         payload["format_version"] = 4
         payload.update(decoder_training.checkpoint_state())
+    if projection_rms:
+        payload["projection_rms_state"] = {k: v.state_dict() for k, v in projection_rms.items()}
     return payload
 
 
@@ -646,6 +686,7 @@ def fixed_conditional_structure_probe(
     cross_cost_source: str = "dino",
     solver_failure_log=None,
     validation_step=None,
+    projection_scales: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Fixed train references / validation queries; no updates or RNG consumption."""
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
@@ -695,7 +736,17 @@ def fixed_conditional_structure_probe(
         if cross_cost_source == "encoder":
             result = encoder_conditional_readout(
                 references, queries, solution.coupling, bandwidth=projection_bandwidth,
-                reference_matching=features, query_matching=query_features)
+                reference_matching=features, query_matching=query_features,
+                projection_scales=projection_scales)
+            # Same first query, same fitted plan/references, different query batch.
+            single = encoder_conditional_readout(
+                references, {d: q[:1] for d, q in queries.items()}, solution.coupling,
+                bandwidth=projection_bandwidth, reference_matching=features,
+                query_matching={d: q[:1] for d, q in query_features.items()},
+                projection_scales=projection_scales)
+            for direction, probability in result.weights.items():
+                result.metrics[direction]["query_batch_dependence_first_query_l1"] = float(
+                    (probability[:1] - single.weights[direction]).abs().sum())
         else:
             result = conditional_structure_loss(
                 references, queries, reference_structure, query_structure, solution.coupling,
@@ -773,7 +824,7 @@ def fixed_conditional_structure_probe(
 def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, inputs, *,
                                     prior, bandwidth, projection_bandwidth, teacher_temperature,
                                     solver_options, seed, cross_cost_weight=1.0, image_dir=None,
-                                    solver_failure_log=None, validation_step=None):
+                                    solver_failure_log=None, validation_step=None, projection_scales=None):
     """Held-out decoded images; fixed noise, train-only OT references, no D update."""
     from diffusion_ot.losses.infoot import infoot_distance_scale
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
@@ -807,7 +858,8 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
             if self_supervised:
                 conditional = encoder_conditional_readout(
                     references, queries, solution.coupling, bandwidth=projection_bandwidth,
-                    reference_matching=ref_matching, query_matching=query_matching)
+                    reference_matching=ref_matching, query_matching=query_matching,
+                    projection_scales=projection_scales)
             else:
                 conditional = conditional_structure_loss(
                     references, queries, reference_structure, query_structure, solution.coupling,
@@ -906,6 +958,9 @@ def train_joint_infoot(
     from diffusion_ot.training.self_supervised_translation import SelfSupervisedDecoderTraining
     from diffusion_ot.losses.encoder_transport import encoder_transport_cost, encoder_conditional_readout
     from diffusion_ot.training.stage1b_logging import Stage1BLogFormatter
+    from diffusion_ot.losses.projection_rms import (
+        ReferenceRMSEMA, checkpoint_projection_rms, projection_rms_options,
+    )
 
     resolved_config_path = Path(config_path).resolve()
     config = load_yaml_config(resolved_config_path)
@@ -938,6 +993,12 @@ def train_joint_infoot(
     conditional_enabled = bool(_nested(config, "conditional_structure").get("enabled", False))
     conditional_config = _nested(config, "conditional_projection" if self_supervised else "conditional_structure")
     projection_enabled = bool(conditional_config.get("enabled", False))
+    rms_options = projection_rms_options(config)
+    if rms_options is not None and (
+            not self_supervised or not projection_enabled or not differentiate_distance_scale
+            or data_config.get("split", "train") != "train"):
+        raise ValueError("Reference-EMA projection RMS requires self-supervised projection, train references, "
+                         "and full live RMS gradients for InfoOT fitting.")
     head_spec = matching_head_spec(config)
     head_config = _nested(config, "matching_head")
     matching_protection_options = matching_regularization_options(_nested(config, "matching_regularization"))
@@ -1083,6 +1144,7 @@ def train_joint_infoot(
     distance_scale_mode = str(matching_config.get("distance_scale", "infoot_rms"))
     anchor_variances: dict[str, float] = {}
     distance_scales: dict[str, float] = {}
+    rms_calibration_latents = {}
     for domain, value in domains.items():
         calibration_dataset = CachedLatentDataset(
             data_paths[domain],
@@ -1101,6 +1163,9 @@ def train_joint_infoot(
             dtype=value.dtype,
             distance_scale_mode=distance_scale_mode,
         )
+        if rms_options is not None and resume_path is None:
+            rms_calibration_latents[domain] = torch.stack([
+                calibration_dataset[i]["x0_latent"] for i in range(min(calibration_count, len(calibration_dataset)))])
 
     loader_generators: dict[str, torch.Generator] = {}
     loaders: dict[str, Any] = {}
@@ -1163,6 +1228,16 @@ def train_joint_infoot(
         matching_heads, decay=float(ema_config.get("decay", 0.995)),
         warmup_steps=int(ema_config.get("warmup_steps", 500)),
     ) if matching_heads and ema is not None else None
+    projection_rms = ({name: ReferenceRMSEMA(decay=rms_options["decay"], eps=rms_options["eps"])
+                       for name in (("raw", "ema") if ema is not None else ("raw",))}
+                      if rms_options is not None else {})
+    if projection_rms and resume_path is None:
+        calibration_features = _projection_reference_features(domains, rms_calibration_latents, matching_heads)
+        # Model EMA starts as an exact copy of raw E/head, so both warm starts agree.
+        for tracker in projection_rms.values():
+            tracker.initialize(calibration_features)
+        del calibration_features
+    rms_calibration_latents.clear()
     training_seconds = 0.0
     if resume_path is not None:
         if not resume_path.is_file():
@@ -1192,6 +1267,8 @@ def train_joint_infoot(
         if ema is not None and checkpoint.get("ema_state") is not None:
             ema.load_state_dict(checkpoint["ema_state"], encoders)
         initial_step = int(checkpoint.get("step", 0))
+        for name in projection_rms:
+            projection_rms[name] = checkpoint_projection_rms(checkpoint, config, weights=name)
         training_seconds = float((checkpoint.get("train_state") or {}).get("training_seconds", 0.0))
         if checkpoint.get("rng_state") is not None:
             torch.set_rng_state(checkpoint["rng_state"])
@@ -1271,6 +1348,7 @@ def train_joint_infoot(
                         projection_probe_inputs[domain][f"{kind}_structure"] = prior.lookup(ids, domain, "train" if kind == "reference" else "val")
 
     def validation_metrics(validation_step) -> dict[str, Any]:
+        projection_scales = projection_rms["raw"].scales() if projection_rms else None
         metrics = fixed_reconstruction_probe(domains, anchors, probe_inputs, seed=seed + 10000,
                                              generator_baselines=decoder_training.baselines if decoder_training else None,
                                              include_stage1a_baseline=not self_supervised)
@@ -1287,6 +1365,7 @@ def train_joint_infoot(
                 matching_contrastive_options=contrastive_options,
                 cross_cost_source=str(infoot_config.get("cross_cost_source", "dino")),
                 solver_failure_log=output_dir / "logs" / "solver_failures.jsonl", validation_step=validation_step,
+                projection_scales=projection_scales,
             ))
             # Fixed validation uses the full coefficient, independent of warmup.
             if conditional_enabled:
@@ -1303,7 +1382,11 @@ def train_joint_infoot(
                 image_dir=(output_dir / "validation" / f"step_{validation_step:06d}"
                            if decoder_training.options.get("save_validation_images", False) else None),
                 solver_failure_log=output_dir / "logs" / "solver_failures.jsonl", validation_step=validation_step,
+                projection_scales=projection_scales,
             )
+        if projection_rms:
+            metrics["projection_rms"] = projection_rms["raw"].diagnostics(
+                bandwidth=float(conditional_config.get("bandwidth_multiplier", .1)))
         if self_supervised:
             metrics["alignment_weight"] = alignment_weight
             metrics["weighted_infoot_alignment_loss"] = alignment_weight * metrics["infoot_feature_loss"]
@@ -1338,6 +1421,7 @@ def train_joint_infoot(
                 loader_generators=loader_generators,
                 matching_heads=matching_heads, matching_ema=matching_ema,
                 decoder_training=decoder_training,
+                projection_rms=projection_rms,
             ),
         )
 
@@ -1400,6 +1484,18 @@ def train_joint_infoot(
         reference_matching = {
             domain: code[:-query_count] if query_count else code for domain, code in matching_z.items()
         }
+        projection_scales = None
+        if projection_rms:
+            # Exactly one update, from this step's references only, before any
+            # sampler/checkpointed forward. Evaluation only reads these states.
+            projection_rms["raw"].update(reference_matching, step=step)
+            if "ema" in projection_rms:
+                ema_features = _projection_reference_features(
+                    domains, {d: latent[:-query_count] for d, latent in x0.items()}, matching_heads,
+                    ema=ema, matching_ema=matching_ema)
+                projection_rms["ema"].update(ema_features, step=step)
+                del ema_features
+            projection_scales = projection_rms["raw"].scales()
         matching_protection = None
         matching_protection_loss = torch.zeros((), device=alignment_device)
         if matching_protection_options is not None:
@@ -1468,6 +1564,7 @@ def train_joint_infoot(
                 reference_matching=reference_matching,
                 query_matching={domain: code[-query_count:] for domain, code in matching_z.items()},
                 differentiate_distance_scale=differentiate_distance_scale,
+                projection_scales=projection_scales,
             )
         contrastive_loss = torch.zeros((), device=alignment_device)
         contrastive_metrics = None
@@ -1905,6 +2002,11 @@ def train_joint_infoot(
                 metrics["projection_support"] = support_result.metrics
             if conditional_result is not None:
                 metrics["conditional_projection" if self_supervised else "conditional_structure"] = conditional_result.metrics
+            if projection_rms:
+                metrics["projection_rms"] = projection_rms["raw"].diagnostics(
+                    bandwidth=float(conditional_config.get("bandwidth_multiplier", .1)))
+                if "ema" in projection_rms:
+                    metrics["projection_rms"]["model_ema_scales"] = projection_rms["ema"].scales()
             metrics["window_mean"] = {}
             for key in loss_window[-1]:
                 values = [row[key] for row in loss_window if row[key] is not None
@@ -1960,6 +2062,7 @@ def train_joint_infoot(
                     loader_generators=loader_generators,
                     matching_heads=matching_heads, matching_ema=matching_ema,
                     decoder_training=decoder_training,
+                    projection_rms=projection_rms,
                 ),
             )
             if bool(train_config.get("keep_step_checkpoints", False)):

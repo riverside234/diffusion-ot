@@ -27,6 +27,8 @@ The canonical configurations are:
 - Stage 1A Cat / Dog optional RGB comparison: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora_rgb.yaml`
 - Stage 1B self-supervised PatchNCE: `configs/stage1b_infoot/self_supervised_patchnce_sit_b2.yaml`
 - Stage 1B global InfoNCE control: `configs/stage1b_infoot/self_supervised_sit_b2.yaml`
+- Stage 1B PatchNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml`
+- Stage 1B global InfoNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_rms_ema_sit_b2.yaml`
 - Experiment D: `configs/stage1b_infoot/structure_decoder_sit_b2.yaml`
 - Experiment D evaluation: `configs/stage1b_eval/structure_decoder_sit_b2.yaml`
 
@@ -34,6 +36,44 @@ The self-supervised controls use original flow-only EMA checkpoints with the
 unchanged `*_sit_b2_lora.yaml` configs. Experiment D uses its selected
 `*_sit_b2_dino.yaml` EMA checkpoints. Neither automatically loads the new RGB
 Stage 1A outputs; replacing checkpoint paths alone is insufficient.
+
+### Reference-EMA RMS projection experiment
+
+The optional `*_rms_ema_sit_b2.yaml` recipes average reference-feature variances
+with decay 0.99 and use their square roots to calibrate conditional projection.
+This makes the scale independent of other queries in the batch. InfoOT fitting
+and neural MI retain live reference RMS with full gradients; fit/projection
+bandwidths remain 0.55/0.10. Losses, weights, learning rates, PCGrad and feature
+protection match their controls. The original recipes remain available.
+
+Start the PatchNCE variant fresh from the original flow-only Stage 1A checkpoints:
+
+```bash
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml
+```
+
+Its output is `outputs/stage1b_self_patch_rms`. Evaluate with the paired recipe:
+
+```bash
+python scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_patchnce_rms_ema_sit_b2.yaml \
+  --checkpoint outputs/stage1b_self_patch_rms/checkpoints/latest.pt --weights ema
+```
+
+For the global InfoNCE variant, use `self_supervised_rms_ema_sit_b2.yaml` in both
+directories and checkpoint output `outputs/stage1b_self_rms`. Resume each new run
+with its own config and `--resume latest`; old Stage 1B checkpoints lack these
+statistics and cannot initialize this experiment through resume.
+
+Raw and model-EMA encoder/head weights have separate RMS histories saved in the
+checkpoint. Model-EMA tracking costs an additional chunked, no-gradient reference
+encoder/head pass per step; it adds no diffusion rollout. Validation/inference
+freeze the selected history. Logs expose `projection_rms` scale lag/effective
+widths and validation `query_batch_dependence_first_query_l1` in both directions.
+EMA projection has detached denominator statistics, so its gradient differs from
+live-RMS projection; this is a controlled experiment, not a proven quality gain.
+See [design, scope, and comparison protocol](docs/analysis/stage1b_projection_rms_ema/review.md).
 
 Experiment D trains both encoders,
 residual matching heads, every added AdaLN/token-MLP conditioning adapter,
