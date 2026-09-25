@@ -374,6 +374,17 @@ def _z_statistics(z_values) -> dict[str, float | int]:
     }
 
 
+def _encoder_input_kwargs(branch, batch, *, device, model_dtype) -> dict[str, Any]:
+    """Route original images only to RGB E; x0_latent remains the flow target."""
+    if getattr(branch, "encoder_input_space", "latent") != "rgb":
+        return {}
+    if "encoder_image" not in batch:
+        raise ValueError("RGB Stage 1A requires original encoder_image in every batch.")
+    return {"encoder_image": batch["encoder_image"].to(
+        device=device, dtype=model_dtype, non_blocking=True,
+    )}
+
+
 def _evaluate_z_dependence(
     branch,
     transformer,
@@ -462,7 +473,9 @@ def _evaluate_z_dependence(
                     device=x0.device,
                     null_label=null_label,
                 )
-                z = branch.encode(x0)
+                z = branch.encode(x0, **_encoder_input_kwargs(
+                    branch, batch, device=device, model_dtype=model_dtype,
+                ))
                 z_values.append(z.detach().float().cpu())
 
                 correct_output = branch.predict_with_z(
@@ -553,6 +566,8 @@ def _evaluate_z_dependence(
     result = {
         "event": "validation",
         "step": int(step),
+        "encoder_input_space": str(getattr(branch, "encoder_input_space", "latent")),
+        "flow_target_space": "vae_latent",
         "use_ema": bool(use_ema and ema is not None),
         "num_samples": int(finalized["correct_z"]["count"]),
         "z_gain": shuffled_mse / max(correct_mse, 1.0e-12) - 1.0,
@@ -708,6 +723,19 @@ def train_pdae_domain(
     data_config_path = _resolve_config_path(config, root, "data_config")
     model_config_path = _resolve_config_path(config, root, "model_config")
     model_config = load_yaml_config(model_config_path)
+    encoder_config = _nested(config, "encoder")
+    encoder_input_space = str(encoder_config.get("input_space", "latent"))
+    if encoder_input_space not in {"latent", "rgb"}:
+        raise ValueError("encoder.input_space must be latent or rgb.")
+    use_original_images = encoder_input_space == "rgb"
+    if use_original_images:
+        image_size = encoder_config.get("image_size", model_config.get("resolution", 256))
+        data_image_size = load_yaml_config(data_config_path).get("image_size", 256)
+        if (isinstance(image_size, bool) or not isinstance(image_size, int)
+                or image_size <= 0 or image_size != data_image_size):
+            raise ValueError("RGB encoder.image_size must match the data config image_size used for latent caching.")
+        if bool(_nested(config, "refinement").get("enabled", False)):
+            raise ValueError("RGB Stage 1A currently supports flow-only training. The legacy latent refinement path requires a separate migration; disable refinement.enabled.")
     pretrained_config_path = (
         resolve_project_local_path(config["pretrained_config"], root, field_name="pretrained_config")
         if config.get("pretrained_config")
@@ -734,6 +762,7 @@ def train_pdae_domain(
         limit=int(limit) if limit is not None else None,
         validate_exists=not dry_run,
         random_horizontal_flip=random_horizontal_flip,
+        include_original_images=use_original_images,
     )
 
     batch_size = int(dataloader_config.get("batch_size", 16))
@@ -914,6 +943,7 @@ def train_pdae_domain(
             ),
             validate_exists=True,
             random_horizontal_flip=0.0,
+            include_original_images=use_original_images,
         )
         validation_loader = DataLoader(
             validation_dataset,
@@ -1083,6 +1113,7 @@ def train_pdae_domain(
                 x_t=target.x_t,
                 timestep=target.t,
                 class_labels=class_labels,
+                **_encoder_input_kwargs(branch, batch, device=device, model_dtype=model_dtype),
             )
             pred_delta_v = output.delta_sample
             base_v = output.base_sample

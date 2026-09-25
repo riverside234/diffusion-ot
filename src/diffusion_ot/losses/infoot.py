@@ -301,8 +301,11 @@ def infoot_mutual_information(
         a = default_a if a is None else a
         b = default_b if b is None else b
     joint, marginal_x, marginal_y = kernel_densities(coupling, kernel_x, kernel_y, a, b)
+    # Keep the density floor's derivative inclusive at equality across PyTorch
+    # versions. Using joint < eps also preserves NaNs instead of hiding them.
+    safe_joint = torch.where(joint < eps, eps, joint)
     log_ratio = (
-        joint.clamp_min(eps).log()
+        safe_joint.log()
         - marginal_x.clamp_min(eps).log()[:, None]
         - marginal_y.clamp_min(eps).log()[None, :]
     )
@@ -325,15 +328,18 @@ def infoot_plan_gradient(
         a = default_a if a is None else a
         b = default_b if b is None else b
     joint, marginal_x, marginal_y = kernel_densities(coupling, kernel_x, kernel_y, a, b)
-    safe_joint = joint.clamp_min(eps)
+    safe_joint = torch.where(joint < eps, eps, joint)
     log_ratio = (
         safe_joint.log()
         - marginal_x.clamp_min(eps).log()[:, None]
         - marginal_y.clamp_min(eps).log()[None, :]
     )
-    joint_dependency = (
-        kernel_x @ (coupling / safe_joint) @ kernel_y.transpose(0, 1)
-    )
+    # Match the explicit density floor used by the MI objective: below the
+    # floor its logarithm is constant; equality uses the unfloored derivative.
+    weighted_dependency = (coupling / safe_joint) * (joint >= eps).to(coupling.dtype)
+    # The adjoint of Kx @ Gamma @ Ky.T is Kx.T @ gradient @ Ky. Gaussian
+    # self-kernels are symmetric, but the derivative is valid more generally.
+    joint_dependency = kernel_x.transpose(0, 1) @ weighted_dependency @ kernel_y
     return log_ratio + joint_dependency
 
 
@@ -396,6 +402,31 @@ def sinkhorn_transport_from_cost(
     tolerance: float = 1.0e-6,
 ) -> torch.Tensor:
     """Solve entropic OT from a cost matrix with log-domain Sinkhorn scaling."""
+    coupling, _ = _sinkhorn_transport_with_duals(
+        cost, a, b, regularization=regularization,
+        max_iterations=max_iterations, tolerance=tolerance,
+    )
+    return coupling
+
+
+@torch.no_grad()
+def _sinkhorn_transport_with_duals(
+    cost: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    regularization: float,
+    max_iterations: int,
+    tolerance: float,
+    initial_log_v: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the plan and log column scaling for bounded warm continuation.
+
+    Only log_v is needed: the next row update recomputes log_u from it. The
+    potentials initialize the current cost's solve, not an extra cost term or
+    a multiplicative plan update. This follows standard Sinkhorn warm starts
+    (e.g. POT's sinkhorn_log); marginals still have to meet the same tolerance.
+    """
     if cost.ndim != 2:
         raise ValueError("Sinkhorn cost must be a matrix.")
     n, m = cost.shape
@@ -414,7 +445,12 @@ def sinkhorn_transport_from_cost(
     log_a = a.log()
     log_b = b.log()
     log_u = torch.zeros_like(a)
-    log_v = torch.zeros_like(b)
+    if initial_log_v is None:
+        log_v = torch.zeros_like(b)
+    else:
+        if initial_log_v.shape != b.shape or not torch.isfinite(initial_log_v).all():
+            raise ValueError("Sinkhorn warm-start log_v must be finite and match the target marginal.")
+        log_v = initial_log_v.detach().to(b)
     coupling = torch.empty_like(cost)
     for iteration in range(max(int(max_iterations), 1)):
         log_u = log_a - torch.logsumexp(log_kernel + log_v[None, :], dim=1)
@@ -425,7 +461,7 @@ def sinkhorn_transport_from_cost(
             column_error = (coupling.sum(dim=0) - b).abs().max()
             if max(float(row_error), float(column_error)) <= tolerance:
                 break
-    return coupling
+    return coupling, log_v
 
 
 @torch.no_grad()
@@ -536,6 +572,8 @@ def solve_infoot(
     output_dtype = coupling.dtype
     output_a, output_b = a, b
     delta_tail: list[float] = []
+    recovery_log_v: torch.Tensor | None = None
+    recovery_warmstarts = 0
     outer_budget = max(int(inner_iterations), 0)
     for iteration in range(outer_budget + int(recovery_iterations)):
         if iteration == outer_budget:
@@ -561,14 +599,26 @@ def solve_infoot(
             coupling, kernel_x, kernel_y, a, b, eps=eps
         )
         previous_coupling = coupling
-        coupling = sinkhorn_transport_from_cost(
-            fixed_cost - float(mi_weight) * mi_gradient,
-            a,
-            b,
-            regularization=entropy_epsilon,
-            max_iterations=projection_iterations,
-            tolerance=effective_projection_tolerance,
-        )
+        subproblem_cost = fixed_cost - float(mi_weight) * mi_gradient
+        if recovery_steps:
+            # A cold, capped inner solve can repeat the same inaccurate plan
+            # forever: outer delta ~0 while stricter recovery marginals fail.
+            # Carry its dual scaling forward so each bounded recovery update
+            # advances Sinkhorn rather than discarding all prior inner work.
+            # Reuse is local to this solve; no state crosses batches/checkpoints.
+            recovery_warmstarts += int(recovery_log_v is not None)
+            coupling, recovery_log_v = _sinkhorn_transport_with_duals(
+                subproblem_cost, a, b, regularization=entropy_epsilon,
+                max_iterations=projection_iterations,
+                tolerance=effective_projection_tolerance,
+                initial_log_v=recovery_log_v,
+            )
+        else:
+            coupling = sinkhorn_transport_from_cost(
+                subproblem_cost, a, b, regularization=entropy_epsilon,
+                max_iterations=projection_iterations,
+                tolerance=effective_projection_tolerance,
+            )
         completed_iterations = iteration + 1
         residual = max(
             float((coupling.sum(1) - a).abs().max()),
@@ -617,10 +667,15 @@ def solve_infoot(
             f"recovery_updates={recovery_steps}/{recovery_iterations}, "
             f"solve_dtype={coupling.dtype}, effective_projection_tolerance={effective_projection_tolerance:.3g}, "
             f"last_inner_residual={residual if completed_iterations else max(row_residual, column_residual):.3g}, "
+            f"last_inner_converged={inner_converged if completed_iterations else False}, "
+            f"recovery_warmstarts={recovery_warmstarts}, "
             f"last_{len(delta_tail)}_delta_range=[{min(delta_tail, default=0.):.3g}, "
             f"{max(delta_tail, default=0.):.3g}]. "
-            "Review the residual trend and cost/MI/entropy scales. inner_iterations is the normal outer "
-            "budget; recovery_iterations enables bounded FP64 continuation with stricter Sinkhorn accuracy."
+            "Outer acceptance requires BOTH plan stability and inner marginal convergence at the effective "
+            "tolerance; sinkhorn_converged above uses the original output tolerance. "
+            "If last_inner_converged=False, the inner solve is limiting: review projection_iterations "
+            "and cost/MI/entropy scales. inner_iterations is the normal outer budget; recovery_iterations "
+            "enables bounded FP64 continuation with warm-started Sinkhorn scaling."
         )
     mi = infoot_mutual_information(coupling, kernel_x, kernel_y, a, b, eps=eps)
     entropy = coupling_entropy(coupling, eps=eps)

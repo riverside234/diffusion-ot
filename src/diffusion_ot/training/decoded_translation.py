@@ -46,6 +46,51 @@ def validate_flow_only_stage1a(config, stage1a_config, checkpoint=None):
         raise ValueError("Self-supervised Stage 1B cannot initialize from a refinement checkpoint.")
 
 
+def self_supervised_translation_options(image: dict[str, Any]) -> dict[str, Any]:
+    """Resolve mutually exclusive global-code and spatial PatchNCE experiments."""
+    objective = image.get("objective", "source_infonce")
+    if objective not in {"source_infonce", "patchnce"}:
+        raise ValueError("Self-supervised decoded objective must be source_infonce or patchnce.")
+    readout = image.get("source_contrastive_readout", "target")
+    if readout not in {"target", "source"}:
+        raise ValueError("Source contrastive readout must be target or source.")
+    if objective == "patchnce":
+        if float(image.get("source_contrastive_weight", 0)) != 0:
+            raise ValueError("PatchNCE replaces global source InfoNCE; set source_contrastive_weight: 0.")
+        patch = image.get("patchnce") or {}
+        if not isinstance(patch, dict) or set(patch) - {"weight", "temperature", "num_patches", "layers"}:
+            raise ValueError("patchnce accepts only weight, temperature, num_patches and layers.")
+        settings = {"weight": float(patch.get("weight", .15)),
+                    "temperature": float(patch.get("temperature", .2)),
+                    "num_patches": patch.get("num_patches", 64),
+                    "layers": patch.get("layers", [0, 1, 2])}
+        for name in ("weight", "temperature"):
+            if not math.isfinite(settings[name]) or settings[name] <= 0:
+                raise ValueError(f"decoded_translation.patchnce.{name} must be finite and positive.")
+        count, layers = settings["num_patches"], settings["layers"]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 2:
+            raise ValueError("PatchNCE num_patches must be an integer >= 2.")
+        if (not isinstance(layers, (list, tuple)) or not layers
+                or any(isinstance(i, bool) or not isinstance(i, int) or i < 0 for i in layers)
+                or len(set(layers)) != len(layers)):
+            raise ValueError("PatchNCE layers must be nonempty, distinct, nonnegative integer indices.")
+        settings["layers"] = list(layers)
+        return {"objective": objective, "name": "patchnce", "readout": readout, **settings}
+    if image.get("patchnce"):
+        raise ValueError("PatchNCE settings require decoded_translation.objective: patchnce.")
+    result = {"objective": objective, "name": "source_contrastive", "readout": readout}
+    for name, default in (("weight", .1), ("temperature", .2)):
+        value = float(image.get(f"source_contrastive_{name}", default))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"decoded_translation.source_contrastive_{name} must be finite and positive.")
+        result[name] = value
+    similarity = float(image.get("source_contrastive_negative_similarity_threshold", .95))
+    if not math.isfinite(similarity) or not -1 <= similarity <= 1:
+        raise ValueError("Source contrastive negative similarity threshold must be in [-1, 1].")
+    result["negative_similarity_threshold"] = similarity
+    return result
+
+
 def validate_decoder_config(config: dict[str, Any]) -> None:
     adapted = generator_adaptation_enabled(config)
     image = config.get("decoded_translation") or {}
@@ -53,6 +98,8 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
     if supervision not in {"external", "self_supervised"}:
         raise ValueError("decoded_translation.supervision must be external or self_supervised.")
     self_supervised = supervision == "self_supervised"
+    if not self_supervised and (image.get("objective") == "patchnce" or image.get("patchnce")):
+        raise ValueError("This PatchNCE experiment requires decoded_translation.supervision: self_supervised.")
     diffaugment_options(image.get("diffaugment"))
     color_histogram_options(image.get("color_histogram"))
     if image.get("discriminator_kind", "dino_feature") not in ("dino_feature", "rgb_patchgan"):
@@ -113,15 +160,7 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
             raise ValueError("Self-supervised translation disables color histogram supervision and diagnostics.")
         if (image.get("diffaugment") or {}).get("enabled", False):
             raise ValueError("Self-supervised translation has no adversarial DiffAugment path.")
-        for name, default in (("source_contrastive_weight", .1), ("source_contrastive_temperature", .2)):
-            value = float(image.get(name, default))
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"decoded_translation.{name} must be finite and positive.")
-        similarity = float(image.get("source_contrastive_negative_similarity_threshold", .95))
-        if not math.isfinite(similarity) or not -1 <= similarity <= 1:
-            raise ValueError("Source contrastive negative similarity threshold must be in [-1, 1].")
-        if image.get("source_contrastive_readout", "target") not in {"target", "source"}:
-            raise ValueError("Source contrastive readout must be target or source.")
+        self_supervised_translation_options(image)
         diagnostics = config.get("self_supervised_diagnostics") or {}
         if not isinstance(diagnostics.get("enabled", False), bool):
             raise ValueError("self_supervised_diagnostics.enabled must be a boolean.")

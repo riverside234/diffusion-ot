@@ -219,6 +219,7 @@ __marimo__/
 
 /notes/
 /docs/
+/tmp/
 
 # Project-local generated data and model artifacts
 /artifacts/pretrained/SiT-B-2-256/

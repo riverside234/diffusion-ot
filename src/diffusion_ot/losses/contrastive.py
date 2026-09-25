@@ -1,9 +1,9 @@
 """Contrastive matching supervision and generated-image/code retrieval.
 
-This project extension maximizes student probability mass on structurally
-similar positives. It supplements the existing neighborhood/conditional KL;
-it does not replace the generative flow loss, truncate the InfoOT plan, or
-compare the coordinates of independently learned domain encoders.
+Teacher-selected matching losses maximize probability mass on structurally
+similar positives. The detached-key helper also serves image/code retrieval,
+including the self-supervised experiment's cross-domain encoder comparison.
+These objectives do not replace generative flow or truncate the InfoOT plan.
 """
 from __future__ import annotations
 
@@ -44,7 +44,13 @@ def detached_key_contrastive_loss(query, positive, bank, *, temperature=.2,
         positive_logits = (query * positive).sum(-1) / temperature
         negative_logits = (query @ bank.T / temperature).masked_fill(~allowed, -torch.inf)
         logits = torch.cat((positive_logits[:, None], negative_logits), dim=1)
-        per_row = torch.logsumexp(logits, dim=-1) - positive_logits
+        # The positive is column zero, as in RElbers/info-nce-pytorch's
+        # explicit-negative formulation. Cross-entropy shifts logits before
+        # reduction: subtracting a large positive logit from logsumexp can
+        # round a small but nonzero loss to zero in FP32.
+        per_row = F.cross_entropy(
+            logits, torch.zeros(len(query), dtype=torch.long, device=query.device), reduction="none",
+        )
         loss = per_row[usable].mean() if usable.any() else query.sum() * 0
         metrics = {
             "loss": float(loss.detach()), "samples": len(query),

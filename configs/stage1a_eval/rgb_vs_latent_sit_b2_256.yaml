@@ -1,0 +1,58 @@
+stage: stage1a_eval
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+
+# Use this same evaluation config for the original latent-input main recipe and
+# the optional RGB-input recipe, with their respective training configs/checkpoints.
+# Both are scored against identical original RGB images, at the same seeds/scales.
+split: val
+weights: ema
+seed: 20260902
+
+dataset:
+  smoke_samples: 8
+  num_samples: 256
+  full_validation: false
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+
+sampling:
+  # Stage 1A learned dx/dt for x_t=(1-t)noise+t*x0, so integrate t=0 -> 1.
+  solver: euler
+  direction: noise_to_data
+  time_evaluation: midpoint
+  smoke_num_steps: 50
+  num_steps: 100
+  # Learned-null semantic CFG: G(null) + scale * (G(z) - G(null)).
+  guidance_scales: [0.0, 1.0, 1.5, 2.0]
+  variants: [correct_z, shuffled_z]
+  fixed_starting_noise: true
+  inferred_noise:
+    enabled: true
+    report_separately: true
+    num_steps: 100
+    guidance_scale: 1.0
+    variants: [correct_z]
+
+metrics:
+  image_reference: original_rgb
+  smoke: [latent_mse, pixel_mse, pixel_psnr]
+  full: [latent_mse, pixel_mse, psnr, ssim, lpips]
+
+latent_analysis:
+  statistics: true
+  nearest_neighbors:
+    enabled: true
+    k: 5
+    metric: cosine
+  interpolation:
+    enabled: true
+    pairs: 4
+    steps: 7
+    mode: linear
+    same_starting_noise: true
+
+output:
+  subdir: stage1a_rgb_comparison
+  save_individual_images: false
+  save_sample_records: true

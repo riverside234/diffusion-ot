@@ -24,6 +24,7 @@ class Stage1BLogFormatter:
         contrast = config.get("matching_contrastive") or {}
         self.decoder = bool(generator.get("enabled", False) and image.get("enabled", False))
         self.self_supervised = image.get("supervision", "external") == "self_supervised"
+        self.patchnce = self.self_supervised and image.get("objective", "source_infonce") == "patchnce"
         self.enabled = {
             **{f"{d}_reconstruction": _positive(weights, f"{d}_reconstruction", 1.) for d in ("cat", "dog")},
             "infoot_alignment": _positive(weights, "infoot_alignment", .02)
@@ -44,7 +45,9 @@ class Stage1BLogFormatter:
                for part, default in (("structure", .1), ("structure_contrastive", 0.),
                                      ("perceptual", 0.), ("adversarial", .01), ("code_consistency", 0.))},
             "color_histogram": self.decoder and _positive(image.get("color_histogram") or {}, "weight"),
-            "source_contrastive": self.decoder and self.self_supervised and _positive(image, "source_contrastive_weight", .1),
+            "source_contrastive": self.decoder and self.self_supervised and not self.patchnce
+                and _positive(image, "source_contrastive_weight", .1),
+            "patchnce": self.decoder and self.patchnce and _positive(image.get("patchnce") or {}, "weight", .15),
         }
         self.guard = bool((config.get("gradient_guard") or {}).get("enabled", False))
         self.stage1a_probes = any(self.enabled[k] for k in
@@ -141,6 +144,11 @@ class Stage1BLogFormatter:
                     "null_preservation", "conditioned_preservation", "matching_contrastive")
         unused = {"primary_objective", "auxiliary_objective", "infoot_restart", "code_routing",
                   "cat_fake_score", "cat_real_score", "dog_fake_score", "dog_real_score"}
+        if self.patchnce:
+            prefixes += ("source_contrastive",)
+            unused.add("source_negative_bank_ids")
+        else:
+            prefixes += ("patchnce",)
         for key in list(values):
             objective_key = key.removeprefix("weighted_").removeprefix("applied_")
             if objective_key.startswith(prefixes) or key in unused:

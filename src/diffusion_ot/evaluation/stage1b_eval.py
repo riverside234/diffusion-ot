@@ -132,6 +132,16 @@ def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
         return
     if current_mode != saved_mode:
         raise ValueError("Alignment config and checkpoint decoded supervision disagree.")
+    current_objective, saved_objective = (
+        image.get("objective", "source_infonce") for image in (current_image, saved_image))
+    if current_objective != saved_objective:
+        raise ValueError("Alignment config and checkpoint decoded objective disagree.")
+    if current_objective == "patchnce":
+        defaults = {"weight": .15, "temperature": .20, "num_patches": 64, "layers": [0, 1, 2]}
+        current_patch = {**defaults, **(current_image.get("patchnce") or {})}
+        saved_patch = {**defaults, **(saved_image.get("patchnce") or {})}
+        if current_patch != saved_patch:
+            raise ValueError("Alignment config and checkpoint PatchNCE protocol disagree.")
     if current_image.get("source_contrastive_readout", "target") != saved_image.get("source_contrastive_readout", "target"):
         raise ValueError("Alignment config and checkpoint source contrastive readout disagree.")
     for field, default in (("variant", "plain"), ("cross_cost_source", "dino")):
@@ -494,6 +504,23 @@ def _torch_dtype_from_model(model: Any) -> torch.dtype:
     return torch.float32
 
 
+def require_latent_stage1a_encoder(
+    stage_config: dict[str, Any], *, source: str, checkpoint: dict[str, Any] | None = None,
+) -> None:
+    """Keep the current latent-only Stage 1B pipeline paired with legacy encoders."""
+    encoder = stage_config.get("encoder") or {}
+    saved_input = ((checkpoint or {}).get("model") or {}).get("encoder_input") or {}
+    if (str(encoder.get("input_space", "latent")).lower() != "latent"
+            or int(encoder.get("input_channels", 4)) != 4
+            or str(saved_input.get("space", "latent")).lower() != "latent"):
+        raise ValueError(
+            f"Stage 1B currently requires a VAE-latent semantic encoder; {source} "
+            "configures an RGB or otherwise incompatible encoder. Use the matching "
+            "cat/dog_sit_b2_lora.yaml recipe with its original latent checkpoint. "
+            "RGB Stage 1A checkpoints require a separate Stage 1B input-pipeline migration."
+        )
+
+
 def _load_domain_context(
     alignment_config: dict[str, Any],
     root: Path,
@@ -516,6 +543,15 @@ def _load_domain_context(
         domain_config["config"], root, field_name=f"stage1a.{domain}.config"
     )
     train_config = load_yaml_config(train_config_path)
+    require_latent_stage1a_encoder(train_config, source=f"Stage 1A {domain} recipe")
+    stage1a_checkpoint_path = resolve_project_local_path(
+        domain_config["checkpoint"], root, field_name=f"stage1a.{domain}.checkpoint"
+    )
+    stage1a_checkpoint = _load_checkpoint(stage1a_checkpoint_path)
+    require_latent_stage1a_encoder(
+        stage1a_checkpoint.get("config") or {}, source=f"Stage 1A {domain} checkpoint",
+        checkpoint=stage1a_checkpoint,
+    )
     model_config_path = resolve_project_local_path(
         train_config["model_config"], root, field_name="model_config"
     )
@@ -544,10 +580,6 @@ def _load_domain_context(
     dtype = _torch_dtype_from_model(components.transformer)
     branch.to(device=device, dtype=dtype)
 
-    stage1a_checkpoint_path = resolve_project_local_path(
-        domain_config["checkpoint"], root, field_name=f"stage1a.{domain}.checkpoint"
-    )
-    stage1a_checkpoint = _load_checkpoint(stage1a_checkpoint_path)
     from diffusion_ot.training.decoded_translation import validate_flow_only_stage1a
     validate_flow_only_stage1a(alignment_config, train_config, stage1a_checkpoint)
     branch.load_pdae_state_dict(stage1a_checkpoint["model"])

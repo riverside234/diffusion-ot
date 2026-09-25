@@ -1,29 +1,41 @@
 # diffusion-ot
 
 Cat/Dog PDAE representations with InfoOT conditional projection and diffusion
-translation. The active Stage 1B experiment is **Experiment D**. It jointly
-adapts the semantic encoders, InfoOT matching heads, and the added conditioning
-components of each domain generator, then trains decoded conditional means with
-source-structure and target-realism losses.
+translation. **Original latent-input, flow-only LoRA remains the main Stage 1A
+experiment**, with its configs/checkpoints unchanged. A separate optional RGB
+encoder experiment supports a quality comparison. SiT diffusion still operates
+on VAE latents in both. Stage 1B includes self-supervised global InfoNCE/PatchNCE controls and
+the external-supervision **Experiment D**; each retains its explicitly selected
+earlier Stage 1A architecture/checkpoints pending a separate RGB migration.
 
 ## Active workflow
 
 The current pipeline has four stages:
 
-1. Train separate Cat and Dog PDAE branches with semantic CFG and rank-64 LoRA.
-2. Run Experiment D co-training with full InfoOT conditional means.
+1. Train separate Cat and Dog encoders/conditioning paths with semantic CFG,
+   rank-64 LoRA and latent flow loss only using the original latent-input main
+   recipe. The optional RGB experiment runs separately for comparison.
+2. Run the selected compatible Stage 1B experiment with full InfoOT conditional
+   means. Existing recipes remain on their earlier latent-input checkpoints.
 3. Evaluate held-out queries with the complete target projection bank.
 4. Export the selected encoders, matching heads, adapted generators, kernels,
    target codes, and fitted transport for downstream inference.
 
 The canonical configurations are:
 
-- Stage 1A Cat: `configs/stage1a_pdae/cat_sit_b2_lora.yaml`
-- Stage 1A Dog: `configs/stage1a_pdae/dog_sit_b2_lora.yaml`
+- Stage 1A Cat / Dog main latent-input recipe: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora.yaml`
+- Stage 1A Cat / Dog optional RGB comparison: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora_rgb.yaml`
+- Stage 1B self-supervised PatchNCE: `configs/stage1b_infoot/self_supervised_patchnce_sit_b2.yaml`
+- Stage 1B global InfoNCE control: `configs/stage1b_infoot/self_supervised_sit_b2.yaml`
 - Experiment D: `configs/stage1b_infoot/structure_decoder_sit_b2.yaml`
 - Experiment D evaluation: `configs/stage1b_eval/structure_decoder_sit_b2.yaml`
 
-Experiment D starts from the Stage 1A EMA checkpoints. It trains both encoders,
+The self-supervised controls use original flow-only EMA checkpoints with the
+unchanged `*_sit_b2_lora.yaml` configs. Experiment D uses its selected
+`*_sit_b2_dino.yaml` EMA checkpoints. Neither automatically loads the new RGB
+Stage 1A outputs; replacing checkpoint paths alone is insufficient.
+
+Experiment D trains both encoders,
 residual matching heads, every added AdaLN/token-MLP conditioning adapter,
 `z_proj`, the final adapter, and rank-64 attention LoRA. The pretrained SiT
 backbone, VAE, DINOv2 model, and learned null tokens stay frozen. Both Stage 1B
@@ -43,6 +55,8 @@ python3 -m pip install -r requirements.txt
 
 Prepare deterministic AFHQ manifests and cache VAE latents before Stage 1A.
 The exact data locations are defined in `configs/data/afhq_huggan.yaml`.
+Keep the original AFHQ source dataset available: RGB Stage 1A reads the original
+images by cached sample metadata, with the same crop/resize and paired flips.
 Experiment D also requires the frozen DINOv2 structural descriptor bank:
 
 ```bash
@@ -55,39 +69,68 @@ content fingerprint.
 
 ## Stage 1A
 
-Train Cat and Dog on separate GPUs:
+The original latent-input Stage 1A remains main. Its training commands, configs,
+checkpoint paths and evaluation config are unchanged:
+
+```bash
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_lora.yaml --device cuda:0
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_lora.yaml --device cuda:1
+```
+
+### Optional RGB encoder comparison
+
+Start fresh Cat and Dog RGB runs on separate GPUs (no old checkpoint resume):
 
 ```bash
 python3 scripts/train_pdae_domain.py \
-  --config configs/stage1a_pdae/cat_sit_b2_lora.yaml \
+  --config configs/stage1a_pdae/cat_sit_b2_lora_rgb.yaml \
   --device cuda:0
 
 python3 scripts/train_pdae_domain.py \
-  --config configs/stage1a_pdae/dog_sit_b2_lora.yaml \
+  --config configs/stage1a_pdae/dog_sit_b2_lora_rgb.yaml \
   --device cuda:1
 ```
 
-Both configs use all 12 SiT-B/2 blocks for AdaLN-Zero injection and attention
-LoRA, LoRA rank/alpha 64/64, semantic dropout 0.10, and 50,000 updates. Stage 1B
-requires checkpoints with learned null tokens and cannot load the older non-CFG
-format.
+Both configs use original RGB in [-1,1] as the semantic encoder input, six
+convolution stages ending at 4x4, and a 512-dimensional code. The diffusion
+target remains the cached four-channel VAE latent. They use all 12 SiT-B/2
+blocks for AdaLN-Zero/LoRA, rank/alpha 64/64, semantic dropout 0.10, 50,000
+updates and batch 64. Encoder/adapter learning rates are 1e-4 and LoRA is 2.5e-5.
+No DINO or refinement objective is enabled.
 
-### Same-domain Stage 1A refinement
+Outputs are `outputs/stage1a_cat_rgb_lora` and `outputs/stage1a_dog_rgb_lora`.
+Use `--resume latest` only to continue the corresponding new RGB run. Old
+latent-input checkpoints cannot initialize this changed encoder; their configs
+remain available unchanged as `*_sit_b2_lora.yaml`, with their original output
+directories and checkpoint paths.
 
-Continue an existing Stage 1A EMA model with real-data flow reconstruction,
-modest original-RGB DINO perceptual/structure supervision, and generator-only
-native-code InfoNCE:
+For a matched quality comparison, use
+`configs/stage1a_eval/rgb_vs_latent_sit_b2_256.yaml` for **both** original and RGB
+branches. It scores against original RGB and uses a separate comparison report
+directory. The existing `sit_b2_256.yaml` evaluation config stays unchanged.
+Match checkpoint steps, samples, noise, guidance and weight mode. The RGB encoder
+uses six conv stages versus the original three-stage latent encoder, so this is
+a recipe comparison rather than proof of the input representation alone.
+See the [RGB encoder protocol](docs/analysis/stage1a_rgb_encoder/review.md)
+for commands and comparison criteria.
+
+### Historical Stage 1A image-supervision alternatives
+
+The separate latent-input `*_refine.yaml` recipes retain the earlier
+flow + original-RGB DINO + native-code InfoNCE experiment:
 
 ```bash
 python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_refine.yaml --device cuda:0
 python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_refine.yaml --device cuda:1
 ```
 
-These recipes warm-start E/G weights and run 2,000 new updates with fresh
-optimizers/EMA history, saving to `outputs/stage1a_cat_refine` and
-`outputs/stage1a_dog_refine`. Use `--resume` to continue a refinement run.
+Their current configs start fresh for 40,000 updates at the lower historical
+learning rates, saving to `outputs/stage1a_{cat,dog}_native40k`.
+The `*_dino.yaml` alternatives retain flow + DINO with native-code InfoNCE off,
+original learning rates, and `outputs/stage1a_{cat,dog}_dino` outputs.
 They require the original AFHQ dataset and the pinned DINO structure cache.
-See [Stage 1A refinement](docs/stage1a_refinement.md) for loss routing,
+These are separate from the new RGB flow-only experiment. See
+[Stage 1A refinement](docs/stage1a_refinement.md) for loss routing,
 hyperparameters, validation grids, and checkpoint selection before Stage 1B.
 
 ## Experiment D co-training

@@ -1,9 +1,11 @@
-"""Own-encoder RGB translation retrieval, without DINO or a discriminator.
+"""Own-encoder RGB translation contrast, without DINO or a discriminator.
 
 For cat -> dog, the default live readout is the dog PDAE encoder. It retrieves
 the detached original cat code among current cat queries and references. This
 deliberately learns cross-domain coordinate agreement; it is not recovery of
 the projected dog condition and does not independently measure dog realism.
+The opt-in PatchNCE experiment instead matches corresponding spatial features
+from the same encoders using CUT's within-image negative construction.
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ from diffusion_ot.training.decoded_translation import (
     DecoderTraining,
     decode_training_images,
     integrate_training_flow,
+    self_supervised_translation_options,
 )
 from diffusion_ot.training.self_supervised_diagnostics import image_correspondence, native_rgb_reconstruction
 
@@ -91,9 +94,10 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         self.config, self.options, self.domains = config, config["decoded_translation"], domains
         if self.options.get("supervision") != "self_supervised":
             raise ValueError("Self-supervised decoder requires supervision: self_supervised.")
-        self.readout = self.options.get("source_contrastive_readout", "target")
-        if self.readout not in ("source", "target"):
-            raise ValueError("source_contrastive_readout must be source or target.")
+        self.contrastive_options = self_supervised_translation_options(self.options)
+        self.objective = self.contrastive_options["objective"]
+        self.objective_name = self.contrastive_options["name"]
+        self.readout = self.contrastive_options["readout"]
         for key in ("structure_weight", "perceptual_weight", "structure_contrastive_weight",
                     "adversarial_weight", "code_consistency_weight"):
             if float(self.options.get(key, 0)) != 0:
@@ -103,9 +107,22 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         for key in ("null_preservation_weight", "conditioned_preservation_weight"):
             if float(config["generator_adaptation"].get(key, 0)) != 0:
                 raise ValueError(f"Self-supervised decoder requires {key}: 0.")
-        self.weight = float(self.options.get("source_contrastive_weight", .1))
-        if not math.isfinite(self.weight) or self.weight <= 0:
-            raise ValueError("source_contrastive_weight must be finite and positive.")
+        self.weight = self.contrastive_options["weight"]
+        self.patch_options = None
+        if self.objective == "patchnce":
+            self.patch_options = {key: self.contrastive_options[key]
+                                  for key in ("weight", "temperature", "num_patches", "layers")}
+            widths = []
+            for context in domains.values():
+                encoder = context.branch.encoder
+                if not callable(getattr(encoder, "forward_spatial_features", None)):
+                    raise ValueError("PatchNCE requires a PDAE encoder exposing forward_spatial_features.")
+                channels = encoder.spatial_feature_channels
+                if any(index >= len(channels) for index in self.patch_options["layers"]):
+                    raise ValueError("PatchNCE layers exceed the PDAE encoder convolution stages.")
+                widths.append(tuple(channels[index] for index in self.patch_options["layers"]))
+            if any(width != widths[0] for width in widths):
+                raise ValueError("Cross-domain PatchNCE requires matching encoder feature channel widths.")
 
         self.views = {d: configure_generator_adaptation(v.branch) for d, v in domains.items()}
         self.parameters = [p for view in self.views.values() for p in view.parameters()]
@@ -126,6 +143,10 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                               warmup_steps=int(ema.get("warmup_steps", 500))) if ema.get("enabled", True) else None
         self.noise_generators = {d: torch.Generator(device=v.device).manual_seed(seed + 901 + i)
                                  for i, (d, v) in enumerate(domains.items())}
+        # Separate from diffusion noise and global RNG. Changing patch sampling
+        # must not change the initial noise used by the paired control rollout.
+        self.patch_generators = ({d: torch.Generator(device="cpu").manual_seed(seed + 1901 + i)
+                                  for i, d in enumerate(domains)} if self.patch_options else {})
         self.code_consistency_objective = torch.zeros((), device=domains["cat"].device)
         self.image_objectives = {}
         self.original_datasets = {}
@@ -159,6 +180,30 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
 
     def conditioned_preservation_loss(self, latents, baseline_codes):
         return torch.zeros((), device=self.domains["cat"].device)
+
+    def _patchnce_loss(self, source, readout, recovered_latents, original_latents, *, validation_seed):
+        from diffusion_ot.losses.patchnce import patchnce_loss
+
+        layers = self.patch_options["layers"]
+        def query_features(value):
+            return tuple(readout.branch.encoder.forward_spatial_features(value, layers))
+
+        values = recovered_latents.to(readout.device, dtype=readout.dtype)
+        features = (checkpoint(query_features, values, use_reentrant=False)
+                    if bool(self.options.get("checkpoint_features", True)) and torch.is_grad_enabled()
+                    else query_features(values))
+        source_context = self.domains[source]
+        with torch.no_grad():
+            keys = source_context.branch.encoder.forward_spatial_features(
+                original_latents.to(source_context.device, dtype=source_context.dtype), layers)
+        generator = (torch.Generator(device="cpu").manual_seed(validation_seed)
+                     if validation_seed is not None else self.patch_generators[source])
+        loss, metrics = patchnce_loss(features, keys, temperature=self.patch_options["temperature"],
+                                     num_patches=self.patch_options["num_patches"], generator=generator)
+        metrics.update(encoder_layers=layers, source_encoder_domain=source,
+                       key_input="original_cached_vae_latent",
+                       query_input="generated_rgb_vae_posterior_mean")
+        return loss, metrics
 
     def loss(self, weights, references, source_latents, real_latents, *, step, validation_seed=None,
              source_reference_structure=None, source_query_structure=None, source_query_metadata=None,
@@ -208,16 +253,21 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 readout.vae, images.to(readout.device),
                 checkpoint_encode=bool(self.options.get("checkpoint_encode", True)),
             )
-            recovered = readout.branch.encode(recovered_latents.to(readout.device, dtype=readout.dtype)).float()
-            source_bank = torch.cat((query_keys, references[source].detach().to(query_keys)), dim=0)
-            loss, retrieval = source_code_contrastive_loss(
-                recovered, query_keys[:count], source_bank,
-                temperature=float(self.options.get("source_contrastive_temperature", .2)),
-                negative_similarity_threshold=float(self.options.get("source_contrastive_negative_similarity_threshold", .95)),
-            )
+            if self.objective == "patchnce":
+                loss, retrieval = self._patchnce_loss(
+                    source, readout, recovered_latents, source_latents[source][:count],
+                    validation_seed=validation_seed + 20000 + offset if evaluation else None)
+            else:
+                recovered = readout.branch.encode(recovered_latents.to(readout.device, dtype=readout.dtype)).float()
+                source_bank = torch.cat((query_keys, references[source].detach().to(query_keys)), dim=0)
+                loss, retrieval = source_code_contrastive_loss(
+                    recovered, query_keys[:count], source_bank,
+                    temperature=self.contrastive_options["temperature"],
+                    negative_similarity_threshold=self.contrastive_options["negative_similarity_threshold"],
+                )
             losses.append(loss.to(device))
             metrics[direction] = {
-                "source_contrastive": retrieval, "source_contrastive_loss": float(loss.detach()),
+                self.objective_name: retrieval, f"{self.objective_name}_loss": float(loss.detach()),
                 "samples": count, "reference_targets": len(references[target]),
                 "readout_domain": readout_domain,
                 "readout": "generated_rgb_to_scaled_vae_posterior_mean_to_live_pdae_encoder",
@@ -255,15 +305,22 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         ramp = 1.0 if evaluation else self.ramp(step)
         weighted = self.weight * contrastive
         objective = ramp * weighted
-        self.image_objectives["source_contrastive"] = objective
+        self.image_objectives[self.objective_name] = objective
+        metrics.update({
+            f"{self.objective_name}_loss": float(contrastive.detach()),
+            f"{self.objective_name}_weight": self.weight,
+            f"{self.objective_name}_effective_weight": self.weight * ramp,
+            f"{self.objective_name}_readout": self.readout,
+            f"{self.objective_name}_gradient_routing":
+                "live_readout_encoder_and_translation_conditioning_and_generator; detached_source_keys",
+        })
         metrics.update(
-            supervision="self_supervised", source_contrastive_loss=float(contrastive.detach()),
-            source_contrastive_weight=self.weight, source_contrastive_effective_weight=self.weight * ramp,
-            source_contrastive_readout=self.readout,
-            source_contrastive_gradient_routing="live_readout_encoder_and_translation_conditioning_and_generator; detached_source_keys",
+            supervision="self_supervised", objective=self.objective,
             weighted_loss=float(weighted.detach()), effective_weighted_loss=float(objective.detach()),
             ramp=ramp, guidance_scale=float(self.options.get("guidance_scale", 1.0)), num_steps=steps,
-            interpretation="Own-encoder source retrieval; training objective, not independent target realism validation.",
+            interpretation=("Own-encoder spatial source correspondence; training objective, not independent target realism validation."
+                            if self.patch_options else
+                            "Own-encoder source retrieval; training objective, not independent target realism validation."),
         )
         if image_diagnostics:
             metrics["image_diagnostics_protocol"] = "original_rgb_pooled_correspondence_and_native_reconstruction_v1"
@@ -272,6 +329,10 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
     def checkpoint_state(self):
         return {
             "decoded_supervision": "self_supervised",
+            "decoded_objective": self.objective,
+            **({"decoded_patchnce_options": self.patch_options,
+                "decoded_patch_sampling_states": {d: gen.get_state().cpu() for d, gen in self.patch_generators.items()}}
+               if self.patch_options else {}),
             "decoded_source_contrastive_readout": self.readout,
             "generators": {d: self._cpu_copy(v.branch.generator_state_dict()) for d, v in self.domains.items()},
             "fixed_generators": self.fixed_generators,
@@ -283,8 +344,12 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
 
     def load_checkpoint(self, payload):
         if (payload.get("decoded_supervision") != "self_supervised"
+                or payload.get("decoded_objective", "source_infonce") != self.objective
                 or payload.get("decoded_source_contrastive_readout") != self.readout):
             raise ValueError("Cannot resume a different decoded supervision/readout; start a fresh Stage 1B run.")
+        if self.patch_options and (payload.get("decoded_patchnce_options") != self.patch_options
+                                  or set(payload.get("decoded_patch_sampling_states", {})) != set(self.patch_generators)):
+            raise ValueError("Cannot resume a different PatchNCE protocol or missing patch sampling state.")
         for domain, value in self.domains.items():
             load_joint_generator(value.branch, payload, domain, weights="raw")
         self.fixed_generators = payload["fixed_generators"]
@@ -299,3 +364,5 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             self.ema.load_state_dict(payload["generator_ema_state"], self.views)
         for d, gen in self.noise_generators.items():
             gen.set_state(payload["decoded_noise_states"][d].cpu())
+        for d, gen in self.patch_generators.items():
+            gen.set_state(payload["decoded_patch_sampling_states"][d].cpu())

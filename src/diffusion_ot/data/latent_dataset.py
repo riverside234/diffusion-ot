@@ -141,6 +141,7 @@ class CachedLatentDataset:
         validate_exists: bool = True,
         validate_shape: bool = True,
         random_horizontal_flip: float = 0.0,
+        include_original_images: bool = False,
     ) -> None:
         self.data_config_path = Path(data_config_path)
         self.domain = domain.lower()
@@ -152,6 +153,12 @@ class CachedLatentDataset:
         self.random_horizontal_flip = float(random_horizontal_flip)
         if not 0.0 <= self.random_horizontal_flip <= 1.0:
             raise ValueError("random_horizontal_flip must be between 0 and 1.")
+        self.include_original_images = bool(include_original_images)
+        self._original_image_loader = None
+        if self.include_original_images:
+            from diffusion_ot.data.ground_truth import OriginalImageLoader
+
+            self._original_image_loader = OriginalImageLoader(self.data_config_path, self.records)
 
         if validate_exists:
             missing = [record["latent_path"] for record in self.records if not Path(record["latent_path"]).exists()]
@@ -180,7 +187,7 @@ class CachedLatentDataset:
             if self.random_horizontal_flip >= 1.0 or torch.rand(()) < self.random_horizontal_flip:
                 latent = torch.flip(latent, dims=(-1,))
                 horizontal_flip = True
-        return {
+        item = {
             "x0_latent": latent,
             "sample_id": record.get("sample_id"),
             "domain": record.get("domain", self.domain),
@@ -189,12 +196,19 @@ class CachedLatentDataset:
             "metadata": record,
             "horizontal_flip": horizontal_flip,
         }
+        if self._original_image_loader is not None:
+            image = self._original_image_loader.load(record)
+            item["encoder_image"] = torch.flip(image, dims=(-1,)) if horizontal_flip else image
+        return item
 
 
 def collate_latent_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
     import torch
 
-    return {
+    has_images = ["encoder_image" in item for item in items]
+    if any(has_images) and not all(has_images):
+        raise ValueError("Cannot collate a mix of samples with and without encoder_image.")
+    batch = {
         "x0_latent": torch.stack([item["x0_latent"] for item in items], dim=0),
         "sample_id": [item["sample_id"] for item in items],
         "domain": [item["domain"] for item in items],
@@ -203,3 +217,6 @@ def collate_latent_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
         "metadata": [item["metadata"] for item in items],
         "horizontal_flip": [item.get("horizontal_flip", False) for item in items],
     }
+    if all(has_images):
+        batch["encoder_image"] = torch.stack([item["encoder_image"] for item in items], dim=0)
+    return batch

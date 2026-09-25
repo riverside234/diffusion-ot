@@ -124,7 +124,11 @@ class LearnedSemanticCondition(nn.Module):
 
 
 class PDAELatentEncoder(nn.Module):
-    """Small PDAE-style encoder: latent image -> stacked GN-SiLU-Conv -> linear z."""
+    """PDAE semantic encoder: image/latent -> GN-SiLU-Conv stages -> global z.
+
+    The historical class name is retained for checkpoint/import compatibility.
+    RGB recipes supply three channels and additional downsampling stages.
+    """
 
     def __init__(
         self,
@@ -134,19 +138,19 @@ class PDAELatentEncoder(nn.Module):
         spatial_size: int = 4,
         num_groups: int = 32,
         normalize_z: bool = True,
+        normalize_input: bool = True,
     ) -> None:
         super().__init__()
         blocks: list[nn.Module] = []
         in_channels = int(input_channels)
-        for out_channels in channels:
-            groups = _valid_group_count(in_channels, num_groups)
-            blocks.extend(
-                [
-                    nn.GroupNorm(groups, in_channels),
-                    nn.SiLU(),
-                    nn.Conv2d(in_channels, int(out_channels), kernel_size=3, stride=2, padding=1),
-                ]
-            )
+        for index, out_channels in enumerate(channels):
+            # RGB channels must reach the first convolution directly. Per-channel
+            # GroupNorm here would discard image color means before learning.
+            # Keep the historical latent stem unchanged for old checkpoints.
+            if index > 0 or normalize_input:
+                groups = _valid_group_count(in_channels, num_groups)
+                blocks.extend([nn.GroupNorm(groups, in_channels), nn.SiLU()])
+            blocks.append(nn.Conv2d(in_channels, int(out_channels), kernel_size=3, stride=2, padding=1))
             in_channels = int(out_channels)
 
         blocks.extend(
@@ -164,6 +168,37 @@ class PDAELatentEncoder(nn.Module):
         h = self.conv(x0_latent)
         z = self.proj(h.flatten(start_dim=1))
         return self.z_norm(z)
+
+    @property
+    def spatial_feature_channels(self) -> tuple[int, ...]:
+        """Channel widths after each strided convolution, before global projection."""
+        return tuple(module.out_channels for module in self.conv if isinstance(module, nn.Conv2d))
+
+    def forward_spatial_features(
+        self, x0_latent: torch.Tensor, layers: Iterable[int],
+    ) -> list[torch.Tensor]:
+        """Return selected zero-based convolution-stage maps for PatchNCE.
+
+        This reuses the native encoder's parameters without changing its code
+        forward pass or checkpoint layout. Layer 0 is the first strided conv;
+        maps are captured before the final pooling/flattening/linear projection.
+        """
+        layers = tuple(layers)
+        if (not layers or len(set(layers)) != len(layers)
+                or any(isinstance(i, bool) or not isinstance(i, int)
+                       or i < 0 or i >= len(self.spatial_feature_channels) for i in layers)):
+            raise ValueError("Spatial feature layers must be distinct valid convolution-stage indices.")
+        selected = {}
+        h, index = x0_latent, -1
+        for module in self.conv:
+            h = module(h)
+            if isinstance(module, nn.Conv2d):
+                index += 1
+                if index in layers:
+                    selected[index] = h
+                if index == max(layers):
+                    break
+        return [selected[index] for index in layers]
 
 
 class AdaLNZeroResidualAdapter(nn.Module):
@@ -540,10 +575,20 @@ class PDAESiTBranch(nn.Module):
         z_dim: int | None = None,
         semantic_cfg_enabled: bool = False,
         semantic_dropout_probability: float = 0.1,
+        encoder_input_space: str = "latent",
+        encoder_image_size: int | None = None,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.semantic_transformer = semantic_transformer
+        if encoder_input_space not in {"latent", "rgb"}:
+            raise ValueError("encoder.input_space must be latent or rgb.")
+        if encoder_image_size is not None and (isinstance(encoder_image_size, bool)
+                                               or not isinstance(encoder_image_size, int)
+                                               or encoder_image_size < 1):
+            raise ValueError("encoder.image_size must be a positive integer.")
+        self.encoder_input_space = encoder_input_space
+        self.encoder_image_size = encoder_image_size if encoder_input_space == "rgb" else None
         if semantic_cfg_enabled and z_dim is None:
             raise ValueError("z_dim is required when semantic CFG is enabled.")
         self.semantic_conditioner = (
@@ -559,7 +604,19 @@ class PDAESiTBranch(nn.Module):
     def semantic_cfg_enabled(self) -> bool:
         return self.semantic_conditioner is not None
 
-    def encode(self, x0_latent: torch.Tensor) -> torch.Tensor:
+    def encode(self, x0_latent: torch.Tensor, *, encoder_image: torch.Tensor | None = None) -> torch.Tensor:
+        if self.encoder_input_space == "rgb":
+            if encoder_image is None:
+                raise ValueError("RGB semantic encoder requires original encoder_image in [-1,1]; "
+                                 "cached VAE latents or VAE reconstructions are not an RGB input fallback.")
+            if (encoder_image.ndim != 4 or encoder_image.shape[0] != x0_latent.shape[0]
+                    or encoder_image.shape[1] != 3 or not encoder_image.is_floating_point()):
+                raise ValueError("encoder_image must be floating-point [batch,3,height,width] matching the latent batch.")
+            if self.encoder_image_size is not None and encoder_image.shape[2:] != (self.encoder_image_size,) * 2:
+                raise ValueError(f"RGB encoder expects {self.encoder_image_size}x{self.encoder_image_size} images.")
+            return self.encoder(encoder_image)
+        if encoder_image is not None:
+            raise ValueError("A latent semantic encoder does not accept encoder_image; check encoder.input_space.")
         return self.encoder(x0_latent)
 
     def semantic_null_like(self, z: torch.Tensor) -> torch.Tensor:
@@ -703,8 +760,9 @@ class PDAESiTBranch(nn.Module):
         force_drop_ids=None,
         semantic_drop_mask: torch.Tensor | None = None,
         return_dict: bool = True,
+        encoder_image: torch.Tensor | None = None,
     ):
-        z = self.encode(x0_latent)
+        z = self.encode(x0_latent, encoder_image=encoder_image)
         conditioned_z, drop_mask = self.condition_semantic_z(
             z,
             apply_dropout=self.training,
@@ -768,7 +826,8 @@ class PDAESiTBranch(nn.Module):
 
     def pdae_state_dict(self) -> dict[str, Any]:
         return {
-            "format_version": 3,
+            "format_version": 4,
+            "encoder_input": {"space": self.encoder_input_space, "image_size": self.encoder_image_size},
             "encoder": self.encoder.state_dict(),
             "generator": self.generator_state_dict(),
         }
@@ -778,6 +837,12 @@ class PDAESiTBranch(nn.Module):
         state_dict: dict[str, Any],
         strict: bool = True,
     ) -> None:
+        saved_input = state_dict.get("encoder_input") or {"space": "latent", "image_size": None}
+        expected_input = {"space": self.encoder_input_space, "image_size": self.encoder_image_size}
+        if saved_input != expected_input:
+            raise ValueError(f"Semantic encoder input mismatch: checkpoint {saved_input}, recipe {expected_input}. "
+                             "Start a fresh RGB Stage 1A run, or use the matching legacy latent recipe; "
+                             "latent and RGB encoder checkpoints cannot be resumed interchangeably.")
         self.encoder.load_state_dict(state_dict["encoder"], strict=strict)
         if "generator" in state_dict:
             self.load_generator_state_dict(state_dict["generator"], strict=strict)
@@ -800,13 +865,21 @@ def build_pdae_sit_branch(
     encoder_config = dict((stage_config or {}).get("encoder") or {})
     adapter_config = dict((stage_config or {}).get("adapter") or {})
     semantic_cfg_config = dict((stage_config or {}).get("semantic_cfg") or {})
+    input_space = str(encoder_config.get("input_space", "latent"))
+    if input_space not in {"latent", "rgb"}:
+        raise ValueError("encoder.input_space must be latent or rgb.")
+    image_size = encoder_config.get("image_size", int(_config_value(model_config, "resolution", 256)))
     z_dim = int(encoder_config.get("z_dim", 512))
     input_channels = int(
         encoder_config.get(
             "input_channels",
-            _config_value(model_config, "latent_channels", _module_config_value(transformer, "in_channels", 4)),
+            3 if input_space == "rgb" else _config_value(model_config, "latent_channels", _module_config_value(transformer, "in_channels", 4)),
         )
     )
+    expected_channels = 3 if input_space == "rgb" else int(_config_value(
+        model_config, "latent_channels", _module_config_value(transformer, "in_channels", 4)))
+    if input_channels != expected_channels:
+        raise ValueError(f"encoder.input_channels must be {expected_channels} for input_space={input_space}.")
 
     encoder = PDAELatentEncoder(
         input_channels=input_channels,
@@ -815,6 +888,7 @@ def build_pdae_sit_branch(
         spatial_size=int(encoder_config.get("spatial_size", 4)),
         num_groups=int(encoder_config.get("num_groups", 32)),
         normalize_z=bool(encoder_config.get("normalize_z", True)),
+        normalize_input=input_space != "rgb",
     )
     semantic_transformer = SemanticSiTWrapper(
         transformer=transformer,
@@ -845,6 +919,8 @@ def build_pdae_sit_branch(
         semantic_dropout_probability=float(
             semantic_cfg_config.get("dropout_probability", 0.1)
         ),
+        encoder_input_space=input_space,
+        encoder_image_size=image_size if input_space == "rgb" else None,
     )
 
 

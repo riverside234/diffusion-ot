@@ -19,6 +19,7 @@ pillow>=10.0
 PyYAML>=6.0
 tqdm>=4.66
 einops>=0.8
+packaging>=20.0  # Version check in the vendored official CUT PatchNCELoss.
 
 # Alignment / evaluation utilities planned for InfoOT experiments
 scipy>=1.13

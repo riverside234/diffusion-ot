@@ -2,8 +2,8 @@
 
 Direct cross-domain cosine cost assumes the two learned matching spaces can
 develop compatible coordinates. Independent Stage 1A encoders do not ensure
-this: the cost breaks the independent-plan symmetry but provides no semantic
-ground truth. Keep this experiment separate from frozen-teacher controls.
+this: the cost supplies a cross-domain geometric preference but provides no
+semantic ground truth. Keep this experiment separate from frozen-teacher controls.
 """
 from __future__ import annotations
 
@@ -41,9 +41,10 @@ def encoder_transport_cost(cat_matching: torch.Tensor, dog_matching: torch.Tenso
 
     Normalize each input row, then return 1 - cosine similarity in [0, 2].
     The normalization gives the cost a bounded scale, not semantic alignment.
-    A nonseparable cross cost avoids the stationary independent product plan
-    of pure MI initialized with independent marginals; it is not a guarantee
-    that the resulting assignments are meaningful.
+    A nonseparable cross cost can break independent-plan symmetry. Pure KDE
+    MI can also move away from independence on irregular banks; independence
+    is a fixed point in symmetric cases, not universally. Neither mechanism
+    guarantees that the resulting assignments are meaningful.
     """
     _validate_features(cat_matching, "cat_matching")
     _validate_features(dog_matching, "dog_matching")

@@ -41,6 +41,8 @@ class Stage1ASmokeReport:
     metrics: dict[str, dict[str, float]]
     grid_path: str
     extra_reports: dict[str, str]
+    encoder_input_space: str = "latent"
+    image_reference: str = "vae_reconstruction"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -69,6 +71,8 @@ class Stage1ARoundTripReport:
     metrics: dict[str, dict[str, float]]
     inferred_noise_stats: dict[str, float]
     grid_path: str
+    encoder_input_space: str = "latent"
+    image_reference: str = "vae_reconstruction"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -165,10 +169,16 @@ def _attention_lora_metadata(branch: Any) -> dict[str, Any]:
 
 
 def stage1a_architecture_metadata(branch: Any) -> dict[str, Any]:
-    return {
+    metadata = {
         "semantic_cfg_enabled": bool(getattr(branch, "semantic_cfg_enabled", False)),
         "attention_lora": _attention_lora_metadata(branch),
     }
+    # Stage 1B compares this dictionary with saved checkpoint provenance exactly.
+    # Preserve the legacy latent shape; absence of input-space metadata means latent.
+    if getattr(branch, "encoder_input_space", "latent") == "rgb":
+        metadata["encoder_input_space"] = "rgb"
+        metadata["encoder_image_size"] = getattr(branch, "encoder_image_size", None)
+    return metadata
 
 
 def validate_stage1a_architecture(
@@ -234,6 +244,7 @@ def _configured_guidance_scales(sampling: dict[str, Any]) -> list[float]:
 
 
 def _validate_eval_config(config: dict[str, Any]) -> None:
+    _evaluation_image_reference(None, config)
     sampling = _nested(config, "sampling")
     _configured_guidance_scales(sampling)
     if str(sampling.get("solver", "euler")) != "euler":
@@ -377,6 +388,10 @@ def load_stage1a_evaluator(
         project_root=root,
         validate_exists=True,
         random_horizontal_flip=0.0,
+        include_original_images=(
+            getattr(branch, "encoder_input_space", "latent") == "rgb"
+            or _evaluation_image_reference(branch, eval_config) == "original_rgb"
+        ),
     )
     return LoadedStage1AEvaluator(
         branch=branch,
@@ -506,6 +521,33 @@ def _collate(items: list[dict[str, Any]]) -> dict[str, Any]:
     from diffusion_ot.data.latent_dataset import collate_latent_batch
 
     return collate_latent_batch(items)
+
+
+def _evaluation_image_reference(branch: Any, config: dict[str, Any]) -> str:
+    reference = _nested(config, "metrics").get("image_reference")
+    if reference is None:
+        return "original_rgb" if getattr(branch, "encoder_input_space", "latent") == "rgb" else "vae_reconstruction"
+    if not isinstance(reference, str) or reference not in {"original_rgb", "vae_reconstruction"}:
+        raise ValueError("metrics.image_reference must be original_rgb or vae_reconstruction.")
+    return reference
+
+
+def _evaluation_encoder_image(
+    evaluator: LoadedStage1AEvaluator,
+    batch: dict[str, Any],
+) -> torch.Tensor | None:
+    """Load original RGB for conditioning or metrics, without a decoded fallback."""
+    if (getattr(evaluator.branch, "encoder_input_space", "latent") != "rgb"
+            and _evaluation_image_reference(evaluator.branch, evaluator.evaluation_config) != "original_rgb"):
+        return None
+    image = batch.get("encoder_image")
+    if not isinstance(image, torch.Tensor):
+        raise ValueError("Stage 1A original-RGB evaluation requires original encoder_image tensors.")
+    if image.ndim != 4 or image.shape[1] != 3:
+        raise ValueError("encoder_image must have shape [B, 3, H, W].")
+    if image.shape[0] != batch["x0_latent"].shape[0]:
+        raise ValueError("encoder_image and x0_latent must contain the same number of samples.")
+    return image.to(device=evaluator.device, dtype=torch.float32)
 
 
 def _noise_like(value: torch.Tensor, seed: int) -> torch.Tensor:
@@ -745,6 +787,7 @@ def _run_inferred_noise_roundtrip(
     seed: int,
     guidance_scale: float,
     null_label: int | None,
+    vae_reconstruction: torch.Tensor | None = None,
 ) -> Stage1ARoundTripReport:
     sampling_config = _nested(evaluator.evaluation_config, "sampling")
     inferred_config = _nested(sampling_config, "inferred_noise")
@@ -785,6 +828,13 @@ def _run_inferred_noise_roundtrip(
 
     row_order = ["original", *latent_outputs.keys()]
     rows = [original_images, *[decoded_outputs[name] for name in latent_outputs]]
+    if vae_reconstruction is not None:
+        row_order.insert(1, "vae_reconstruction")
+        rows.insert(1, vae_reconstruction)
+        vae_metrics = _mse_and_psnr(vae_reconstruction, original_images)
+        metrics["vae_reconstruction"] = {
+            "pixel_mse": vae_metrics["mse"], "pixel_psnr": vae_metrics["psnr"],
+        }
     output_dir = _roundtrip_output_dir(evaluator)
     grid_path = output_dir / "roundtrip_grid.png"
     _save_grid(grid_path, rows, samples_per_row=x0.shape[0])
@@ -811,6 +861,8 @@ def _run_inferred_noise_roundtrip(
         metrics=metrics,
         inferred_noise_stats=_inferred_noise_stats(inferred_noise),
         grid_path=str(grid_path),
+        encoder_input_space=str(getattr(evaluator.branch, "encoder_input_space", "latent")),
+        image_reference="original_rgb" if vae_reconstruction is not None else "vae_reconstruction",
     )
     _write_json(output_dir / "roundtrip_report.json", report.to_dict())
     return report
@@ -854,7 +906,14 @@ def run_stage1a_smoke_test(
         device=evaluator.device,
         dtype=evaluator.model_dtype,
     )
-    z = evaluator.branch.encode(x0)
+    encoder_image = _evaluation_encoder_image(evaluator, batch)
+    image_reference = _evaluation_image_reference(evaluator.branch, evaluator.evaluation_config)
+    uses_rgb_encoder = getattr(evaluator.branch, "encoder_input_space", "latent") == "rgb"
+    z = (
+        evaluator.branch.encode(x0, encoder_image=encoder_image.to(dtype=evaluator.model_dtype))
+        if uses_rgb_encoder
+        else evaluator.branch.encode(x0)
+    )
     starting_noise = _noise_like(x0, seed + 1)
 
     latent_outputs = reconstruct_cfg_sweep(
@@ -868,7 +927,11 @@ def run_stage1a_smoke_test(
         null_label=null_label,
     )
 
-    original_images = decode_vae_latents(evaluator.vae, x0)
+    vae_images = decode_vae_latents(evaluator.vae, x0)
+    original_images = (
+        ((encoder_image + 1.0) / 2.0).clamp(0.0, 1.0)
+        if image_reference == "original_rgb" else vae_images
+    )
     decoded_outputs = {
         name: decode_vae_latents(evaluator.vae, value)
         for name, value in latent_outputs.items()
@@ -882,6 +945,13 @@ def run_stage1a_smoke_test(
 
     row_order = ["original", *latent_outputs.keys()]
     rows = [original_images, *[decoded_outputs[name] for name in latent_outputs]]
+    if image_reference == "original_rgb":
+        row_order.insert(1, "vae_reconstruction")
+        rows.insert(1, vae_images)
+        vae_metrics = _mse_and_psnr(vae_images, original_images)
+        metrics["vae_reconstruction"] = {
+            "pixel_mse": vae_metrics["mse"], "pixel_psnr": vae_metrics["psnr"],
+        }
     output_dir = _smoke_output_dir(evaluator)
     grid_path = output_dir / "reconstruction_grid.png"
     _save_grid(grid_path, rows, samples_per_row=num_samples)
@@ -899,6 +969,7 @@ def run_stage1a_smoke_test(
             seed=seed,
             guidance_scale=roundtrip_guidance_scale,
             null_label=null_label,
+            vae_reconstruction=vae_images if image_reference == "original_rgb" else None,
         )
         extra_reports["inferred_noise_roundtrip"] = str(
             Path(roundtrip_report.output_dir) / "roundtrip_report.json"
@@ -925,6 +996,8 @@ def run_stage1a_smoke_test(
         metrics=metrics,
         grid_path=str(grid_path),
         extra_reports=extra_reports,
+        encoder_input_space=str(getattr(evaluator.branch, "encoder_input_space", "latent")),
+        image_reference=image_reference,
     )
     _write_json(output_dir / "smoke_report.json", report.to_dict())
     return report

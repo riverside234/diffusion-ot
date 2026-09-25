@@ -284,6 +284,7 @@ def _load_training_domain(
     )
     from diffusion_ot.integrations.sit_diffusers import load_sit_components, validate_transformer_config
     from diffusion_ot.models.pdae_sit import build_pdae_sit_branch
+    from diffusion_ot.evaluation.stage1b_eval import require_latent_stage1a_encoder
 
     stage1a_config = _nested(config, "stage1a")
     domain_config = _nested(stage1a_config, domain)
@@ -293,6 +294,14 @@ def _load_training_domain(
     train_config = load_yaml_config(train_config_path)
     if str(train_config.get("domain", "")).lower() != domain:
         raise ValueError(f"Stage 1A config for {domain} has a mismatched domain.")
+    require_latent_stage1a_encoder(train_config, source=f"Stage 1A {domain} recipe")
+    checkpoint_path = resolve_project_local_path(
+        domain_config["checkpoint"], root, field_name=f"stage1a.{domain}.checkpoint"
+    )
+    checkpoint = _load_checkpoint(checkpoint_path)
+    require_latent_stage1a_encoder(
+        checkpoint.get("config") or {}, source=f"Stage 1A {domain} checkpoint", checkpoint=checkpoint,
+    )
     model_config_path = resolve_project_local_path(
         train_config["model_config"], root, field_name=f"stage1a.{domain}.model_config"
     )
@@ -320,10 +329,6 @@ def _load_training_domain(
     branch = build_pdae_sit_branch(transformer, model_config=model_config, stage_config=train_config)
     dtype = _torch_dtype_from_model(transformer)
     branch.to(device=device, dtype=dtype)
-    checkpoint_path = resolve_project_local_path(
-        domain_config["checkpoint"], root, field_name=f"stage1a.{domain}.checkpoint"
-    )
-    checkpoint = _load_checkpoint(checkpoint_path)
     from diffusion_ot.training.decoded_translation import validate_flow_only_stage1a
     validate_flow_only_stage1a(config, train_config, checkpoint)
     branch.load_pdae_state_dict(checkpoint["model"])
@@ -846,9 +851,12 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
                 metrics["solver"]["health"] = solver_health(solution, solver_options)
                 for domain, native in metrics.get("native_reconstruction", {}).items():
                     native["query_ids"] = inputs[domain]["query_ids"][:native["samples"]]
-                metrics["source_negative_bank_ids"] = {
-                    d: data["query_ids"] + data["reference_ids"] for d, data in inputs.items()}
-                metrics["interpretation"] = "Own-encoder source retrieval after RGB decode/re-encode; a training signal, not independent target realism or semantic validation."
+                if decoder_training.options.get("objective", "source_infonce") == "patchnce":
+                    metrics["interpretation"] = "Own-encoder spatial PatchNCE after RGB decode/re-encode; same-location source correspondence is a training signal, not independent target realism or semantic validation."
+                else:
+                    metrics["source_negative_bank_ids"] = {
+                        d: data["query_ids"] + data["reference_ids"] for d, data in inputs.items()}
+                    metrics["interpretation"] = "Own-encoder source retrieval after RGB decode/re-encode; a training signal, not independent target realism or semantic validation."
             else:
                 metrics["interpretation"] = "Decoded DINO, source-palette and optional code-recovery metrics are training signals, not independent semantic validation. RGB-uv measures whole-image palette, not spatial markings or exposure. Discriminator scores are not calibrated across checkpoints or critic kinds."
             return metrics
@@ -1120,6 +1128,7 @@ def train_joint_infoot(
     head_parameters = [p for head in matching_heads.values() for p in head.parameters()]
     decoder_class = SelfSupervisedDecoderTraining if self_supervised else DecoderTraining
     decoder_training = decoder_class(config, domains, prior, root, seed=seed) if generator_adaptation_enabled(config) else None
+    self_translation_objective = getattr(decoder_training, "objective_name", "source_contrastive")
     generator_parameters = decoder_training.parameters if decoder_training is not None else []
     parameters = [parameter for encoder in encoders.values() for parameter in encoder.parameters()]
     conflict_monitor = GradientConflictMonitor()
@@ -1769,8 +1778,8 @@ def train_joint_infoot(
             **({"infoot_outer_delta_to_tolerance": health["outer_delta_to_tolerance"],
                 "infoot_marginal_residual_to_tolerance": health["marginal_residual_to_tolerance"],
                 "infoot_outer_total_budget_fraction": health["outer_total_budget_fraction"],
-                "source_contrastive_loss": decoded_metrics.get("source_contrastive_loss", 0.),
-                "source_contrastive_active": float(decoded_metrics["active"]),
+                f"{self_translation_objective}_loss": decoded_metrics.get(f"{self_translation_objective}_loss", 0.),
+                f"{self_translation_objective}_active": float(decoded_metrics["active"]),
                 "weighted_infoot_alignment_loss": float(beta * infoot_loss.detach())}
                if self_supervised else {}),
             "semantic_neighborhood_loss": float(neighborhood_loss.detach()),
@@ -1899,7 +1908,8 @@ def train_joint_infoot(
             metrics["window_mean"] = {}
             for key in loss_window[-1]:
                 values = [row[key] for row in loss_window if row[key] is not None
-                          and (key != "source_contrastive_loss" or row["source_contrastive_active"])]
+                          and (not self_supervised or key != f"{self_translation_objective}_loss"
+                               or row[f"{self_translation_objective}_active"])]
                 metrics["window_mean"][key] = sum(values) / len(values) if values else None
             metrics["window_updates"] = len(loss_window)
             if cross_cost is not None:

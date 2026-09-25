@@ -1,0 +1,192 @@
+# Controlled CUT PatchNCE replacement for the global source-code InfoNCE experiment.
+# Protocol: docs/analysis/stage1b_self_patchnce/review.md.
+# Start fresh from the SAME original flow-only Stage 1A checkpoints as the control.
+stage: stage1b_fused_infoot
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+output_dir: outputs/stage1b_self_patch
+
+stage1a:
+  # Original native-flow-only PDAE recipe; these are NOT the *_dino checkpoints.
+  weights: ema
+  require_semantic_cfg: true
+  require_attention_lora: true
+  require_attention_lora_rank: 64
+  require_attention_lora_alpha: 64
+  cat:
+    config: configs/stage1a_pdae/cat_sit_b2_lora.yaml
+    checkpoint: outputs/stage1a_cat_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+    device: cuda:0
+  dog:
+    config: configs/stage1a_pdae/dog_sit_b2_lora.yaml
+    checkpoint: outputs/stage1a_dog_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+    device: cuda:0
+
+data:
+  split: train
+  transport_batch_size: 256  # 224 references + 32 disjoint translation queries/domain.
+  reconstruction_batch_size: 32
+  random_horizontal_flip: 0.0
+  num_workers: 16
+  pin_memory: true
+  drop_last: true
+
+train:
+  max_steps: 5000
+  smoke_steps: 500
+  seed: 20260905
+  lr_encoder: 0.00002
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  log_every: 100
+  gradient_diagnostics_every: 200
+  gradient_conflicts: true
+  save_every: 500
+  resume_from: null
+  loss_window: 100
+  validation_every: 500
+  validation_samples: 32
+  keep_step_checkpoints: true
+
+ema:
+  enabled: true
+  decay: 0.995
+  warmup_steps: 500
+  update_every: 1
+
+loss_weights:
+  cat_reconstruction: 1.0
+  dog_reconstruction: 1.0
+  infoot_alignment: 0.20  # Effective neural -MI coefficient remains 0.02.
+  latent_anchor: 0.0
+  semantic_neighborhood: 0.0
+  conditional_structure: 0.0
+  projection_support: 0.0
+  alignment_warmup_steps: 1000
+
+matching:
+  normalize: l2
+  calibration_samples: 256
+  distance_scale: infoot_rms
+  distance_scale_gradient: full
+  bandwidth_multiplier: 0.55
+
+infoot:
+  variant: fused
+  # Own normalized matching-feature cosine cost, detached during the plan solve.
+  # Separate Stage 1A encoders do not guarantee shared semantic coordinates.
+  cross_cost_source: encoder
+  cross_cost_weight: 1.0
+  algorithm: official_projected_sinkhorn
+  mi_weight: 0.10
+  entropy_epsilon: 0.02
+  inner_iterations: 1200
+  recovery_iterations: 4800
+  projection_iterations: 10000
+  projection_tolerance: 0.00001
+  outer_tolerance: 0.00001
+  min_inner_iterations: 5
+  outer_patience: 3
+  strict_convergence: true
+  require_outer_convergence: true
+  initialization: independent_product
+  numerical_epsilon: 0.00000001
+
+trainable:
+  encoders: true
+  adapters: true
+  attention_lora: true
+  base_transformers: false
+
+quick_evaluation:
+  config: configs/stage1b_eval/self_supervised_patchnce_sit_b2.yaml
+  weights: ema
+
+# Readout/split settings are independent of the disabled DINO conditional teacher.
+conditional_projection:
+  enabled: true
+  query_samples_per_domain: 32
+  bandwidth_multiplier: 0.10
+  validation_reference_samples: 96
+  validation_query_samples: 32
+conditional_structure:
+  enabled: false
+
+pcgrad:
+  enabled: true
+  eps: 0.000000000001
+gradient_guard:
+  enabled: false
+decoded_encoder_balance:
+  enabled: false
+matching_contrastive:
+  enabled: false
+projection_support:
+  enabled: false
+
+matching_head:
+  enabled: true
+  kind: residual_mlp_v1
+  input_dim: 512
+  hidden_dim: 256
+  lr: 0.0002
+  grad_clip_norm: 1.0
+
+# Intrinsic anti-collapse penalties use only the model's reference features.
+matching_regularization:
+  enabled: true
+  std_target: 0.70
+  variance_weight: 0.05
+  covariance_weight: 0.01
+  eps: 0.0001
+
+generator_adaptation:
+  enabled: true
+  lr_adapter: 0.000005
+  lr_lora: 0.00000375
+  grad_clip_norm: 1.0
+  null_preservation_weight: 0.0
+  conditioned_preservation_weight: 0.0
+  conditioned_preservation_samples: 4
+
+decoded_translation:
+  enabled: true
+  supervision: self_supervised
+  objective: patchnce
+  batch_size: 32
+  num_steps: 20
+  validation_num_steps: 20
+  guidance_scale: 1.0
+  every_steps: 1
+  start_step: 0
+  warmup_steps: 2000
+  # Generated target RGB -> frozen VAE mean -> target PDAE spatial maps.
+  # Detached source maps come from the source PDAE encoder of cached input latents.
+  # CUT's no-MLP sampler: corresponding positions positive, other SAME-image
+  # positions negative. The duplicate-positive diagonal is masked as upstream.
+  source_contrastive_weight: 0.0
+  source_contrastive_readout: target
+  patchnce:
+    weight: 0.15
+    temperature: 0.20  # Preserve the control temperature; CUT's default is 0.07.
+    layers: [0, 1, 2]  # Strided conv outputs; normally 16x16, 8x8, 4x4 maps.
+    num_patches: 64    # Per layer/image, capped by spatial size: 64, 64, 16.
+  structure_weight: 0.0
+  perceptual_weight: 0.0
+  structure_contrastive_weight: 0.0
+  code_consistency_weight: 0.0
+  adversarial_weight: 0.0
+  color_histogram:
+    weight: 0.0
+  diffaugment:
+    enabled: false
+  save_validation_images: true
+  checkpoint_sampler: true
+  checkpoint_features: true
+
+# Validation-only diagnostics; no new loss or external feature model.
+# Adds one native rollout per domain on the same fixed query prefix.
+self_supervised_diagnostics:
+  enabled: true
+  image_samples: 32
+  pooled_size: 16
