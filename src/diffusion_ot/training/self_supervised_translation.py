@@ -54,11 +54,28 @@ def encode_generated_images(vae, images, *, checkpoint_encode=True):
 
 
 def source_code_contrastive_loss(recovered, positive, source_bank, *, temperature=.2,
-                                 negative_similarity_threshold=.95):
+                                 negative_similarity_threshold=.95,
+                                 query_projector=None, key_projector=None):
     """Contrast a live recovered code against detached original-source keys."""
+    if (query_projector is None) != (key_projector is None):
+        raise ValueError("Global InfoNCE requires both query and key projectors, or neither.")
+    query, keys, bank, negative_mask = recovered, positive, source_bank, None
+    if query_projector is not None:
+        query = query_projector(recovered)
+        # Detach AFTER projection too: this direction trains only the live
+        # readout head. The other head learns as query in the reverse direction.
+        with torch.no_grad(), torch.autocast(device_type=positive.device.type, enabled=False):
+            raw_positive, raw_bank = positive.detach().float(), source_bank.detach().to(positive).float()
+            negative_mask = ((F.normalize(raw_positive, dim=-1, eps=1e-6)
+                              @ F.normalize(raw_bank, dim=-1, eps=1e-6).T)
+                             < negative_similarity_threshold - 1e-6)
+            negative_mask &= (raw_positive.norm(dim=-1) > 1e-6)[:, None]
+            negative_mask &= (raw_bank.norm(dim=-1) > 1e-6)[None, :]
+            keys = key_projector(raw_positive)
+            bank = key_projector(raw_bank)
     loss, metrics = detached_key_contrastive_loss(
-        recovered, positive, source_bank, temperature=temperature,
-        negative_similarity_threshold=negative_similarity_threshold,
+        query, keys, bank, temperature=temperature,
+        negative_similarity_threshold=negative_similarity_threshold, negative_mask=negative_mask,
     )
     with torch.no_grad():
         target = positive.detach().to(recovered).float()
@@ -77,6 +94,17 @@ def source_code_contrastive_loss(recovered, positive, source_bank, *, temperatur
             negative_source="current_source_queries_and_disjoint_source_references",
             positive_target="detached_original_source_encoder_code",
         )
+        if query_projector is not None:
+            projected_keys = keys.to(query)
+            metrics.update(
+                comparison_space="global_mlp", projection_dim=query.shape[-1],
+                negative_filter_space="original_source_encoder_code",
+                code_geometry_space="raw_encoder_code",
+                positive_target="detached_mlp_of_original_source_encoder_code",
+                projected_matched_cosine=float(F.cosine_similarity(query, projected_keys, dim=-1).mean()),
+                projected_source_batch_variance=float(projected_keys.var(dim=0, unbiased=False).mean()),
+                projected_recovered_batch_variance=float(query.var(dim=0, unbiased=False).mean()),
+            )
     return loss, metrics
 
 
@@ -131,6 +159,15 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                                             device=v.device, seed=seed + 2901 + i)
                     for i, (d, v) in enumerate(domains.items())}
         self.patch_projector_parameters = [p for head in self.patch_projectors.values() for p in head.parameters()]
+        self.code_options = self.contrastive_options.get("projector")
+        self.code_projectors = {}
+        if self.code_options is not None:
+            from diffusion_ot.models.code_projector import CodeProjectionMLP
+            self.code_projectors = {
+                d: CodeProjectionMLP(v.branch.semantic_conditioner.z_dim,
+                                     self.code_options["projection_dim"], seed=seed + 2901 + i).to(v.device)
+                for i, (d, v) in enumerate(domains.items())}
+        self.code_projector_parameters = [p for head in self.code_projectors.values() for p in head.parameters()]
 
         self.views = {d: configure_generator_adaptation(v.branch) for d, v in domains.items()}
         self.parameters = [p for view in self.views.values() for p in view.parameters()]
@@ -152,6 +189,16 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         self.patch_projector_ema = (EncoderEMA(self.patch_projectors, decay=float(ema.get("decay", .995)),
                                                warmup_steps=int(ema.get("warmup_steps", 500)))
                                     if self.patch_projectors and self.ema is not None else None)
+        self.code_projector_ema = (EncoderEMA(self.code_projectors, decay=float(ema.get("decay", .995)),
+                                              warmup_steps=int(ema.get("warmup_steps", 500)))
+                                   if self.code_projectors and self.ema is not None else None)
+        self.projector_groups = {
+            name: {"heads": heads, "parameters": parameters, "options": options, "ema": tracker}
+            for name, heads, parameters, options, tracker in (
+                ("patch_projector", self.patch_projectors, self.patch_projector_parameters,
+                 self.patch_options, self.patch_projector_ema),
+                ("code_projector", self.code_projectors, self.code_projector_parameters,
+                 self.code_options, self.code_projector_ema)) if heads}
         self.noise_generators = {d: torch.Generator(device=v.device).manual_seed(seed + 901 + i)
                                  for i, (d, v) in enumerate(domains.items())}
         # Separate from diffusion noise and global RNG. Changing patch sampling
@@ -165,9 +212,9 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
 
     def parameter_groups(self):
         groups = super().parameter_groups()
-        if self.patch_projector_parameters:
-            groups.append({"params": self.patch_projector_parameters, "lr": self.patch_options["lr"],
-                           "name": "patch_projectors"})
+        for name, group in self.projector_groups.items():
+            groups.append({"params": group["parameters"], "lr": group["options"]["lr"],
+                           "name": f"{name}s"})
         return groups
 
     @torch.no_grad()
@@ -288,7 +335,12 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                     recovered, query_keys[:count], source_bank,
                     temperature=self.contrastive_options["temperature"],
                     negative_similarity_threshold=self.contrastive_options["negative_similarity_threshold"],
+                    query_projector=self.code_projectors.get(readout_domain),
+                    key_projector=self.code_projectors.get(source),
                 )
+                if self.code_projectors:
+                    retrieval.update(query_projector_domain=readout_domain, key_projector_domain=source,
+                                     key_projector_detached=True)
             losses.append(loss.to(device))
             metrics[direction] = {
                 self.objective_name: retrieval, f"{self.objective_name}_loss": float(loss.detach()),
@@ -337,7 +389,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             f"{self.objective_name}_readout": self.readout,
             f"{self.objective_name}_gradient_routing":
                 ("live_readout_encoder_and_translation_conditioning_and_generator_and_query_projector; detached_source_encoder_and_key_projector"
-                 if self.patch_projectors else
+                 if self.projector_groups else
                  "live_readout_encoder_and_translation_conditioning_and_generator; detached_source_keys"),
         })
         metrics.update(
@@ -363,6 +415,11 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 "patch_projector_ema": self.patch_projector_ema.export() if self.patch_projector_ema else None,
                 "patch_projector_ema_state": self.patch_projector_ema.state_dict() if self.patch_projector_ema else None}
                if self.patch_projectors else {}),
+            **({"decoded_code_projector_options": self.code_options,
+                "code_projectors": {d: self._cpu_copy(head.state_dict()) for d, head in self.code_projectors.items()},
+                "code_projector_ema": self.code_projector_ema.export() if self.code_projector_ema else None,
+                "code_projector_ema_state": self.code_projector_ema.state_dict() if self.code_projector_ema else None}
+               if self.code_projectors else {}),
             "decoded_source_contrastive_readout": self.readout,
             "generators": {d: self._cpu_copy(v.branch.generator_state_dict()) for d, v in self.domains.items()},
             "fixed_generators": self.fixed_generators,
@@ -377,6 +434,17 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 or payload.get("decoded_objective", "source_infonce") != self.objective
                 or payload.get("decoded_source_contrastive_readout") != self.readout):
             raise ValueError("Cannot resume a different decoded supervision/readout; start a fresh Stage 1B run.")
+        if payload.get("decoded_code_projector_options") != self.code_options:
+            raise ValueError("Cannot resume a different global InfoNCE projector protocol; start a fresh run.")
+        for domain, head in self.code_projectors.items():
+            state = (payload.get("code_projectors") or {}).get(domain)
+            if state is None:
+                raise ValueError(f"Resume checkpoint has no code_projectors.{domain}; start a fresh MLP run.")
+            head.load_state_dict(state, strict=True)
+        if self.code_projector_ema is not None:
+            if payload.get("code_projector_ema_state") is None:
+                raise ValueError("Resume checkpoint has no code projector EMA state.")
+            self.code_projector_ema.load_state_dict(payload["code_projector_ema_state"], self.code_projectors)
         # Legacy no-MLP checkpoints omit sampler; their effective default is sample.
         saved_patch = payload.get("decoded_patchnce_options")
         if saved_patch is not None:

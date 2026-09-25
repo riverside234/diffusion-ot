@@ -1207,8 +1207,7 @@ def train_joint_infoot(
     decoder_training = decoder_class(config, domains, prior, root, seed=seed) if generator_adaptation_enabled(config) else None
     self_translation_objective = getattr(decoder_training, "objective_name", "source_contrastive")
     generator_parameters = decoder_training.parameters if decoder_training is not None else []
-    patch_projectors = getattr(decoder_training, "patch_projectors", {})
-    patch_parameters = [p for head in patch_projectors.values() for p in head.parameters()]
+    projector_groups = getattr(decoder_training, "projector_groups", {})
     parameters = [parameter for encoder in encoders.values() for parameter in encoder.parameters()]
     conflict_monitor = GradientConflictMonitor()
     diagnostic_groups = {f"encoder.{d}": list(encoder.parameters()) for d, encoder in encoders.items()}
@@ -1781,9 +1780,9 @@ def train_joint_infoot(
                     gradient_diagnostics.update({f"weighted_matching_{name}_{group}_gradient_norm": norm
                                                  for group, norm in norms.items()})
             if decoder_training is not None and decoded_metrics["active"]:
-                if patch_parameters:
-                    gradient_diagnostics["weighted_decoded_patch_projector_gradient_norm"] = _autograd_norm(
-                        decoded_loss, patch_parameters)
+                for name, group in projector_groups.items():
+                    gradient_diagnostics[f"weighted_decoded_{name}_gradient_norm"] = _autograd_norm(
+                        decoded_loss, group["parameters"])
                 image_norms = ({group: conflict_norms["decoded"][f"{group}.all"]
                                 for group in ("encoder", "matching_head", "generator")} if conflict_norms else
                               _autograd_group_norms(decoded_loss, {
@@ -1833,12 +1832,12 @@ def train_joint_infoot(
             pcgrad_metrics = pcgrad_backward(
                 tasks, {"encoder": parameters, "matching_head": head_parameters,
                         "generator": generator_parameters,
-                        **({"patch_projector": patch_parameters} if patch_parameters else {})}, seed=seed, step=step,
+                        **{name: group["parameters"] for name, group in projector_groups.items()}}, seed=seed, step=step,
                 eps=pcgrad_config.eps, routed_gradients=routed)
         elif gradient_guard_enabled:
-            if patch_parameters:
-                patch_gradients = torch.autograd.grad(total, patch_parameters, retain_graph=True, allow_unused=True)
-                for parameter, gradient in zip(patch_parameters, patch_gradients):
+            for group in projector_groups.values():
+                projector_gradients = torch.autograd.grad(total, group["parameters"], retain_graph=True, allow_unused=True)
+                for parameter, gradient in zip(group["parameters"], projector_gradients):
                     parameter.grad = None if gradient is None else gradient.detach()
             if generator_parameters:
                 generator_gradients = torch.autograd.grad(total, generator_parameters, retain_graph=True, allow_unused=True)
@@ -1894,10 +1893,10 @@ def train_joint_infoot(
         generator_grad_norm = _clip_gradient_norm(
             generator_parameters, _nested(config, "generator_adaptation").get("grad_clip_norm", 1.0)
         ) if generator_parameters else 0.0
-        patch_grad_norm = (_clip_gradient_norm(patch_parameters, decoder_training.patch_options["grad_clip_norm"])
-                           if patch_parameters else 0.)
-        if not math.isfinite(patch_grad_norm):
-            raise FloatingPointError(f"Non-finite PatchNCE projector gradients at step {step}.")
+        projector_grad_norms = {name: _clip_gradient_norm(group["parameters"], group["options"]["grad_clip_norm"])
+                                for name, group in projector_groups.items()}
+        if not all(math.isfinite(value) for value in projector_grad_norms.values()):
+            raise FloatingPointError(f"Non-finite contrastive projector gradients at step {step}.")
         if not all(math.isfinite(v) for v in (total_grad_norm, generator_grad_norm)):
             raise FloatingPointError(f"Non-finite encoder/generator gradients at step {step}.")
         optimizer.step()
@@ -1907,8 +1906,9 @@ def train_joint_infoot(
                 matching_ema.update(matching_heads)
             if decoder_training is not None and decoder_training.ema is not None:
                 decoder_training.ema.update(decoder_training.views)
-            if patch_projectors and decoder_training.patch_projector_ema is not None:
-                decoder_training.patch_projector_ema.update(patch_projectors)
+            for group in projector_groups.values():
+                if group["ema"] is not None:
+                    group["ema"].update(group["heads"])
 
         elapsed = time.perf_counter() - started
         training_seconds += elapsed
@@ -2036,10 +2036,10 @@ def train_joint_infoot(
                 metrics["generator_gradient_norm_pre_clip"] = generator_grad_norm
                 metrics["generator_learning_rates"] = {g["name"]: g["lr"] for g in optimizer.param_groups
                                                        if g.get("name") in {"adapters", "lora"}}
-                if patch_parameters:
-                    metrics["patch_projector_gradient_norm_pre_clip"] = patch_grad_norm
-                    metrics["patch_projector_learning_rate"] = next(g["lr"] for g in optimizer.param_groups
-                                                                    if g.get("name") == "patch_projectors")
+                for name, norm in projector_grad_norms.items():
+                    metrics[f"{name}_gradient_norm_pre_clip"] = norm
+                    metrics[f"{name}_learning_rate"] = next(g["lr"] for g in optimizer.param_groups
+                                                            if g.get("name") == f"{name}s")
                 metrics["reconstruction_diagnostics"] = reconstruction_diagnostics
                 metrics["null_preservation_loss"] = float(null_preservation.detach())
                 metrics["conditioned_preservation_loss"] = float(conditioned_preservation.detach())

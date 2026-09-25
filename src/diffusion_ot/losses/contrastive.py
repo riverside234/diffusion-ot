@@ -15,13 +15,15 @@ import torch.nn.functional as F
 
 
 def detached_key_contrastive_loss(query, positive, bank, *, temperature=.2,
-                                 negative_similarity_threshold=.95):
+                                 negative_similarity_threshold=.95, negative_mask=None):
     """Single-positive InfoNCE with detached keys and similar-key masking.
 
     The bank can include the positive: its duplicate is masked. The mask is
     computed from keys only, so the query cannot evade negatives by moving.
     Rows without a valid positive and at least one distinct negative contribute
     no supervision. A zero loss with zero usable rows is not retrieval success.
+    An optional boolean mask selects negatives using unprojected keys, so a
+    learned projection head cannot remove negatives by contracting its outputs.
     """
     if (query.ndim != 2 or positive.shape != query.shape or bank.ndim != 2
             or bank.shape[1] != query.shape[1] or not len(query) or not query.shape[1]):
@@ -30,6 +32,9 @@ def detached_key_contrastive_loss(query, positive, bank, *, temperature=.2,
         raise ValueError("Contrastive temperature must be finite and positive.")
     if not math.isfinite(float(negative_similarity_threshold)) or not -1 <= negative_similarity_threshold <= 1:
         raise ValueError("Contrastive negative similarity threshold must be in [-1, 1].")
+    if negative_mask is not None and (negative_mask.shape != (len(query), len(bank))
+                                      or negative_mask.dtype != torch.bool):
+        raise ValueError("Contrastive negative_mask must be boolean [queries, bank].")
     with torch.autocast(device_type=query.device.type, enabled=False):
         query, positive, bank = query.float(), positive.detach().to(query.device).float(), bank.detach().to(query.device).float()
         if not all(torch.isfinite(value).all() for value in (query, positive, bank)):
@@ -38,7 +43,9 @@ def detached_key_contrastive_loss(query, positive, bank, *, temperature=.2,
         query = F.normalize(query, dim=-1, eps=1e-6)
         positive, bank = F.normalize(positive, dim=-1, eps=1e-6), F.normalize(bank, dim=-1, eps=1e-6)
         # The tolerance also masks exact copies when fp32 cosine rounds below 1.
-        allowed = ((positive @ bank.T) < negative_similarity_threshold - 1e-6) & valid_bank[None, :]
+        allowed = (((positive @ bank.T) < negative_similarity_threshold - 1e-6)
+                   if negative_mask is None else negative_mask.detach().to(query.device))
+        allowed = allowed & valid_bank[None, :]
         counts = allowed.sum(-1)
         usable = valid_positive & (counts > 0)
         positive_logits = (query * positive).sum(-1) / temperature

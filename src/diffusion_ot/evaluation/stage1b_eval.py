@@ -99,6 +99,7 @@ class DomainEvaluationContext:
     matching_head: Any | None = None
     projection_rms: Any | None = None
     patch_projector: Any | None = None
+    code_projector: Any | None = None
 
 
 @dataclass
@@ -153,6 +154,11 @@ def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
         saved_patch.pop("readout")
         if current_patch != saved_patch:
             raise ValueError("Alignment config and checkpoint PatchNCE protocol disagree.")
+    elif current_objective == "source_infonce":
+        from diffusion_ot.models.code_projector import code_projector_options
+        if (code_projector_options(current_image.get("source_contrastive_projector"))
+                != code_projector_options(saved_image.get("source_contrastive_projector"))):
+            raise ValueError("Alignment config and checkpoint global InfoNCE projector protocol disagree.")
     if current_image.get("source_contrastive_readout", "target") != saved_image.get("source_contrastive_readout", "target"):
         raise ValueError("Alignment config and checkpoint source contrastive readout disagree.")
     for field, default in (("variant", "plain"), ("cross_cost_source", "dino")):
@@ -662,6 +668,7 @@ def _load_domain_context(
     matching_head = None
     projection_rms = None
     patch_projector = None
+    code_projector = None
     if checkpoint_path is not None:
         if matching_head_spec(joint.get("config") or {}) != matching_head_spec(alignment_config):
             raise ValueError("Alignment config and checkpoint matching_head architectures disagree.")
@@ -674,6 +681,13 @@ def _load_domain_context(
             patch_projector = load_patch_projector(
                 branch.encoder, self_supervised_translation_options(image_options), joint, domain,
                 weights=joint_weights, device=device)
+        elif image_options.get("supervision") == "self_supervised":
+            from diffusion_ot.models.code_projector import code_projector_options, load_code_projector
+            options = code_projector_options(image_options.get("source_contrastive_projector"))
+            if options is not None:
+                code_projector = load_code_projector(
+                    branch.semantic_conditioner.z_dim, options, joint, domain,
+                    weights=joint_weights, device=device)
     branch.eval()
     components.vae.eval()
     return DomainEvaluationContext(
@@ -695,6 +709,7 @@ def _load_domain_context(
         matching_head=matching_head,
         projection_rms=projection_rms,
         patch_projector=patch_projector,
+        code_projector=code_projector,
     )
 
 

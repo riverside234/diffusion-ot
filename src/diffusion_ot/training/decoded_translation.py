@@ -55,6 +55,8 @@ def self_supervised_translation_options(image: dict[str, Any]) -> dict[str, Any]
     if readout not in {"target", "source"}:
         raise ValueError("Source contrastive readout must be target or source.")
     if objective == "patchnce":
+        if image.get("source_contrastive_projector") is not None:
+            raise ValueError("source_contrastive_projector requires objective: source_infonce.")
         if float(image.get("source_contrastive_weight", 0)) != 0:
             raise ValueError("PatchNCE replaces global source InfoNCE; set source_contrastive_weight: 0.")
         patch = image.get("patchnce") or {}
@@ -105,6 +107,10 @@ def self_supervised_translation_options(image: dict[str, Any]) -> dict[str, Any]
     if not math.isfinite(similarity) or not -1 <= similarity <= 1:
         raise ValueError("Source contrastive negative similarity threshold must be in [-1, 1].")
     result["negative_similarity_threshold"] = similarity
+    from diffusion_ot.models.code_projector import code_projector_options
+    projector = code_projector_options(image.get("source_contrastive_projector"))
+    if projector is not None:
+        result["projector"] = projector
     return result
 
 
@@ -115,6 +121,8 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
     if supervision not in {"external", "self_supervised"}:
         raise ValueError("decoded_translation.supervision must be external or self_supervised.")
     self_supervised = supervision == "self_supervised"
+    if not self_supervised and image.get("source_contrastive_projector") is not None:
+        raise ValueError("source_contrastive_projector requires supervision: self_supervised.")
     if not self_supervised and (image.get("objective") == "patchnce" or image.get("patchnce")):
         raise ValueError("This PatchNCE experiment requires decoded_translation.supervision: self_supervised.")
     diffaugment_options(image.get("diffaugment"))

@@ -30,6 +30,7 @@ The canonical configurations are:
 - Stage 1B PatchNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml`
 - Stage 1B **main**, learned PatchNCE samplers + reference-EMA RMS: `configs/stage1b_infoot/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml`
 - Stage 1B full neural InfoOT + relative transport experiment: `configs/stage1b_infoot/self_supervised_patchnce_mlp_full_sit_b2.yaml`
+- Stage 1B global MLP InfoNCE + full InfoOT, revised protection/rates: `configs/stage1b_infoot/self_supervised_infonce_full_sit_b2.yaml`
 - Stage 1B global InfoNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_rms_ema_sit_b2.yaml`
 - Experiment D: `configs/stage1b_infoot/structure_decoder_sit_b2.yaml`
 - Experiment D evaluation: `configs/stage1b_eval/structure_decoder_sit_b2.yaml`
@@ -104,6 +105,69 @@ resume it with the same config and `--resume latest`. Objective changes across
 resume are rejected. Paired evaluation uses
 `configs/stage1b_eval/self_supervised_patchnce_mlp_full_sit_b2.yaml`.
 See [full objective, gradients, and checks](docs/analysis/stage1b_full_infoot/review.md).
+
+### Global InfoNCE with full InfoOT and revised hyperparameters
+
+`self_supervised_infonce_full_sit_b2.yaml` replaces the full recipe's spatial
+PatchNCE with bidirectional global source-code InfoNCE. Each domain has a learned
+two-layer MLP (`512 -> 256 -> 256`, ReLU between layers), reusing the CUT sampler's
+MLP transform on global codes. The generated dog is read by the dog encoder and
+dog MLP, then contrasted against detached cat-MLP embeddings of the original cat
+query/reference codes; the reverse direction is symmetric. InfoNCE L2-normalizes
+these embeddings. This uses the existing RGB decode/re-encode path and
+target-domain readout. The global InfoOT matching heads are separate; spatial
+PatchNCE sampling is disabled.
+
+The weighted objective is:
+
+```text
+flow_cat + flow_dog
++ alignment_ramp * [0.20 * (cost - 0.10 * MI - 0.02 * entropy) + 0.01 * relative]
++ 0.10 * variance + 0.03 * covariance
++ 0.05 * translation_ramp * global_source_InfoNCE
+```
+
+The variance standard-deviation target is **0.80**. Encoder/matching-head LRs
+are **1e-5 / 5e-5**; adapter/LoRA LRs remain **5e-6 / 3.75e-6**. InfoNCE temperature
+is 0.20, with the existing 0.95 near-duplicate negative filter computed on raw
+source codes so a contracting MLP cannot filter away distinct negatives. MLP LR
+is **2e-4**, matching the PatchNCE sampler control, with gradient clipping at 1.0.
+Each MLP learns through the generated-image query branch; projected source keys
+are detached. The heads participate in PCGrad, optimizer state, EMA, and resume.
+Full InfoOT,
+relative weight 0.01, PCGrad, EMA RMS, original flow-only Stage 1A initializers,
+5,000 steps, batches and warmups match the full PatchNCE recipe. The paired
+evaluation also retains 512 fit references and all training projection targets.
+The fitted plan is detached; entropy has no neural gradient, and PCGrad projects
+the weighted task gradients before clipping and Adam.
+
+Start a fresh run:
+
+```bash
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_infonce_full_sit_b2.yaml
+```
+
+Output: `outputs/stage1b_nce_full`. Resume this experiment using the same config
+and `--resume latest`. Use the same fixed Stage 1A checkpoint files for a
+comparison; a prior PatchNCE or MI-only Stage 1B checkpoint is not a compatible
+resume. A raw-code InfoNCE checkpoint without these MLPs is also incompatible;
+start fresh when enabling the heads. Evaluate with:
+
+```bash
+python scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/self_supervised_infonce_full_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_infonce_full_sit_b2.yaml \
+  --checkpoint outputs/stage1b_nce_full/checkpoints/latest.pt --weights ema
+```
+
+Global InfoNCE loss/retrieval and original-RGB diagnostics are in training's
+`validation.jsonl`. Retrieval is measured after the MLP, while existing raw-code
+geometry metrics remain available. Standalone evaluation loads the matching
+raw/EMA MLP state and disables the PatchNCE metric. Because
+the requested experiment also changes protection and learning rates, comparison
+with the old PatchNCE recipe alone does not isolate the loss choice. Quality and
+artifact improvement still require a GPU run and matched image panels.
+See [experiment details](docs/analysis/stage1b_infonce_full/review.md).
 
 ### Reference-EMA RMS projection
 
