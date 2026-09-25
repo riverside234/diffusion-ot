@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import math
 from typing import Any
 
 
@@ -95,6 +96,12 @@ def pdae_flow_snr_weight_from_snr(
     gamma: float = 0.25,
     eps: float = 1.0e-8,
 ):
+    """PDAE's SNR curve, reused as a heuristic velocity-loss weight.
+
+    This alone does not convert PDAE's noise-prediction objective to velocity:
+    on x_t=t*x0+(1-t)*noise, squared noise error equals t**2 times squared
+    velocity error. The active flow recipe uses the curve as-is.
+    """
     one = snr.new_tensor(1.0)
     denom = one + snr
     clean_factor = (snr / denom).clamp_min(eps).pow(gamma)
@@ -165,6 +172,67 @@ def pdae_flow_snr_weight(
     if clamp_min is not None or clamp_max is not None:
         weight = weight.clamp(min=clamp_min, max=clamp_max)
     return weight
+
+
+def resolve_flow_loss_weighting(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve Stage 1A weighting without changing historical trainer defaults.
+
+    Uniform and CosMap are complete velocity objectives. Reject leftover SNR
+    options so a copied config cannot silently stack or rescale the new curve.
+    """
+    config = dict(config or {})
+    weight_type = str(config.pop("type", "pdae_flow_snr")).lower()
+    if weight_type not in {"pdae_flow_snr", "uniform", "cosmap"}:
+        raise ValueError(
+            f"Unsupported Stage 1A loss_weighting.type: {weight_type!r}. "
+            "Choose pdae_flow_snr, uniform, or cosmap."
+        )
+    if weight_type in {"uniform", "cosmap"}:
+        if config:
+            raise ValueError(
+                f"Stage 1A {weight_type} weighting accepts only 'type'; remove "
+                f"the SNR normalization/clamping options: {', '.join(sorted(config))}."
+            )
+        return {"type": weight_type}
+
+    defaults = {
+        "gamma": 0.1,
+        "normalize_mean_to": 1.0,
+        "normalization_mode": "fixed_uniform",
+        "normalization_samples": 65536,
+        "clamp_min": 0.001,
+        "clamp_max": None,
+    }
+    unknown = set(config) - set(defaults)
+    if unknown:
+        raise ValueError(f"Unknown Stage 1A loss_weighting options: {', '.join(sorted(unknown))}.")
+    options = {**defaults, **config}
+    options["gamma"] = float(options["gamma"])
+    options["normalization_samples"] = int(options["normalization_samples"])
+    options["normalization_mode"] = str(options["normalization_mode"]).lower()
+    for key in ("normalize_mean_to", "clamp_min", "clamp_max"):
+        if options[key] is not None:
+            options[key] = float(options[key])
+    return {"type": weight_type, **options}
+
+
+def flow_loss_weight(t, config: dict[str, Any] | None = None, *, direction: str = "noise_to_data"):
+    """Per-sample weights for direct linear-path velocity MSE and uniform time.
+
+    CosMap integrates to one on [0, 1] and ranges from 2/pi to 4/pi.
+    Neither new mode uses batch normalization, clamping, an SNR multiplier,
+    or an epsilon/clean-prediction conversion factor. No random draws occur.
+    """
+    import torch
+
+    options = resolve_flow_loss_weighting(config)
+    weight_type = options.pop("type")
+    alpha_t, sigma_t = linear_alpha_sigma(t, direction=direction)
+    if weight_type == "uniform":
+        return torch.ones_like(t)
+    if weight_type == "cosmap":
+        return 2.0 / (math.pi * (alpha_t.square() + sigma_t.square()))
+    return pdae_flow_snr_weight(t=t, direction=direction, **options)
 
 
 def weighted_mean_flat(value, weight=None):

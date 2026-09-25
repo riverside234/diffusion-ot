@@ -1,0 +1,90 @@
+# Learned domain-specific CUT MLP samplers; compare with the matching no-MLP control.
+# Reference-EMA RMS projection experiment; original recipe is the control.
+# Fitting / neural MI retain live reference RMS with full gradients.
+# Projection statistics use training references only; frozen in evaluation.
+projection_rms:
+  mode: reference_ema
+  decay: 0.99
+  eps: 1.0e-8
+
+# Matched evaluation for self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml.
+# Patch metrics use saved raw/EMA samplers on the generated evaluation images; no external feature model.
+stage: stage1b_eval_quick
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+output_dir: outputs/stage1b_eval_patch_mlp_rms
+seed: 20260906
+alignment_device: cuda:0
+
+data:
+  reference_split: train
+  projection_split: train
+  query_split: val
+  reference_samples_per_domain: 512
+  projection_samples_per_domain: all
+  query_samples_per_domain: 256
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+
+proxy_labels:
+  attributes: []
+
+matching:
+  normalize: l2
+  distance_scale: infoot_rms
+  bandwidth_multiplier: 0.55
+  projection_bandwidth_multiplier: 0.10
+
+infoot:
+  variant: fused
+  cross_cost_source: encoder
+  cross_cost_weight: 1.0
+  algorithm: official_projected_sinkhorn
+  mi_weight: 0.10
+  entropy_epsilon: 0.02
+  inner_iterations: 1200
+  recovery_iterations: 4800
+  projection_iterations: 10000
+  projection_tolerance: 0.00001
+  outer_tolerance: 0.00001
+  min_inner_iterations: 5
+  outer_patience: 3
+  strict_convergence: true
+  require_outer_convergence: true
+  initialization: independent_product
+  numerical_epsilon: 0.00000001
+
+projection:
+  directions: [cat_to_dog, dog_to_cat]
+
+reconstruction:
+  enabled: true
+  samples_per_domain: 32
+  num_steps: 20
+  guidance_scale: 1.0
+  # Actual original RGB targets; no learned LPIPS/DINO metric is loaded.
+  metrics: [latent_mse, pixel_mse, pixel_psnr]
+
+translation:
+  patchnce_metrics: true
+  enabled: true
+  decoded_structure_metrics: false
+  include_source: true
+  include_structure_teacher_mean: false
+  samples_per_direction: 16
+  num_steps: 20
+  guidance_scale: 1.0
+  readouts: [conditional_mean]
+  primary_readout: conditional_mean
+  temperature: 1.0
+
+comparison:
+  require_stage1a_baseline: false
+
+visualization:
+  enabled: true
+  method: umap
+  random_state: 20260906
+  n_jobs: 1
+  target_alpha: 0.30
+  projection_alpha: 0.90

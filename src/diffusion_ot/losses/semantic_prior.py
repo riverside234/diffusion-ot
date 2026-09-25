@@ -185,6 +185,9 @@ def _compatible_infoot_resume(saved: dict[str, Any], current: dict[str, Any]) ->
 
 
 def validate_prior_resume(saved_config: dict[str, Any], current_config: dict[str, Any]) -> None:
+    from diffusion_ot.losses.infoot_alignment import infoot_alignment_options
+    if infoot_alignment_options(saved_config) != infoot_alignment_options(current_config):
+        raise ValueError("Resume cannot change InfoOT neural objectives or relative weight; start a new run.")
     from diffusion_ot.losses.projection_rms import projection_rms_options
     if projection_rms_options(saved_config) != projection_rms_options(current_config):
         raise ValueError("Resume cannot change projection_rms; start a new run.")

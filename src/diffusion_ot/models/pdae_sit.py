@@ -9,6 +9,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from diffusion_ot.models.residual_encoder import PDAEResidualLatentEncoder
+
 
 def _as_list(value: Any, default: list[int] | None = None) -> list[int]:
     if value is None:
@@ -604,6 +606,10 @@ class PDAESiTBranch(nn.Module):
     def semantic_cfg_enabled(self) -> bool:
         return self.semantic_conditioner is not None
 
+    @property
+    def encoder_architecture(self) -> dict[str, Any]:
+        return getattr(self.encoder, "architecture_spec", {"kind": "plain_cnn_v1"})
+
     def encode(self, x0_latent: torch.Tensor, *, encoder_image: torch.Tensor | None = None) -> torch.Tensor:
         if self.encoder_input_space == "rgb":
             if encoder_image is None:
@@ -825,12 +831,16 @@ class PDAESiTBranch(nn.Module):
             self.semantic_conditioner.load_state_dict(conditioner_state, strict=strict)
 
     def pdae_state_dict(self) -> dict[str, Any]:
-        return {
+        state = {
             "format_version": 4,
             "encoder_input": {"space": self.encoder_input_space, "image_size": self.encoder_image_size},
             "encoder": self.encoder.state_dict(),
             "generator": self.generator_state_dict(),
         }
+        if self.encoder_architecture["kind"] != "plain_cnn_v1":
+            state["format_version"] = 5
+            state["encoder_architecture"] = self.encoder_architecture
+        return state
 
     def load_pdae_state_dict(
         self,
@@ -843,6 +853,14 @@ class PDAESiTBranch(nn.Module):
             raise ValueError(f"Semantic encoder input mismatch: checkpoint {saved_input}, recipe {expected_input}. "
                              "Start a fresh RGB Stage 1A run, or use the matching legacy latent recipe; "
                              "latent and RGB encoder checkpoints cannot be resumed interchangeably.")
+        saved_architecture = state_dict.get("encoder_architecture") or {"kind": "plain_cnn_v1"}
+        if (saved_architecture != self.encoder_architecture
+                or (state_dict.get("format_version", 0) >= 5 and "encoder_architecture" not in state_dict)):
+            raise ValueError(
+                f"Semantic encoder architecture mismatch: checkpoint {saved_architecture}, "
+                f"recipe {self.encoder_architecture}. Use its matching training config for "
+                "evaluation/resume; a changed encoder requires fresh Stage 1A training."
+            )
         self.encoder.load_state_dict(state_dict["encoder"], strict=strict)
         if "generator" in state_dict:
             self.load_generator_state_dict(state_dict["generator"], strict=strict)
@@ -881,15 +899,34 @@ def build_pdae_sit_branch(
     if input_channels != expected_channels:
         raise ValueError(f"encoder.input_channels must be {expected_channels} for input_space={input_space}.")
 
-    encoder = PDAELatentEncoder(
-        input_channels=input_channels,
-        z_dim=z_dim,
-        channels=encoder_config.get("channels") or [64, 128, 256],
-        spatial_size=int(encoder_config.get("spatial_size", 4)),
-        num_groups=int(encoder_config.get("num_groups", 32)),
-        normalize_z=bool(encoder_config.get("normalize_z", True)),
-        normalize_input=input_space != "rgb",
-    )
+    encoder_kind = str(encoder_config.get("kind", "plain_cnn_v1"))
+    if encoder_kind == "plain_cnn_v1":
+        encoder = PDAELatentEncoder(
+            input_channels=input_channels,
+            z_dim=z_dim,
+            channels=encoder_config.get("channels") or [64, 128, 256],
+            spatial_size=int(encoder_config.get("spatial_size", 4)),
+            num_groups=int(encoder_config.get("num_groups", 32)),
+            normalize_z=bool(encoder_config.get("normalize_z", True)),
+            normalize_input=input_space != "rgb",
+        )
+    elif encoder_kind == "residual_cnn_v1":
+        if input_space != "latent":
+            raise ValueError("encoder.kind residual_cnn_v1 currently requires input_space: latent.")
+        encoder = PDAEResidualLatentEncoder(
+            input_channels=input_channels, z_dim=z_dim,
+            input_size=encoder_config.get("input_size", 32),
+            channels=encoder_config.get("channels", [64, 128, 256, 256]),
+            blocks_per_stage=encoder_config.get("blocks_per_stage", [2, 2, 2, 2]),
+            spatial_size=encoder_config.get("spatial_size", 4),
+            num_groups=encoder_config.get("num_groups", 32),
+            normalize_z=encoder_config.get("normalize_z", True),
+            attention_resolutions=encoder_config.get("attention_resolutions", [16]),
+            attention_heads=encoder_config.get("attention_heads", 4),
+            dropout=encoder_config.get("dropout", 0.0),
+        )
+    else:
+        raise ValueError(f"Unsupported encoder.kind: {encoder_kind}")
     semantic_transformer = SemanticSiTWrapper(
         transformer=transformer,
         z_dim=z_dim,

@@ -33,6 +33,7 @@ def test_patchnce_evaluation_rejects_global_spatial_objective_mismatch(current_p
 @pytest.mark.parametrize("key,value", [
     ("weight", .3), ("temperature", .07), ("num_patches", 32),
     ("layers", [1, 2]), ("include_all_negatives_from_minibatch", True),
+    ("sampler", "mlp_sample"),
 ])
 def test_patchnce_evaluation_rejects_changed_protocol(key, value):
     config, saved = _config(), _config()

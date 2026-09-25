@@ -20,6 +20,7 @@ def options():
     ("num_patches", 3.5), ("layers", []), ("layers", [0, 0]),
     ("layers", [True]), ("layers", [-1]), ("layers", [0, "1"]),
     ("unknown_option", 1),
+    ("sampler", "typo"), ("projection_dim", 256), ("lr", .0002),
 ])
 def test_invalid_patch_options_are_rejected(field, value):
     image = options()
@@ -46,6 +47,27 @@ def test_objectives_are_mutually_exclusive_and_old_default_is_unchanged():
     assert self_supervised_translation_options({"source_contrastive_weight": .15}) == {
         "objective": "source_infonce", "name": "source_contrastive", "readout": "target",
         "weight": .15, "temperature": .2, "negative_similarity_threshold": .95}
+
+
+@pytest.mark.parametrize("field,value", [("projection_dim", 0), ("projection_dim", True),
+                                         ("projection_dim", 2.5), ("lr", 0),
+                                         ("lr", float("nan")), ("grad_clip_norm", -1)])
+def test_invalid_mlp_options_are_rejected(field, value):
+    image = options()
+    image["patchnce"].update(sampler="mlp_sample", **{field: value})
+    with pytest.raises(ValueError):
+        self_supervised_translation_options(image)
+
+
+def test_mlp_defaults_keep_loss_protocol_and_choose_cut_width():
+    image = options()
+    plain = self_supervised_translation_options(image)
+    assert plain["sampler"] == "sample"
+    image["patchnce"]["sampler"] = "mlp_sample"
+    mlp = self_supervised_translation_options(image)
+    assert mlp["projection_dim"] == 256 and mlp["lr"] == .0002 and mlp["grad_clip_norm"] == 1
+    for key in ("weight", "temperature", "layers", "num_patches"):
+        assert mlp[key] == plain[key]
 
 
 def test_spatial_features_match_convolution_stages_without_changing_native_encoder():

@@ -1,0 +1,74 @@
+stage: stage1a_eval
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+
+# Pair with configs/stage1a_pdae/{cat,dog}_sit_b2_lora_residual.yaml.
+# The same protocol also evaluates *_residual_uniform.yaml and
+# *_residual_cosmap.yaml. Pass the exact run's YAML as --train-config;
+# evaluation outputs are placed under that training run's output directory.
+# The checkpoint must match the complete encoder specification, including
+# attention heads and GN groups; image metrics use original RGB targets.
+# evaluate_pdae_domain.py currently runs only the smoke test and optional
+# inferred-noise round trip. num_samples/full_validation, metrics.full and
+# latent_analysis below describe the intended full protocol; the CLI does not
+# execute them. Read each report's actual num_samples and metrics.
+architecture:
+  require_encoder_kind: residual_cnn_v1
+  require_encoder_input_space: latent
+  require_semantic_cfg: true
+  require_attention_lora: true
+  require_attention_lora_rank: 64
+  require_attention_lora_alpha: 64
+
+split: val
+weights: ema
+seed: 20260902
+
+dataset:
+  smoke_samples: 8
+  num_samples: 256
+  full_validation: false
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+
+sampling:
+  # Stage 1A learned dx/dt for x_t=(1-t)noise+t*x0, so integrate t=0 -> 1.
+  solver: euler
+  direction: noise_to_data
+  time_evaluation: midpoint
+  # Euler evaluates midpoint TIMES at the current state; this is not RK2.
+  smoke_num_steps: 50
+  num_steps: 100
+  # Learned-null semantic CFG: G(null) + scale * (G(z) - G(null)).
+  guidance_scales: [0.0, 1.0, 1.5, 2.0]
+  variants: [correct_z, shuffled_z]
+  fixed_starting_noise: true
+  inferred_noise:
+    enabled: true
+    report_separately: true
+    num_steps: 100
+    guidance_scale: 1.0
+    variants: [correct_z]
+
+metrics:
+  image_reference: original_rgb
+  smoke: [latent_mse, pixel_mse, pixel_psnr]
+  full: [latent_mse, pixel_mse, psnr, ssim, lpips]
+
+latent_analysis:
+  statistics: true
+  nearest_neighbors:
+    enabled: true
+    k: 5
+    metric: cosine
+  interpolation:
+    enabled: true
+    pairs: 4
+    steps: 7
+    mode: linear
+    same_starting_noise: true
+
+output:
+  subdir: stage1a_rescnn_eval
+  save_individual_images: false
+  save_sample_records: true

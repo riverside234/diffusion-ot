@@ -98,6 +98,7 @@ class DomainEvaluationContext:
     stage1a_architecture: dict[str, Any]
     matching_head: Any | None = None
     projection_rms: Any | None = None
+    patch_projector: Any | None = None
 
 
 @dataclass
@@ -141,9 +142,15 @@ def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
     if current_objective != saved_objective:
         raise ValueError("Alignment config and checkpoint decoded objective disagree.")
     if current_objective == "patchnce":
-        defaults = {"weight": .15, "temperature": .20, "num_patches": 64, "layers": [0, 1, 2]}
-        current_patch = {**defaults, **(current_image.get("patchnce") or {})}
-        saved_patch = {**defaults, **(saved_image.get("patchnce") or {})}
+        from diffusion_ot.training.decoded_translation import self_supervised_translation_options
+        try:
+            current_patch, saved_patch = (self_supervised_translation_options(image)
+                                          for image in (current_image, saved_image))
+        except ValueError as error:
+            raise ValueError(f"Invalid PatchNCE protocol: {error}") from error
+        # The separate guard below describes readout mismatches explicitly.
+        current_patch.pop("readout")
+        saved_patch.pop("readout")
         if current_patch != saved_patch:
             raise ValueError("Alignment config and checkpoint PatchNCE protocol disagree.")
     if current_image.get("source_contrastive_readout", "target") != saved_image.get("source_contrastive_readout", "target"):
@@ -654,11 +661,19 @@ def _load_domain_context(
 
     matching_head = None
     projection_rms = None
+    patch_projector = None
     if checkpoint_path is not None:
         if matching_head_spec(joint.get("config") or {}) != matching_head_spec(alignment_config):
             raise ValueError("Alignment config and checkpoint matching_head architectures disagree.")
         matching_head = load_matching_head(joint, domain, weights=joint_weights, device=device)
         projection_rms = checkpoint_projection_rms(joint, alignment_config, weights=joint_weights)
+        image_options = alignment_config.get("decoded_translation") or {}
+        if image_options.get("supervision") == "self_supervised" and image_options.get("objective") == "patchnce":
+            from diffusion_ot.models.patch_sampler import load_patch_projector
+            from diffusion_ot.training.decoded_translation import self_supervised_translation_options
+            patch_projector = load_patch_projector(
+                branch.encoder, self_supervised_translation_options(image_options), joint, domain,
+                weights=joint_weights, device=device)
     branch.eval()
     components.vae.eval()
     return DomainEvaluationContext(
@@ -679,6 +694,7 @@ def _load_domain_context(
         stage1a_architecture=stage1a_architecture,
         matching_head=matching_head,
         projection_rms=projection_rms,
+        patch_projector=patch_projector,
     )
 
 
@@ -819,6 +835,7 @@ def _save_translation_grid(
     readouts: list[str] | None = None,
     include_source: bool = True,
     color_histogram: dict[str, Any] | None = None,
+    patchnce_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
@@ -866,6 +883,17 @@ def _save_translation_grid(
     decoded_metrics: dict[str, Any] = {}
     source_structure = None
     original_images = None
+    if patchnce_options is not None:
+        from diffusion_ot.losses.patchnce import patchnce_loss
+        from diffusion_ot.training.self_supervised_translation import encode_generated_images
+        readout = target if patchnce_options["readout"] == "target" else source
+        patch_keys = source.branch.encoder.forward_spatial_features(source_x0, patchnce_options["layers"])
+        if patchnce_options["sampler"] == "mlp_sample" and any(
+                getattr(context, "patch_projector", None) is None for context in (source, readout)):
+            raise ValueError("PatchNCE evaluation requires trained MLP checkpoint weights.")
+        decoded_metrics["patchnce_weights"] = source.weights
+        decoded_metrics["patchnce_query_ids"] = source_query.sample_ids[:count]
+        decoded_metrics["patchnce_seed"] = seed + 20000
     if color_histogram is not None:
         from diffusion_ot.data.ground_truth import load_ground_truth_images
         from diffusion_ot.losses.color_histogram import COLOR_PROTOCOL, color_histogram_options, histogan_color_distance
@@ -894,11 +922,22 @@ def _save_translation_grid(
         )
         decoded_images = decode_vae_latents(target.vae, latent).cpu()
         rows.append(decoded_images)
+        if patchnce_options is not None:
+            recovered = encode_generated_images(readout.vae, decoded_images.to(readout.device), checkpoint_encode=False)
+            query_maps = readout.branch.encoder.forward_spatial_features(
+                recovered.to(readout.device, dtype=readout.dtype), patchnce_options["layers"])
+            _, patch_metrics = patchnce_loss(
+                query_maps, patch_keys, temperature=patchnce_options["temperature"],
+                num_patches=patchnce_options["num_patches"],
+                generator=torch.Generator(device="cpu").manual_seed(seed + 20000),
+                query_projector=getattr(readout, "patch_projector", None),
+                key_projector=getattr(source, "patch_projector", None))
+            decoded_metrics.setdefault(row_name, {"samples": count})["patchnce"] = patch_metrics
         if image_features is not None:
             structure, _ = image_features(decoded_images.to(feature_device))
             per_image = 1 - torch.nn.functional.cosine_similarity(structure, source_structure, dim=-1)
-            decoded_metrics[row_name] = {"structure_loss": float(per_image.mean()),
-                                         "per_image_structure_loss": per_image.cpu().tolist(), "samples": count}
+            decoded_metrics.setdefault(row_name, {"samples": count}).update(
+                structure_loss=float(per_image.mean()), per_image_structure_loss=per_image.cpu().tolist())
         if original_images is not None:
             distances = histogan_color_distance(decoded_images, original_images, **color_parameters)
             decoded_metrics.setdefault(row_name, {"samples": count}).update(
@@ -1666,6 +1705,13 @@ def run_stage1b_evaluation(
                 readouts.append("structure_teacher_mean")
         include_source = bool(translation_config.get("include_source", True))
         image_features = None
+        patch_options = None
+        if translation_config.get("patchnce_metrics", False):
+            from diffusion_ot.training.decoded_translation import self_supervised_translation_options
+            image_options = alignment_config.get("decoded_translation") or {}
+            if image_options.get("supervision") != "self_supervised" or image_options.get("objective") != "patchnce":
+                raise ValueError("patchnce_metrics requires the self-supervised PatchNCE experiment.")
+            patch_options = self_supervised_translation_options(image_options)
         if translation_config.get("decoded_structure_metrics", False):
             if prior is None:
                 raise ValueError("Decoded structure evaluation requires a frozen semantic prior.")
@@ -1694,6 +1740,7 @@ def run_stage1b_evaluation(
                 **({"image_features": image_features} if image_features is not None else {}),
                 **({"color_histogram": translation_config["color_histogram"]}
                    if translation_config.get("color_histogram") is not None else {}),
+                **({"patchnce_options": patch_options} if patch_options is not None else {}),
             )
             if decoded_metrics:
                 projections[name]["decoded_image_diagnostics"] = decoded_metrics

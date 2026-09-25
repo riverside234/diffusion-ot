@@ -1,6 +1,7 @@
 """Reference-only running distance scales for conditional InfoOT projection.
 
-This is an opt-in projection experiment. Fitting and the neural MI objective
+This is the main self-supervised projection recipe; legacy controls remain
+available through their query_batch configuration. Fitting and the neural MI objective
 continue to use live reference RMS (including its full derivative). Running
 statistics are detached: no straight-through surrogate denominator gradients.
 """

@@ -237,17 +237,25 @@ def test_self_supervised_configs_match_and_link_original_flow_only_checkpoints()
 
 @pytest.mark.parametrize("rms_enabled", [False, True])
 @pytest.mark.parametrize("weights", ["raw", "ema"])
+@pytest.mark.parametrize("patch_mlp", [False, True])
 def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
-        own_encoder_run, monkeypatch, tmp_path, rms_enabled, weights):
+        own_encoder_run, monkeypatch, tmp_path, rms_enabled, weights, patch_mlp):
     import diffusion_ot.data.ground_truth as ground_truth
     import diffusion_ot.evaluation.stage1b_eval as evaluation
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec
     from diffusion_ot.models.generator_adaptation import load_joint_generator
     from diffusion_ot.losses.projection_rms import checkpoint_projection_rms
 
-    run, _, latest, _ = own_encoder_run
+    run, originals, latest, _ = own_encoder_run
+    if patch_mlp:
+        from diffusion_ot.models.pdae_sit import PDAELatentEncoder
+        for context in originals.values():
+            context.branch.encoder = PDAELatentEncoder(channels=(8,), z_dim=6, spatial_size=2, num_groups=2)
     def recipe(cfg):
         self_supervised_recipe(cfg)
+        if patch_mlp:
+            cfg["decoded_translation"].update(objective="patchnce", source_contrastive_weight=0.,
+                patchnce={"sampler": "mlp_sample", "projection_dim": 16, "num_patches": 8, "layers": [0]})
         if rms_enabled:
             cfg["projection_rms"] = {"mode": "reference_ema", "decay": .99, "eps": 1e-8}
     checkpoint, _ = run("self_eval_training", steps=1, modify=recipe)
@@ -263,6 +271,8 @@ def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
     eval_config["data"].update(reference_samples_per_domain=6, projection_samples_per_domain=8,
                                query_samples_per_domain=2, batch_size=4, num_workers=0)
     eval_config["translation"].update(samples_per_direction=2, num_steps=3)
+    if patch_mlp:
+        eval_config["translation"]["patchnce_metrics"] = True
     eval_config["reconstruction"].update(samples_per_domain=2, num_steps=3)
     eval_config["visualization"]["enabled"] = False
     eval_path = tmp_path / "self_evaluation.yaml"
@@ -299,6 +309,12 @@ def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
         value.matching_head = make_matching_head(matching_head_spec(config), device="cpu")
         value.matching_head.load_state_dict(checkpoint["matching_head_ema" if weights == "ema" else "matching_heads"][domain])
         value.projection_rms = checkpoint_projection_rms(checkpoint, config, weights=weights)
+        if patch_mlp:
+            from diffusion_ot.models.patch_sampler import load_patch_projector
+            from diffusion_ot.training.decoded_translation import self_supervised_translation_options
+            value.patch_projector = load_patch_projector(
+                value.branch.encoder, self_supervised_translation_options(config["decoded_translation"]),
+                checkpoint, domain, weights=weights, device="cpu")
         value.branch.eval()
         value.matching_head.eval()
         return value
@@ -328,6 +344,14 @@ def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
         assert Path(report.translation_grids[direction]).is_file()
         assert report.projections[direction]["projection_target_count"] == 8
         assert "structure_prior_diagnostics" not in report.projections[direction]
+        if patch_mlp:
+            metrics = report.projections[direction]["decoded_image_diagnostics"]
+            assert metrics["patchnce_weights"] == weights
+            scores = [item["patchnce"] for item in metrics.values() if isinstance(item, dict) and "patchnce" in item]
+            assert len(scores) == 1
+            assert scores[0]["projector"] == "domain_mlp"
+            assert scores[0]["loss"] > 0 and scores[0]["batch_size"] == 2
+            assert_finite_numbers(scores[0])
     assert (Path(report.output_dir) / "evaluation_report.json").is_file()
     if rms_enabled:
         rms = report.generation_protocol["projection_rms"]

@@ -1,5 +1,6 @@
 stage: stage4_final_eval
-output_dir: outputs/s4_eval
+output_dir: outputs/s4_rms
+require_projection_rms_mode: reference_ema
 evaluation_split: val
 source_samples_per_domain: all
 real_samples_per_domain: all
@@ -19,7 +20,9 @@ fid_device: cuda:0
 fid_batch_size: 32
 fid_cache_dir: outputs/fid_cache
 num_workers: 4
-# Projection bandwidth and frozen RMS calibration come from the Stage 2-3 bundle.
+# Projection bandwidth and frozen checkpoint EMA RMS come from the Stage 2-3 bundle.
+# --weights ema in Stage 2-3 selects model-EMA weights AND their own RMS history.
+# No re-estimation from full banks or held-out query batches during projection.
 # Entropy epsilon is inherited through that fitted coupling (active recipe: 0.02).
 # Refit Stage 2-3 to use 0.02; this config cannot change an existing bundle's entropy.
 # No Stage 4 refit or independent projection-bandwidth override.

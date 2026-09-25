@@ -1,7 +1,7 @@
 """Spatial source correspondence using CUT's official within-image PatchNCE.
 
-The loss itself is vendored unmodified. Sampling adapts the official no-MLP
-PatchSampleF to private Torch RNG and FP32; see third_party/cut/README.md.
+The loss itself is vendored unmodified. Sampling adapts official PatchSampleF
+with optional learned MLPs to private Torch RNG and FP32; see third_party/cut/README.md.
 PatchNCE is still an InfoNCE objective, now over locations within each image.
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ from diffusion_ot.third_party.cut.patchnce import PatchNCELoss
 
 CUT_COMMIT = "b3ac297708dfb6f7589d04662277e53c0d579c27"
 PATCHNCE_PROTOCOL = "cut_within_image_no_mlp_private_rng_v1"
+PATCHNCE_MLP_PROTOCOL = "cut_within_image_domain_mlp_private_rng_v1"
 
 
 def _normalize_patches(patches: torch.Tensor) -> torch.Tensor:
@@ -29,7 +30,8 @@ def _normalize_patches(patches: torch.Tensor) -> torch.Tensor:
 def _layer_metrics(query, key, query_raw, key_raw, per_patch, patch_ids, shape):
     batch, channels, height, width = shape
     count = len(patch_ids)
-    query, key = query.reshape(batch, count, channels), key.reshape(batch, count, channels)
+    embedding_dim = query.shape[-1]
+    query, key = query.reshape(batch, count, embedding_dim), key.reshape(batch, count, embedding_dim)
     similarities = torch.bmm(query, key.transpose(2, 1))
     matched = similarities.diagonal(dim1=1, dim2=2)
     best = similarities.max(-1, keepdim=True).values
@@ -41,6 +43,7 @@ def _layer_metrics(query, key, query_raw, key_raw, per_patch, patch_ids, shape):
     key_spread = (key - key.mean(1, keepdim=True)).square().sum(-1).mean(1)
     return {
         "feature_shape": [batch, channels, height, width],
+        "embedding_dim": embedding_dim,
         "patches_per_image": count,
         "patch_ids": patch_ids.detach().cpu().tolist(),
         "samples": batch * count,
@@ -68,14 +71,18 @@ def patchnce_loss(
     temperature: float = .2,
     num_patches: int = 64,
     generator: torch.Generator,
+    query_projector=None,
+    key_projector=None,
 ):
     """Return mean PatchNCE and JSON-safe diagnostics for paired BCHW maps.
 
     Query features must remain live; source keys are detached before transfer
     and sampling. The same random locations are selected for both maps and all
     images within each layer. Negatives are other locations of the same source
-    image only. No global code bank, key-similarity mask or trainable projector
-    is used. Layer means receive equal weight even when resolutions differ.
+    image only. Optional domain-specific MLPs transform sampled patches before
+    normalization, as in CUT/DCLGAN. The entire key path (including its MLP) is
+    detached; bidirectional training updates each MLP through its query path.
+    Layer means receive equal weight even when resolutions differ.
 
     The caller owns/checkpoints ``generator``. This function does not consume
     global RNG. A private CPU generator also avoids GPU randperm variability.
@@ -96,8 +103,15 @@ def patchnce_loss(
     if not isinstance(first, torch.Tensor) or first.ndim != 4:
         raise ValueError("PatchNCE requires BCHW tensors.")
     batch, device = first.shape[0], first.device
+    if (query_projector is None) != (key_projector is None):
+        raise ValueError("PatchNCE needs both query and key projectors, or neither.")
+    if query_projector is not None:
+        if (len(query_projector.channels) != len(query_features)
+                or len(key_projector.channels) != len(key_features)
+                or query_projector.projection_dim != key_projector.projection_dim):
+            raise ValueError("PatchNCE projectors must match the layers and output dimension.")
     # Validate before sampling so malformed inputs cannot advance private RNG.
-    for query, key in zip(query_features, key_features):
+    for layer, (query, key) in enumerate(zip(query_features, key_features)):
         if (not isinstance(query, torch.Tensor) or not isinstance(key, torch.Tensor)
                 or query.ndim != 4 or key.shape != query.shape
                 or min(query.shape) < 1 or query.shape[0] != batch
@@ -106,6 +120,11 @@ def patchnce_loss(
             raise ValueError("PatchNCE maps must have paired BCHW shapes, a common query batch/device and >= 2 locations.")
         if not bool(torch.isfinite(query).all()) or not bool(torch.isfinite(key).all()):
             raise FloatingPointError("Non-finite PatchNCE feature maps.")
+        if query_projector is not None:
+            for projector, feature in ((query_projector, query), (key_projector, key)):
+                if (projector.channels[layer] != feature.shape[1]
+                        or next(projector.parameters()).device != feature.device):
+                    raise ValueError("PatchNCE projector channels/device must match its encoder maps.")
 
     criterion = PatchNCELoss(SimpleNamespace(
         batch_size=batch, nce_T=float(temperature),
@@ -115,13 +134,22 @@ def patchnce_loss(
     with torch.autocast(device_type=device.type, enabled=False):
         for layer, (query_map, key_map) in enumerate(zip(query_features, key_features)):
             query_map = query_map.float()
-            key_map = key_map.detach().to(device=device, dtype=torch.float32)
+            key_map = key_map.detach().float()
             locations = query_map.shape[2] * query_map.shape[3]
             patch_ids = torch.randperm(locations, generator=generator, device=generator.device)[:min(num_patches, locations)]
             patch_ids = patch_ids.to(device=device)
             # The original sampler uses BCHW -> B(HW)C -> (BP)C in this order.
             query_raw = query_map.permute(0, 2, 3, 1).flatten(1, 2)[:, patch_ids].flatten(0, 1)
-            key_raw = key_map.permute(0, 2, 3, 1).flatten(1, 2)[:, patch_ids].flatten(0, 1)
+            key_raw = key_map.permute(0, 2, 3, 1).flatten(1, 2)[:, patch_ids.to(key_map.device)].flatten(0, 1)
+            if query_projector is not None:
+                query_raw = query_projector(query_raw, layer)
+                # Keep the key MLP on the source encoder's device. Detaching
+                # only its input would incorrectly train the key-side MLP.
+                with torch.no_grad():
+                    key_raw = key_projector(key_raw, layer)
+            key_raw = key_raw.detach().to(device)
+            if not torch.isfinite(query_raw).all() or not torch.isfinite(key_raw).all():
+                raise FloatingPointError("Non-finite PatchNCE sampled embeddings.")
             query, key = _normalize_patches(query_raw), _normalize_patches(key_raw)
             per_patch = criterion(query, key)
             losses.append(per_patch.mean())
@@ -136,7 +164,7 @@ def patchnce_loss(
         "key_spatial_variance", "query_collapsed_image_fraction", "key_collapsed_image_fraction",
     )
     metrics = {
-        "protocol": PATCHNCE_PROTOCOL,
+        "protocol": PATCHNCE_MLP_PROTOCOL if query_projector is not None else PATCHNCE_PROTOCOL,
         "upstream_commit": CUT_COMMIT,
         "loss": float(loss.detach()),
         "temperature": float(temperature),
@@ -145,10 +173,13 @@ def patchnce_loss(
         "num_layers": len(layer_metrics),
         "samples": sum(item["samples"] for item in layer_metrics),
         "negative_scope": "within_source_image",
-        "projector": "none",
+        "projector": "domain_mlp" if query_projector is not None else "none",
         "keys_detached": True,
         "layers": layer_metrics,
-        "interpretation": "Same-location retrieval in own encoder maps; not an independent image-quality or target-realism metric. Collapsed maps receive chance-level tie credit.",
+        "interpretation": (
+            "Same-location retrieval in learned patch-projection space; not independent image quality or target realism. Spread is measured after the MLP; collapsed embeddings receive chance-level tie credit."
+            if query_projector is not None else
+            "Same-location retrieval in own encoder maps; not an independent image-quality or target-realism metric. Collapsed maps receive chance-level tie credit."),
     }
     metrics.update({name: sum(item[name] for item in layer_metrics) / len(layer_metrics) for name in mean_fields})
     return loss, metrics

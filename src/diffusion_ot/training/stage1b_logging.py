@@ -22,13 +22,17 @@ class Stage1BLogFormatter:
         image = config.get("decoded_translation") or {}
         protection = config.get("matching_regularization") or {}
         contrast = config.get("matching_contrastive") or {}
+        infoot = config.get("infoot") or {}
+        self.full_infoot = infoot.get("feature_objective", "mi") == "full"
         self.decoder = bool(generator.get("enabled", False) and image.get("enabled", False))
         self.self_supervised = image.get("supervision", "external") == "self_supervised"
         self.patchnce = self.self_supervised and image.get("objective", "source_infonce") == "patchnce"
         self.enabled = {
             **{f"{d}_reconstruction": _positive(weights, f"{d}_reconstruction", 1.) for d in ("cat", "dog")},
             "infoot_alignment": _positive(weights, "infoot_alignment", .02)
-                and _positive(config.get("infoot") or {}, "mi_weight", 1.),
+                and (_positive(infoot, "mi_weight", 1.)
+                     or (self.full_infoot and _positive(infoot, "cross_cost_weight", 1.))),
+            "infoot_relative": _positive(weights, "infoot_relative"),
             "latent_anchor": _positive(weights, "latent_anchor", .01),
             "semantic_neighborhood": _positive(weights, "semantic_neighborhood"),
             "conditional_structure": bool((config.get("conditional_structure") or {}).get("enabled", False))
@@ -56,6 +60,7 @@ class Stage1BLogFormatter:
         fields = {
             "latent_anchor": ("cat_anchor_loss", "dog_anchor_loss", "latent_anchor_weight"),
             "infoot_alignment": ("infoot_feature_loss", "alignment_weight", "weighted_alignment_", "alignment_to_"),
+            "infoot_relative": ("infoot_relative_", "weighted_infoot_relative_"),
             "semantic_neighborhood": ("semantic_neighborhood", "weighted_neighborhood_"),
             "conditional_structure": ("conditional_structure", "weighted_conditional_structure_"),
             "projection_support": ("projection_support", "weighted_projection_support_"),
@@ -112,14 +117,14 @@ class Stage1BLogFormatter:
         e = self.enabled
         structure = e["structure"] or e["structure_contrastive"]
         components = {
-            "conditional": e["conditional_structure"], "infoot": e["infoot_alignment"],
+            "conditional": e["conditional_structure"], "infoot": e["infoot_alignment"] or e["infoot_relative"],
             "protection": e["matching_variance"] or e["matching_covariance"],
             "perceptual": e["perceptual"], "structure": structure,
             "dino": e["perceptual"] or structure, "adversarial": e["adversarial"],
             "color": e["color_histogram"], "code": e["code_consistency"],
             "decoded": self.decoder, "translation": self.decoder,
             "reconstruction": e["cat_reconstruction"] or e["dog_reconstruction"],
-            "matching": any(e[k] for k in ("infoot_alignment", "semantic_neighborhood", "conditional_structure",
+            "matching": any(e[k] for k in ("infoot_alignment", "infoot_relative", "semantic_neighborhood", "conditional_structure",
                 "projection_support", "matching_variance", "matching_covariance",
                 "matching_neighborhood_contrastive", "matching_conditional_contrastive")),
         }

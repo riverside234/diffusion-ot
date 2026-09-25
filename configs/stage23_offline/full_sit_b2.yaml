@@ -1,6 +1,9 @@
 stage: stage23_offline_alignment
-alignment_config: configs/stage1b_infoot/structure_decoder_sit_b2.yaml
-output_dir: outputs/s23_full
+alignment_config: configs/stage1b_infoot/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml
+output_dir: outputs/s23_rms
+# Require the checkpoint's saved reference RMS history, paired with --weights.
+# Full-bank fitting computes its own RMS; only projection uses the saved EMA.
+require_projection_rms_mode: reference_ema
 reference_split: train
 reference_samples_per_domain: all
 encoding_device: cuda:0

@@ -194,7 +194,8 @@ def test_model_fingerprints_exclude_mutable_loader_receipts(tmp_path):
     assert dependency_hashes(alignment, tmp_path) != original
 
 
-def test_toy_stage23_to_stage4_and_resume(monkeypatch, tmp_path):
+@pytest.mark.parametrize("rms_mode,weights", [("full_bank", "ema"), ("reference_ema", "raw"), ("reference_ema", "ema")])
+def test_toy_stage23_to_stage4_and_resume(monkeypatch, tmp_path, rms_mode, weights):
     """Exercise both orchestrators; replace expensive models/dataset/FID only."""
     import yaml
     import diffusion_ot.evaluation.offline_pipeline as pipeline
@@ -203,6 +204,9 @@ def test_toy_stage23_to_stage4_and_resume(monkeypatch, tmp_path):
     import diffusion_ot.data.afhq as afhq
     import diffusion_ot.data.ground_truth as ground_truth
     import diffusion_ot.losses.semantic_prior as prior_module
+    from diffusion_ot.losses.projection_rms import checkpoint_projection_rms
+    from diffusion_ot.models.patch_sampler import PatchSampleMLP, load_patch_projector
+    from diffusion_ot.training.decoded_translation import self_supervised_translation_options
 
     class Dataset:
         def __init__(self, domain, split):
@@ -227,31 +231,96 @@ def test_toy_stage23_to_stage4_and_resume(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "domain_data_path", lambda *a: data_path)
     monkeypatch.setattr(final, "domain_data_path", pipeline.domain_data_path)
     class Encoder(torch.nn.Module):
+        spatial_feature_channels = (3,)
         def forward(self, x):
             return x.mean((2, 3))
     loads = []
+    alignment = {"stage": "stage1b_fused_infoot"}
+    checkpoint = {"stage": "stage1b_fused_infoot", "format_version": 4, "step": 10, "config": alignment}
+    if rms_mode == "reference_ema":
+        alignment.update({"projection_rms": {"mode": "reference_ema", "decay": .99, "eps": 1e-8},
+                          "infoot": {"variant": "fused", "cross_cost_source": "encoder"},
+                          "decoded_translation": {"supervision": "self_supervised", "objective": "patchnce",
+                              "patchnce": {"sampler": "mlp_sample", "layers": [0], "projection_dim": 8}}})
+        checkpoint["projection_rms_state"] = {
+            family: {"version": 1, "decay": .99, "eps": 1e-8, "num_updates": 10,
+                     "variances": values, "batch_variances": values}
+            for family, values in (("raw", {"cat": .25, "dog": .36}), ("ema", {"cat": .49, "dog": .64}))}
+        for seed, key in enumerate(("patch_projectors", "patch_projector_ema")):
+            checkpoint[key] = {d: PatchSampleMLP((3,), 8, seed=seed).state_dict() for d in ("cat", "dog")}
+
     def context(*args, **kwargs):
         loads.append(args[2])
         branch = torch.nn.Module()
         branch.encoder = Encoder()
+        paired = read_torch(kwargs["checkpoint_path"])
+        tracker = checkpoint_projection_rms(paired, args[0], weights=kwargs["joint_weights"])
+        if rms_mode == "reference_ema":
+            assert tracker.state_dict() == checkpoint["projection_rms_state"][weights]
+            head = load_patch_projector(branch.encoder, self_supervised_translation_options(alignment["decoded_translation"]),
+                                        paired, args[2], weights=weights, device="cpu")
+            expected_head = checkpoint["patch_projector_ema" if weights == "ema" else "patch_projectors"][args[2]]
+            for key, value in head.state_dict().items():
+                torch.testing.assert_close(value, expected_head[key], atol=0, rtol=0)
         return SimpleNamespace(branch=branch, vae=torch.nn.Identity(), matching_head=None, device="cpu",
                                dtype=torch.float32, transformer=None, training_config={})
     monkeypatch.setattr(pipeline.legacy, "_load_domain_context", context)
     fake_prior = SimpleNamespace(fingerprint="prior", lookup=lambda ids, *a: torch.arange(len(ids)*3).view(-1, 3).float(),
                                  cost=lambda a, b: torch.cdist(a, b) / 100)
-    monkeypatch.setattr(prior_module, "load_semantic_prior", lambda *a: fake_prior)
-    torch.save({"stage": "stage1b_fused_infoot", "format_version": 4, "step": 10}, tmp_path / "joint.pt")
-    (tmp_path / "alignment.yaml").write_text("stage: stage1b_fused_infoot\n", encoding="utf-8")
+    def load_prior(*args):
+        assert rms_mode == "full_bank", "Self-supervised offline alignment must not load DINO"
+        return fake_prior
+    monkeypatch.setattr(prior_module, "load_semantic_prior", load_prior)
+    torch.save(checkpoint, tmp_path / "joint.pt")
+    (tmp_path / "alignment.yaml").write_text(yaml.safe_dump(alignment), encoding="utf-8")
     config = {"alignment_config": "alignment.yaml", "output_dir": "s23", "reference_split": "train",
               "reference_samples_per_domain": "all", "encoding_batch_size": 3, "solver_device": "cpu",
+              "require_projection_rms_mode": rms_mode,
               "projection_bandwidth": .1, "fit": {"mi_weight": 0., "block_size": 3, "outer_iterations": 10}}
     (tmp_path / "s23.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
-    result = pipeline.run_stage23(tmp_path / "s23.yaml", "joint.pt", root=tmp_path, device="cpu", max_new_iterations=2)
+    fit_scales_seen = []
+    original_fit = pipeline.fit_global
+    def checked_fit(x, y, cost, **kwargs):
+        scales = (reference_rms(x), reference_rms(y))
+        assert kwargs["scales"] == scales
+        fit_scales_seen.append(scales)
+        if rms_mode == "reference_ema":
+            from diffusion_ot.losses.encoder_transport import encoder_transport_cost
+            torch.testing.assert_close(cost, encoder_transport_cost(x, y))
+        return original_fit(x, y, cost, **kwargs)
+    monkeypatch.setattr(pipeline, "fit_global", checked_fit)
+    result = pipeline.run_stage23(tmp_path / "s23.yaml", "joint.pt", root=tmp_path, device="cpu", weights=weights, max_new_iterations=2)
     assert result["status"] == "preflight_complete" and not (tmp_path / "s23/bundle.json").exists()
-    result = pipeline.run_stage23(tmp_path / "s23.yaml", "joint.pt", root=tmp_path, device="cpu", resume=True)
+    result = pipeline.run_stage23(tmp_path / "s23.yaml", "joint.pt", root=tmp_path, device="cpu", weights=weights, resume=True)
     assert result["status"] == "complete"
     manifest, banks, plan = pipeline.load_bundle(tmp_path / "s23")
     assert plan.shape == (6, 6) and manifest["projection_bandwidth"] == .1
+    assert fit_scales_seen == [tuple(manifest["fit_scales"].values())] * 2
+    if rms_mode == "reference_ema":
+        assert manifest["projection_rms"]["weights"] == weights
+        assert manifest["projection_rms"]["num_updates"] == 10
+        assert manifest["projection_scales"] == {d: value ** .5 for d, value in checkpoint["projection_rms_state"][weights]["variances"].items()}
+        assert manifest["projection_scales"] != manifest["fit_scales"]
+        assert manifest["prior_fingerprint"] is None
+        exported = read_torch(tmp_path / "s23/models/paired_state.pt")
+        assert exported["projection_rms_state"] == checkpoint["projection_rms_state"]
+    else:
+        assert manifest["projection_scales"] == manifest["fit_scales"]
+
+    with monkeypatch.context() as scope:
+        scope.setattr(pipeline, "reference_rms", lambda features: reference_rms(features) * (1 + 1e-14))
+        pipeline.load_bundle(tmp_path / "s23")  # FP64 reduction roundoff across machines is harmless.
+        scope.setattr(pipeline, "reference_rms", lambda features: reference_rms(features) * 1.01)
+        with pytest.raises(ValueError, match="fit RMS"):
+            pipeline.load_bundle(tmp_path / "s23")
+
+    projection_calls = []
+    def checked_projection(*args, **kwargs):
+        direction = ("cat", "dog") if len(projection_calls) == 0 else ("dog", "cat")
+        assert (kwargs["source_scale"], kwargs["target_scale"]) == tuple(manifest["projection_scales"][d] for d in direction)
+        projection_calls.append(direction)
+        return project_full(*args, **kwargs)
+    monkeypatch.setattr(final, "project_full", checked_projection)
     monkeypatch.setattr(final, "metric_versions", lambda: {"test": "toy"})
     monkeypatch.setattr(afhq, "load_afhq_dataset", lambda *a: SimpleNamespace(_fingerprint="toy"))
     monkeypatch.setattr(ground_truth, "load_ground_truth_images", lambda path, records, **kw:
@@ -271,6 +340,7 @@ def test_toy_stage23_to_stage4_and_resume(monkeypatch, tmp_path):
             return 1.25
     monkeypatch.setattr(final, "CleanFID", FakeFID)
     config4 = {"output_dir": "s4", "evaluation_split": "val", "source_samples_per_domain": "all",
+               "require_projection_rms_mode": rms_mode,
                "real_samples_per_domain": "all", "metrics": ["fid", "source_ssim"], "seed": 1,
                "image_size": 16, "num_steps": 2, "guidance_scale": 1, "gallery_pairs_per_direction": 16,
                "encoding_batch_size": 3, "projection_batch_size": 4, "projection_target_block_size": 3,
@@ -278,6 +348,10 @@ def test_toy_stage23_to_stage4_and_resume(monkeypatch, tmp_path):
     (tmp_path / "s4.yaml").write_text(yaml.safe_dump(config4), encoding="utf-8")
     report = final.run_stage4(tmp_path / "s4.yaml", "s23", root=tmp_path, device="cpu")
     assert report["status"] == "complete" and sum(generation_calls) == 36
+    assert len(projection_calls) == 2
+    evaluation_protocol = json.loads((tmp_path / "s4/protocol.json").read_text())
+    assert evaluation_protocol["projection_rms"] == manifest["projection_rms"]
+    assert evaluation_protocol["projection_scales"] == manifest["projection_scales"]
     for direction in ["cat_to_dog", "dog_to_cat"]:
         assert report["metrics"][direction]["source_ssim"]["count"] == 18
         assert len(list((tmp_path / f"s4/galleries/{direction}").glob("*.png"))) == 49
@@ -291,6 +365,14 @@ def test_toy_stage23_to_stage4_and_resume(monkeypatch, tmp_path):
     damaged.write_bytes(b"damaged")
     final.run_stage4(tmp_path / "s4.yaml", "s23", root=tmp_path, device="cpu", resume=True)
     assert sum(generation_calls) == 37
+    # No history is updated while encoding held-out queries or resuming.
+    if rms_mode == "reference_ema":
+        assert read_torch(tmp_path / "s23/models/paired_state.pt")["projection_rms_state"] == checkpoint["projection_rms_state"]
+    # A recipe cannot silently override a bundle's calibration policy.
+    config4["require_projection_rms_mode"] = "reference_ema" if rms_mode == "full_bank" else "full_bank"
+    (tmp_path / "s4.yaml").write_text(yaml.safe_dump(config4), encoding="utf-8")
+    with pytest.raises(ValueError, match="requires projection RMS"):
+        final.run_stage4(tmp_path / "s4.yaml", "s23", root=tmp_path, device="cpu", resume=True)
     # Coupling tampering must be rejected even if its shape still matches.
     atomic_torch(tmp_path / "s23/transport.pt", {"coupling": plan * 2})
     with pytest.raises(ValueError, match="changed"):

@@ -148,6 +148,8 @@ def pcgrad_backward(losses, groups, *, seed, step, eps=1e-12, routed_gradients=N
     generator = torch.Generator(device="cpu").manual_seed((int(seed) + 104729 * int(step) + 1701) % (2 ** 63 - 1))
     report = {"enabled": True, "reduction": "sum", "scope": "separate_encoder_matching_head_generator",
               "order": "private_seed_and_step", "step": step, "groups": {}}
+    if groups.get("patch_projector"):
+        report["scope"] += "_patch_projector"
     start = 0
     for name, group in groups.items():
         end = start + len(group)

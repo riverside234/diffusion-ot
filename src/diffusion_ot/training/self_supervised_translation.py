@@ -109,9 +109,10 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 raise ValueError(f"Self-supervised decoder requires {key}: 0.")
         self.weight = self.contrastive_options["weight"]
         self.patch_options = None
+        self.patch_projectors = {}
         if self.objective == "patchnce":
-            self.patch_options = {key: self.contrastive_options[key]
-                                  for key in ("weight", "temperature", "num_patches", "layers")}
+            self.patch_options = {key: value for key, value in self.contrastive_options.items()
+                                  if key not in {"objective", "name", "readout"}}
             widths = []
             for context in domains.values():
                 encoder = context.branch.encoder
@@ -123,6 +124,13 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 widths.append(tuple(channels[index] for index in self.patch_options["layers"]))
             if any(width != widths[0] for width in widths):
                 raise ValueError("Cross-domain PatchNCE requires matching encoder feature channel widths.")
+            if self.patch_options["sampler"] == "mlp_sample":
+                from diffusion_ot.models.patch_sampler import make_patch_projector
+                self.patch_projectors = {
+                    d: make_patch_projector(v.branch.encoder, self.patch_options,
+                                            device=v.device, seed=seed + 2901 + i)
+                    for i, (d, v) in enumerate(domains.items())}
+        self.patch_projector_parameters = [p for head in self.patch_projectors.values() for p in head.parameters()]
 
         self.views = {d: configure_generator_adaptation(v.branch) for d, v in domains.items()}
         self.parameters = [p for view in self.views.values() for p in view.parameters()]
@@ -141,6 +149,9 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         ema = config.get("ema") or {}
         self.ema = EncoderEMA(self.views, decay=float(ema.get("decay", .995)),
                               warmup_steps=int(ema.get("warmup_steps", 500))) if ema.get("enabled", True) else None
+        self.patch_projector_ema = (EncoderEMA(self.patch_projectors, decay=float(ema.get("decay", .995)),
+                                               warmup_steps=int(ema.get("warmup_steps", 500)))
+                                    if self.patch_projectors and self.ema is not None else None)
         self.noise_generators = {d: torch.Generator(device=v.device).manual_seed(seed + 901 + i)
                                  for i, (d, v) in enumerate(domains.items())}
         # Separate from diffusion noise and global RNG. Changing patch sampling
@@ -151,6 +162,13 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         self.image_objectives = {}
         self.original_datasets = {}
         self.diagnostic_options = config.get("self_supervised_diagnostics") or {}
+
+    def parameter_groups(self):
+        groups = super().parameter_groups()
+        if self.patch_projector_parameters:
+            groups.append({"params": self.patch_projector_parameters, "lr": self.patch_options["lr"],
+                           "name": "patch_projectors"})
+        return groups
 
     @torch.no_grad()
     def _validation_images(self, source, images, originals, query_keys, source_latents, *, seed, steps):
@@ -181,10 +199,11 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
     def conditioned_preservation_loss(self, latents, baseline_codes):
         return torch.zeros((), device=self.domains["cat"].device)
 
-    def _patchnce_loss(self, source, readout, recovered_latents, original_latents, *, validation_seed):
+    def _patchnce_loss(self, source, readout_domain, recovered_latents, original_latents, *, validation_seed):
         from diffusion_ot.losses.patchnce import patchnce_loss
 
         layers = self.patch_options["layers"]
+        readout = self.domains[readout_domain]
         def query_features(value):
             return tuple(readout.branch.encoder.forward_spatial_features(value, layers))
 
@@ -199,10 +218,15 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         generator = (torch.Generator(device="cpu").manual_seed(validation_seed)
                      if validation_seed is not None else self.patch_generators[source])
         loss, metrics = patchnce_loss(features, keys, temperature=self.patch_options["temperature"],
-                                     num_patches=self.patch_options["num_patches"], generator=generator)
+                                     num_patches=self.patch_options["num_patches"], generator=generator,
+                                     query_projector=self.patch_projectors.get(readout_domain),
+                                     key_projector=self.patch_projectors.get(source))
         metrics.update(encoder_layers=layers, source_encoder_domain=source,
                        key_input="original_cached_vae_latent",
                        query_input="generated_rgb_vae_posterior_mean")
+        if self.patch_projectors:
+            metrics.update(query_projector_domain=readout_domain, key_projector_domain=source,
+                           key_projector_detached=True)
         return loss, metrics
 
     def loss(self, weights, references, source_latents, real_latents, *, step, validation_seed=None,
@@ -255,7 +279,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             )
             if self.objective == "patchnce":
                 loss, retrieval = self._patchnce_loss(
-                    source, readout, recovered_latents, source_latents[source][:count],
+                    source, readout_domain, recovered_latents, source_latents[source][:count],
                     validation_seed=validation_seed + 20000 + offset if evaluation else None)
             else:
                 recovered = readout.branch.encode(recovered_latents.to(readout.device, dtype=readout.dtype)).float()
@@ -312,7 +336,9 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             f"{self.objective_name}_effective_weight": self.weight * ramp,
             f"{self.objective_name}_readout": self.readout,
             f"{self.objective_name}_gradient_routing":
-                "live_readout_encoder_and_translation_conditioning_and_generator; detached_source_keys",
+                ("live_readout_encoder_and_translation_conditioning_and_generator_and_query_projector; detached_source_encoder_and_key_projector"
+                 if self.patch_projectors else
+                 "live_readout_encoder_and_translation_conditioning_and_generator; detached_source_keys"),
         })
         metrics.update(
             supervision="self_supervised", objective=self.objective,
@@ -333,6 +359,10 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             **({"decoded_patchnce_options": self.patch_options,
                 "decoded_patch_sampling_states": {d: gen.get_state().cpu() for d, gen in self.patch_generators.items()}}
                if self.patch_options else {}),
+            **({"patch_projectors": {d: self._cpu_copy(head.state_dict()) for d, head in self.patch_projectors.items()},
+                "patch_projector_ema": self.patch_projector_ema.export() if self.patch_projector_ema else None,
+                "patch_projector_ema_state": self.patch_projector_ema.state_dict() if self.patch_projector_ema else None}
+               if self.patch_projectors else {}),
             "decoded_source_contrastive_readout": self.readout,
             "generators": {d: self._cpu_copy(v.branch.generator_state_dict()) for d, v in self.domains.items()},
             "fixed_generators": self.fixed_generators,
@@ -347,9 +377,22 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 or payload.get("decoded_objective", "source_infonce") != self.objective
                 or payload.get("decoded_source_contrastive_readout") != self.readout):
             raise ValueError("Cannot resume a different decoded supervision/readout; start a fresh Stage 1B run.")
-        if self.patch_options and (payload.get("decoded_patchnce_options") != self.patch_options
+        # Legacy no-MLP checkpoints omit sampler; their effective default is sample.
+        saved_patch = payload.get("decoded_patchnce_options")
+        if saved_patch is not None:
+            saved_patch = {"sampler": "sample", **saved_patch}
+        if self.patch_options and (saved_patch != self.patch_options
                                   or set(payload.get("decoded_patch_sampling_states", {})) != set(self.patch_generators)):
             raise ValueError("Cannot resume a different PatchNCE protocol or missing patch sampling state.")
+        for domain, head in self.patch_projectors.items():
+            state = (payload.get("patch_projectors") or {}).get(domain)
+            if state is None:
+                raise ValueError(f"Resume checkpoint has no patch_projectors.{domain}; start a fresh MLP run.")
+            head.load_state_dict(state, strict=True)
+        if self.patch_projector_ema is not None:
+            if payload.get("patch_projector_ema_state") is None:
+                raise ValueError("Resume checkpoint has no patch projector EMA state.")
+            self.patch_projector_ema.load_state_dict(payload["patch_projector_ema_state"], self.patch_projectors)
         for domain, value in self.domains.items():
             load_joint_generator(value.branch, payload, domain, weights="raw")
         self.fixed_generators = payload["fixed_generators"]

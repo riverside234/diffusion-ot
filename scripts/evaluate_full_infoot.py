@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 def main():
     parser = argparse.ArgumentParser(description="Stage 4: all held-out translations, FID, source SSIM and 16 pairs/direction.")
     parser.add_argument("--config", default="configs/stage4_eval/fid_ssim_sit_b2.yaml")
-    parser.add_argument("--bundle", default="outputs/s23_full", help="Completed Stage 2-3 offline alignment output directory.")
+    parser.add_argument("--bundle", default="outputs/s23_rms", help="Completed Stage 2-3 offline alignment output directory.")
     parser.add_argument("--project-root", type=Path, default=ROOT)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", default=None, help="Override all evaluation devices.")

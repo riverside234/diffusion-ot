@@ -28,6 +28,8 @@ The canonical configurations are:
 - Stage 1B self-supervised PatchNCE: `configs/stage1b_infoot/self_supervised_patchnce_sit_b2.yaml`
 - Stage 1B global InfoNCE control: `configs/stage1b_infoot/self_supervised_sit_b2.yaml`
 - Stage 1B PatchNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml`
+- Stage 1B **main**, learned PatchNCE samplers + reference-EMA RMS: `configs/stage1b_infoot/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml`
+- Stage 1B full neural InfoOT + relative transport experiment: `configs/stage1b_infoot/self_supervised_patchnce_mlp_full_sit_b2.yaml`
 - Stage 1B global InfoNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_rms_ema_sit_b2.yaml`
 - Experiment D: `configs/stage1b_infoot/structure_decoder_sit_b2.yaml`
 - Experiment D evaluation: `configs/stage1b_eval/structure_decoder_sit_b2.yaml`
@@ -37,16 +39,82 @@ unchanged `*_sit_b2_lora.yaml` configs. Experiment D uses its selected
 `*_sit_b2_dino.yaml` EMA checkpoints. Neither automatically loads the new RGB
 Stage 1A outputs; replacing checkpoint paths alone is insufficient.
 
-### Reference-EMA RMS projection experiment
+### Main Stage 1B: learned PatchNCE samplers and reference-EMA RMS
 
-The optional `*_rms_ema_sit_b2.yaml` recipes average reference-feature variances
+The new `self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml` recipe adds CUT-style
+per-layer MLPs with DCLGAN's separate cat/dog sampler routing. Each sampled
+feature becomes a 256-dimensional vector through Linear-ReLU-Linear, then L2
+normalization and the existing official PatchNCE loss. Source keys are detached;
+both samplers learn through the two generated-image query directions.
+
+The sampler learning rate is `2e-4`, with gradient clipping at 1.0. PatchNCE
+weight/temperature remain `0.15/0.20`; existing encoder/G learning rates, losses,
+PCGrad and reference-EMA RMS settings are unchanged. The samplers have their own
+optimizer group and raw/EMA checkpoint state. They are separate from InfoOT's
+global matching heads and are not needed to generate images after training.
+
+Start a **fresh** run using the original flow-only Stage 1A checkpoints:
+
+```bash
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml
+```
+
+Output: `outputs/stage1b_patch_mlp_rms`. Resume it with the same config and
+`--resume latest`. Earlier no-MLP Stage 1B checkpoints cannot resume into this
+architecture. Evaluate with:
+
+```bash
+python scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml \
+  --checkpoint outputs/stage1b_patch_mlp_rms/checkpoints/latest.pt --weights ema
+```
+
+The paired evaluator re-encodes generated images and reports PatchNCE using
+the checkpoint's selected raw/EMA samplers. Training validation uses raw heads,
+as it does for raw E/G. These are learned correspondence scores; use the fixed
+image grids and original-RGB reconstruction checks to assess visual benefit.
+
+For an isolated comparison against the older live-RMS PatchNCE control, use
+`self_supervised_patchnce_mlp_sit_b2.yaml` in both config directories, output
+`outputs/stage1b_patch_mlp`. All original no-MLP/global-InfoNCE recipes remain
+available. See [design and comparison protocol](docs/analysis/stage1b_patchnce_mlp/review.md).
+
+### Full neural InfoOT and relative transport experiment
+
+The `self_supervised_patchnce_mlp_full_sit_b2.yaml` recipe adds live encoder-cost
+gradients to the neural alignment objective and retains its MI term. Its full
+objective is `0.20 * alignment_ramp * (cost - 0.10 * MI - 0.02 * entropy)`.
+Entropy is measured on the detached fitted plan and has no neural gradient.
+A separate `0.01 * alignment_ramp` term rewards transported centered feature
+correlation. Both sides of its independent-matching baseline remain differentiable.
+
+Variance/covariance weights remain `0.05/0.01`; PatchNCE, PCGrad, learning rates,
+live fitting RMS, reference-EMA projection RMS, and the original flow-only
+Stage 1A checkpoints match the existing MI-only control. This is an additive
+experiment: retaining raw cost means the relative term does not guarantee
+prevention of feature contraction. Check feature spread/rank and image grids.
+
+```bash
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_patchnce_mlp_full_sit_b2.yaml
+```
+
+Output: `outputs/stage1b_patch_mlp_full`. Start fresh; after starting this recipe,
+resume it with the same config and `--resume latest`. Objective changes across
+resume are rejected. Paired evaluation uses
+`configs/stage1b_eval/self_supervised_patchnce_mlp_full_sit_b2.yaml`.
+See [full objective, gradients, and checks](docs/analysis/stage1b_full_infoot/review.md).
+
+### Reference-EMA RMS projection
+
+The main recipe and the `*_rms_ema_sit_b2.yaml` comparison recipes average reference-feature variances
 with decay 0.99 and use their square roots to calibrate conditional projection.
 This makes the scale independent of other queries in the batch. InfoOT fitting
 and neural MI retain live reference RMS with full gradients; fit/projection
 bandwidths remain 0.55/0.10. Losses, weights, learning rates, PCGrad and feature
 protection match their controls. The original recipes remain available.
 
-Start the PatchNCE variant fresh from the original flow-only Stage 1A checkpoints:
+For the **no-MLP comparison**, start the PatchNCE variant fresh from the original flow-only Stage 1A checkpoints:
 
 ```bash
 python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml
@@ -109,13 +177,60 @@ content fingerprint.
 
 ## Stage 1A
 
-The original latent-input Stage 1A remains main. Its training commands, configs,
-checkpoint paths and evaluation config are unchanged:
+The revised latent-input Stage 1A uses a residual CNN: an unnormalized stride-1
+stem, two residual blocks at each of 32/16/8/4 pixels, four-head attention at
+16x16, and a 512-dimensional code. Start fresh Cat/Dog runs:
 
 ```bash
-python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_lora.yaml --device cuda:0
-python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_lora.yaml --device cuda:1
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_lora_residual.yaml --device cuda:0
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_lora_residual.yaml --device cuda:1
 ```
+
+These flow-only runs retain batch 64, 50,000 steps and encoder/adapter/LoRA
+learning rates 1e-4/1e-4/2.5e-5. Outputs are `outputs/stage1a_{cat,dog}_rescnn`.
+Evaluate each domain using its exact training config:
+
+```bash
+python3 scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae/cat_sit_b2_lora_residual.yaml --eval-config configs/stage1a_eval/residual_sit_b2_256.yaml --device cuda:0
+python3 scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae/dog_sit_b2_lora_residual.yaml --eval-config configs/stage1a_eval/residual_sit_b2_256.yaml --device cuda:1
+```
+
+Image metrics use original RGB targets; encoder inputs remain cached VAE
+latents. Reports record the encoder specification. Resume with `--resume latest`
+only within the corresponding residual run. Old plain-CNN or RGB checkpoints
+cannot initialize the new encoder. The original `*_sit_b2_lora.yaml` recipes
+remain available for existing checkpoints and current Stage 1B initialization.
+Architecture, checkpoint and comparison details are in the
+[residual encoder protocol](docs/analysis/stage1a_residual_encoder/review.md).
+
+### Stage 1A time-weighting comparison
+
+The residual-CNN trainer supports `loss_weighting.type: uniform` (velocity
+weight 1) and `cosmap` (velocity weight `2 / (pi * (t^2 + (1-t)^2))`). Both
+sample time uniformly. These modes accept only the `type` field: remove the
+PDAE gamma/normalization/clamping fields when switching a copied config.
+
+Ready-to-run Cat/Dog comparisons retain the same initialization seed, batch
+64, 50,000 steps, architecture and learning rates as the existing SNR control:
+
+```bash
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_lora_residual_uniform.yaml --device cuda:0
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_lora_residual_uniform.yaml --device cuda:1
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml --device cuda:0
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_lora_residual_cosmap.yaml --device cuda:1
+```
+
+Outputs are `outputs/stage1a_{cat,dog}_rescnn_{uniform,cosmap}`. Resume a run
+using its same config and `--resume latest`; changing the flow weighting on
+resume is rejected. The original `*_lora_residual.yaml` files retain the SNR
+control and their original output directories.
+
+Use the same `configs/stage1a_eval/residual_sit_b2_256.yaml` for evaluation,
+passing each experiment's exact training YAML as `--train-config`. Training
+logs identify the weighting and include `unweighted_flow_mse`; validation MSE
+and time-bin metrics stay unweighted. Compare original-RGB fidelity and code
+usefulness, not the differently weighted training losses. Full commands and
+metric details: [time-weighting comparison](docs/analysis/stage1a_time_weighting/implementation.md).
 
 ### Optional RGB encoder comparison
 
@@ -253,10 +368,19 @@ The combined **Stage 2–3: Offline Alignment** workflow first freezes the selec
 checkpoint and builds complete feature banks (Stage 2), then fits and exports
 **one global fused InfoOT coupling over all training Cats and
 Dogs**, with fit bandwidth **0.55** and frozen projection bandwidth **0.10**.
-It includes paired raw/EMA checkpoint
-restoration, complete-manifest checks, fixed training-reference RMS calibration,
-and resumable global fitting (Stage 3). Matrix tiles are computation chunks, not separate
+The main config selects **self-supervised PatchNCE + learned MLPs + reference-EMA
+RMS**, using the encoder matching-feature cosine cross-cost. No DINO cache is
+needed. It includes paired raw/EMA checkpoint restoration, complete-manifest
+checks, and resumable global fitting (Stage 3). Matrix tiles are computation chunks, not separate
 OT problems. Unequal domain counts are supported.
+
+The `full_bank_calibrated_projection_v2` bundle separates two scales:
+
+- **Fit RMS:** computed from each complete training reference bank.
+- **Projection RMS:** copied from the selected checkpoint's reference-EMA
+  history, then frozen. `--weights ema` selects the history for model-EMA
+  encoder/head weights; `--weights raw` selects the raw history. Neither is
+  recalculated from held-out queries or replaced with the full-bank fit RMS.
 
 Stage 4 translates **every held-out validation source** using that exported
 coupling. It reports FID against real target-domain validation RGB and SSIM
@@ -267,7 +391,7 @@ labeled contact sheets. The full generated corpus is used for FID.
 ### Linux commands
 
 Run in the existing training environment (Python 3.10 supported). The configured
-Stage 1A checkpoints, pretrained SiT/VAE snapshot, DINO structure cache,
+Stage 1A checkpoints, pretrained SiT/VAE snapshot,
 canonical train/validation manifests, cached latents, and original AFHQ dataset
 must be available under the project paths. Inception weights download on the
 first Stage 4 metric run and are cached in `outputs/fid_cache`.
@@ -277,7 +401,7 @@ cd /data/not_backed_up/yxu209/diffusion-ot
 python -m pip install -r requirements-stage4.txt
 
 # Example only: select an existing numbered checkpoint from the run you want.
-CHECKPOINT=outputs/stage1b_d_nce/checkpoints/step_004000.pt
+CHECKPOINT=outputs/stage1b_patch_mlp_rms/checkpoints/step_004000.pt
 
 # Stage 2-3: frozen banks and global InfoOT fit, paired EMA weights.
 python scripts/run_offline_alignment.py \
@@ -287,16 +411,26 @@ python scripts/run_offline_alignment.py \
 # Stage 4: use the completed Stage 2-3 bundle; no refitting.
 python scripts/evaluate_full_infoot.py \
   --config configs/stage4_eval/fid_ssim_sit_b2.yaml \
-  --bundle outputs/s23_full --device cuda:0
+  --bundle outputs/s23_rms --device cuda:0
 ```
 
 Use `--weights raw` on Stage 2–3 if selecting a raw checkpoint evaluation; Stage 4
 always inherits the same paired model state. Set Stage 2–3 `alignment_config` to
 the configuration matching the checkpoint architecture and Stage 1A provenance.
-The final bundle copies learned E/head/G state; the large frozen model files
+The final bundle copies learned E/head/G, PatchNCE samplers, and both RMS histories; the large frozen model files
 and configuration dependencies remain external and are checked by content hash.
 It requires a format-4 Stage 1B checkpoint and never substitutes Stage 1A outputs
 as image-quality references.
+
+Both main offline YAMLs require `reference_ema` calibration and reject missing
+or mismatched history. The pre-EMA controls remain supported by selecting their
+matching `alignment_config` and using `require_projection_rms_mode: full_bank`
+in both offline configs, with separate outputs. Their projection uses the old
+full-training-bank calibration; the DINO controls still require their cache.
+Old v1 bundles must be rebuilt in a new directory. The new defaults
+`outputs/s23_rms` and `outputs/s4_rms` keep earlier output directories intact.
+`calibration.json`, Stage 4 `protocol.json`/`metrics.json`, and `report.md`
+record fit/projection scales and the selected calibration mode for review.
 
 An optional **full-size preflight** measures actual iteration time and GPU
 memory without changing the reference count:
@@ -310,7 +444,7 @@ python scripts/run_offline_alignment.py \
 
 # Resume interrupted evaluation, optionally lowering generation memory use.
 python scripts/evaluate_full_infoot.py \
-  --bundle outputs/s23_full --device cuda:0 --resume --generation-batch-size 2
+  --bundle outputs/s23_rms --device cuda:0 --resume --generation-batch-size 2
 ```
 
 Run the preflight instead of the initial Stage 2–3 command, or add `--resume`
@@ -331,13 +465,13 @@ overrides all devices; omit it when using separate encoding/solver devices.
 
 Outputs:
 
-- `outputs/s23_full/bundle.json`, `transport.pt`, `banks/`, `models/`,
+- `outputs/s23_rms/bundle.json`, `transport.pt`, `banks/`, `models/`,
   `calibration.json`, `solver_progress.pt`, `solver_log.jsonl`, `checks.json`.
-- `outputs/s4_eval/metrics.json`, `ssim_per_image.jsonl`,
+- `outputs/s4_rms/metrics.json`, `ssim_per_image.jsonl`,
   `generation_manifest.jsonl`, `gallery_ids.json`, `report.md`.
-- `outputs/s4_eval/images/{cat_to_dog,dog_to_cat}/`: complete metric corpus.
-- `outputs/s4_eval/real/{cat,dog}/`: original held-out RGB references.
-- `outputs/s4_eval/galleries/{cat_to_dog,dog_to_cat}/contact_sheet.png`:
+- `outputs/s4_rms/images/{cat_to_dog,dog_to_cat}/`: complete metric corpus.
+- `outputs/s4_rms/real/{cat,dog}/`: original held-out RGB references.
+- `outputs/s4_rms/galleries/{cat_to_dog,dog_to_cat}/contact_sheet.png`:
   16 pairs per direction, with source IDs and separate source/translation PNGs.
 
 SSIM measures source preservation, not target-domain fidelity: copying the

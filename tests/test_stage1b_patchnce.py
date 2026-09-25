@@ -29,9 +29,11 @@ def patchnce_recipe(config):
     patchnce_options(config["decoded_translation"])
 
 
-def patchnce_runtime(tmp_path, seed=11):
+def patchnce_runtime(tmp_path, seed=11, *, mlp=False):
     config = runtime_config()
     patchnce_options(config["decoded_translation"])
+    if mlp:
+        config["decoded_translation"]["patchnce"].update(sampler="mlp_sample", projection_dim=16)
     contexts = domains()
     for context in contexts.values():
         context.branch.encoder = PDAELatentEncoder(channels=(8,), z_dim=6, spatial_size=2, num_groups=2)
@@ -58,7 +60,8 @@ def assert_no_global_retrieval_metrics(record):
             assert_no_global_retrieval_metrics(value)
 
 
-def test_patchnce_runtime_has_live_translation_path_and_detached_source_spatial_keys(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mlp", [False, True])
+def test_patchnce_runtime_has_live_translation_path_and_detached_source_spatial_keys(monkeypatch, tmp_path, mlp):
     import diffusion_ot.training.self_supervised_translation as translation
 
     def forbidden(*args, **kwargs):
@@ -66,7 +69,7 @@ def test_patchnce_runtime_has_live_translation_path_and_detached_source_spatial_
 
     monkeypatch.setattr(translation, "source_code_contrastive_loss", forbidden)
     torch.manual_seed(15)
-    runtime = patchnce_runtime(tmp_path)
+    runtime = patchnce_runtime(tmp_path, mlp=mlp)
     calls = {domain: [] for domain in runtime.domains}
     for domain, context in runtime.domains.items():
         original = context.branch.encoder.forward_spatial_features
@@ -100,13 +103,19 @@ def test_patchnce_runtime_has_live_translation_path_and_detached_source_spatial_
         for group in ("adapters", "lora"):
             assert any(p.grad is not None and p.grad.norm() > 0 for p in runtime.views[source][group].parameters())
         assert all(p.grad is None for p in context.vae.parameters())
+        if mlp:
+            assert all(p.grad is not None and p.grad.norm() > 0 for p in runtime.patch_projectors[source].parameters())
+            retrieval = metrics[f"{source}_to_{target}"]["patchnce"]
+            assert retrieval["query_projector_domain"] == target and retrieval["key_projector_domain"] == source
+            assert retrieval["key_projector_detached"]
     assert_no_global_retrieval_metrics(metrics)
     assert_no_external_metrics(metrics)
 
 
-def test_patchnce_validation_is_repeatable_and_preserves_both_private_random_streams(tmp_path):
+@pytest.mark.parametrize("mlp", [False, True])
+def test_patchnce_validation_is_repeatable_and_preserves_both_private_random_streams(tmp_path, mlp):
     torch.manual_seed(17)
-    runtime = patchnce_runtime(tmp_path)
+    runtime = patchnce_runtime(tmp_path, mlp=mlp)
     weights, references, source_codes, _, latents = batch()
     global_rng = torch.get_rng_state().clone()
     before = deepcopy(runtime.checkpoint_state())
@@ -122,14 +131,22 @@ def test_patchnce_validation_is_repeatable_and_preserves_both_private_random_str
     after = runtime.checkpoint_state()
     for key in ("decoded_noise_states", "decoded_patch_sampling_states"):
         assert_tensor_tree_equal(before[key], after[key])
+    if mlp:
+        for key in ("patch_projectors", "patch_projector_ema", "patch_projector_ema_state"):
+            assert_tensor_tree_equal(before[key], after[key])
 
 
-def test_patchnce_resume_restores_next_patches_and_diffusion_noise(tmp_path):
+@pytest.mark.parametrize("mlp", [False, True])
+def test_patchnce_resume_restores_next_patches_and_diffusion_noise(tmp_path, mlp):
     torch.manual_seed(23)
-    runtime = patchnce_runtime(tmp_path)
+    runtime = patchnce_runtime(tmp_path, mlp=mlp)
     weights, references, source_codes, _, latents = batch()
-    with torch.no_grad():
-        runtime.loss(weights, references, latents, latents, step=2, source_query_codes=source_codes)
+    optimizer = torch.optim.AdamW(runtime.parameter_groups())
+    loss, _ = runtime.loss(weights, references, latents, latents, step=2, source_query_codes=source_codes)
+    loss.backward()
+    optimizer.step()
+    if runtime.patch_projector_ema is not None:
+        runtime.patch_projector_ema.update(runtime.patch_projectors)
     state = deepcopy(runtime.checkpoint_state())
     state.update(config=runtime.config, format_version=4)
     restored = SelfSupervisedDecoderTraining(runtime.config, deepcopy(runtime.domains), None, tmp_path, seed=901)
@@ -141,11 +158,23 @@ def test_patchnce_resume_restores_next_patches_and_diffusion_noise(tmp_path):
     assert actual[1] == expected[1]
     for key in ("decoded_noise_states", "decoded_patch_sampling_states"):
         assert_tensor_tree_equal(runtime.checkpoint_state()[key], restored.checkpoint_state()[key])
+    if mlp:
+        for key in ("patch_projectors", "patch_projector_ema", "patch_projector_ema_state"):
+            assert_tensor_tree_equal(state[key], restored.checkpoint_state()[key])
+        missing = deepcopy(state)
+        missing.pop("patch_projectors")
+        with pytest.raises(ValueError, match="no patch_projectors"):
+            restored.load_checkpoint(missing)
+    else:
+        legacy = deepcopy(state)
+        legacy["decoded_patchnce_options"].pop("sampler")
+        restored.load_checkpoint(legacy)
 
 
 @pytest.mark.parametrize("rms_enabled", [False, True])
+@pytest.mark.parametrize("mlp", [False, True])
 def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_logs(
-        patchnce_training, monkeypatch, rms_enabled):
+        patchnce_training, monkeypatch, rms_enabled, mlp):
     import diffusion_ot.training.self_supervised_translation as translation
 
     def forbidden(*args, **kwargs):
@@ -155,6 +184,8 @@ def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_log
     run, originals, latest, encode_calls = patchnce_training
     def recipe(config):
         patchnce_recipe(config)
+        if mlp:
+            config["decoded_translation"]["patchnce"].update(sampler="mlp_sample", projection_dim=16)
         if rms_enabled:
             config["projection_rms"] = {"mode": "reference_ema", "decay": .99, "eps": 1e-8}
     complete, logs = run("patchnce_complete", modify=recipe)
@@ -167,6 +198,17 @@ def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_log
         "matching_head": {"transport", "protection", "patchnce"},
         "generator": {"native", "patchnce"},
     }
+    if mlp:
+        expected_tasks["patch_projector"] = {"patchnce"}
+        from diffusion_ot.models.patch_sampler import PatchSampleMLP
+        for i, domain in enumerate(("cat", "dog")):
+            initial = PatchSampleMLP((8,), 16, seed=complete["config"]["train"].get("seed", 20260905) + 2901 + i)
+            assert any(not torch.equal(value, initial.state_dict()[name])
+                       for name, value in complete["patch_projectors"][domain].items())
+        assert complete["patch_projector_ema_state"]["num_updates"] == 2
+        group = next(g for g in complete["optimizer"]["param_groups"] if g.get("name") == "patch_projectors")
+        assert group["lr"] == .0002
+        assert all(complete["optimizer"]["state"][p]["step"] == 2 for p in group["params"])
     expected_losses = {"cat_reconstruction", "dog_reconstruction", "infoot_alignment",
                        "matching_variance", "matching_covariance", "patchnce"}
     for row in logs["train"] + logs["validation"]:
@@ -187,6 +229,11 @@ def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_log
         assert row["weighted_decoded_generator_gradient_norm"] > 0
         assert row["weighted_decoded_matching_head_gradient_norm"] > 0
         assert "patchnce_loss" in row["window_mean"]
+        if mlp:
+            assert row["weighted_decoded_patch_projector_gradient_norm"] > 0
+            assert row["patch_projector_gradient_norm_pre_clip"] > 0
+            assert row["patch_projector_learning_rate"] == .0002
+            assert set(row["generator_learning_rates"]) == {"adapters", "lora"}
     for row in logs["validation"]:
         assert row["loss"] == pytest.approx(row["cat_raw_reconstruction"] + row["dog_raw_reconstruction"]
             + row["weighted_infoot_alignment_loss"] + row["matching_regularization_loss"]
@@ -202,20 +249,32 @@ def test_patchnce_real_training_retains_flow_transport_protection_and_cleans_log
                        for key, value in generator_parameter_view(current)[group].state_dict().items())
 
 
-def test_patchnce_real_resume_preserves_streams_and_rejects_objective_changes(patchnce_training):
+@pytest.mark.parametrize("mlp", [False, True])
+def test_patchnce_real_resume_preserves_streams_and_rejects_objective_changes(patchnce_training, mlp):
     run, _, _, _ = patchnce_training
-    complete, _ = run("patchnce_uninterrupted", modify=patchnce_recipe)
-    run("patchnce_resumed", steps=1, modify=patchnce_recipe)
-    resumed, logs = run("patchnce_resumed", resume=True, modify=patchnce_recipe)
+    def recipe(config):
+        patchnce_recipe(config)
+        if mlp:
+            config["decoded_translation"]["patchnce"].update(sampler="mlp_sample", projection_dim=16)
+    complete, _ = run("patchnce_uninterrupted", modify=recipe)
+    run("patchnce_resumed", steps=1, modify=recipe)
+    resumed, logs = run("patchnce_resumed", resume=True, modify=recipe)
     assert [row["step"] for row in logs["train"]] == [1, 2]
     # As with the global-code control, the shuffled DataLoader cursor is not
     # restored. The guaranteed continuation here is the two private streams.
     for key in ("decoded_noise_states", "decoded_patch_sampling_states", "rng_state"):
         assert_tensor_tree_equal(complete[key], resumed[key])
-    for update in ({"temperature": .1}, {"weight": .1}, {"num_patches": 4}):
+    if mlp:
+        assert resumed["patch_projector_ema_state"]["num_updates"] == 2
+        group = next(g for g in resumed["optimizer"]["param_groups"] if g.get("name") == "patch_projectors")
+        assert all(resumed["optimizer"]["state"][p]["step"] == 2 for p in group["params"])
+    for update in ({"temperature": .1}, {"weight": .1}, {"num_patches": 4},
+                   {"sampler": "sample" if mlp else "mlp_sample"}):
         def modify(config):
-            patchnce_recipe(config)
+            recipe(config)
             config["decoded_translation"]["patchnce"].update(update)
+            if update.get("sampler") == "sample":
+                config["decoded_translation"]["patchnce"].pop("projection_dim", None)
         with pytest.raises(ValueError, match="Resume cannot change decoded_translation"):
             run("patchnce_resumed", resume=True, modify=modify)
     with pytest.raises(ValueError, match="Resume cannot change decoded_translation"):
@@ -241,3 +300,41 @@ def test_patchnce_configs_change_only_translation_objective_and_output_destinati
     assert not evaluate["translation"]["decoded_structure_metrics"]
     from diffusion_ot.training.decoded_translation import validate_decoder_config
     validate_decoder_config(experiment_config)
+
+
+@pytest.mark.parametrize("suffix", ["", "_rms_ema"])
+def test_mlp_configs_change_only_sampler_and_destinations(suffix):
+    root = Path(__file__).resolve().parents[1]
+    old_stem = f"self_supervised_patchnce{suffix}_sit_b2"
+    new_stem = f"self_supervised_patchnce_mlp{suffix}_sit_b2"
+    for directory in ("stage1b_infoot", "stage1b_eval"):
+        old = yaml.safe_load((root / f"configs/{directory}/{old_stem}.yaml").read_text())
+        new = yaml.safe_load((root / f"configs/{directory}/{new_stem}.yaml").read_text())
+        assert new.pop("output_dir") != old.pop("output_dir")
+        if directory == "stage1b_infoot":
+            from diffusion_ot.training.decoded_translation import validate_decoder_config
+            validate_decoder_config(new)
+            assert Path(root / new["quick_evaluation"]["config"]).is_file()
+            new["quick_evaluation"]["config"] = old["quick_evaluation"]["config"]
+            patch = new["decoded_translation"]["patchnce"]
+            assert patch.pop("sampler") == "mlp_sample"
+            assert patch.pop("projection_dim") == 256
+            assert patch.pop("lr") == .0002
+            assert patch.pop("grad_clip_norm") == 1.
+        else:
+            assert new["translation"].pop("patchnce_metrics") is True
+        assert new == old
+
+
+@pytest.mark.parametrize("mode", ["weighted_sum", "guarded"])
+def test_mlp_heads_also_update_without_pcgrad(patchnce_training, mode):
+    run, _, _, _ = patchnce_training
+    def recipe(config):
+        patchnce_recipe(config)
+        config["decoded_translation"]["patchnce"].update(sampler="mlp_sample", projection_dim=16)
+        config["pcgrad"]["enabled"] = False
+        config["gradient_guard"]["enabled"] = mode == "guarded"
+    checkpoint, logs = run("mlp_without_pcgrad", steps=1, modify=recipe)
+    assert logs["train"][0]["patch_projector_gradient_norm_pre_clip"] > 0
+    group = next(g for g in checkpoint["optimizer"]["param_groups"] if g.get("name") == "patch_projectors")
+    assert all(checkpoint["optimizer"]["state"][p]["step"] == 1 for p in group["params"])

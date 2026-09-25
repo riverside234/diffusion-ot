@@ -283,7 +283,8 @@ def _residual_diagnostics(pred_delta, target_v, base_v) -> dict[str, float]:
         error = pred_delta - target_delta
         target_delta_rms = target_delta.square().mean().sqrt()
         pred_delta_rms = pred_delta.square().mean().sqrt()
-        error_rms = error.square().mean().sqrt()
+        unweighted_flow_mse = error.square().mean()
+        error_rms = unweighted_flow_mse.sqrt()
         base_rms = base_v.detach().float().square().mean().sqrt()
         relative_error = error_rms / target_delta_rms.clamp_min(1.0e-8)
         delta_to_base = pred_delta_rms / base_rms.clamp_min(1.0e-8)
@@ -297,6 +298,7 @@ def _residual_diagnostics(pred_delta, target_v, base_v) -> dict[str, float]:
         "delta_target_cosine": float(cosine.cpu()),
         "delta_to_base_rms": float(delta_to_base.cpu()),
         "error_rms": float(error_rms.cpu()),
+        "unweighted_flow_mse": float(unweighted_flow_mse.cpu()),
         "pred_delta_rms": float(pred_delta_rms.cpu()),
         "relative_error": float(relative_error.cpu()),
         "target_delta_rms": float(target_delta_rms.cpu()),
@@ -567,6 +569,7 @@ def _evaluate_z_dependence(
         "event": "validation",
         "step": int(step),
         "encoder_input_space": str(getattr(branch, "encoder_input_space", "latent")),
+        "encoder_kind": getattr(branch, "encoder_architecture", {"kind": "plain_cnn_v1"})["kind"],
         "flow_target_space": "vae_latent",
         "use_ema": bool(use_ema and ema is not None),
         "num_samples": int(finalized["correct_z"]["count"]),
@@ -696,9 +699,10 @@ def train_pdae_domain(
     from diffusion_ot.data.latent_dataset import CachedLatentDataset, collate_latent_batch
     from diffusion_ot.integrations.sit_diffusers import load_sit_components, validate_transformer_config
     from diffusion_ot.losses.pdae_flow import (
+        flow_loss_weight,
         make_linear_flow_target,
-        pdae_flow_snr_weight,
         pdae_velocity_gap_loss,
+        resolve_flow_loss_weighting,
     )
     from diffusion_ot.models.pdae_sit import build_pdae_sit_branch, make_null_class_labels
     from diffusion_ot.training.stage1a_refinement import (
@@ -711,7 +715,8 @@ def train_pdae_domain(
     dataloader_config = _nested(config, "dataloader")
     flow_config = _nested(config, "flow")
     class_config = _nested(config, "class_conditioning")
-    loss_weight_config = _nested(config, "loss_weighting")
+    loss_weight_config = resolve_flow_loss_weighting(_nested(config, "loss_weighting"))
+    loss_weight_type = loss_weight_config["type"]
     ema_config = _nested(config, "ema")
     evaluation_config = _nested(config, "evaluation")
 
@@ -880,6 +885,15 @@ def train_pdae_domain(
             raise FileNotFoundError(f"Resume checkpoint not found: {resolved_resume_path}")
         checkpoint = _load_torch_checkpoint(resolved_resume_path, device=device)
         validate_refinement_resume(checkpoint.get("config") or {}, config)
+        saved_weighting = (checkpoint.get("train_state") or {}).get("loss_weighting")
+        if saved_weighting is None:
+            saved_weighting = _nested(checkpoint.get("config") or {}, "loss_weighting")
+        if resolve_flow_loss_weighting(saved_weighting) != loss_weight_config:
+            raise ValueError(
+                "Stage 1A flow weighting objective changed on resume. Use the "
+                "matching recipe to resume, or train.initialize_from with a new "
+                "output_dir for an explicitly warm-started experiment."
+            )
         if checkpoint.get("domain") != domain:
             raise ValueError("Resume checkpoint domain does not match the recipe.")
         branch.load_pdae_state_dict(checkpoint["model"])
@@ -964,6 +978,7 @@ def train_pdae_domain(
     def current_train_state():
         return {"loss_ema": loss_ema, "clip_events": clip_events, "clip_checks": clip_checks,
                 "training_seconds": training_seconds, "initialization": initialization,
+                "loss_weighting": loss_weight_config,
                 "refinement": refinement.state_dict() if refinement is not None else None}
 
     if resolved_resume_path is None:
@@ -1012,6 +1027,10 @@ def train_pdae_domain(
             ema=ema,
             use_ema=bool(evaluation_config.get("use_ema", True)),
         )
+        # Validation deliberately stays unweighted for comparisons across recipes.
+        metrics["training_loss_weighting"] = loss_weight_type
+        metrics["mse_weighting"] = "uniform"
+        metrics["timestep_sampling"] = "uniform"
         if refinement is not None:
             parameter_context = (ema.average_parameters(branch)
                                  if ema is not None and evaluation_config.get("use_ema", True)
@@ -1122,16 +1141,7 @@ def train_pdae_domain(
                     output.semantic_drop_mask.detach().float().sum()
                 )
                 interval_semantic_drop_count += output.semantic_drop_mask.numel()
-            weight = pdae_flow_snr_weight(
-                t=target.t.float(),
-                direction=flow_direction,
-                gamma=float(loss_weight_config.get("gamma", 0.1)),
-                normalize_mean_to=loss_weight_config.get("normalize_mean_to", 1.0),
-                normalization_mode=str(loss_weight_config.get("normalization_mode", "fixed_uniform")),
-                normalization_samples=int(loss_weight_config.get("normalization_samples", 65536)),
-                clamp_min=loss_weight_config.get("clamp_min", 0.001),
-                clamp_max=loss_weight_config.get("clamp_max"),
-            )
+            weight = flow_loss_weight(target.t.float(), loss_weight_config, direction=flow_direction)
             loss = pdae_velocity_gap_loss(
                 pred_delta_v.float(),
                 target.target_v.float(),
@@ -1218,8 +1228,11 @@ def train_pdae_domain(
             metrics: dict[str, Any] = {
                 "event": "train",
                 "step": step,
+                "encoder_kind": getattr(branch, "encoder_architecture", {"kind": "plain_cnn_v1"})["kind"],
                 "loss": loss_value,
                 "loss_ema": loss_ema,
+                "loss_weighting": loss_weight_type,
+                "timestep_sampling": "uniform",
                 "weight_mean": weight_mean_value,
                 "effective_batch_size": effective_batch_size,
                 "gradient_accumulation_steps": accumulation_steps,

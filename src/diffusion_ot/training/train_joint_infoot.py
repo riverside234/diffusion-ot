@@ -687,10 +687,13 @@ def fixed_conditional_structure_probe(
     solver_failure_log=None,
     validation_step=None,
     projection_scales: dict[str, float] | None = None,
+    alignment_options=None,
+    alignment_weight: float = 1.0,
 ) -> dict[str, Any]:
     """Fixed train references / validation queries; no updates or RNG consumption."""
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
-    from diffusion_ot.losses.infoot import infoot_distance_scale, plain_infoot_feature_loss, transport_diagnostics
+    from diffusion_ot.losses.infoot import infoot_distance_scale, transport_diagnostics
+    from diffusion_ot.losses.infoot_alignment import InfoOTAlignmentOptions, infoot_alignment_loss
     from diffusion_ot.models.matching_head import matching_features, matching_geometry_diagnostics
     from diffusion_ot.losses.encoder_transport import encoder_transport_cost, encoder_conditional_readout
 
@@ -789,11 +792,19 @@ def fixed_conditional_structure_probe(
             metrics["projection_probe"]["encoder_cost_gain_over_independent"] = float(
                 cost.mean() - (solution.coupling * cost).sum())
             metrics["projection_probe"]["infoot_mutual_information"] = solution.mutual_information
-            metrics["infoot_feature_loss"] = float(plain_infoot_feature_loss(
+            alignment_options = alignment_options or InfoOTAlignmentOptions()
+            alignment = infoot_alignment_loss(
                 features["cat"], features["dog"], solution.coupling,
+                options=alignment_options,
                 bandwidth=bandwidth, distance_scale_x=infoot_distance_scale(features["cat"]),
                 distance_scale_y=infoot_distance_scale(features["dog"]),
-                mi_weight=solver_options["mi_weight"], eps=solver_options["eps"]))
+                mi_weight=solver_options["mi_weight"], entropy_epsilon=solver_options["entropy_epsilon"],
+                cross_cost_weight=cross_cost_weight, eps=solver_options["eps"])
+            metrics["infoot_feature_loss"] = float(alignment.loss)
+            if alignment_options.extended:
+                metrics["infoot_feature_objective"] = alignment_options.feature_objective
+                metrics.update(alignment.metrics(alignment_weight=alignment_weight,
+                                                 relative_weight=alignment_options.relative_weight))
         if projection_support_options is not None:
             from diffusion_ot.losses.projection_support import projection_support_loss
             support = projection_support_loss(
@@ -933,7 +944,6 @@ def train_joint_infoot(
         infoot_distance_scale,
         kernel_offdiagonal_stats,
         normalize_matching_features,
-        plain_infoot_feature_loss,
         solver_kwargs,
         transport_diagnostics,
     )
@@ -957,6 +967,7 @@ def train_joint_infoot(
     from diffusion_ot.training.decoded_translation import DecoderTraining, validate_decoder_config
     from diffusion_ot.training.self_supervised_translation import SelfSupervisedDecoderTraining
     from diffusion_ot.losses.encoder_transport import encoder_transport_cost, encoder_conditional_readout
+    from diffusion_ot.losses.infoot_alignment import infoot_alignment_loss, infoot_alignment_options
     from diffusion_ot.training.stage1b_logging import Stage1BLogFormatter
     from diffusion_ot.losses.projection_rms import (
         ReferenceRMSEMA, checkpoint_projection_rms, projection_rms_options,
@@ -989,6 +1000,7 @@ def train_joint_infoot(
     if differentiate_distance_scale and matching_config.get("distance_scale", "infoot_rms") != "infoot_rms":
         raise ValueError("Full distance-scale gradients require matching.distance_scale=infoot_rms.")
     infoot_config = _nested(config, "infoot")
+    alignment_options = infoot_alignment_options(config)
     self_supervised = _nested(config, "decoded_translation").get("supervision", "external") == "self_supervised"
     conditional_enabled = bool(_nested(config, "conditional_structure").get("enabled", False))
     conditional_config = _nested(config, "conditional_projection" if self_supervised else "conditional_structure")
@@ -1195,6 +1207,8 @@ def train_joint_infoot(
     decoder_training = decoder_class(config, domains, prior, root, seed=seed) if generator_adaptation_enabled(config) else None
     self_translation_objective = getattr(decoder_training, "objective_name", "source_contrastive")
     generator_parameters = decoder_training.parameters if decoder_training is not None else []
+    patch_projectors = getattr(decoder_training, "patch_projectors", {})
+    patch_parameters = [p for head in patch_projectors.values() for p in head.parameters()]
     parameters = [parameter for encoder in encoders.values() for parameter in encoder.parameters()]
     conflict_monitor = GradientConflictMonitor()
     diagnostic_groups = {f"encoder.{d}": list(encoder.parameters()) for d, encoder in encoders.items()}
@@ -1366,6 +1380,7 @@ def train_joint_infoot(
                 cross_cost_source=str(infoot_config.get("cross_cost_source", "dino")),
                 solver_failure_log=output_dir / "logs" / "solver_failures.jsonl", validation_step=validation_step,
                 projection_scales=projection_scales,
+                alignment_options=alignment_options, alignment_weight=alignment_weight,
             ))
             # Fixed validation uses the full coefficient, independent of warmup.
             if conditional_enabled:
@@ -1393,6 +1408,7 @@ def train_joint_infoot(
             metrics["loss"] = (
                 sum(rec_weights[d] * metrics[f"{d}_raw_reconstruction"] for d in domains)
                 + metrics["weighted_infoot_alignment_loss"] + metrics.get("matching_regularization_loss", 0.)
+                + metrics.get("weighted_infoot_relative_loss", 0.)
                 + metrics["decoded_translation"]["weighted_loss"])
             metrics["loss_measurement"] = "fixed_raw_weights_full_coefficients_without_semantic_dropout"
         return log_formatter.format(metrics)
@@ -1530,18 +1546,24 @@ def train_joint_infoot(
             "cat": infoot_distance_scale(cat_features, detach=False),
             "dog": infoot_distance_scale(dog_features, detach=False),
         } if differentiate_distance_scale else solve_distance_scales)
-        infoot_loss = plain_infoot_feature_loss(
+        alignment_result = infoot_alignment_loss(
             cat_features,
             dog_features,
             solution.coupling.detach(),
+            options=alignment_options,
             bandwidth=bandwidth,
             distance_scale_x=feature_distance_scales["cat"],
             distance_scale_y=feature_distance_scales["dog"],
             mi_weight=float(infoot_config.get("mi_weight", 1.0)),
+            entropy_epsilon=solver_options["entropy_epsilon"],
+            cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
             eps=float(infoot_config.get("numerical_epsilon", 1.0e-8)),
         )
+        infoot_loss = alignment_result.loss
         warmup = 1.0 if warmup_steps <= 0 else min(step / warmup_steps, 1.0)
         beta = alignment_weight * warmup
+        relative_beta = alignment_options.relative_weight * warmup
+        alignment_objective = beta * infoot_loss + relative_beta * alignment_result.relative_loss
         neighborhood_loss = sum(neighborhood_losses.values(), torch.zeros((), device=alignment_device))
         conditional_result = None
         projection_loss = torch.zeros((), device=alignment_device)
@@ -1620,7 +1642,7 @@ def train_joint_infoot(
             + conditioned_preservation_weight * conditioned_preservation
         )
         transport_objective = (
-            beta * infoot_loss
+            alignment_objective
             + neighborhood_weight * warmup * neighborhood_loss
             + conditional_weight * warmup * projection_loss
             + warmup * contrastive_loss
@@ -1664,11 +1686,11 @@ def train_joint_infoot(
                     "adversarial": decoder_training.image_objectives.get("adversarial", decoded_loss.new_zeros(())),
                     "structure": decoder_training.image_objectives.get("structure", decoded_loss.new_zeros(())),
                     "color": decoder_training.image_objectives.get("color", decoded_loss.new_zeros(())),
-                    "matching": (beta * infoot_loss + neighborhood_weight * warmup * neighborhood_loss
+                    "matching": (alignment_objective + neighborhood_weight * warmup * neighborhood_loss
                                  + conditional_weight * warmup * projection_loss + warmup * contrastive_loss
                                  + support_weight * warmup * support_loss + matching_protection_loss),
                     **({"conditional": conditional_weight * warmup * projection_loss,
-                        "infoot": beta * infoot_loss, "protection": matching_protection_loss}
+                        "infoot": alignment_objective, "protection": matching_protection_loss}
                        if projection_enabled else {}),
                 }, diagnostic_groups,
                 code_gradients={id(p): g for p, g in zip(generator_parameters, code_generator_gradients)},
@@ -1681,7 +1703,7 @@ def train_joint_infoot(
                     reconstruction_objective, parameters
                 )),
                 "weighted_alignment_gradient_norm": (conflict_norms["infoot"]["encoder.all"] if conflict_norms and "infoot" in conflict_norms else _autograd_norm(
-                    beta * infoot_loss, parameters
+                    alignment_objective, parameters
                 )),
             }
             if decoder_training is not None:
@@ -1706,7 +1728,22 @@ def train_joint_infoot(
             if head_parameters:
                 gradient_diagnostics["weighted_alignment_matching_head_gradient_norm"] = (
                     conflict_norms["infoot"]["matching_head.all"] if conflict_norms and "infoot" in conflict_norms else
-                    _autograd_norm(beta * infoot_loss, head_parameters))
+                    _autograd_norm(alignment_objective, head_parameters))
+            if alignment_options.extended:
+                # Component norms expose whether raw attraction overwhelms the
+                # relative term. Aggregate alignment/conflict metrics above
+                # include BOTH terms, before PCGrad and clipping.
+                components = {}
+                if alignment_options.feature_objective == "full":
+                    components.update(cost=beta * alignment_result.cost_loss, mi=beta * alignment_result.mi_loss)
+                if alignment_options.relative_weight > 0:
+                    components["relative"] = relative_beta * alignment_result.relative_loss
+                for name, objective in components.items():
+                    norms = _autograd_group_norms(objective, {"encoder": parameters, "matching_head": head_parameters})
+                    gradient_diagnostics[f"weighted_infoot_{name}_gradient_norm"] = norms["encoder"]
+                    if head_parameters:
+                        gradient_diagnostics[f"weighted_infoot_{name}_matching_head_gradient_norm"] = norms["matching_head"]
+                del components, objective
             if conditional_enabled:
                 gradient_diagnostics["weighted_conditional_structure_gradient_norm"] = (
                     conflict_norms["conditional"]["encoder.all"] if conflict_norms else
@@ -1744,6 +1781,9 @@ def train_joint_infoot(
                     gradient_diagnostics.update({f"weighted_matching_{name}_{group}_gradient_norm": norm
                                                  for group, norm in norms.items()})
             if decoder_training is not None and decoded_metrics["active"]:
+                if patch_parameters:
+                    gradient_diagnostics["weighted_decoded_patch_projector_gradient_norm"] = _autograd_norm(
+                        decoded_loss, patch_parameters)
                 image_norms = ({group: conflict_norms["decoded"][f"{group}.all"]
                                 for group in ("encoder", "matching_head", "generator")} if conflict_norms else
                               _autograd_group_norms(decoded_loss, {
@@ -1792,9 +1832,14 @@ def train_joint_infoot(
                       if code_generator_gradients else None)
             pcgrad_metrics = pcgrad_backward(
                 tasks, {"encoder": parameters, "matching_head": head_parameters,
-                        "generator": generator_parameters}, seed=seed, step=step,
+                        "generator": generator_parameters,
+                        **({"patch_projector": patch_parameters} if patch_parameters else {})}, seed=seed, step=step,
                 eps=pcgrad_config.eps, routed_gradients=routed)
         elif gradient_guard_enabled:
+            if patch_parameters:
+                patch_gradients = torch.autograd.grad(total, patch_parameters, retain_graph=True, allow_unused=True)
+                for parameter, gradient in zip(patch_parameters, patch_gradients):
+                    parameter.grad = None if gradient is None else gradient.detach()
             if generator_parameters:
                 generator_gradients = torch.autograd.grad(total, generator_parameters, retain_graph=True, allow_unused=True)
                 for parameter, gradient in zip(generator_parameters, generator_gradients):
@@ -1849,6 +1894,10 @@ def train_joint_infoot(
         generator_grad_norm = _clip_gradient_norm(
             generator_parameters, _nested(config, "generator_adaptation").get("grad_clip_norm", 1.0)
         ) if generator_parameters else 0.0
+        patch_grad_norm = (_clip_gradient_norm(patch_parameters, decoder_training.patch_options["grad_clip_norm"])
+                           if patch_parameters else 0.)
+        if not math.isfinite(patch_grad_norm):
+            raise FloatingPointError(f"Non-finite PatchNCE projector gradients at step {step}.")
         if not all(math.isfinite(v) for v in (total_grad_norm, generator_grad_norm)):
             raise FloatingPointError(f"Non-finite encoder/generator gradients at step {step}.")
         optimizer.step()
@@ -1858,13 +1907,17 @@ def train_joint_infoot(
                 matching_ema.update(matching_heads)
             if decoder_training is not None and decoder_training.ema is not None:
                 decoder_training.ema.update(decoder_training.views)
+            if patch_projectors and decoder_training.patch_projector_ema is not None:
+                decoder_training.patch_projector_ema.update(patch_projectors)
 
         elapsed = time.perf_counter() - started
         training_seconds += elapsed
         if self_supervised:
             from diffusion_ot.training.self_supervised_diagnostics import solver_health
             health = solver_health(solution, solver_options)
+        alignment_metrics = alignment_result.metrics(alignment_weight=beta, relative_weight=relative_beta)
         loss_window.append({
+            **alignment_metrics,
             "loss": float(reported_total),
             "infoot_iterations": solution.iterations,
             "infoot_recovery_iterations": solution.recovery_iterations,
@@ -1911,6 +1964,10 @@ def train_joint_infoot(
                 "dog_anchor_loss": float(anchor_losses["dog"].detach().cpu()),
                 "latent_anchor_weight": anchor_weight,
                 "infoot_feature_loss": float(infoot_loss.detach().cpu()),
+                **({"weighted_infoot_alignment_loss": float(beta * infoot_loss.detach())}
+                   if self_supervised or alignment_options.extended else {}),
+                **alignment_metrics,
+                **({"infoot_feature_objective": alignment_options.feature_objective} if alignment_options.extended else {}),
                 "infoot_mutual_information": solution.mutual_information,
                 "infoot_entropy": solution.entropy,
                 "infoot_objective": solution.objective,
@@ -1977,7 +2034,12 @@ def train_joint_infoot(
                 metrics["decoded_translation"] = decoded_metrics
                 metrics["code_consistency_loss"] = float(code_consistency_loss.detach())
                 metrics["generator_gradient_norm_pre_clip"] = generator_grad_norm
-                metrics["generator_learning_rates"] = {g["name"]: g["lr"] for g in optimizer.param_groups if "name" in g}
+                metrics["generator_learning_rates"] = {g["name"]: g["lr"] for g in optimizer.param_groups
+                                                       if g.get("name") in {"adapters", "lora"}}
+                if patch_parameters:
+                    metrics["patch_projector_gradient_norm_pre_clip"] = patch_grad_norm
+                    metrics["patch_projector_learning_rate"] = next(g["lr"] for g in optimizer.param_groups
+                                                                    if g.get("name") == "patch_projectors")
                 metrics["reconstruction_diagnostics"] = reconstruction_diagnostics
                 metrics["null_preservation_loss"] = float(null_preservation.detach())
                 metrics["conditioned_preservation_loss"] = float(conditioned_preservation.detach())
@@ -2036,6 +2098,7 @@ def train_joint_infoot(
             # Drop loss roots before validation/the next expensive rollout.
             del total, primary_objective, auxiliary_objective, reconstruction_objective
             del transport_objective, decoded_loss, null_preservation, conditioned_preservation
+            del alignment_objective, alignment_result, infoot_loss
             rec_losses.clear()
             anchor_losses.clear()
 

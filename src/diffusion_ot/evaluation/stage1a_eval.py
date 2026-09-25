@@ -43,6 +43,7 @@ class Stage1ASmokeReport:
     extra_reports: dict[str, str]
     encoder_input_space: str = "latent"
     image_reference: str = "vae_reconstruction"
+    encoder_architecture: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -73,6 +74,7 @@ class Stage1ARoundTripReport:
     grid_path: str
     encoder_input_space: str = "latent"
     image_reference: str = "vae_reconstruction"
+    encoder_architecture: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -178,6 +180,9 @@ def stage1a_architecture_metadata(branch: Any) -> dict[str, Any]:
     if getattr(branch, "encoder_input_space", "latent") == "rgb":
         metadata["encoder_input_space"] = "rgb"
         metadata["encoder_image_size"] = getattr(branch, "encoder_image_size", None)
+    encoder_architecture = getattr(branch, "encoder_architecture", {"kind": "plain_cnn_v1"})
+    if encoder_architecture["kind"] != "plain_cnn_v1":
+        metadata["encoder_architecture"] = encoder_architecture
     return metadata
 
 
@@ -192,6 +197,14 @@ def validate_stage1a_architecture(
     expected_lora_rank = stage1a_config.get("require_attention_lora_rank")
     expected_lora_alpha = stage1a_config.get("require_attention_lora_alpha")
     mismatches = []
+    expected_encoder = stage1a_config.get("require_encoder_kind")
+    actual_encoder = metadata.get("encoder_architecture", {"kind": "plain_cnn_v1"})["kind"]
+    if expected_encoder is not None and expected_encoder != actual_encoder:
+        mismatches.append(f"encoder kind is {actual_encoder}, expected {expected_encoder}")
+    expected_input = stage1a_config.get("require_encoder_input_space")
+    actual_input = getattr(branch, "encoder_input_space", "latent")
+    if expected_input is not None and expected_input != actual_input:
+        mismatches.append(f"encoder input is {actual_input}, expected {expected_input}")
     if expected_cfg is not None and metadata["semantic_cfg_enabled"] != bool(expected_cfg):
         mismatches.append(
             "semantic CFG "
@@ -324,7 +337,13 @@ def load_stage1a_evaluator(
     model_config_path = _resolve_config_path(train_config, root, "model_config")
     data_config_path = _resolve_config_path(train_config, root, "data_config")
     model_config = load_yaml_config(model_config_path)
-    pretrained_config_path = _resolve_config_path(model_config, root, "pretrained")
+    # E/G checkpoints omit the frozen backbone. Match the trainer's override
+    # precedence so evaluation cannot silently load a different SiT/VAE pair.
+    pretrained_config_path = (
+        _resolve_config_path(train_config, root, "pretrained_config")
+        if train_config.get("pretrained_config")
+        else _resolve_config_path(model_config, root, "pretrained")
+    )
 
     if checkpoint_path is None:
         output_dir = resolve_project_local_path(
@@ -371,6 +390,7 @@ def load_stage1a_evaluator(
         model_config=model_config,
         stage_config=train_config,
     )
+    validate_stage1a_architecture(branch, _nested(eval_config, "architecture"))
     model_dtype = _torch_dtype_from_model(components.transformer)
     branch.to(device=selected_device, dtype=model_dtype)
     branch.load_pdae_state_dict(checkpoint["model"])
@@ -863,6 +883,7 @@ def _run_inferred_noise_roundtrip(
         grid_path=str(grid_path),
         encoder_input_space=str(getattr(evaluator.branch, "encoder_input_space", "latent")),
         image_reference="original_rgb" if vae_reconstruction is not None else "vae_reconstruction",
+        encoder_architecture=getattr(evaluator.branch, "encoder_architecture", None),
     )
     _write_json(output_dir / "roundtrip_report.json", report.to_dict())
     return report
@@ -998,6 +1019,7 @@ def run_stage1a_smoke_test(
         extra_reports=extra_reports,
         encoder_input_space=str(getattr(evaluator.branch, "encoder_input_space", "latent")),
         image_reference=image_reference,
+        encoder_architecture=getattr(evaluator.branch, "encoder_architecture", None),
     )
     _write_json(output_dir / "smoke_report.json", report.to_dict())
     return report

@@ -58,8 +58,10 @@ def self_supervised_translation_options(image: dict[str, Any]) -> dict[str, Any]
         if float(image.get("source_contrastive_weight", 0)) != 0:
             raise ValueError("PatchNCE replaces global source InfoNCE; set source_contrastive_weight: 0.")
         patch = image.get("patchnce") or {}
-        if not isinstance(patch, dict) or set(patch) - {"weight", "temperature", "num_patches", "layers"}:
-            raise ValueError("patchnce accepts only weight, temperature, num_patches and layers.")
+        allowed = {"weight", "temperature", "num_patches", "layers", "sampler",
+                   "projection_dim", "lr", "grad_clip_norm"}
+        if not isinstance(patch, dict) or set(patch) - allowed:
+            raise ValueError("Unknown PatchNCE protocol option.")
         settings = {"weight": float(patch.get("weight", .15)),
                     "temperature": float(patch.get("temperature", .2)),
                     "num_patches": patch.get("num_patches", 64),
@@ -75,6 +77,21 @@ def self_supervised_translation_options(image: dict[str, Any]) -> dict[str, Any]
                 or len(set(layers)) != len(layers)):
             raise ValueError("PatchNCE layers must be nonempty, distinct, nonnegative integer indices.")
         settings["layers"] = list(layers)
+        settings["sampler"] = patch.get("sampler", "sample")
+        if settings["sampler"] not in {"sample", "mlp_sample"}:
+            raise ValueError("PatchNCE sampler must be sample or mlp_sample.")
+        if settings["sampler"] == "mlp_sample":
+            width = patch.get("projection_dim", 256)
+            if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+                raise ValueError("PatchNCE projection_dim must be a positive integer.")
+            settings["projection_dim"] = width
+            for name, default in (("lr", 2e-4), ("grad_clip_norm", 1.)):
+                value = float(patch.get(name, default))
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"PatchNCE {name} must be finite and positive.")
+                settings[name] = value
+        elif set(patch) & {"projection_dim", "lr", "grad_clip_norm"}:
+            raise ValueError("PatchNCE MLP options require sampler: mlp_sample.")
         return {"objective": objective, "name": "patchnce", "readout": readout, **settings}
     if image.get("patchnce"):
         raise ValueError("PatchNCE settings require decoded_translation.objective: patchnce.")

@@ -18,6 +18,7 @@ from diffusion_ot.evaluation.offline_artifacts import (
 )
 from diffusion_ot.evaluation.offline_pipeline import (
     DOMAINS, build_bank, complete_dataset, domain_data_path, load_bundle, local, release_models,
+    require_projection_mode,
 )
 from diffusion_ot.integrations.hf_snapshot import load_yaml_config
 
@@ -111,6 +112,7 @@ def run_stage4(config_path, bundle_path, *, root, output_dir=None, device=None, 
     versions = metric_versions()  # Fail before expensive generation if packages are missing/wrong.
     bundle_path = local(root, bundle_path)
     manifest, references, plan = load_bundle(bundle_path)
+    require_projection_mode(config, manifest["projection_rms"]["mode"])
     verify_files(root, manifest["dependencies"])
     alignment = manifest["alignment"]
     seed = int(config["seed"])
@@ -140,6 +142,11 @@ def run_stage4(config_path, bundle_path, *, root, output_dir=None, device=None, 
     protocol = {"bundle_identity": manifest["identity"], "bundle_sha256": file_hash(bundle_path / "bundle.json"),
                 "seed": seed, "image_size": image_size, "num_steps": steps, "guidance_scale": guidance,
                 "readout": "conditional_mean", "metrics": config["metrics"], "versions": versions,
+                "weights": manifest["weights"], "cross_cost_source": manifest["cross_cost_source"],
+                "fit_bandwidth": manifest["fit_settings"]["bandwidth"],
+                "projection_bandwidth": manifest["projection_bandwidth"],
+                "fit_scales": manifest["fit_scales"], "projection_scales": manifest["projection_scales"],
+                "projection_rms": manifest["projection_rms"],
                 "gallery_pairs_per_direction": count, "implementation": implementation,
                 "datasets": {str(p): getattr(ds, "_fingerprint", None) for p, ds in datasets.items()}}
     identity = fingerprint(protocol)
@@ -194,8 +201,8 @@ def run_stage4(config_path, bundle_path, *, root, output_dir=None, device=None, 
             coupling = (plan if source == "cat" else plan.T).to(solver_device)
             codes = project_full(query.matching_features, references[source].matching_features.to(coupling),
                                  references[target].matching_features.to(coupling), coupling,
-                                 references[target].raw_codes, source_scale=manifest["scales"][source],
-                                 target_scale=manifest["scales"][target], bandwidth=manifest["projection_bandwidth"],
+                                 references[target].raw_codes, source_scale=manifest["projection_scales"][source],
+                                 target_scale=manifest["projection_scales"][target], bandwidth=manifest["projection_bandwidth"],
                                  query_batch_size=query_batch, target_block_size=target_block)
             atomic_torch(code_path, codes)
             atomic_json(code_receipt, {"identity": identity, "sha256": file_hash(code_path)})
@@ -250,6 +257,10 @@ def run_stage4(config_path, bundle_path, *, root, output_dir=None, device=None, 
               "ssim_reference": "original_source_rgb", "evaluation_split": "val"}
     atomic_json(output / "metrics.json", report)
     lines = ["# Stage 4 evaluation", "", "All held-out sources; full training-bank InfoOT.", "",
+             f"Model weights: {manifest['weights']}; transport cost: {manifest['cross_cost_source']}.", "",
+             f"Fit / projection bandwidth: {protocol['fit_bandwidth']:g} / {protocol['projection_bandwidth']:g}.", "",
+             f"Fit RMS (full training bank): {protocol['fit_scales']}.", "",
+             f"Projection RMS ({protocol['projection_rms']['mode']}, frozen): {protocol['projection_scales']}.", "",
              "| Direction | FID | Source SSIM (mean ± std) | Generated / real |",
              "|---|---:|---:|---:|"]
     for direction, result in metrics.items():

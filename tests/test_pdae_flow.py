@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import pytest
 
 
@@ -104,3 +105,73 @@ def test_velocity_gap_target_detaches_by_default():
 
     assert not target_delta.requires_grad
     torch.testing.assert_close(target_delta, torch.ones_like(target_delta))
+
+
+def test_uniform_flow_loss_is_direct_velocity_mse_with_the_same_gradient():
+    from diffusion_ot.losses.pdae_flow import flow_loss_weight, pdae_velocity_gap_loss
+
+    t = torch.tensor([0., .25, .5, .9, 1.], dtype=torch.float64)
+    delta = torch.arange(10, dtype=t.dtype).reshape(5, 2).requires_grad_()
+    base = torch.full_like(delta, 0.4, requires_grad=True)
+    target = torch.full_like(delta, 0.7, requires_grad=True)
+    weight = flow_loss_weight(t, {"type": "uniform"})
+    loss = pdae_velocity_gap_loss(delta, target, base, weight=weight)
+    direct_loss = (delta + base.detach() - target.detach()).square().mean()
+    actual_grad = torch.autograd.grad(loss, (delta, base, target), allow_unused=True)
+    expected_grad = torch.autograd.grad(direct_loss, delta)[0]
+    torch.testing.assert_close(loss, direct_loss)
+    torch.testing.assert_close(actual_grad[0], expected_grad)
+    assert actual_grad[1:] == (None, None)
+    torch.testing.assert_close(weight, torch.ones_like(t), rtol=0, atol=0)
+
+
+def test_cosmap_has_unit_integral_symmetry_and_fixed_endpoint_weights():
+    from diffusion_ot.losses.pdae_flow import flow_loss_weight
+
+    t = torch.tensor([0., .25, .5, .75, 1.], dtype=torch.float64)
+    weight = flow_loss_weight(t, {"type": "cosmap"})
+    expected = torch.tensor([2., 3.2, 4., 3.2, 2.], dtype=t.dtype) / math.pi
+    torch.testing.assert_close(weight, expected)
+    torch.testing.assert_close(weight, flow_loss_weight(t, {"type": "cosmap"}, direction="data_to_noise"))
+    torch.testing.assert_close(weight[1:2], flow_loss_weight(t[1:2], {"type": "cosmap"}))
+    midpoints = (torch.arange(10000, dtype=t.dtype) + .5) / 10000
+    assert flow_loss_weight(midpoints, {"type": "cosmap"}).mean().item() == pytest.approx(1., abs=1e-8)
+
+
+def test_cosmap_weighting_matches_its_sampling_measure():
+    from diffusion_ot.losses.pdae_flow import flow_loss_weight
+
+    u = (torch.arange(10000, dtype=torch.float64) + .5) / 10000
+    sampled_t = 1 - 1 / (torch.tan(math.pi * u / 2) + 1)
+    # Integrate a nonconstant loss by two independently expressed measures.
+    weighted = (flow_loss_weight(u, {"type": "cosmap"}) * (1 + 2*u + 3*u.square())).mean()
+    sampled = (1 + 2*sampled_t + 3*sampled_t.square()).mean()
+    torch.testing.assert_close(weighted, sampled, rtol=0, atol=1e-8)
+
+
+@pytest.mark.parametrize("weight_type", ["uniform", "cosmap"])
+def test_new_flow_weighting_does_not_consume_rng_or_stack_snr_options(weight_type):
+    from diffusion_ot.losses.pdae_flow import flow_loss_weight, resolve_flow_loss_weighting
+
+    before = torch.get_rng_state().clone()
+    t = torch.tensor([.2, .8], dtype=torch.float64)
+    weight = flow_loss_weight(t, {"type": weight_type})
+    assert weight.dtype == t.dtype and weight.device == t.device and weight.shape == t.shape
+    assert torch.equal(before, torch.get_rng_state())
+    for option in ("gamma", "normalize_mean_to", "normalization_mode", "clamp_min"):
+        with pytest.raises(ValueError, match="accepts only 'type'"):
+            resolve_flow_loss_weighting({"type": weight_type, option: .1})
+
+
+@pytest.mark.parametrize("overrides", [{}, {"gamma": .25, "normalization_mode": "batch"},
+                                       {"normalize_mean_to": None, "clamp_min": None}])
+def test_flow_weight_dispatch_preserves_previous_stage1a_weights(overrides):
+    from diffusion_ot.losses.pdae_flow import flow_loss_weight, pdae_flow_snr_weight
+
+    t = torch.tensor([0., .01, .25, .5, .9, 1.], dtype=torch.float64)
+    old_options = dict(gamma=.1, normalization_mode="fixed_uniform", normalization_samples=65536,
+                       normalize_mean_to=1., clamp_min=.001, clamp_max=None)
+    old_options.update(overrides)
+    expected = pdae_flow_snr_weight(t=t, **old_options)
+    # Omitted type/defaults are how historical checkpoints encode this recipe.
+    torch.testing.assert_close(flow_loss_weight(t, overrides), expected, rtol=0, atol=0)

@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import gc
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -14,14 +15,57 @@ from diffusion_ot.evaluation.offline_artifacts import (
     atomic_json, atomic_torch, bind_run, file_hash, fingerprint, read_torch, verify_files,
 )
 from diffusion_ot.integrations.hf_snapshot import load_yaml_config, resolve_project_local_path
+from diffusion_ot.losses.encoder_transport import encoder_transport_cost
 from diffusion_ot.losses.infoot import uniform_marginals
+from diffusion_ot.losses.projection_rms import checkpoint_projection_rms, validate_projection_scales
 
-PROTOCOL = "full_bank_fixed_rms_v1"
+PROTOCOL = "full_bank_calibrated_projection_v2"
 DOMAINS = ("cat", "dog")
 
 
 def local(root, value):
     return resolve_project_local_path(value, root)
+
+
+def require_projection_mode(config, mode):
+    """A recipe may require a calibration mode; it cannot override the checkpoint."""
+    required = config.get("require_projection_rms_mode")
+    if required is not None and required not in {"reference_ema", "full_bank"}:
+        raise ValueError("require_projection_rms_mode must be reference_ema or full_bank")
+    if required is not None and required != mode:
+        raise ValueError(f"This recipe requires projection RMS {required}, but selected state uses {mode}")
+
+
+def checkpoint_rms_calibration(checkpoint, alignment, weights):
+    """Restore, never update, the statistics paired with the chosen encoder/head."""
+    if weights not in {"raw", "ema"}:
+        raise ValueError("weights must be raw or ema")
+    tracker = checkpoint_projection_rms(checkpoint, alignment, weights=weights)
+    if tracker is None:
+        # Preserve the original offline protocol for pre-EMA controls. It uses
+        # the complete training bank, never a validation-query batch.
+        return {"mode": "full_bank", "source": "full_training_bank"}, None
+    metadata = {"mode": "reference_ema", "source": "checkpoint", "weights": weights,
+                "checkpoint_step": int(checkpoint["step"]), "num_updates": tracker.num_updates,
+                "decay": tracker.decay, "eps": tracker.eps,
+                "state_sha256": fingerprint(tracker.state_dict())}
+    return metadata, validate_projection_scales(tracker.scales())
+
+
+def full_cross_cost(x, y, *, source, prior, train_ids, block_size):
+    """Build the same fixed cost as Stage 1B, tiled over all training references."""
+    if source not in {"encoder", "dino"}:
+        raise ValueError("infoot.cross_cost_source must be dino or encoder")
+    if source == "dino" and prior is None:
+        raise ValueError("DINO cross cost requires a semantic prior")
+    descriptors = ([prior.lookup(train_ids[d], d, "train").to(x.device) for d in DOMAINS]
+                   if source == "dino" else None)
+    cost = torch.empty((len(x), len(y)), device=x.device, dtype=x.dtype)
+    for start in range(0, len(x), block_size):
+        stop = start + block_size
+        cost[start:stop] = (encoder_transport_cost(x[start:stop], y) if source == "encoder"
+                            else prior.cost(descriptors[0][start:stop], descriptors[1]))
+    return cost
 
 
 def release_models():
@@ -94,6 +138,7 @@ def implementation_hash():
     names = ["evaluation/full_infoot.py", "evaluation/offline_pipeline.py",
              "evaluation/stage1b_eval.py", "evaluation/stage1a_eval.py",
              "models/generator_adaptation.py", "models/matching_head.py", "models/pdae_sit.py",
+             "models/patch_sampler.py", "losses/projection_rms.py", "losses/encoder_transport.py",
              "losses/infoot.py", "losses/semantic_prior.py", "integrations/sit_diffusers.py",
              "data/ground_truth.py", "data/latent_cache.py", "data/latent_dataset.py"]
     return fingerprint({name: file_hash(base / name) for name in names})
@@ -120,21 +165,38 @@ def load_bundle(path):
     path = Path(path).resolve()
     manifest = json.loads((path / "bundle.json").read_text(encoding="utf-8"))
     if manifest.get("protocol") != PROTOCOL or not manifest["solver"].get("converged"):
-        raise ValueError("Bundle is unsupported or its fit is incomplete")
-    scientific_inputs = {k: v for k, v in manifest.items() if k not in {"identity", "scales", "solver", "files"}}
+        raise ValueError("Bundle is unsupported or its fit is incomplete; rebuild Stage 2-3 in a new output directory")
+    scientific_inputs = {k: v for k, v in manifest.items()
+                         if k not in {"identity", "fit_scales", "projection_scales", "solver", "files"}}
     if fingerprint(scientific_inputs) != manifest["identity"]:
         raise ValueError("Bundle protocol fingerprint mismatch")
     if manifest["implementation"] != implementation_hash():
         raise ValueError("Model/InfoOT implementation changed since this bundle was built; rerun Stage 2-3")
+    required_files = {"models/paired_state.pt", "banks/cat.pt", "banks/dog.pt", "transport.pt", "calibration.json"}
+    if not required_files <= manifest["files"].keys():
+        raise ValueError("Bundle is missing required artifact fingerprints")
     verify_files(path, manifest["files"])
     calibration = json.loads((path / "calibration.json").read_text(encoding="utf-8"))
-    if calibration != {"protocol": PROTOCOL, "scales": manifest["scales"]}:
+    if calibration != {k: manifest[k] for k in ("protocol", "fit_scales", "projection_scales", "projection_rms")}:
         raise ValueError("Bundle calibration mismatch")
     banks = {d: legacy.load_latent_bank(path / f"banks/{d}.pt") for d in DOMAINS}
     for domain, bank in banks.items():
         if (bank.checkpoint_id != manifest["identity"] or bank.domain != domain or bank.split != "train"
                 or bank.sample_ids != manifest["train_ids"][domain]):
             raise ValueError("Bundle bank identity/order mismatch")
+    fit_scales = validate_projection_scales(manifest["fit_scales"])
+    # CPU reduction order can differ across export/evaluation machines. The
+    # serialized calibration is already hash-checked; allow only FP64 roundoff
+    # in this independent recomputation, not a different feature geometry.
+    if any(not math.isclose(fit_scales[d], reference_rms(banks[d].matching_features),
+                            rel_tol=1e-12, abs_tol=1e-12) for d in DOMAINS):
+        raise ValueError("Bundle fit RMS differs from the complete training bank")
+    paired = read_torch(path / "models/paired_state.pt")
+    rms_metadata, projection_scales = checkpoint_rms_calibration(paired, manifest["alignment"], manifest["weights"])
+    if (rms_metadata != manifest["projection_rms"]
+            or validate_projection_scales(manifest["projection_scales"]) != (projection_scales or fit_scales)):
+        raise ValueError("Bundle projection RMS does not match the selected checkpoint statistics")
+    del paired
     transport = read_torch(path / "transport.pt")
     plan = transport["coupling"]
     if plan.shape != (len(banks["cat"].sample_ids), len(banks["dog"].sample_ids)):
@@ -170,8 +232,21 @@ def run_stage23(config_path, checkpoint_path, *, root, output_dir=None, weights=
     checkpoint = legacy._load_joint_checkpoint(checkpoint_path)
     if checkpoint.get("format_version") != 4:
         raise ValueError("This offline pipeline requires a Stage 1B format-4 paired checkpoint")
-    from diffusion_ot.losses.semantic_prior import load_semantic_prior
-    prior = load_semantic_prior({**alignment, "infoot": {"variant": "fused"}}, root)
+    legacy._validate_self_supervised_checkpoint(alignment, checkpoint)
+    rms_metadata, saved_projection_scales = checkpoint_rms_calibration(checkpoint, alignment, weights)
+    require_projection_mode(config, rms_metadata["mode"])
+    infoot = {"variant": "fused", **(alignment.get("infoot") or {})}
+    if infoot["variant"] != "fused":
+        raise ValueError("Stage 2-3 requires fused InfoOT with an encoder or DINO cross cost")
+    cost_source = infoot.get("cross_cost_source", "dino")
+    if cost_source not in {"encoder", "dino"}:
+        raise ValueError("infoot.cross_cost_source must be dino or encoder")
+    prior = None
+    if cost_source == "dino":
+        from diffusion_ot.losses.semantic_prior import load_semantic_prior
+        prior = load_semantic_prior({**alignment, "infoot": infoot}, root)
+    elif alignment.get("semantic_prior"):
+        raise ValueError("Encoder-only transport must not configure a semantic_prior")
     print("Verifying complete manifests and model fingerprints...", flush=True)
     train_ids, validation_ids = {}, {}
     for domain in DOMAINS:
@@ -186,7 +261,8 @@ def run_stage23(config_path, checkpoint_path, *, root, output_dir=None, weights=
     protocol = {"protocol": PROTOCOL, "checkpoint_sha256": file_hash(checkpoint_path),
                 "weights": weights, "alignment": alignment, "dependencies": dependencies,
                 "train_ids": train_ids, "validation_ids": validation_ids,
-                "prior_fingerprint": prior.fingerprint, "fit_settings": asdict(settings),
+                "cross_cost_source": cost_source, "prior_fingerprint": prior.fingerprint if prior is not None else None,
+                "projection_rms": rms_metadata, "fit_settings": asdict(settings),
                 "projection_bandwidth": projection_bandwidth, "solver_dtype": dtype_name,
                 "implementation": implementation_hash(), "torch_version": str(torch.__version__),
                 "cuda_version": torch.version.cuda}
@@ -203,7 +279,8 @@ def run_stage23(config_path, checkpoint_path, *, root, output_dir=None, weights=
             raise ValueError("Cached paired model state changed")
     else:
         keys = ("stage", "step", "format_version", "config", "stage1a_provenance", "encoders",
-                "encoder_ema", "matching_heads", "matching_head_ema", "generators", "generator_ema")
+                "encoder_ema", "matching_heads", "matching_head_ema", "generators", "generator_ema",
+                "projection_rms_state", "patch_projectors", "patch_projector_ema")
         atomic_torch(paired_path, {key: checkpoint[key] for key in keys if key in checkpoint})
         atomic_json(paired_receipt, {"identity": identity, "sha256": file_hash(paired_path)})
     del checkpoint
@@ -225,19 +302,23 @@ def run_stage23(config_path, checkpoint_path, *, root, output_dir=None, weights=
         if bank.sample_ids != train_ids[domain] or bank.checkpoint_id != identity:
             raise ValueError("Bank does not cover the complete ordered training manifest")
         banks[domain] = bank
-    scales = {d: reference_rms(banks[d].matching_features) for d in DOMAINS}
+    # Fitting sees all training references. Conditional projection retains the
+    # checkpoint's running statistics, including both source and target scales.
+    fit_scales = {d: reference_rms(banks[d].matching_features) for d in DOMAINS}
+    projection_scales = saved_projection_scales or dict(fit_scales)
+    calibration = {"protocol": PROTOCOL, "fit_scales": fit_scales,
+                   "projection_scales": projection_scales, "projection_rms": rms_metadata}
+    atomic_json(output / "calibration.json", calibration)
+    print(f"RMS fit={fit_scales}; projection ({rms_metadata['mode']}, {weights})={projection_scales}", flush=True)
     dtype = getattr(torch, dtype_name)
     solver_device = device or config["solver_device"]
     x, y = [banks[d].matching_features.to(device=solver_device, dtype=dtype) for d in DOMAINS]
-    descriptors = [prior.lookup(train_ids[d], d, "train").to(solver_device) for d in DOMAINS]
-    cost = torch.empty((len(x), len(y)), device=solver_device, dtype=dtype)
-    for start in range(0, len(x), settings.block_size):
-        cost[start:start+settings.block_size] = prior.cost(descriptors[0][start:start+settings.block_size], descriptors[1])
-    del descriptors, prior
+    cost = full_cross_cost(x, y, source=cost_source, prior=prior, train_ids=train_ids, block_size=settings.block_size)
+    del prior
     print(f"Global InfoOT: {len(x)} x {len(y)}; one plan matrix is {cost.numel()*cost.element_size()/2**20:.1f} MiB", flush=True)
     if x.is_cuda:
         torch.cuda.reset_peak_memory_stats(x.device)
-    plan, report = fit_global(x, y, cost, scales=(scales["cat"], scales["dog"]), settings=settings,
+    plan, report = fit_global(x, y, cost, scales=(fit_scales["cat"], fit_scales["dog"]), settings=settings,
                               output=output, identity=identity, resume=resume,
                               max_new_iterations=max_new_iterations)
     atomic_json(output / "checks.json", report)
@@ -246,9 +327,9 @@ def run_stage23(config_path, checkpoint_path, *, root, output_dir=None, weights=
         return {"status": status, "output_dir": str(output), "solver": report}
     a, b = uniform_marginals(*plan.shape, device="cpu", dtype=plan.dtype)
     atomic_torch(output / "transport.pt", {"coupling": plan.cpu(), "a": a, "b": b})
-    atomic_json(output / "calibration.json", {"protocol": PROTOCOL, "scales": scales})
     files = ["models/paired_state.pt", "banks/cat.pt", "banks/dog.pt", "transport.pt", "calibration.json"]
-    manifest = {**protocol, "identity": identity, "scales": scales, "solver": report,
+    manifest = {**protocol, "identity": identity, "fit_scales": fit_scales,
+                "projection_scales": projection_scales, "solver": report,
                 "files": {p: file_hash(output / p) for p in files}}
     atomic_json(output / "bundle.json", manifest)
     return {"status": "complete", "output_dir": str(output), "solver": report}

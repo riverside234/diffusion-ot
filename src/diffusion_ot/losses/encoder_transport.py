@@ -35,27 +35,54 @@ def _validate_features(features: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must contain finite floating-point features.")
 
 
-@torch.no_grad()
-def encoder_transport_cost(cat_matching: torch.Tensor, dog_matching: torch.Tensor) -> torch.Tensor:
-    """Detached cosine cost, fixed for each OT solve, with no external features.
+def encoder_transport_cost(
+    cat_matching: torch.Tensor, dog_matching: torch.Tensor, *, detach: bool = True,
+) -> torch.Tensor:
+    """Cosine cost, detached by default for OT fitting, with no external features.
 
     Normalize each input row, then return 1 - cosine similarity in [0, 2].
     The normalization gives the cost a bounded scale, not semantic alignment.
     A nonseparable cross cost can break independent-plan symmetry. Pure KDE
     MI can also move away from independence on irregular banks; independence
     is a fixed point in symmetric cases, not universally. Neither mechanism
-    guarantees that the resulting assignments are meaningful.
+    guarantees that the resulting assignments are meaningful. Neural full-InfoOT
+    objectives explicitly request ``detach=False``; the plan solve stays detached.
     """
     _validate_features(cat_matching, "cat_matching")
     _validate_features(dog_matching, "dog_matching")
     if cat_matching.device != dog_matching.device or cat_matching.shape[1] != dog_matching.shape[1]:
         raise ValueError("Encoder cross cost requires matching dimensions and the same device.")
     dtype = torch.float64 if torch.float64 in (cat_matching.dtype, dog_matching.dtype) else torch.float32
-    with torch.autocast(device_type=cat_matching.device.type, enabled=False):
+    with torch.set_grad_enabled(torch.is_grad_enabled() and not detach), torch.autocast(
+        device_type=cat_matching.device.type, enabled=False,
+    ):
         cat, dog = cat_matching.to(dtype=dtype), dog_matching.to(dtype=dtype)
         if (cat.norm(dim=1) < 1e-8).any() or (dog.norm(dim=1) < 1e-8).any():
             raise ValueError("Encoder cross cost requires nonzero matching features.")
         return (1.0 - F.normalize(cat, dim=1) @ F.normalize(dog, dim=1).T).clamp(0.0, 2.0)
+
+
+def relative_encoder_transport_loss(
+    cat_matching: torch.Tensor, dog_matching: torch.Tensor, coupling: torch.Tensor,
+) -> torch.Tensor:
+    """Negative transported centered correlation, with uniform reference masses.
+
+    For a feasible probability plan this equals <Gamma, C> - <a b^T, C>.
+    Both feature means are LIVE: detaching the independent baseline would
+    restore the raw attraction gradient. The centered form also avoids leaking
+    small solver marginal residuals into the common-mean component. Only the
+    coupling is detached. This is an auxiliary objective, not Sinkhorn divergence.
+    """
+    # Share the cost helper's input validation, normalization, and precision.
+    cost = encoder_transport_cost(cat_matching, dog_matching, detach=False)
+    if coupling.shape != cost.shape or coupling.device != cost.device:
+        raise ValueError("Relative transport requires a same-device plan matching the feature banks.")
+    plan = coupling.detach().to(cost)
+    if not torch.isfinite(plan).all() or (plan < 0).any():
+        raise ValueError("Relative transport requires a finite nonnegative coupling.")
+    # Centering cosine cost is negative centered correlation for unit features.
+    centered_cost = cost - cost.mean(1, keepdim=True) - cost.mean(0, keepdim=True) + cost.mean()
+    return (plan * centered_cost).sum()
 
 
 def encoder_conditional_readout(
