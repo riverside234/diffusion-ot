@@ -1,0 +1,147 @@
+{
+  "protocol": "fixed_noise_smoke",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/residual_sit_b2_256.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_rescnn_cosmap/checkpoints/latest.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_rescnn_cosmap/stage1a_rescnn_eval/step_050000/ema/smoke",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 50000,
+  "weights": "ema",
+  "semantic_cfg_enabled": true,
+  "attention_lora": {
+    "enabled": true,
+    "rank": 64,
+    "alpha": 64.0,
+    "dropout": 0.0,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "targets": [
+      "qkv",
+      "proj"
+    ]
+  },
+  "seed": 20260902,
+  "num_samples": 8,
+  "num_steps": 50,
+  "guidance_scales": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "vae_reconstruction",
+    "correct_z_cfg_0",
+    "shuffled_z_cfg_0",
+    "correct_z_cfg_1",
+    "shuffled_z_cfg_1",
+    "correct_z_cfg_1.5",
+    "shuffled_z_cfg_1.5",
+    "correct_z_cfg_2",
+    "shuffled_z_cfg_2"
+  ],
+  "metrics": {
+    "correct_z_cfg_0": {
+      "latent_mse": 1.201050877571106,
+      "pixel_mse": 0.12193895876407623,
+      "pixel_psnr": 9.138575177358367
+    },
+    "shuffled_z_cfg_0": {
+      "latent_mse": 1.201050877571106,
+      "pixel_mse": 0.12193895876407623,
+      "pixel_psnr": 9.138575177358367
+    },
+    "correct_z_cfg_1": {
+      "latent_mse": 0.5192506313323975,
+      "pixel_mse": 0.017740754410624504,
+      "pixel_psnr": 17.510279161049134
+    },
+    "shuffled_z_cfg_1": {
+      "latent_mse": 1.0377026796340942,
+      "pixel_mse": 0.09995858371257782,
+      "pixel_psnr": 10.0017990590863
+    },
+    "correct_z_cfg_1.5": {
+      "latent_mse": 0.518375813961029,
+      "pixel_mse": 0.017145313322544098,
+      "pixel_psnr": 17.658545739489433
+    },
+    "shuffled_z_cfg_1.5": {
+      "latent_mse": 1.0799381732940674,
+      "pixel_mse": 0.10275287926197052,
+      "pixel_psnr": 9.88205999816214
+    },
+    "correct_z_cfg_2": {
+      "latent_mse": 0.5312076210975647,
+      "pixel_mse": 0.01770589128136635,
+      "pixel_psnr": 17.51882206785754
+    },
+    "shuffled_z_cfg_2": {
+      "latent_mse": 1.1092808246612549,
+      "pixel_mse": 0.10417601466178894,
+      "pixel_psnr": 9.822322608743328
+    },
+    "vae_reconstruction": {
+      "pixel_mse": 0.0016538286581635475,
+      "pixel_psnr": 27.8150948672341
+    }
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_rescnn_cosmap/stage1a_rescnn_eval/step_050000/ema/smoke/reconstruction_grid.png",
+  "extra_reports": {
+    "inferred_noise_roundtrip": "/data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_rescnn_cosmap/stage1a_rescnn_eval/step_050000/ema/roundtrip/roundtrip_report.json"
+  },
+  "encoder_input_space": "latent",
+  "image_reference": "original_rgb",
+  "encoder_architecture": {
+    "kind": "residual_cnn_v1",
+    "input_channels": 4,
+    "input_size": 32,
+    "stem_stride": 1,
+    "normalize_input": false,
+    "channels": [
+      64,
+      128,
+      256,
+      256
+    ],
+    "blocks_per_stage": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "spatial_size": 4,
+    "num_groups": 32,
+    "attention_resolutions": [
+      16
+    ],
+    "attention_heads": 4,
+    "dropout": 0.0,
+    "z_dim": 512,
+    "normalize_z": true
+  }
+}
