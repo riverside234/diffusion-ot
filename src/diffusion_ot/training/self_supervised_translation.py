@@ -17,6 +17,9 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from diffusion_ot.losses.contrastive import detached_key_contrastive_loss
+from diffusion_ot.losses.translation_image import (
+    IMAGE_LOSS_PROTOCOL, translation_image_losses, translation_image_options,
+)
 from diffusion_ot.models.generator_adaptation import (
     baseline_parameter_snapshot,
     configure_generator_adaptation,
@@ -144,8 +147,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                     "adversarial_weight", "code_consistency_weight"):
             if float(self.options.get(key, 0)) != 0:
                 raise ValueError(f"Self-supervised decoder requires {key}: 0.")
-        if float((self.options.get("color_histogram") or {}).get("weight", 0)) != 0:
-            raise ValueError("Self-supervised decoder requires color_histogram.weight: 0.")
+        self.rgb_options = translation_image_options(self.options)
         for key in ("null_preservation_weight", "conditioned_preservation_weight"):
             if float(config["generator_adaptation"].get(key, 0)) != 0:
                 raise ValueError(f"Self-supervised decoder requires {key}: 0.")
@@ -219,8 +221,11 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         # must not change the initial noise used by the paired control rollout.
         self.patch_generators = ({d: torch.Generator(device="cpu").manual_seed(seed + 1901 + i)
                                   for i, d in enumerate(domains)} if self.patch_options else {})
+        self.image_generators = ({d: torch.Generator(device="cpu").manual_seed(seed + 3901 + i)
+                                 for i, d in enumerate(domains)} if "target_patch_swd" in self.rgb_options else {})
         self.code_consistency_objective = torch.zeros((), device=domains["cat"].device)
         self.image_objectives = {}
+        self.diagnostic_objectives = {}
         self.original_datasets = {}
         self.diagnostic_options = config.get("self_supervised_diagnostics") or {}
 
@@ -292,17 +297,22 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
 
     def loss(self, weights, references, source_latents, real_latents, *, step, validation_seed=None,
              source_reference_structure=None, source_query_structure=None, source_query_metadata=None,
-             validation_image_dir=None, source_query_codes=None):
+             validation_image_dir=None, source_query_codes=None, source_reference_metadata=None):
         evaluation = validation_seed is not None
         device = self.domains["cat"].device
         losses, metrics = [], {}
+        rgb_losses = {name: [] for name in self.rgb_options}
         self.code_consistency_objective = torch.zeros((), device=device)
         self.image_objectives = {}
+        self.diagnostic_objectives = {}
         save_images = (evaluation and validation_image_dir is not None
                        and bool(self.options.get("save_validation_images", False)))
         image_diagnostics = evaluation and bool(self.diagnostic_options.get("enabled", False))
-        if (save_images or image_diagnostics) and (source_query_metadata is None or any(d not in source_query_metadata for d in self.domains)):
-            raise ValueError("Self-supervised validation images/diagnostics require original source metadata.")
+        needs_originals = save_images or image_diagnostics or bool(self.rgb_options)
+        if needs_originals and (source_query_metadata is None or any(d not in source_query_metadata for d in self.domains)):
+            raise ValueError("Self-supervised image objectives/diagnostics require original source metadata.")
+        if self.image_generators and (source_reference_metadata is None or any(d not in source_reference_metadata for d in self.domains)):
+            raise ValueError("Target patch SWD requires original training reference metadata.")
         if source_query_codes is None:
             with torch.no_grad():
                 source_query_codes = {
@@ -317,8 +327,8 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             query_keys = source_query_codes[source].detach()
             if len(query_keys) != len(probability) or len(query_keys) > len(source_latents[source]):
                 raise ValueError("Source query codes must match all conditional query rows.")
-            # Keep the complete forward mean. Only the InfoNCE gradient through
-            # W is scaled; direct target-code, G and readout gradients stay live.
+            # Keep the complete forward mean. All decoded gradients through W
+            # share the gate; direct target-code, G and readout gradients stay live.
             decoded_probability = scale_conditional_weight_gradient(
                 probability[:count], self.projection_gradient_scale)
             codes = (decoded_probability @ references[target].float()).to(context.device, dtype=context.dtype)
@@ -365,7 +375,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 "readout_domain": readout_domain,
                 "readout": "generated_rgb_to_scaled_vae_posterior_mean_to_live_pdae_encoder",
             }
-            if save_images or image_diagnostics:
+            if needs_originals:
                 records = source_query_metadata[source][:count]
                 if len(records) != count:
                     raise ValueError("Original source metadata must match the decoded query count.")
@@ -373,6 +383,37 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                     originals = self.original_source_images(source, records).to(device=images.device, dtype=torch.float32)
                 if originals.shape != images.shape:
                     raise ValueError("Decoded and original source RGB shapes differ; check cache preprocessing.")
+            if self.rgb_options:
+                image_generator = (torch.Generator(device="cpu").manual_seed(validation_seed + 30000 + offset)
+                                   if evaluation else self.image_generators.get(target))
+                real_images, baseline_images = None, None
+                if "target_patch_swd" in self.rgb_options:
+                    records = source_reference_metadata[target]
+                    if len(records) != len(references[target]) or len(records) < count:
+                        raise ValueError("Target patch SWD needs at least one disjoint real reference per decoded image.")
+                    selected = torch.randperm(len(records), generator=image_generator).tolist()
+                    selected = selected[:2 * count if evaluation else count]
+                    target_records = [records[i] for i in selected]
+                    with torch.no_grad():
+                        target_rgb = self.original_source_images(target, target_records).to(images.device, dtype=torch.float32)
+                    real_images = target_rgb[:count]
+                    if evaluation and len(target_rgb) == 2 * count:
+                        baseline_images = target_rgb[count:]
+                    metrics[direction]["target_rgb_reference_ids"] = [r["sample_id"] for r in target_records[:count]]
+                    if baseline_images is not None:
+                        metrics[direction]["target_rgb_baseline_ids"] = [r["sample_id"] for r in target_records[count:]]
+                components, image_metrics = translation_image_losses(images, originals, self.rgb_options,
+                    generator=image_generator, real_target=real_images, real_baseline=baseline_images,
+                    per_image=evaluation)
+                diagnostic_every = int((self.config.get("train") or {}).get("gradient_diagnostics_every", 200))
+                for name, component in components.items():
+                    rgb_losses[name].append(component.to(device))
+                    if (not evaluation and diagnostic_every > 0 and step % diagnostic_every == 0
+                            and component.requires_grad):
+                        gradient = torch.autograd.grad(self.ramp(step) * self.rgb_options[name]["weight"] * component,
+                                                       images, retain_graph=True)[0]
+                        image_metrics[name]["weighted_rgb_gradient_norm"] = float(gradient.detach().float().norm())
+                metrics[direction]["image_losses"] = image_metrics
             if image_diagnostics:
                 correspondence, native_metrics, native = self._validation_images(
                     source, images, originals, query_keys, source_latents[source],
@@ -397,8 +438,25 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         contrastive = torch.stack(losses).mean()
         ramp = 1.0 if evaluation else self.ramp(step)
         weighted = self.weight * contrastive
+        if self.rgb_options:
+            self.diagnostic_objectives[self.objective_name] = ramp * weighted
+            image_metrics = {}
+            for name, components in rgb_losses.items():
+                component = torch.stack(components).mean()
+                weight = self.rgb_options[name]["weight"]
+                weighted = weighted + weight * component
+                self.diagnostic_objectives[name] = ramp * weight * component
+                image_metrics[name] = {"loss": float(component.detach()), "weight": weight,
+                    "effective_weight": ramp * weight,
+                    "effective_weighted_loss": float(component.detach()) * ramp * weight}
+            metrics.update(image_losses=image_metrics, image_loss_protocol=IMAGE_LOSS_PROTOCOL,
+                           image_loss_options=self.rgb_options,
+                           decoded_conditional_weight_gradient_scale=self.projection_gradient_scale,
+                           decoded_conditional_weight_gradient_scope="all_decoded_losses; conditional_weights_only")
         objective = ramp * weighted
-        self.image_objectives[self.objective_name] = objective
+        # Keep one decoded PCGrad task so enabling RGB terms does not also
+        # change conflict projection into a separate task per new loss.
+        self.image_objectives["decoded_images" if self.rgb_options else self.objective_name] = objective
         metrics.update({
             f"{self.objective_name}_loss": float(contrastive.detach()),
             f"{self.objective_name}_weight": self.weight,
@@ -432,6 +490,9 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         return {
             "decoded_supervision": "self_supervised",
             "decoded_objective": self.objective,
+            **({"decoded_image_loss_protocol": IMAGE_LOSS_PROTOCOL, "decoded_image_loss_options": self.rgb_options,
+                "decoded_image_sampling_states": {d: gen.get_state().cpu() for d, gen in self.image_generators.items()}}
+               if self.rgb_options else {}),
             **({"decoded_source_contrastive_projection_gradient_scale": self.projection_gradient_scale}
                if self.objective == "source_infonce" else {}),
             **({"decoded_patchnce_options": self.patch_options,
@@ -456,6 +517,12 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         }
 
     def load_checkpoint(self, payload):
+        if payload.get("decoded_image_loss_options", {}) != self.rgb_options:
+            raise ValueError("Cannot resume a different decoded image-loss protocol; start a fresh run.")
+        if self.rgb_options and payload.get("decoded_image_loss_protocol") != IMAGE_LOSS_PROTOCOL:
+            raise ValueError("Missing or incompatible decoded image-loss protocol.")
+        if set(payload.get("decoded_image_sampling_states", {})) != set(self.image_generators):
+            raise ValueError("Missing decoded image sampling state.")
         if (payload.get("decoded_supervision") != "self_supervised"
                 or payload.get("decoded_objective", "source_infonce") != self.objective
                 or payload.get("decoded_source_contrastive_readout") != self.readout):
@@ -505,3 +572,5 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             gen.set_state(payload["decoded_noise_states"][d].cpu())
         for d, gen in self.patch_generators.items():
             gen.set_state(payload["decoded_patch_sampling_states"][d].cpu())
+        for d, gen in self.image_generators.items():
+            gen.set_state(payload["decoded_image_sampling_states"][d].cpu())

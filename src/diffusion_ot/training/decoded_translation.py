@@ -145,6 +145,10 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
         raise ValueError("This PatchNCE experiment requires decoded_translation.supervision: self_supervised.")
     diffaugment_options(image.get("diffaugment"))
     color_histogram_options(image.get("color_histogram"))
+    from diffusion_ot.losses.translation_image import translation_image_options
+    fixed_image_options = translation_image_options(image)
+    if not self_supervised and any(name != "color_histogram" for name in fixed_image_options):
+        raise ValueError("Teacher-free RGB/layout/patch objectives require supervision: self_supervised.")
     if image.get("discriminator_kind", "dino_feature") not in ("dino_feature", "rgb_patchgan"):
         raise ValueError("decoded_translation.discriminator_kind must be dino_feature or rgb_patchgan.")
     width = image.get("discriminator_base_channels", 32)
@@ -199,8 +203,8 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
         if any(float(options.get(name, default)) != 0 for name, default in
                (("null_preservation_weight", .1), ("conditioned_preservation_weight", 0.))):
             raise ValueError("Self-supervised translation disables Stage 1A teacher preservation losses.")
-        if float((image.get("color_histogram") or {}).get("weight", 0.)) != 0 or (image.get("color_histogram") or {}).get("validation_enabled", False):
-            raise ValueError("Self-supervised translation disables color histogram supervision and diagnostics.")
+        # Fixed RGB operators are permitted; pretrained image teachers and GAN
+        # objectives above remain rejected. Legacy recipes keep zero weights.
         if (image.get("diffaugment") or {}).get("enabled", False):
             raise ValueError("Self-supervised translation has no adversarial DiffAugment path.")
         self_supervised_translation_options(image)
@@ -253,6 +257,12 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
     count = int((config.get(readout_key) or {}).get("query_samples_per_domain", 32))
     if int(image.get("batch_size", 4)) > count:
         raise ValueError("Decoded batch_size cannot exceed the disjoint conditional query count.")
+    if "target_patch_swd" in fixed_image_options:
+        decoded_count = int(image.get("batch_size", 4))
+        train_references = int((config.get("data") or {}).get("transport_batch_size", 128)) - count
+        validation_references = int((config.get(readout_key) or {}).get("validation_reference_samples", 96))
+        if min(train_references, validation_references) < decoded_count:
+            raise ValueError("Target patch SWD requires at least batch_size disjoint real references in training and validation.")
     if (config.get("projection_support") or {}).get("enabled", False):
         raise ValueError("Experiment D disables the conditional-mean support loss.")
 

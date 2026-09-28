@@ -1,0 +1,206 @@
+# v4.5: v4 + detached own-encoder spatially-correlative reference matching.
+# All v4 losses, optimizer settings, projection kernels and gradient routes are unchanged.
+spatial_correlative_cost:
+  enabled: true
+  feature_source: own_encoder
+  layers: [0, 1]
+  grid_size: 8
+  spatial_center: true
+  channel_normalize: true
+  exclude_diagonal: true
+  comparison: symmetric_row_cosine
+  mixing_weight: 0.20
+  calibration: fixed_train_centered_rms
+  detach: true
+  eps: 1.0e-06
+  min_calibration_spread: 1.0e-06
+projection_rms:
+  mode: reference_ema
+  decay: 0.99
+  eps: 1.0e-08
+stage: stage1b_fused_infoot
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+output_dir: outputs/stage1b_nce_v4_5
+stage1a:
+  weights: ema
+  require_semantic_cfg: true
+  require_attention_lora: true
+  require_attention_lora_rank: 64
+  require_attention_lora_alpha: 64
+  cat:
+    config: configs/stage1a_pdae/cat_sit_b2_lora.yaml
+    checkpoint: outputs/stage1a_cat_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+    device: cuda:0
+  dog:
+    config: configs/stage1a_pdae/dog_sit_b2_lora.yaml
+    checkpoint: outputs/stage1a_dog_sit_b2_cfg_adaln_all_lora_r64/checkpoints/latest.pt
+    device: cuda:0
+data:
+  split: train
+  transport_batch_size: 256
+  reconstruction_batch_size: 32
+  random_horizontal_flip: 0.0
+  num_workers: 16
+  pin_memory: true
+  drop_last: true
+train:
+  max_steps: 2500
+  smoke_steps: 500
+  seed: 20260905
+  lr_encoder: 1.0e-05
+  weight_decay: 0.0
+  betas:
+  - 0.9
+  - 0.999
+  grad_clip_norm: 1.0
+  log_every: 100
+  gradient_diagnostics_every: 100
+  gradient_conflicts: true
+  save_every: 250
+  resume_from: null
+  loss_window: 100
+  validation_every: 250
+  validation_samples: 32
+  keep_step_checkpoints: true
+ema:
+  enabled: true
+  decay: 0.995
+  warmup_steps: 500
+  update_every: 1
+loss_weights:
+  cat_reconstruction: 1.0
+  dog_reconstruction: 1.0
+  infoot_alignment: 0.2
+  infoot_relative: 0.01
+  latent_anchor: 0.0
+  semantic_neighborhood: 0.0
+  conditional_structure: 0.0
+  projection_support: 0.0
+  alignment_warmup_steps: 1000
+matching:
+  normalize: l2
+  calibration_samples: 256
+  distance_scale: infoot_rms
+  distance_scale_gradient: full
+  bandwidth_multiplier: 0.55
+infoot:
+  feature_objective: mi
+  variant: fused
+  cross_cost_source: encoder
+  cross_cost_weight: 1.0
+  algorithm: official_projected_sinkhorn
+  mi_weight: 0.1
+  entropy_epsilon: 0.02
+  inner_iterations: 1200
+  recovery_iterations: 4800
+  projection_iterations: 10000
+  projection_tolerance: 1.0e-05
+  outer_tolerance: 1.0e-05
+  min_inner_iterations: 5
+  outer_patience: 3
+  strict_convergence: true
+  require_outer_convergence: true
+  initialization: independent_product
+  numerical_epsilon: 1.0e-08
+trainable:
+  encoders: true
+  adapters: true
+  attention_lora: true
+  base_transformers: false
+quick_evaluation:
+  config: configs/stage1b_eval/self_supervised_infonce_v4_5_sit_b2.yaml
+  weights: ema
+conditional_projection:
+  enabled: true
+  query_samples_per_domain: 32
+  bandwidth_multiplier: 0.1
+  validation_reference_samples: 96
+  validation_query_samples: 32
+conditional_structure:
+  enabled: false
+pcgrad:
+  enabled: true
+  eps: 1.0e-12
+gradient_guard:
+  enabled: false
+decoded_encoder_balance:
+  enabled: false
+matching_contrastive:
+  enabled: false
+projection_support:
+  enabled: false
+matching_head:
+  enabled: true
+  kind: residual_mlp_v1
+  input_dim: 512
+  hidden_dim: 256
+  lr: 1.0e-05
+  grad_clip_norm: 1.0
+matching_regularization:
+  enabled: true
+  std_target: 0.8
+  variance_weight: 0.1
+  covariance_weight: 0.3
+  eps: 0.0001
+generator_adaptation:
+  enabled: true
+  lr_adapter: 5.0e-06
+  lr_lora: 3.75e-06
+  grad_clip_norm: 1.0
+  null_preservation_weight: 0.0
+  conditioned_preservation_weight: 0.0
+  conditioned_preservation_samples: 4
+decoded_translation:
+  enabled: true
+  supervision: self_supervised
+  objective: source_infonce
+  batch_size: 32
+  num_steps: 20
+  validation_num_steps: 20
+  guidance_scale: 1.0
+  every_steps: 1
+  start_step: 0
+  warmup_steps: 2000
+  source_contrastive_weight: 0.05
+  source_contrastive_temperature: 0.2
+  source_contrastive_negative_similarity_threshold: 0.95
+  source_contrastive_readout: target
+  source_contrastive_projector:
+    kind: mlp
+    projection_dim: 256
+    lr: 0.0002
+    grad_clip_norm: 1.0
+  structure_weight: 0.0
+  perceptual_weight: 0.0
+  structure_contrastive_weight: 0.0
+  code_consistency_weight: 0.0
+  adversarial_weight: 0.0
+  coarse_rgb:
+    weight: 0.02
+    sizes: [8, 16]
+  color_histogram:
+    weight: 0.02
+    bins: 64
+    input_size: 128
+    sigma: 0.02
+  local_layout:
+    weight: 0.02
+    sizes: [32, 64]
+    contrast_eps: 0.01
+  target_patch_swd:
+    weight: 0.01
+    sizes: [256, 128, 64]
+    patch_size: 7
+    patches_per_image: 32
+    directions: 64
+    scale_floor: 0.01
+  diffaugment:
+    enabled: false
+  save_validation_images: true
+  checkpoint_sampler: true
+  checkpoint_features: true
+  source_contrastive_projection_gradient_scale: 0.1
+self_supervised_diagnostics:
+  enabled: true
+  image_samples: 32
+  pooled_size: 16

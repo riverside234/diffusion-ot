@@ -38,6 +38,11 @@ from diffusion_ot.models.matching_head import (
 from diffusion_ot.losses.projection_rms import (
     checkpoint_projection_rms, projection_rms_options, reference_variances, validate_projection_scales,
 )
+from diffusion_ot.losses.spatial_correlative import (
+    checkpoint_spatial_cost, spatial_correlative_options, validate_spatial_training_config,
+    encode_spatial_descriptors, spatial_descriptor_id, spatial_cost_diagnostics,
+    conditional_spatial_diagnostics,
+)
 
 
 @dataclass
@@ -50,6 +55,8 @@ class LatentBank:
     metadata: list[dict[str, Any]]
     checkpoint_id: str
     matching_id: str = "l2_raw_v1"
+    spatial_descriptors: torch.Tensor | None = None
+    spatial_id: str | None = None
 
     def validate(self) -> None:
         count = self.raw_codes.shape[0]
@@ -63,11 +70,19 @@ class LatentBank:
             raise ValueError(f"Duplicate sample IDs in {self.domain}_{self.split} bank.")
         if not torch.isfinite(self.raw_codes).all() or not torch.isfinite(self.matching_features).all():
             raise FloatingPointError("Latent bank contains non-finite values.")
+        if (self.spatial_descriptors is None) != (self.spatial_id is None):
+            raise ValueError("Spatial bank descriptors and protocol ID must be present together.")
+        if self.spatial_descriptors is not None:
+            value = self.spatial_descriptors
+            if value.ndim != 4 or value.shape[0] != count or value.shape[-1] != value.shape[-2]:
+                raise ValueError("Spatial bank descriptors must have shape [samples,layers,P,P].")
+            if not torch.isfinite(value).all():
+                raise FloatingPointError("Spatial bank descriptors contain non-finite values.")
 
     def to_payload(self) -> dict[str, Any]:
         self.validate()
         return {
-            "format_version": 2,
+            "format_version": 3 if self.spatial_descriptors is not None else 2,
             "domain": self.domain,
             "split": self.split,
             "raw_codes": self.raw_codes.detach().cpu(),
@@ -76,6 +91,8 @@ class LatentBank:
             "metadata": self.metadata,
             "checkpoint_id": self.checkpoint_id,
             "matching_id": self.matching_id,
+            **({"spatial_descriptors": self.spatial_descriptors.detach().cpu(), "spatial_id": self.spatial_id}
+               if self.spatial_descriptors is not None else {}),
         }
 
 
@@ -100,6 +117,7 @@ class DomainEvaluationContext:
     projection_rms: Any | None = None
     patch_projector: Any | None = None
     code_projector: Any | None = None
+    spatial_cost: Any | None = None
 
 
 @dataclass
@@ -131,6 +149,7 @@ class Stage1BEvaluationReport:
 
 def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
     """Do not label weights trained with external losses as the new control."""
+    checkpoint_spatial_cost(checkpoint, alignment_config)
     saved = checkpoint.get("config") or {}
     current_image, saved_image = (config.get("decoded_translation") or {} for config in (alignment_config, saved))
     current_mode, saved_mode = (image.get("supervision", "external") for image in (current_image, saved_image))
@@ -142,6 +161,12 @@ def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
         image.get("objective", "source_infonce") for image in (current_image, saved_image))
     if current_objective != saved_objective:
         raise ValueError("Alignment config and checkpoint decoded objective disagree.")
+    from diffusion_ot.losses.translation_image import IMAGE_LOSS_PROTOCOL, translation_image_options
+    current_rgb, saved_rgb = (translation_image_options(image) for image in (current_image, saved_image))
+    if current_rgb != saved_rgb or checkpoint.get("decoded_image_loss_options", {}) != saved_rgb:
+        raise ValueError("Alignment config and checkpoint decoded image-loss options disagree.")
+    if current_rgb and checkpoint.get("decoded_image_loss_protocol") != IMAGE_LOSS_PROTOCOL:
+        raise ValueError("Checkpoint decoded image-loss protocol is missing or incompatible.")
     if current_objective == "patchnce":
         from diffusion_ot.training.decoded_translation import self_supervised_translation_options
         try:
@@ -269,6 +294,8 @@ def load_latent_bank(path: str | Path) -> LatentBank:
         metadata=list(payload["metadata"]),
         checkpoint_id=str(payload["checkpoint_id"]),
         matching_id=str(payload.get("matching_id", "l2_raw_v1")),
+        spatial_descriptors=payload.get("spatial_descriptors"),
+        spatial_id=payload.get("spatial_id"),
     )
     bank.validate()
     return bank
@@ -288,6 +315,10 @@ def validate_bank_compatibility(
         raise ValueError("Reference and query banks were produced by different encoders.")
     if reference.matching_id != query.matching_id:
         raise ValueError("Reference and query banks were produced by different matching heads.")
+    if reference.spatial_id != query.spatial_id:
+        raise ValueError("Reference and query spatial descriptor protocols differ or are missing.")
+    if reference.spatial_descriptors is not None and reference.spatial_descriptors.shape[1:] != query.spatial_descriptors.shape[1:]:
+        raise ValueError("Reference and query spatial descriptor shapes differ.")
     if reference.raw_codes.shape[1] != query.raw_codes.shape[1]:
         raise ValueError("Reference and query raw-code dimensions differ.")
     if reference.matching_features.shape[1] != query.matching_features.shape[1]:
@@ -309,10 +340,13 @@ def build_latent_bank(
     dtype: torch.dtype,
     checkpoint_id: str,
     matching_head: Any | None = None,
+    spatial_options: dict | None = None,
+    spatial_protocol_id: str | None = None,
 ) -> LatentBank:
     indices = deterministic_indices(len(dataset), count, seed)
     codes: list[torch.Tensor] = []
     features: list[torch.Tensor] = []
+    spatial: list[torch.Tensor] = []
     sample_ids: list[str] = []
     metadata: list[dict[str, Any]] = []
     encoder.eval()
@@ -327,6 +361,8 @@ def build_latent_bank(
             raw = encoder(x0).detach().float()
             codes.append(raw.cpu())
             features.append(matching_features(raw, matching_head).cpu())
+            if spatial_options is not None:
+                spatial.append(encode_spatial_descriptors(encoder, x0, spatial_options, device=device, dtype=dtype).cpu())
             sample_ids.extend(str(item["sample_id"]) for item in items)
             metadata.extend(dict(item["metadata"]) for item in items)
     raw_codes = torch.cat(codes, dim=0)
@@ -339,6 +375,8 @@ def build_latent_bank(
         metadata=metadata,
         checkpoint_id=checkpoint_id,
         matching_id=matching_head_id(matching_head),
+        spatial_descriptors=torch.cat(spatial) if spatial else None,
+        spatial_id=(spatial_protocol_id or spatial_descriptor_id(spatial_options)) if spatial else None,
     )
     bank.validate()
     return bank
@@ -357,6 +395,8 @@ def subset_latent_bank(bank: LatentBank, *, count: int, seed: int) -> LatentBank
         metadata=[dict(bank.metadata[index]) for index in indices],
         checkpoint_id=bank.checkpoint_id,
         matching_id=bank.matching_id,
+        spatial_descriptors=bank.spatial_descriptors[indices].clone() if bank.spatial_descriptors is not None else None,
+        spatial_id=bank.spatial_id,
     )
     selected.validate()
     return selected
@@ -676,11 +716,13 @@ def _load_domain_context(
     projection_rms = None
     patch_projector = None
     code_projector = None
+    spatial_cost = None
     if checkpoint_path is not None:
         if matching_head_spec(joint.get("config") or {}) != matching_head_spec(alignment_config):
             raise ValueError("Alignment config and checkpoint matching_head architectures disagree.")
         matching_head = load_matching_head(joint, domain, weights=joint_weights, device=device)
         projection_rms = checkpoint_projection_rms(joint, alignment_config, weights=joint_weights)
+        spatial_cost = checkpoint_spatial_cost(joint, alignment_config)
         image_options = alignment_config.get("decoded_translation") or {}
         if image_options.get("supervision") == "self_supervised" and image_options.get("objective") == "patchnce":
             from diffusion_ot.models.patch_sampler import load_patch_projector
@@ -717,6 +759,7 @@ def _load_domain_context(
         projection_rms=projection_rms,
         patch_projector=patch_projector,
         code_projector=code_projector,
+        spatial_cost=spatial_cost,
     )
 
 
@@ -858,6 +901,8 @@ def _save_translation_grid(
     include_source: bool = True,
     color_histogram: dict[str, Any] | None = None,
     patchnce_options: dict[str, Any] | None = None,
+    teacher_free_image_options: dict[str, Any] | None = None,
+    include_transport_references: bool = False,
 ) -> dict[str, Any]:
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
@@ -905,6 +950,27 @@ def _save_translation_grid(
     decoded_metrics: dict[str, Any] = {}
     source_structure = None
     original_images = None
+    real_target_images, real_baseline_images = None, None
+    if teacher_free_image_options:
+        from diffusion_ot.data.ground_truth import load_ground_truth_images
+        from diffusion_ot.losses.translation_image import IMAGE_LOSS_PROTOCOL, translation_image_losses
+        original_images = load_ground_truth_images(source.data_config_path, source_query.metadata[:count]).cpu()
+        image_generator = torch.Generator(device="cpu").manual_seed(seed + 30000)
+        decoded_metrics.update(image_loss_protocol=IMAGE_LOSS_PROTOCOL,
+                               image_loss_options=teacher_free_image_options,
+                               source_query_ids=source_query.sample_ids[:count], image_loss_seed=seed + 30000)
+        if "target_patch_swd" in teacher_free_image_options:
+            if len(target_projection.metadata) < count:
+                raise ValueError("Image evaluation needs at least one real target reference per generated image.")
+            indices = torch.randperm(len(target_projection.metadata), generator=image_generator).tolist()[:2 * count]
+            records = [target_projection.metadata[i] for i in indices]
+            real_images = load_ground_truth_images(target.data_config_path, records).cpu()
+            real_target_images = real_images[:count]
+            decoded_metrics["target_rgb_reference_ids"] = [r["sample_id"] for r in records[:count]]
+            if len(real_images) == 2 * count:
+                real_baseline_images = real_images[count:]
+                decoded_metrics["target_rgb_baseline_ids"] = [r["sample_id"] for r in records[count:]]
+        image_sampling_state = image_generator.get_state()
     if patchnce_options is not None:
         from diffusion_ot.losses.patchnce import patchnce_loss
         from diffusion_ot.training.self_supervised_translation import encode_generated_images
@@ -960,11 +1026,17 @@ def _save_translation_grid(
             per_image = 1 - torch.nn.functional.cosine_similarity(structure, source_structure, dim=-1)
             decoded_metrics.setdefault(row_name, {"samples": count}).update(
                 structure_loss=float(per_image.mean()), per_image_structure_loss=per_image.cpu().tolist())
-        if original_images is not None:
+        if color_histogram is not None:
             distances = histogan_color_distance(decoded_images, original_images, **color_parameters)
             decoded_metrics.setdefault(row_name, {"samples": count}).update(
                 color_histogram_loss=float(distances.mean()),
                 per_image_color_histogram_loss=distances.tolist())
+        if teacher_free_image_options:
+            image_generator.set_state(image_sampling_state)
+            _, component_metrics = translation_image_losses(decoded_images, original_images,
+                teacher_free_image_options, generator=image_generator, real_target=real_target_images,
+                real_baseline=real_baseline_images, per_image=True)
+            decoded_metrics.setdefault(row_name, {"samples": count})["image_losses"] = component_metrics
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_image(torch.cat(rows), str(output_path), nrow=count, padding=2, pad_value=1.0)
     if original_images is not None:
@@ -976,6 +1048,25 @@ def _save_translation_grid(
                    str(paired_path), nrow=8, padding=2, pad_value=1.)
         decoded_metrics["source_pair_grid"] = str(paired_path)
         decoded_metrics["source_pair_readout"] = "conditional_mean" if "conditional_mean" in readouts else readouts[0]
+    if include_transport_references:
+        from diffusion_ot.data.ground_truth import load_ground_truth_images
+        if original_images is None:
+            original_images = load_ground_truth_images(source.data_config_path, source_query.metadata[:count]).cpu()
+        selected = weights.topk(min(2, weights.shape[1]), dim=1)
+        reference_rows = [load_ground_truth_images(target.data_config_path,
+                          [target_projection.metadata[i] for i in indices.tolist()]).cpu()
+                          for indices in selected.indices.T]
+        readout_index = readouts.index("conditional_mean") if "conditional_mean" in readouts else 0
+        generated = rows[int(include_source) + readout_index]
+        reference_path = output_path.with_name(output_path.stem + "_transport_refs.png")
+        save_image(torch.cat([original_images, *reference_rows, generated]), str(reference_path),
+                   nrow=count, padding=2, pad_value=1.)
+        decoded_metrics["transport_reference_grid"] = dict(
+            path=str(reference_path), rows=["original_source", *[f"top_{i + 1}_target_reference" for i in range(len(reference_rows))],
+                                          _TRANSLATION_ROW_NAMES[readouts[readout_index]]],
+            query_ids=source_query.sample_ids[:count],
+            target_ids=[[target_projection.sample_ids[i] for i in indices] for indices in selected.indices.tolist()],
+            probabilities=selected.values.tolist())
     if image_features is not None:
         decoded_metrics["interpretation"] = "Decoded DINO structure against source; uses the training feature prior, not independent proxy labels or a calibrated realism score."
     return decoded_metrics
@@ -1336,6 +1427,11 @@ def run_stage1b_evaluation(
     evaluation_path = Path(evaluation_config_path).resolve()
     alignment_config = load_yaml_config(alignment_path)
     evaluation_config = load_yaml_config(evaluation_path)
+    spatial_options = validate_spatial_training_config(alignment_config)
+    if spatial_correlative_options(evaluation_config) != spatial_options:
+        raise ValueError("Evaluation must match the training spatial_correlative_cost protocol.")
+    if spatial_options is not None and checkpoint_path is None:
+        raise ValueError("Spatial evaluation needs a v4.5 checkpoint with frozen calibration; use the saved step-0 checkpoint for an initial screen.")
     rms_options = projection_rms_options(alignment_config)
     if projection_rms_options(evaluation_config) != rms_options:
         raise ValueError("Evaluation must match the training projection_rms protocol.")
@@ -1365,6 +1461,8 @@ def run_stage1b_evaluation(
     # Evaluation chooses a solver variant explicitly; fitted prior provenance
     # participates in the protocol hash, including the actual descriptor bytes.
     eval_variant = str(_nested(evaluation_config, "infoot").get("variant", "plain"))
+    if spatial_options is not None and (eval_variant != "fused" or matching_config.get("distance_scale", "infoot_rms") != "infoot_rms"):
+        raise ValueError("Spatial evaluation requires fused InfoOT with live RMS fitting kernels.")
     prior_config = dict(alignment_config)
     prior_config["infoot"] = dict(_nested(evaluation_config, "infoot"))
     prior_config["infoot"]["variant"] = eval_variant
@@ -1409,6 +1507,13 @@ def run_stage1b_evaluation(
             device_override=device_dog,
         ),
     }
+    spatial_cost = None
+    if spatial_options is not None:
+        spatial_cost = contexts["cat"].spatial_cost
+        other = contexts["dog"].spatial_cost
+        if spatial_cost is None or other is None or spatial_cost.metadata() != other.metadata():
+            raise ValueError("Evaluation needs the same checkpoint spatial calibration for both domains.")
+        evaluation_config["spatial_correlative_protocol"] = spatial_cost.metadata()
     protocol_identifier = _protocol_identifier(
         evaluation_config,
         max_reference=max_reference,
@@ -1423,6 +1528,11 @@ def run_stage1b_evaluation(
         )[:8]
         for domain in ("cat", "dog")
     ) + f"_protocol_{protocol_identifier}"
+    if spatial_cost is not None:
+        initial_path = resolved_checkpoint.with_name("step_000000.pt")
+        baseline_identifier = (
+            f"stage1b_{_checkpoint_identifier(initial_path, 0, weights)[:8]}"
+            f"_step_000000_{weights}_protocol_{protocol_identifier}")
     mode = "stage1a_offline_infoot" if resolved_checkpoint is None else str(alignment_config["stage"])
     identifier = (
         baseline_identifier
@@ -1440,6 +1550,8 @@ def run_stage1b_evaluation(
     baseline_required = _stage1a_baseline_required(
         evaluation_config, require_stage1a_baseline
     )
+    if spatial_cost is not None and baseline_required:
+        raise ValueError("Use require_stage1a_baseline: false for spatial evaluation; compare the saved step-0 v4.5 checkpoint explicitly.")
     if (
         resolved_checkpoint is not None
         and baseline_required
@@ -1457,6 +1569,8 @@ def run_stage1b_evaluation(
         raise ValueError("Train-only evaluation requires different reference and query splits.")
     if rms_options is not None and (reference_split != "train" or projection_split != "train"):
         raise ValueError("Reference-EMA projection uses training reference and projection banks only.")
+    if spatial_cost is not None and (reference_split != "train" or projection_split != "train"):
+        raise ValueError("Spatial transport uses training reference and projection banks only.")
     seed = int(evaluation_config.get("seed", 20260906))
     batch_size = int(data_config.get("batch_size", 32))
     reference_count = int(max_reference or data_config.get("reference_samples_per_domain", 512))
@@ -1466,6 +1580,9 @@ def run_stage1b_evaluation(
     query_count = int(max_query or data_config.get("query_samples_per_domain", 256))
 
     banks: dict[str, dict[str, LatentBank]] = {"cat": {}, "dog": {}}
+    spatial_bank_options = (dict(spatial_options=spatial_options,
+                                 spatial_protocol_id=spatial_descriptor_id(spatial_cost.metadata()))
+                            if spatial_cost is not None else {})
     for domain_index, domain in enumerate(("cat", "dog")):
         context = contexts[domain]
         checkpoint_id = _checkpoint_identifier(
@@ -1484,6 +1601,7 @@ def run_stage1b_evaluation(
             dtype=context.dtype,
             checkpoint_id=checkpoint_id,
             matching_head=getattr(context, "matching_head", None),
+            **spatial_bank_options,
         )
         if reference_split == projection_split:
             banks[domain]["reference"] = subset_latent_bank(
@@ -1504,6 +1622,7 @@ def run_stage1b_evaluation(
                 dtype=context.dtype,
                 checkpoint_id=checkpoint_id,
                 matching_head=getattr(context, "matching_head", None),
+                **spatial_bank_options,
             )
         banks[domain]["query"] = build_latent_bank(
             context.branch.encoder,
@@ -1517,6 +1636,7 @@ def run_stage1b_evaluation(
             dtype=context.dtype,
             checkpoint_id=checkpoint_id,
             matching_head=getattr(context, "matching_head", None),
+            **spatial_bank_options,
         )
         validate_bank_compatibility(banks[domain]["reference"], banks[domain]["query"])
         validate_bank_compatibility(
@@ -1578,6 +1698,13 @@ def run_stage1b_evaluation(
     elif eval_variant == "fused" and eval_cost_source == "encoder":
         from diffusion_ot.losses.encoder_transport import encoder_transport_cost
         cross_cost = encoder_transport_cost(cat_features, dog_features)
+    spatial_costs, spatial_references = None, None
+    reference_matching = dict(cat=cat_features, dog=dog_features)
+    if spatial_cost is not None:
+        spatial_references = {d: banks[d]["reference"].spatial_descriptors.to(alignment_device) for d in banks}
+        spatial_costs = spatial_cost.costs(reference_matching, spatial_references)
+        cross_cost = spatial_costs["mixed"]
+    reported_encoder_cost = spatial_costs["encoder"] if spatial_costs is not None else cross_cost
     solution = solve_infoot(
         cat_features,
         dog_features,
@@ -1611,6 +1738,7 @@ def run_stage1b_evaluation(
             "bandwidth": bandwidth,
             "projection_bandwidth": projection_bandwidth,
             **({"projection_rms": rms_report} if rms_report is not None else {}),
+            **({"spatial_correlative": spatial_cost.metadata()} if spatial_cost is not None else {}),
             "solver_algorithm": str(
                 infoot_config.get("algorithm", "official_projected_sinkhorn")
             ),
@@ -1660,6 +1788,13 @@ def run_stage1b_evaluation(
         )
         projections[str(name)] = direction_report
         direction_tensors[str(name)] = tensors
+        if spatial_cost is not None:
+            direction_report["spatial_correlative"] = conditional_spatial_diagnostics(
+                banks[source_domain]["query"].spatial_descriptors.to(alignment_device),
+                banks[target_domain]["projection"].spatial_descriptors.to(alignment_device),
+                tensors["conditional_weights"].to(alignment_device))
+            direction_report["spatial_correlative"]["interpretation"] = (
+                "Own-encoder spatial prior; queries are diagnostic only, not part of transport fitting or conditional kernels.")
         if prior is not None and all(
             key in prior.index for bank in (banks[source_domain]["query"], banks[target_domain]["projection"])
             for key in bank.sample_ids
@@ -1728,6 +1863,15 @@ def run_stage1b_evaluation(
         include_source = bool(translation_config.get("include_source", True))
         image_features = None
         patch_options = None
+        fixed_image_options = None
+        if translation_config.get("teacher_free_image_metrics", False):
+            from diffusion_ot.losses.translation_image import translation_image_options
+            image_options = alignment_config.get("decoded_translation") or {}
+            if image_options.get("supervision") != "self_supervised":
+                raise ValueError("teacher_free_image_metrics requires self-supervised training provenance.")
+            fixed_image_options = translation_image_options(image_options)
+            if not fixed_image_options:
+                raise ValueError("teacher_free_image_metrics requires configured image objectives.")
         if translation_config.get("patchnce_metrics", False):
             from diffusion_ot.training.decoded_translation import self_supervised_translation_options
             image_options = alignment_config.get("decoded_translation") or {}
@@ -1763,6 +1907,8 @@ def run_stage1b_evaluation(
                 **({"color_histogram": translation_config["color_histogram"]}
                    if translation_config.get("color_histogram") is not None else {}),
                 **({"patchnce_options": patch_options} if patch_options is not None else {}),
+                **({"teacher_free_image_options": fixed_image_options} if fixed_image_options is not None else {}),
+                **({"include_transport_references": True} if spatial_cost is not None else {}),
             )
             if decoded_metrics:
                 projections[name]["decoded_image_diagnostics"] = decoded_metrics
@@ -1805,7 +1951,7 @@ def run_stage1b_evaluation(
                 visualization_paths[f"{name}_{readout}"] = str(path)
 
     baseline_comparison: dict[str, Any]
-    if resolved_checkpoint is None:
+    if resolved_checkpoint is None or (spatial_cost is not None and contexts["cat"].checkpoint_step == 0):
         baseline_comparison = {"status": "baseline", "baseline_report": str(output_root / "evaluation_report.json")}
     elif baseline_report_path.is_file():
         baseline_payload = json.loads(baseline_report_path.read_text(encoding="utf-8"))
@@ -1867,6 +2013,7 @@ def run_stage1b_evaluation(
             "stage1b_trainable_generator_components": ["adaln_adapters", "token_mlps", "z_proj", "final_adapter", "attention_lora"]
                 if generator_adaptation_enabled(alignment_config) else [],
             "generator_weights": weights if checkpoint_path is not None else "stage1a",
+            **({"spatial_correlative": spatial_cost.metadata()} if spatial_cost is not None else {}),
         },
         reference_sizes={domain: len(banks[domain]["reference"].sample_ids) for domain in banks},
         projection_sizes={domain: len(banks[domain]["projection"].sample_ids) for domain in banks},
@@ -1877,8 +2024,8 @@ def run_stage1b_evaluation(
             "cross_cost_source": eval_cost_source if eval_variant == "fused" else None,
             "semantic_prior_fingerprint": prior.fingerprint if prior is not None else None,
             "transport": transport_diagnostics(solution.coupling),
-            **({"transport_encoder_cost": float((solution.coupling * cross_cost).sum()),
-                "independent_encoder_cost": float(cross_cost.mean())} if eval_variant == "fused" and eval_cost_source == "encoder" else
+            **({"transport_encoder_cost": float((solution.coupling * reported_encoder_cost).sum()),
+                "independent_encoder_cost": float(reported_encoder_cost.mean())} if eval_variant == "fused" and eval_cost_source == "encoder" else
                {"transport_structure_cost": float((solution.coupling * cross_cost).sum()) if cross_cost is not None else None,
                 "independent_structure_cost": float(cross_cost.mean()) if cross_cost is not None else None}),
             "fit_bandwidth_multiplier": bandwidth,
@@ -1916,6 +2063,10 @@ def run_stage1b_evaluation(
                 bandwidth=bandwidth,
                 distance_scale=scales["dog"],
             ),
+            **({"spatial_correlative": spatial_cost_diagnostics(
+                spatial_cost, spatial_costs, spatial_references, solution.coupling, reference_matching,
+                bandwidth=bandwidth, solver_options=solver_kwargs(infoot_config),
+                cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)))} if spatial_cost is not None else {}),
         },
         latent_diagnostics={
             f"{domain}_{kind}": latent_diagnostics(bank)

@@ -49,6 +49,8 @@ class Stage1BLogFormatter:
                for part, default in (("structure", .1), ("structure_contrastive", 0.),
                                      ("perceptual", 0.), ("adversarial", .01), ("code_consistency", 0.))},
             "color_histogram": self.decoder and _positive(image.get("color_histogram") or {}, "weight"),
+            **{part: self.decoder and self.self_supervised and _positive(image.get(part) or {}, "weight")
+               for part in ("coarse_rgb", "local_layout", "target_patch_swd")},
             "source_contrastive": self.decoder and self.self_supervised and not self.patchnce
                 and _positive(image, "source_contrastive_weight", .1),
             "patchnce": self.decoder and self.patchnce and _positive(image.get("patchnce") or {}, "weight", .15),
@@ -123,6 +125,8 @@ class Stage1BLogFormatter:
             "dino": e["perceptual"] or structure, "adversarial": e["adversarial"],
             "color": e["color_histogram"], "code": e["code_consistency"],
             "decoded": self.decoder, "translation": self.decoder,
+            **{part: e[part] for part in ("coarse_rgb", "color_histogram", "local_layout",
+                                         "target_patch_swd", "source_contrastive", "patchnce")},
             "reconstruction": e["cat_reconstruction"] or e["dog_reconstruction"],
             "matching": any(e[k] for k in ("infoot_alignment", "infoot_relative", "semantic_neighborhood", "conditional_structure",
                 "projection_support", "matching_variance", "matching_covariance",
@@ -144,11 +148,13 @@ class Stage1BLogFormatter:
         they remain useful even though they are not additional objectives.
         """
         prefixes = ("perceptual_", "structure_", "adversarial_", "discriminator_", "dino_", "teacher_",
-                    "decoded_discriminator_", "color_histogram", "code_consistency",
+                    "decoded_discriminator_", "code_consistency",
                     "conditional_structure", "semantic_neighborhood", "projection_support",
                     "null_preservation", "conditioned_preservation", "matching_contrastive")
         unused = {"primary_objective", "auxiliary_objective", "infoot_restart", "code_routing",
                   "cat_fake_score", "cat_real_score", "dog_fake_score", "dog_real_score"}
+        prefixes += tuple(name for name in ("color_histogram", "coarse_rgb", "local_layout", "target_patch_swd")
+                          if not self.enabled[name])
         if self.patchnce:
             prefixes += ("source_contrastive",)
             unused.add("source_negative_bank_ids")
@@ -193,6 +199,7 @@ class Stage1BLogFormatter:
                         del contrast[key]
         if self.self_supervised:
             self._clean_self_supervised(result)
-        result["log_schema_version"] = 3 if self.self_supervised else 2
+        image_losses = any(self.enabled[name] for name in ("color_histogram", "coarse_rgb", "local_layout", "target_patch_swd"))
+        result["log_schema_version"] = (4 if image_losses else 3) if self.self_supervised else 2
         result["enabled_losses"] = [name for name, enabled in self.enabled.items() if enabled]
         return result

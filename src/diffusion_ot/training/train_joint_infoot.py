@@ -11,6 +11,11 @@ from typing import Any
 
 import torch
 
+from diffusion_ot.losses.spatial_correlative import (
+    SpatialCorrelativeCost, checkpoint_spatial_cost, encode_spatial_descriptors,
+    spatial_cost_diagnostics, conditional_spatial_diagnostics, validate_spatial_training_config,
+)
+
 from diffusion_ot.integrations.hf_snapshot import (
     effective_project_root,
     find_project_root,
@@ -553,6 +558,7 @@ def _build_checkpoint_payload(
     matching_ema: EncoderEMA | None = None,
     decoder_training: Any | None = None,
     projection_rms: dict | None = None,
+    spatial_cost: SpatialCorrelativeCost | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "format_version": 3 if matching_heads else 2,
@@ -595,6 +601,8 @@ def _build_checkpoint_payload(
         payload.update(decoder_training.checkpoint_state())
     if projection_rms:
         payload["projection_rms_state"] = {k: v.state_dict() for k, v in projection_rms.items()}
+    if spatial_cost is not None:
+        payload["spatial_correlative_cost_state"] = spatial_cost.state_dict()
     return payload
 
 
@@ -689,6 +697,7 @@ def fixed_conditional_structure_probe(
     projection_scales: dict[str, float] | None = None,
     alignment_options=None,
     alignment_weight: float = 1.0,
+    spatial_cost: SpatialCorrelativeCost | None = None,
 ) -> dict[str, Any]:
     """Fixed train references / validation queries; no updates or RNG consumption."""
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
@@ -699,6 +708,7 @@ def fixed_conditional_structure_probe(
 
     states = {domain: value.branch.encoder.training for domain, value in domains.items()}
     references, queries, reference_structure, query_structure, anchor_codes = {}, {}, {}, {}, {}
+    spatial_references, spatial_queries = {}, {}
     alignment_device = domains["cat"].device
     try:
         for domain, value in domains.items():
@@ -712,6 +722,11 @@ def fixed_conditional_structure_probe(
                     value.branch.encoder(part.to(value.device, dtype=value.dtype)).float().to(alignment_device)
                     for part in latents.split(32)
                 ])
+                if spatial_cost is not None:
+                    target = spatial_references if kind == "reference" else spatial_queries
+                    target[domain] = encode_spatial_descriptors(
+                        value.branch.encoder, latents, spatial_cost.options,
+                        device=value.device, dtype=value.dtype).to(alignment_device)
             if cross_cost_source == "dino":
                 reference_structure[domain] = batch["reference_structure"].to(alignment_device)
                 query_structure[domain] = batch["query_structure"].to(alignment_device)
@@ -727,12 +742,14 @@ def fixed_conditional_structure_probe(
             head = (matching_heads or {}).get(domain)
             features[domain] = matching_features(references[domain].to(value.device), head).to(alignment_device)
             query_features[domain] = matching_features(queries[domain].to(value.device), head).to(alignment_device)
+        spatial_costs = spatial_cost.costs(features, spatial_references) if spatial_cost is not None else None
         solution = _solve_infoot_logged(
             features["cat"], features["dog"], bandwidth=bandwidth,
             failure_log=solver_failure_log, phase="validation_projection", step=validation_step,
             distance_scale_x=infoot_distance_scale(features["cat"]),
             distance_scale_y=infoot_distance_scale(features["dog"]),
-            cross_cost=(encoder_transport_cost(features["cat"], features["dog"]) if cross_cost_source == "encoder"
+            cross_cost=(spatial_costs["mixed"] if spatial_costs is not None else
+                        encoder_transport_cost(features["cat"], features["dog"]) if cross_cost_source == "encoder"
                         else torch.cdist(reference_structure["cat"], reference_structure["dog"]) / cost_scale),
             cross_cost_weight=cross_cost_weight, **solver_options,
         )
@@ -805,6 +822,16 @@ def fixed_conditional_structure_probe(
                 metrics["infoot_feature_objective"] = alignment_options.feature_objective
                 metrics.update(alignment.metrics(alignment_weight=alignment_weight,
                                                  relative_weight=alignment_options.relative_weight))
+        if spatial_cost is not None:
+            metrics["spatial_correlative"] = spatial_cost_diagnostics(
+                spatial_cost, spatial_costs, spatial_references, solution.coupling, features,
+                bandwidth=bandwidth, solver_options=solver_options, cross_cost_weight=cross_cost_weight)
+            metrics["spatial_correlative"]["fixed_reference_descriptor_drift_rms"] = spatial_cost.probe_drift(
+                spatial_references, {d: inputs[d]["reference_ids"] for d in domains})
+            metrics["spatial_correlative"]["conditional"] = {
+                direction: conditional_spatial_diagnostics(spatial_queries[source], spatial_references[target], weights)
+                for direction, source, target in (("cat_to_dog", "cat", "dog"), ("dog_to_cat", "dog", "cat"))
+                for weights in [result.weights[direction]]}
         if projection_support_options is not None:
             from diffusion_ot.losses.projection_support import projection_support_loss
             support = projection_support_loss(
@@ -835,7 +862,8 @@ def fixed_conditional_structure_probe(
 def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, inputs, *,
                                     prior, bandwidth, projection_bandwidth, teacher_temperature,
                                     solver_options, seed, cross_cost_weight=1.0, image_dir=None,
-                                    solver_failure_log=None, validation_step=None, projection_scales=None):
+                                    solver_failure_log=None, validation_step=None, projection_scales=None,
+                                    spatial_cost=None):
     """Held-out decoded images; fixed noise, train-only OT references, no D update."""
     from diffusion_ot.losses.infoot import infoot_distance_scale
     from diffusion_ot.losses.conditional_structure import conditional_structure_loss
@@ -849,6 +877,7 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
         try:
             references, queries, ref_matching, query_matching = {}, {}, {}, {}
             reference_structure, query_structure = {}, {}
+            spatial_references = {}
             for domain, value in domains.items():
                 value.branch.encoder.eval()
                 data = inputs[domain]
@@ -856,14 +885,20 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
                 queries[domain] = value.branch.encoder(data["query_latents"].to(value.device, dtype=value.dtype)).float().to(target_device)
                 ref_matching[domain] = matching_features(references[domain].to(value.device), matching_heads[domain]).to(target_device)
                 query_matching[domain] = matching_features(queries[domain].to(value.device), matching_heads[domain]).to(target_device)
+                if spatial_cost is not None:
+                    spatial_references[domain] = encode_spatial_descriptors(
+                        value.branch.encoder, data["reference_latents"], spatial_cost.options,
+                        device=value.device, dtype=value.dtype).to(target_device)
                 if not self_supervised:
                     reference_structure[domain] = data["reference_structure"].to(target_device)
                     query_structure[domain] = data["query_structure"].to(target_device)
+            spatial_costs = spatial_cost.costs(ref_matching, spatial_references) if spatial_cost is not None else None
             solution = _solve_infoot_logged(ref_matching["cat"], ref_matching["dog"], bandwidth=bandwidth,
                                     failure_log=solver_failure_log, phase="validation_decoded", step=validation_step,
                                     distance_scale_x=float(infoot_distance_scale(ref_matching["cat"])),
                                     distance_scale_y=float(infoot_distance_scale(ref_matching["dog"])),
-                                    cross_cost=(encoder_transport_cost(ref_matching["cat"], ref_matching["dog"]) if self_supervised else
+                                    cross_cost=(spatial_costs["mixed"] if spatial_costs is not None else
+                                                encoder_transport_cost(ref_matching["cat"], ref_matching["dog"]) if self_supervised else
                                                 prior.cost(reference_structure["cat"], reference_structure["dog"])),
                                     cross_cost_weight=cross_cost_weight, **solver_options)
             if self_supervised:
@@ -884,9 +919,15 @@ def fixed_decoded_translation_probe(decoder_training, domains, matching_heads, i
                 source_reference_structure=reference_structure,
                 source_query_structure=query_structure,
                 source_query_metadata={d: data.get("query_metadata", []) for d, data in inputs.items()},
-                **({"source_query_codes": queries} if self_supervised else {}),
+                **({"source_query_codes": queries,
+                    "source_reference_metadata": {d: data.get("reference_metadata", []) for d, data in inputs.items()}}
+                   if self_supervised else {}),
                 **({"validation_image_dir": image_dir} if image_dir is not None else {}))
             metrics["seed"] = seed
+            if spatial_cost is not None:
+                metrics["spatial_correlative"] = spatial_cost_diagnostics(
+                    spatial_cost, spatial_costs, spatial_references, solution.coupling, ref_matching,
+                    bandwidth=bandwidth, solver_options=solver_options, cross_cost_weight=cross_cost_weight)
             # This probe refits its own plan; do not borrow convergence from
             # the conditional probe, which can encode references in chunks.
             metrics["solver"] = {
@@ -1000,6 +1041,7 @@ def train_joint_infoot(
     if differentiate_distance_scale and matching_config.get("distance_scale", "infoot_rms") != "infoot_rms":
         raise ValueError("Full distance-scale gradients require matching.distance_scale=infoot_rms.")
     infoot_config = _nested(config, "infoot")
+    spatial_options = validate_spatial_training_config(config)
     alignment_options = infoot_alignment_options(config)
     self_supervised = _nested(config, "decoded_translation").get("supervision", "external") == "self_supervised"
     conditional_enabled = bool(_nested(config, "conditional_structure").get("enabled", False))
@@ -1157,6 +1199,7 @@ def train_joint_infoot(
     anchor_variances: dict[str, float] = {}
     distance_scales: dict[str, float] = {}
     rms_calibration_latents = {}
+    spatial_calibration_ids = {}
     for domain, value in domains.items():
         calibration_dataset = CachedLatentDataset(
             data_paths[domain],
@@ -1175,9 +1218,10 @@ def train_joint_infoot(
             dtype=value.dtype,
             distance_scale_mode=distance_scale_mode,
         )
-        if rms_options is not None and resume_path is None:
-            rms_calibration_latents[domain] = torch.stack([
-                calibration_dataset[i]["x0_latent"] for i in range(min(calibration_count, len(calibration_dataset)))])
+        if (rms_options is not None or spatial_options is not None) and resume_path is None:
+            calibration_rows = [calibration_dataset[i] for i in range(min(calibration_count, len(calibration_dataset)))]
+            rms_calibration_latents[domain] = torch.stack([row["x0_latent"] for row in calibration_rows])
+            spatial_calibration_ids[domain] = [str(row["sample_id"]) for row in calibration_rows]
 
     loader_generators: dict[str, torch.Generator] = {}
     loaders: dict[str, Any] = {}
@@ -1244,11 +1288,20 @@ def train_joint_infoot(
     projection_rms = ({name: ReferenceRMSEMA(decay=rms_options["decay"], eps=rms_options["eps"])
                        for name in (("raw", "ema") if ema is not None else ("raw",))}
                       if rms_options is not None else {})
-    if projection_rms and resume_path is None:
+    spatial_cost = SpatialCorrelativeCost(spatial_options) if spatial_options is not None else None
+    if (projection_rms or spatial_cost is not None) and resume_path is None:
         calibration_features = _projection_reference_features(domains, rms_calibration_latents, matching_heads)
         # Model EMA starts as an exact copy of raw E/head, so both warm starts agree.
         for tracker in projection_rms.values():
             tracker.initialize(calibration_features)
+        if spatial_cost is not None:
+            calibration_descriptors = {
+                d: encode_spatial_descriptors(value.branch.encoder, rms_calibration_latents[d], spatial_options,
+                                              device=value.device, dtype=value.dtype).to(domains["cat"].device)
+                for d, value in domains.items()}
+            spatial_cost.calibrate({d: f.to(domains["cat"].device) for d, f in calibration_features.items()},
+                                   calibration_descriptors, spatial_calibration_ids)
+            del calibration_descriptors
         del calibration_features
     rms_calibration_latents.clear()
     training_seconds = 0.0
@@ -1256,6 +1309,7 @@ def train_joint_infoot(
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         checkpoint = _load_checkpoint(resume_path)
+        spatial_cost = checkpoint_spatial_cost(checkpoint, config)
         validate_prior_resume(checkpoint.get("config") or {}, config)
         _validate_resume_provenance(
             checkpoint,
@@ -1380,6 +1434,7 @@ def train_joint_infoot(
                 solver_failure_log=output_dir / "logs" / "solver_failures.jsonl", validation_step=validation_step,
                 projection_scales=projection_scales,
                 alignment_options=alignment_options, alignment_weight=alignment_weight,
+                **({"spatial_cost": spatial_cost} if spatial_cost is not None else {}),
             ))
             # Fixed validation uses the full coefficient, independent of warmup.
             if conditional_enabled:
@@ -1397,6 +1452,7 @@ def train_joint_infoot(
                            if decoder_training.options.get("save_validation_images", False) else None),
                 solver_failure_log=output_dir / "logs" / "solver_failures.jsonl", validation_step=validation_step,
                 projection_scales=projection_scales,
+                **({"spatial_cost": spatial_cost} if spatial_cost is not None else {}),
             )
         if projection_rms:
             metrics["projection_rms"] = projection_rms["raw"].diagnostics(
@@ -1437,8 +1493,15 @@ def train_joint_infoot(
                 matching_heads=matching_heads, matching_ema=matching_ema,
                 decoder_training=decoder_training,
                 projection_rms=projection_rms,
+                spatial_cost=spatial_cost,
             ),
         )
+
+    if resume_path is None and spatial_cost is not None:
+        # Retain the common starting weights/calibration for a fixed-checkpoint
+        # screen. latest.pt will be replaced by subsequent updates.
+        import shutil
+        shutil.copyfile(checkpoint_path, checkpoint_path.with_name("step_000000.pt"))
 
     for step in range(initial_step + 1, final_step + 1):
         started = time.perf_counter()
@@ -1452,11 +1515,12 @@ def train_joint_infoot(
         neighborhood_losses: dict[str, torch.Tensor] = {}
         matching_z: dict[str, torch.Tensor] = {}
         reconstruction_diagnostics: dict[str, dict[str, float]] = {}
-        query_metadata = {}
+        query_metadata, reference_metadata = {}, {}
         for domain, value in domains.items():
             batch = next(loaders[domain])
             if query_count:
                 query_metadata[domain] = batch["metadata"][-query_count:]
+                reference_metadata[domain] = batch["metadata"][:-query_count]
             x0[domain] = batch["x0_latent"].to(
                 value.device, dtype=value.dtype, non_blocking=True
             )
@@ -1528,6 +1592,15 @@ def train_joint_infoot(
         cross_cost = prior.cost(reference_structure["cat"], reference_structure["dog"]) if prior is not None else None
         if infoot_config.get("cross_cost_source", "dino") == "encoder":
             cross_cost = encoder_transport_cost(cat_features, dog_features)
+        spatial_costs, spatial_references = None, None
+        if spatial_cost is not None:
+            spatial_references = {
+                d: encode_spatial_descriptors(value.branch.encoder,
+                    x0[d][:-query_count] if query_count else x0[d], spatial_cost.options,
+                    device=value.device, dtype=value.dtype).to(alignment_device)
+                for d, value in domains.items()}
+            spatial_costs = spatial_cost.costs(reference_matching, spatial_references)
+            cross_cost = spatial_costs["mixed"]
         solution = _solve_infoot_logged(
             cat_features.detach(),
             dog_features.detach(),
@@ -1614,7 +1687,8 @@ def train_joint_infoot(
                 source_reference_structure=reference_structure,
                 source_query_structure={d: teacher[-query_count:] for d, teacher in teacher_features.items()},
                 source_query_metadata=query_metadata,
-                **({"source_query_codes": {d: code[-query_count:] for d, code in z.items()}} if self_supervised else {}),
+                **({"source_query_codes": {d: code[-query_count:] for d, code in z.items()},
+                    "source_reference_metadata": reference_metadata} if self_supervised else {}),
             )
             code_consistency_loss = decoder_training.code_consistency_objective
             decoded_metrics["active"] = True
@@ -1685,6 +1759,7 @@ def train_joint_infoot(
                     "adversarial": decoder_training.image_objectives.get("adversarial", decoded_loss.new_zeros(())),
                     "structure": decoder_training.image_objectives.get("structure", decoded_loss.new_zeros(())),
                     "color": decoder_training.image_objectives.get("color", decoded_loss.new_zeros(())),
+                    **getattr(decoder_training, "diagnostic_objectives", {}),
                     "matching": (alignment_objective + neighborhood_weight * warmup * neighborhood_loss
                                  + conditional_weight * warmup * projection_loss + warmup * contrastive_loss
                                  + support_weight * warmup * support_loss + matching_protection_loss),
@@ -1782,6 +1857,16 @@ def train_joint_infoot(
                     gradient_diagnostics.update({f"weighted_matching_{name}_{group}_gradient_norm": norm
                                                  for group, norm in norms.items()})
             if decoder_training is not None and decoded_metrics["active"]:
+                for name, component in getattr(decoder_training, "diagnostic_objectives", {}).items():
+                    component_norms = ({group: conflict_norms[name][f"{group}.all"]
+                                        for group in ("encoder", "matching_head", "generator")}
+                                       if conflict_norms and name in conflict_norms else
+                                       _autograd_group_norms(component, {"encoder": parameters,
+                                           "matching_head": head_parameters, "generator": generator_parameters}))
+                    gradient_diagnostics.update({f"weighted_{name}_{group}_gradient_norm": norm
+                                                 for group, norm in component_norms.items()})
+                if getattr(decoder_training, "diagnostic_objectives", {}):
+                    del component  # Do not retain a decoded graph between diagnostic steps.
                 for name, group in projector_groups.items():
                     gradient_diagnostics[f"weighted_decoded_{name}_gradient_norm"] = _autograd_norm(
                         decoded_loss, group["parameters"])
@@ -1880,6 +1965,8 @@ def train_joint_infoot(
             # Diagnostics have consumed these live losses; do not retain their
             # graphs into the next image rollout.
             decoder_training.image_objectives = {}
+            if hasattr(decoder_training, "diagnostic_objectives"):
+                decoder_training.diagnostic_objectives = {}
         grad_norms = {
             domain: _gradient_norm(list(encoder.parameters()))
             for domain, encoder in encoders.items()
@@ -1926,6 +2013,8 @@ def train_joint_infoot(
             "infoot_recovery_used": float(solution.recovery_iterations > 0),
             "cat_reconstruction_loss": float(rec_losses["cat"].detach()),
             "dog_reconstruction_loss": float(rec_losses["dog"].detach()),
+            **{f"{name}_loss": decoded_metrics.get("image_losses", {}).get(name, {}).get("loss")
+               for name in getattr(decoder_training, "rgb_options", {})},
             "infoot_mutual_information": solution.mutual_information,
             **({"infoot_outer_delta_to_tolerance": health["outer_delta_to_tolerance"],
                 "infoot_marginal_residual_to_tolerance": health["marginal_residual_to_tolerance"],
@@ -2079,12 +2168,18 @@ def train_joint_infoot(
                 metrics["window_mean"][key] = sum(values) / len(values) if values else None
             metrics["window_updates"] = len(loss_window)
             if cross_cost is not None:
+                reported_cost = spatial_costs["encoder"] if spatial_costs is not None else cross_cost
                 cost_name = "encoder_cost" if self_supervised else "structure_cost"
                 metrics["infoot_cross_cost_source"] = str(infoot_config.get("cross_cost_source", "dino"))
-                metrics[f"transport_{cost_name}"] = float((solution.coupling * cross_cost).sum())
-                metrics[f"independent_{cost_name}"] = float(cross_cost.mean())
+                metrics[f"transport_{cost_name}"] = float((solution.coupling * reported_cost).sum())
+                metrics[f"independent_{cost_name}"] = float(reported_cost.mean())
                 if self_supervised:
-                    metrics["encoder_cost_gain_over_independent"] = float(cross_cost.mean() - (solution.coupling * cross_cost).sum())
+                    metrics["encoder_cost_gain_over_independent"] = float(reported_cost.mean() - (solution.coupling * reported_cost).sum())
+            if spatial_cost is not None:
+                metrics["spatial_correlative"] = spatial_cost_diagnostics(
+                    spatial_cost, spatial_costs, spatial_references, solution.coupling, reference_matching,
+                    bandwidth=bandwidth, solver_options=solver_options,
+                    cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)))
             if self_supervised:
                 metrics["solver_health"] = health
                 metrics["solver_window_max"] = {key: max((row[key] for row in loss_window if row[key] is not None), default=None) for key in (
@@ -2128,6 +2223,7 @@ def train_joint_infoot(
                     matching_heads=matching_heads, matching_ema=matching_ema,
                     decoder_training=decoder_training,
                     projection_rms=projection_rms,
+                    spatial_cost=spatial_cost,
                 ),
             )
             if bool(train_config.get("keep_step_checkpoints", False)):

@@ -166,6 +166,17 @@ def training_gradient_conflicts(losses, groups, *, code_gradients, encoder_scale
         if kind == "generator":
             pairs["code_vs_decoded"] = (grads["code"], decoded)
             pairs["code_vs_reconstruction"] = (grads["code"], grads["reconstruction"])
+        for objective in ("coarse_rgb", "color_histogram", "local_layout", "target_patch_swd"):
+            if objective not in grads:
+                continue
+            component = combine_gradients((scale, grads[objective]))
+            if kind != "matching_head":
+                pairs[f"{objective}_vs_reconstruction"] = (component, grads["reconstruction"])
+            contrast = "source_contrastive" if "source_contrastive" in grads else "patchnce"
+            if contrast in grads:
+                pairs[f"{objective}_vs_{contrast}"] = (component, combine_gradients((scale, grads[contrast])))
+            if kind != "generator":
+                pairs[f"{objective}_vs_matching"] = (component, grads["matching"])
         report[name] = {pair: monitor.record(name, pair, gradient_pair_metrics(a, b))
                         for pair, (a, b) in pairs.items()}
     return {

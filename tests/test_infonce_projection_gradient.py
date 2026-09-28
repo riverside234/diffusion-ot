@@ -37,7 +37,8 @@ def test_weight_gate_preserves_forward_values_and_scales_backward(scale, dtype):
         assert scale_conditional_weight_gradient(weights, scale) is weights
 
 
-def test_decoded_mlp_infonce_scales_only_weight_path_preserving_conditions_and_generator(tmp_path, monkeypatch):
+@pytest.mark.parametrize("rgb_losses", [False, True])
+def test_decoded_mlp_infonce_scales_only_weight_path_preserving_conditions_and_generator(tmp_path, monkeypatch, rgb_losses):
     import diffusion_ot.training.self_supervised_translation as translation
 
     integrate = translation.integrate_training_flow
@@ -53,10 +54,17 @@ def test_decoded_mlp_infonce_scales_only_weight_path_preserving_conditions_and_g
         torch.manual_seed(53)
         cfg = mlp_config()
         cfg["decoded_translation"][SCALE] = scale
+        if rgb_losses:
+            from test_translation_image import image_options
+            cfg["decoded_translation"].update(image_options())
         ctx = domains()
         runtime = SelfSupervisedDecoderTraining(cfg, ctx, None, tmp_path, seed=53)
+        monkeypatch.setattr(runtime, "original_source_images", lambda domain, records: torch.rand(
+            len(records), 3, 8, 8, generator=torch.Generator().manual_seed(100 if domain == "cat" else 200)))
         weights, refs, keys, logits, latents = batch()
-        loss, metrics = runtime.loss(weights, refs, latents, latents, step=2, source_query_codes=keys)
+        metadata = {d: [{"sample_id": f"{d}_{i}"} for i in range(5)] for d in ctx}
+        loss, metrics = runtime.loss(weights, refs, latents, latents, step=2, source_query_codes=keys,
+                                     source_query_metadata=metadata, source_reference_metadata=metadata)
         loss.backward()
         grads = {
             "weight_logits": {d: x.grad.clone() for d, x in logits.items()},

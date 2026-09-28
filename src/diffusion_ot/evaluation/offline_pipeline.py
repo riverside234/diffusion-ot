@@ -216,6 +216,10 @@ def run_stage23(config_path, checkpoint_path, *, root, output_dir=None, weights=
     torch.set_float32_matmul_precision("highest")
     config = load_yaml_config(config_path)
     alignment = load_yaml_config(local(root, config["alignment_config"]))
+    from diffusion_ot.losses.spatial_correlative import spatial_correlative_options
+    if spatial_correlative_options(alignment) is not None:
+        raise ValueError("Stage 2-3 full-bank export does not yet support spatial_correlative_cost. "
+                         "Use the matched v4.5 Stage 1B evaluator; exporting encoder-only cost would change this experiment.")
     if weights not in {"raw", "ema"}:
         raise ValueError("weights must be raw or ema")
     if config.get("reference_split") != "train" or config.get("reference_samples_per_domain") != "all":

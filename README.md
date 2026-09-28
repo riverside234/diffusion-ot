@@ -30,7 +30,11 @@ The canonical configurations are:
 - Stage 1B self-supervised PatchNCE: `configs/stage1b_infoot/self_supervised_patchnce_sit_b2.yaml`
 - Stage 1B global InfoNCE control: `configs/stage1b_infoot/self_supervised_sit_b2.yaml`
 - Stage 1B PatchNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml`
-- Stage 1B **current v3 pilot**, global MLP InfoNCE with 10% conditional-weight gradients: `configs/stage1b_infoot/self_supervised_infonce_v3_sit_b2.yaml`
+- Stage 1B **current v4.5 spatial-cost experiment**: `configs/stage1b_infoot/self_supervised_infonce_v4_5_sit_b2.yaml`
+- Stage 1B v4.5 matched evaluation: `configs/stage1b_eval/self_supervised_infonce_v4_5_sit_b2.yaml`
+- Stage 1B v4 image-loss control: `configs/stage1b_infoot/self_supervised_infonce_v4_sit_b2.yaml`
+- Stage 1B v4 matched image evaluation: `configs/stage1b_eval/self_supervised_infonce_v4_sit_b2.yaml`
+- Stage 1B v3 control, global MLP InfoNCE with 10% conditional-weight gradients: `configs/stage1b_infoot/self_supervised_infonce_v3_sit_b2.yaml`
 - Stage 1B v3 **100% gradient control**: `configs/stage1b_infoot/self_supervised_infonce_v3_control_sit_b2.yaml`
 - Stage 1B v3 matched evaluation: `configs/stage1b_eval/self_supervised_infonce_v3_sit_b2.yaml`
 - Stage 1B learned PatchNCE baseline + reference-EMA RMS: `configs/stage1b_infoot/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml`
@@ -45,7 +49,99 @@ unchanged `*_sit_b2_lora.yaml` configs. Experiment D uses its selected
 `*_sit_b2_dino.yaml` EMA checkpoints. Neither automatically loads the new RGB
 Stage 1A outputs; replacing checkpoint paths alone is insufficient.
 
-### Current Stage 1B v3 pilot: protect matching geometry
+### Current Stage 1B v4.5: spatially-correlative transport cost
+
+The separate **v4.5** recipe implements the
+[spatial-correlative plan](docs/analysis/stage1b_v3_2500/spatial_correlative_plan.md).
+It adds own-encoder spatial relationships to **reference-plan fitting**:
+convolution stages 0/1, pooled to 8x8, spatial centering, normalized local
+correlations, diagonal removal, and symmetric row-cosine comparison.
+Descriptors are detached; conditional projection still uses the existing global
+matching kernels. The global InfoNCE MLPs and all v4 losses, weights, learning
+rates, PCGrad, projection RMS EMA, and 10% decoded W-gradient routing are retained.
+
+```text
+C_mix = g * (0.80 * C_encoder + 0.20 * (s_encoder / s_spatial) * C_spatial)
+```
+
+Component spreads use doubly centered cost RMS on a fixed initial training bank.
+The gain g matches the initial mixture spread to the encoder-only cost. Scales
+and calibration IDs are frozen and checkpointed, separately from RMS EMA.
+Constant calibration costs produce an explicit encoder-only fallback. No
+external teacher, GAN, extra spatial neural loss, or diffusion rollout is added.
+
+```bash
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_infonce_v4_5_sit_b2.yaml --smoke
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_infonce_v4_5_sit_b2.yaml --resume latest
+python scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/self_supervised_infonce_v4_5_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_infonce_v4_5_sit_b2.yaml \
+  --checkpoint outputs/stage1b_nce_v4_5/checkpoints/latest.pt --weights ema
+```
+
+Training outputs are `outputs/stage1b_nce_v4_5`; evaluation outputs are
+`outputs/stage1b_eval_nce_v4_5`. Start fresh from the same original Stage 1A
+checkpoints as v4. A `step_000000.pt` checkpoint retains the starting weights and
+calibration. The evaluator requires a v4.5 checkpoint; evaluate that initial
+checkpoint before `latest.pt` for automatic numeric comparison. `--quick-eval`
+does both after training. Raw/EMA evaluation uses the corresponding encoder
+maps with the same frozen calibration. Incompatible recipes/caches are rejected.
+
+Enabled-only `spatial_correlative` diagnostics report component costs/spreads,
+uniform baselines, effective Sinkhorn-cost spread, degenerate rows, fixed-cohort
+descriptor drift, and held-out query matching. Evaluation also saves original
+source / top two target references / generated image grids with IDs and weights.
+These measure the model's own matching prior; judge layout, species, native
+reconstruction and artifacts on matched images. CPU integration tests passed;
+AFHQ image-quality improvement requires the paired GPU runs. See the
+[v4.5 implementation note](docs/analysis/stage1b_v4_5/implementation.md).
+
+### Stage 1B v4 control: four fixed-image losses
+
+The separate v4 recipe adds **coarse RGB 0.02, RGB-uv histogram 0.02,
+local layout 0.02, and target patch SWD 0.01** to v3. It retains global MLP
+InfoNCE 0.05, native flow, MI/relative alignment, variance/covariance protection,
+learning rates, bandwidths, and the original flow-only Stage 1A initialization.
+The v3 files and outputs remain available as the control.
+
+The source losses compare generated RGB with **original source RGB**. Texture
+SWD compares fixed luminance Laplacian patches with **unpaired original target
+training images**, sampled from the disjoint transport-reference pool. No
+external feature network, discriminator, own-feature SWD or spectral loss is
+added. Each new term can be disabled independently with `weight: 0`.
+
+```text
+v4 decoded loss = translation_ramp * (
+    0.05 * source_InfoNCE
+  + 0.02 * coarse_RGB + 0.02 * RGBuv_histogram
+  + 0.02 * local_layout + 0.01 * target_patch_SW1)
+```
+
+All terms share the existing decoded images and 2,000-step ramp. The 10% W
+backward gate now applies to **all decoded terms**; forward conditions and
+direct generator/reference-code derivatives are unscaled. PCGrad treats their
+sum as one `decoded_images` task. Component gradient norms and cosines are
+measured separately every 100 steps, without changing that task grouping.
+
+Training/validation schema 4 records enabled losses, weights, reductions,
+original target IDs and gradient scope. Fixed validation reports per-image
+source distances and a disjoint real-versus-real SWD baseline when enough
+references are available. Standalone v4 evaluation uses the same definitions
+on the displayed images and saves an original-source paired grid. These are
+training-related diagnostics, not independent semantic/realism scores.
+
+```bash
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_infonce_v4_sit_b2.yaml
+```
+
+Outputs go to `outputs/stage1b_nce_v4`; the quick evaluator is linked in that
+training YAML. Start fresh for this loss comparison. Resume within v4 restores
+private image-sampling RNG along with diffusion noise; protocol changes are
+rejected. The 2,500-step pilot retains v3's duration for a matched comparison.
+Weights are initial experimental values; full-model image-quality improvement
+must be established with a new GPU run.
+
+### Stage 1B v3 control: protect matching geometry
 
 The v2 log review found matching dimensional collapse despite preserved total
 spread. The new v3 pilot uses **MI-only neural alignment**, covariance weight

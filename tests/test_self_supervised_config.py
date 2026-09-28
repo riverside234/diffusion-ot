@@ -65,7 +65,6 @@ def test_self_supervised_initializers_point_to_original_pdae_not_dino_recipes():
     ("decoded_translation", "structure_weight", .1),
     ("decoded_translation", "structure_contrastive_weight", .01),
     ("decoded_translation", "code_consistency_weight", .01),
-    ("decoded_translation", "color_histogram", {"weight": .02}),
     ("decoded_translation", "diffaugment", {"enabled": True, "policy": "translation"}),
     ("conditional_structure", "enabled", True),
     ("matching_contrastive", "enabled", True),
@@ -83,6 +82,26 @@ def test_self_supervised_recipe_rejects_external_or_incompatible_objectives(sect
     config[section][key] = value
     with pytest.raises(ValueError):
         validate_decoder_config(config)
+
+
+def test_v4_enables_four_fixed_image_losses_with_matched_evaluation_and_retains_v3_control():
+    from diffusion_ot.losses.translation_image import translation_image_options
+    config = load_yaml_config(ROOT / "configs/stage1b_infoot/self_supervised_infonce_v4_sit_b2.yaml")
+    control = load_yaml_config(ROOT / "configs/stage1b_infoot/self_supervised_infonce_v3_sit_b2.yaml")
+    evaluation = load_yaml_config(ROOT / "configs/stage1b_eval/self_supervised_infonce_v4_sit_b2.yaml")
+    validate_decoder_config(config)
+    assert {k: v["weight"] for k, v in translation_image_options(config["decoded_translation"]).items()} == {
+        "coarse_rgb": .02, "color_histogram": .02, "local_layout": .02, "target_patch_swd": .01}
+    assert translation_image_options(control["decoded_translation"]) == {}
+    for key in ("stage1a", "train", "data", "loss_weights", "matching", "infoot", "generator_adaptation",
+                "matching_regularization", "pcgrad", "projection_rms", "conditional_projection"):
+        assert config[key] == control[key]
+    for key, value in evaluation["infoot"].items():
+        assert config["infoot"][key] == value
+    assert evaluation["matching"]["bandwidth_multiplier"] == config["matching"]["bandwidth_multiplier"]
+    assert evaluation["translation"]["teacher_free_image_metrics"]
+    assert config["output_dir"] != control["output_dir"]
+    assert "semantic_prior" not in config and "semantic_prior" not in evaluation
 
 
 @pytest.mark.parametrize("origin", ["configured", "checkpoint_config", "checkpoint_training_state"])

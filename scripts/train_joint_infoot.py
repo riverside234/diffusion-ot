@@ -41,8 +41,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="CONFIG",
         help=(
-            "Run the matching Stage 1A baseline before training and evaluate the final "
-            "Stage 1B checkpoint. With no value, use quick_evaluation.config."
+            "Evaluate the initial baseline and final Stage 1B checkpoint. Spatial-cost "
+            "recipes use their retained calibrated step-0 checkpoint after training; "
+            "other recipes evaluate Stage 1A before training. With no value, use quick_evaluation.config."
         ),
     )
     parser.add_argument("--eval-weights", choices=["ema", "raw"], default=None)
@@ -57,10 +58,12 @@ def main() -> int:
     from diffusion_ot.integrations.hf_snapshot import load_yaml_config
     from diffusion_ot.evaluation.stage1b_eval import run_stage1b_evaluation
     from diffusion_ot.training.train_joint_infoot import train_joint_infoot
+    from diffusion_ot.losses.spatial_correlative import spatial_correlative_options
 
     args = parse_args()
     config_path = repo_path(args.config)
     config = load_yaml_config(config_path)
+    spatial_enabled = spatial_correlative_options(config) is not None
     train_config = config.get("train") or {}
     if args.smoke and args.max_steps is not None:
         raise ValueError("Use either --smoke or --max-steps, not both.")
@@ -81,7 +84,7 @@ def main() -> int:
         eval_weights = eval_weights or str(quick_config.get("weights", "ema"))
 
     baseline_report = None
-    if quick_eval_path is not None and not args.dry_run:
+    if quick_eval_path is not None and not args.dry_run and not spatial_enabled:
         baseline_report = run_stage1b_evaluation(
             config_path,
             quick_eval_path,
@@ -107,6 +110,15 @@ def main() -> int:
     if quick_eval_path is not None and not args.dry_run:
         if report.checkpoint_path is None:
             raise RuntimeError("Training completed without a checkpoint to evaluate.")
+        if spatial_enabled:
+            # Calibration is created by training and frozen in step_000000.pt.
+            # Evaluate that retained initial state before the final checkpoint.
+            baseline_report = run_stage1b_evaluation(
+                config_path, quick_eval_path,
+                checkpoint_path=Path(report.checkpoint_path).with_name("step_000000.pt"),
+                weights=str(eval_weights), device_cat=args.device_cat, device_dog=args.device_dog,
+                max_reference=args.max_reference, max_projection=args.max_projection, max_query=args.max_query)
+            print(f"stage1b_initial_calibrated_report: {baseline_report.output_dir}")
         joint_report = run_stage1b_evaluation(
             config_path,
             quick_eval_path,
