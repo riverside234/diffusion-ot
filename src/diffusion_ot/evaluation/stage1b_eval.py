@@ -156,9 +156,16 @@ def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
             raise ValueError("Alignment config and checkpoint PatchNCE protocol disagree.")
     elif current_objective == "source_infonce":
         from diffusion_ot.models.code_projector import code_projector_options
+        from diffusion_ot.training.decoded_translation import source_contrastive_projection_gradient_scale
         if (code_projector_options(current_image.get("source_contrastive_projector"))
                 != code_projector_options(saved_image.get("source_contrastive_projector"))):
             raise ValueError("Alignment config and checkpoint global InfoNCE projector protocol disagree.")
+        current_scale, saved_scale = (source_contrastive_projection_gradient_scale(image)
+                                      for image in (current_image, saved_image))
+        if current_scale != saved_scale:
+            raise ValueError("Alignment config and checkpoint source InfoNCE projection gradient scale disagree.")
+        if checkpoint.get("decoded_source_contrastive_projection_gradient_scale", 1.0) != saved_scale:
+            raise ValueError("Checkpoint source InfoNCE projection gradient scale metadata disagree.")
     if current_image.get("source_contrastive_readout", "target") != saved_image.get("source_contrastive_readout", "target"):
         raise ValueError("Alignment config and checkpoint source contrastive readout disagree.")
     for field, default in (("variant", "plain"), ("cross_cost_source", "dino")):

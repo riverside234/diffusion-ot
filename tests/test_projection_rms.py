@@ -176,9 +176,11 @@ def test_training_and_standalone_readouts_agree_with_frozen_scales():
 
 
 def test_training_tracks_references_once_keeps_live_fit_gradients_and_resumes(own_encoder_run, monkeypatch):
-    import diffusion_ot.losses.infoot as infoot
+    # Patch the call site: the alignment module binds this helper at import.
+    # Patching infoot itself only worked when this test happened to import first.
+    import diffusion_ot.losses.infoot_alignment as alignment
     run, _, _, _ = own_encoder_run
-    original_loss, original_update = infoot.plain_infoot_feature_loss, ReferenceRMSEMA.update
+    original_loss, original_update = alignment.plain_infoot_feature_loss, ReferenceRMSEMA.update
     gradient_modes, updates = [], []
 
     def loss(*args, **kwargs):
@@ -191,7 +193,7 @@ def test_training_tracks_references_once_keeps_live_fit_gradients_and_resumes(ow
         updates.append((step, {d: len(x) for d, x in references.items()}))
         return original_update(self, references, step=step)
 
-    monkeypatch.setattr(infoot, "plain_infoot_feature_loss", loss)
+    monkeypatch.setattr(alignment, "plain_infoot_feature_loss", loss)
     monkeypatch.setattr(ReferenceRMSEMA, "update", update)
     cp, logs = run("ema_projection", steps=1, modify=rms_recipe)
     assert gradient_modes == [(True, True)]

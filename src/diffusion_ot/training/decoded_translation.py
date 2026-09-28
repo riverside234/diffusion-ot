@@ -46,6 +46,19 @@ def validate_flow_only_stage1a(config, stage1a_config, checkpoint=None):
         raise ValueError("Self-supervised Stage 1B cannot initialize from a refinement checkpoint.")
 
 
+def source_contrastive_projection_gradient_scale(image: dict[str, Any]) -> float:
+    """Backward-only scale on conditional weights, not on the target codes."""
+    name = "source_contrastive_projection_gradient_scale"
+    value = image.get(name, 1.0)
+    try:
+        scale = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"decoded_translation.{name} must be finite and in [0, 1].") from error
+    if isinstance(value, bool) or not math.isfinite(scale) or not 0 <= scale <= 1:
+        raise ValueError(f"decoded_translation.{name} must be finite and in [0, 1].")
+    return scale
+
+
 def self_supervised_translation_options(image: dict[str, Any]) -> dict[str, Any]:
     """Resolve mutually exclusive global-code and spatial PatchNCE experiments."""
     objective = image.get("objective", "source_infonce")
@@ -55,6 +68,8 @@ def self_supervised_translation_options(image: dict[str, Any]) -> dict[str, Any]
     if readout not in {"target", "source"}:
         raise ValueError("Source contrastive readout must be target or source.")
     if objective == "patchnce":
+        if "source_contrastive_projection_gradient_scale" in image:
+            raise ValueError("source_contrastive_projection_gradient_scale requires objective: source_infonce.")
         if image.get("source_contrastive_projector") is not None:
             raise ValueError("source_contrastive_projector requires objective: source_infonce.")
         if float(image.get("source_contrastive_weight", 0)) != 0:
@@ -98,6 +113,7 @@ def self_supervised_translation_options(image: dict[str, Any]) -> dict[str, Any]
     if image.get("patchnce"):
         raise ValueError("PatchNCE settings require decoded_translation.objective: patchnce.")
     result = {"objective": objective, "name": "source_contrastive", "readout": readout}
+    result["projection_gradient_scale"] = source_contrastive_projection_gradient_scale(image)
     for name, default in (("weight", .1), ("temperature", .2)):
         value = float(image.get(f"source_contrastive_{name}", default))
         if not math.isfinite(value) or value <= 0:
@@ -121,6 +137,8 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
     if supervision not in {"external", "self_supervised"}:
         raise ValueError("decoded_translation.supervision must be external or self_supervised.")
     self_supervised = supervision == "self_supervised"
+    if not self_supervised and "source_contrastive_projection_gradient_scale" in image:
+        raise ValueError("source_contrastive_projection_gradient_scale requires supervision: self_supervised.")
     if not self_supervised and image.get("source_contrastive_projector") is not None:
         raise ValueError("source_contrastive_projector requires supervision: self_supervised.")
     if not self_supervised and (image.get("objective") == "patchnce" or image.get("patchnce")):

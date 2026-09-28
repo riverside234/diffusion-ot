@@ -17,7 +17,9 @@ The current pipeline has four stages:
    recipe. The optional RGB experiment runs separately for comparison.
 2. Run the selected compatible Stage 1B experiment with full InfoOT conditional
    means. Existing recipes remain on their earlier latent-input checkpoints.
-3. Evaluate held-out queries with the complete target projection bank.
+3. Evaluate held-out queries with the recipe's specified target bank; v3 uses
+   224 references/targets for the primary comparison, with all-bank evaluation
+   retained as a separate stress test.
 4. Export the selected encoders, matching heads, adapted generators, kernels,
    target codes, and fitted transport for downstream inference.
 
@@ -28,7 +30,10 @@ The canonical configurations are:
 - Stage 1B self-supervised PatchNCE: `configs/stage1b_infoot/self_supervised_patchnce_sit_b2.yaml`
 - Stage 1B global InfoNCE control: `configs/stage1b_infoot/self_supervised_sit_b2.yaml`
 - Stage 1B PatchNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml`
-- Stage 1B **main**, learned PatchNCE samplers + reference-EMA RMS: `configs/stage1b_infoot/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml`
+- Stage 1B **current v3 pilot**, global MLP InfoNCE with 10% conditional-weight gradients: `configs/stage1b_infoot/self_supervised_infonce_v3_sit_b2.yaml`
+- Stage 1B v3 **100% gradient control**: `configs/stage1b_infoot/self_supervised_infonce_v3_control_sit_b2.yaml`
+- Stage 1B v3 matched evaluation: `configs/stage1b_eval/self_supervised_infonce_v3_sit_b2.yaml`
+- Stage 1B learned PatchNCE baseline + reference-EMA RMS: `configs/stage1b_infoot/self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml`
 - Stage 1B full neural InfoOT + relative transport experiment: `configs/stage1b_infoot/self_supervised_patchnce_mlp_full_sit_b2.yaml`
 - Stage 1B global MLP InfoNCE + full InfoOT, revised protection/rates: `configs/stage1b_infoot/self_supervised_infonce_full_sit_b2.yaml`
 - Stage 1B global InfoNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_rms_ema_sit_b2.yaml`
@@ -40,7 +45,71 @@ unchanged `*_sit_b2_lora.yaml` configs. Experiment D uses its selected
 `*_sit_b2_dino.yaml` EMA checkpoints. Neither automatically loads the new RGB
 Stage 1A outputs; replacing checkpoint paths alone is insufficient.
 
-### Main Stage 1B: learned PatchNCE samplers and reference-EMA RMS
+### Current Stage 1B v3 pilot: protect matching geometry
+
+The v2 log review found matching dimensional collapse despite preserved total
+spread. The new v3 pilot uses **MI-only neural alignment**, covariance weight
+**0.30** (previously 0.03), and matching-head LR **1e-5** (previously 5e-5).
+The solver still fits fused InfoOT with own-encoder cosine cost, MI 0.10,
+and entropy 0.02. The relative loss stays at 0.01. Native flow, variance
+protection, global InfoNCE with separate cat/dog MLPs, and PCGrad stay enabled.
+
+```text
+flow_cat + flow_dog
+- 0.02 * alignment_ramp * MI + 0.01 * alignment_ramp * relative
++ 0.10 * variance + 0.30 * covariance
++ 0.05 * translation_ramp * global_source_InfoNCE
+```
+
+`decoded_translation.source_contrastive_projection_gradient_scale: 0.10`
+applies only to InfoNCE's backward path through conditional matching weights W:
+
+```python
+decoded_W = W.detach() + 0.10 * (W - W.detach())
+condition = decoded_W @ target_codes
+```
+
+The forward weights, conditions, sampled images, scalar loss, and direct
+generator/target-code/readout/MLP gradients are unchanged at fixed model state,
+inputs and noise. The gradient through W is multiplied by 0.10; encoder gradients
+through that path also change. Other loss graphs are untouched. PCGrad then
+combines the routed task gradients. Subsequent training trajectories can differ.
+The default is 1.0 for existing recipes. The scale is logged in train/validation
+and saved in checkpoints; changing it on resume is rejected.
+
+Start both runs fresh from the same original flow-only Stage 1A EMA checkpoints:
+
+```bash
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_infonce_v3_sit_b2.yaml
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_infonce_v3_control_sit_b2.yaml
+```
+
+Outputs are `outputs/stage1b_nce_v3` and `outputs/stage1b_nce_v3_g1`. The control
+differs only in the output path and gradient scale 1.0. Both run 2,500 steps,
+save/validate every 250, and measure gradients every 100. Keep the same Stage 1A
+checkpoint files across the pair. Resume each run with its own config and
+`--resume latest`; the existing v2 full-objective config remains available.
+
+Evaluate each with its own alignment config/checkpoint and the same evaluator:
+
+```bash
+python scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/self_supervised_infonce_v3_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_infonce_v3_sit_b2.yaml \
+  --checkpoint outputs/stage1b_nce_v3/checkpoints/latest.pt --weights ema
+```
+
+The evaluator uses 224 fit references/224 projection targets, fit bandwidth 0.55,
+projection bandwidth 0.10 and conditional means. Checkpoint-specific report
+subdirectories separate comparisons. Use it for v2 as well before comparing
+images. Stage 2–3/4 defaults still point to the established PatchNCE experiment
+until the new pilot is evaluated. See the
+[v2 analysis](docs/analysis/stage1b_v2_5000/review.md) and
+[v3 implementation/tests](docs/analysis/stage1b_v2_5000/implementation.md).
+CPU gradient and training/resume tests verify routing; AFHQ quality gains
+require the paired GPU runs.
+
+### Stage 1B baseline: learned PatchNCE samplers and reference-EMA RMS
 
 The new `self_supervised_patchnce_mlp_rms_ema_sit_b2.yaml` recipe adds CUT-style
 per-layer MLPs with DCLGAN's separate cat/dog sampler routing. Each sampled

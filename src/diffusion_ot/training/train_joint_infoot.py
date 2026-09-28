@@ -1732,9 +1732,11 @@ def train_joint_infoot(
                 # Component norms expose whether raw attraction overwhelms the
                 # relative term. Aggregate alignment/conflict metrics above
                 # include BOTH terms, before PCGrad and clipping.
-                components = {}
+                # MI and relative gradients are separate diagnostics even in
+                # the MI-only neural recipe (where no live cost term exists).
+                components = {"mi": beta * alignment_result.mi_loss}
                 if alignment_options.feature_objective == "full":
-                    components.update(cost=beta * alignment_result.cost_loss, mi=beta * alignment_result.mi_loss)
+                    components["cost"] = beta * alignment_result.cost_loss
                 if alignment_options.relative_weight > 0:
                     components["relative"] = relative_beta * alignment_result.relative_loss
                 for name, objective in components.items():

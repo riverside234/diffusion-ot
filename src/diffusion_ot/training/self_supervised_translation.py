@@ -108,6 +108,19 @@ def source_code_contrastive_loss(recovered, positive, source_bank, *, temperatur
     return loss, metrics
 
 
+def scale_conditional_weight_gradient(probability: torch.Tensor, scale: float) -> torch.Tensor:
+    """Preserve finite forward probabilities while scaling only their backward path.
+
+    Apply before W @ Z, on the decoded branch only. Gating W @ Z would also
+    scale direct target-code gradients; reducing the loss weight would scale G.
+    Scale is validated when resolving the translation config.
+    """
+    if scale == 1.0 or not torch.is_grad_enabled() or not probability.requires_grad:
+        return probability
+    fixed = probability.detach()
+    return fixed + scale * (probability - fixed)
+
+
 class SelfSupervisedDecoderTraining(DecoderTraining):
     """Opt-in self-supervised translation branch using existing generator views.
 
@@ -126,6 +139,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         self.objective = self.contrastive_options["objective"]
         self.objective_name = self.contrastive_options["name"]
         self.readout = self.contrastive_options["readout"]
+        self.projection_gradient_scale = self.contrastive_options.get("projection_gradient_scale", 1.0)
         for key in ("structure_weight", "perceptual_weight", "structure_contrastive_weight",
                     "adversarial_weight", "code_consistency_weight"):
             if float(self.options.get(key, 0)) != 0:
@@ -303,8 +317,11 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             query_keys = source_query_codes[source].detach()
             if len(query_keys) != len(probability) or len(query_keys) > len(source_latents[source]):
                 raise ValueError("Source query codes must match all conditional query rows.")
-            # Keep the complete weighted target mean and its live gradient.
-            codes = (probability[:count] @ references[target].float()).to(context.device, dtype=context.dtype)
+            # Keep the complete forward mean. Only the InfoNCE gradient through
+            # W is scaled; direct target-code, G and readout gradients stay live.
+            decoded_probability = scale_conditional_weight_gradient(
+                probability[:count], self.projection_gradient_scale)
+            codes = (decoded_probability @ references[target].float()).to(context.device, dtype=context.dtype)
             generator = (torch.Generator(device=context.device).manual_seed(validation_seed + offset)
                          if evaluation else self.noise_generators[target])
             noise = torch.randn((count, *source_latents[source].shape[1:]), generator=generator,
@@ -400,6 +417,13 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                             if self.patch_options else
                             "Own-encoder source retrieval; training objective, not independent target realism validation."),
         )
+        if self.objective == "source_infonce":
+            metrics["source_contrastive_projection_gradient_scale"] = self.projection_gradient_scale
+            metrics["source_contrastive_projection_gradient_scope"] = "conditional_weights_only"
+            if self.projection_gradient_scale != 1.0:
+                metrics["source_contrastive_gradient_routing"] = metrics[
+                    "source_contrastive_gradient_routing"].replace(
+                        "translation_conditioning", "scaled_conditional_weights_and_live_target_reference_codes")
         if image_diagnostics:
             metrics["image_diagnostics_protocol"] = "original_rgb_pooled_correspondence_and_native_reconstruction_v1"
         return objective, metrics
@@ -408,6 +432,8 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         return {
             "decoded_supervision": "self_supervised",
             "decoded_objective": self.objective,
+            **({"decoded_source_contrastive_projection_gradient_scale": self.projection_gradient_scale}
+               if self.objective == "source_infonce" else {}),
             **({"decoded_patchnce_options": self.patch_options,
                 "decoded_patch_sampling_states": {d: gen.get_state().cpu() for d, gen in self.patch_generators.items()}}
                if self.patch_options else {}),
@@ -434,6 +460,8 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 or payload.get("decoded_objective", "source_infonce") != self.objective
                 or payload.get("decoded_source_contrastive_readout") != self.readout):
             raise ValueError("Cannot resume a different decoded supervision/readout; start a fresh Stage 1B run.")
+        if payload.get("decoded_source_contrastive_projection_gradient_scale", 1.0) != self.projection_gradient_scale:
+            raise ValueError("Cannot resume a different source InfoNCE projection gradient scale; start a fresh run.")
         if payload.get("decoded_code_projector_options") != self.code_options:
             raise ValueError("Cannot resume a different global InfoNCE projector protocol; start a fresh run.")
         for domain, head in self.code_projectors.items():
