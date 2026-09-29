@@ -52,7 +52,7 @@ data:
   pin_memory: true
   drop_last: true
 train:
-  max_steps: 2500
+  max_steps: 8000
   smoke_steps: 500
   seed: 20260905
   lr_encoder: 1.0e-05
