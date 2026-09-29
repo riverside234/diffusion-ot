@@ -145,8 +145,11 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
         raise ValueError("This PatchNCE experiment requires decoded_translation.supervision: self_supervised.")
     diffaugment_options(image.get("diffaugment"))
     color_histogram_options(image.get("color_histogram"))
-    from diffusion_ot.losses.translation_image import translation_image_options
+    from diffusion_ot.losses.translation_image import translation_image_options, texture_diagnostic_options
     fixed_image_options = translation_image_options(image)
+    texture_options = texture_diagnostic_options(config)
+    if texture_options and not self_supervised:
+        raise ValueError("Teacher-free texture diagnostics require supervision: self_supervised.")
     if not self_supervised and any(name != "color_histogram" for name in fixed_image_options):
         raise ValueError("Teacher-free RGB/layout/patch objectives require supervision: self_supervised.")
     if image.get("discriminator_kind", "dino_feature") not in ("dino_feature", "rgb_patchgan"):
@@ -263,6 +266,11 @@ def validate_decoder_config(config: dict[str, Any]) -> None:
         validation_references = int((config.get(readout_key) or {}).get("validation_reference_samples", 96))
         if min(train_references, validation_references) < decoded_count:
             raise ValueError("Target patch SWD requires at least batch_size disjoint real references in training and validation.")
+    if texture_options:
+        readout = config.get(readout_key) or {}
+        validation_count = min(int(image.get("batch_size", 4)), int(readout.get("validation_query_samples", 32)))
+        if int(readout.get("validation_reference_samples", 96)) < 2 * validation_count:
+            raise ValueError("Texture diagnostics need two disjoint real reference subsets in validation.")
     if (config.get("projection_support") or {}).get("enabled", False):
         raise ValueError("Experiment D disables the conditional-mean support loss.")
 

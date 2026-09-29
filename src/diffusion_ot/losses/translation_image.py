@@ -13,10 +13,15 @@ import torch
 import torch.nn.functional as F
 
 from diffusion_ot.losses.color_histogram import color_histogram_options, histogan_color_distance
+from diffusion_ot.losses.lab_swd import source_lab_swd
 
 
 IMAGE_LOSS_PROTOCOL = "source_rgb_layout_target_laplacian_sw1_v1"
-IMAGE_LOSS_NAMES = ("coarse_rgb", "color_histogram", "local_layout", "target_patch_swd")
+IMAGE_LOSS_NAMES = ("coarse_rgb", "color_histogram", "local_layout", "target_patch_swd", "source_lab_swd")
+
+
+def image_loss_protocol(options):
+    return "source_normalized_lab_patch_sw1_v2" if "source_lab_swd" in options else IMAGE_LOSS_PROTOCOL
 
 
 def translation_image_options(image):
@@ -27,6 +32,7 @@ def translation_image_options(image):
         "target_patch_swd": {"weight": 0., "sizes": [256, 128, 64],
                              "patch_size": 7, "patches_per_image": 32,
                              "directions": 64, "scale_floor": .01},
+        "source_lab_swd": {"weight": 0., "sizes": [64, 32, 16], "patch_size": 5, "directions": 128},
     }
     resolved = {}
     for name in IMAGE_LOSS_NAMES:
@@ -51,16 +57,49 @@ def translation_image_options(image):
                     or len(set(sizes)) != len(sizes)):
                 raise ValueError(f"{name}.sizes must contain distinct integer resolutions >= 4.")
             options["sizes"] = list(sizes)
-            if name == "target_patch_swd":
-                for key in ("patch_size", "patches_per_image", "directions"):
+            if name in {"target_patch_swd", "source_lab_swd"}:
+                for key in ("patch_size", "directions") + (("patches_per_image",) if name == "target_patch_swd" else ()):
                     value = options[key]
                     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                         raise ValueError(f"{name}.{key} must be a positive integer.")
                 if options["patch_size"] > min(sizes):
-                    raise ValueError("target_patch_swd.patch_size exceeds a band resolution.")
+                    raise ValueError(f"{name}.patch_size exceeds a resolution.")
+                if name == "source_lab_swd" and (options["patch_size"] % 2 != 1
+                        or any(a != 2 * b for a, b in zip(sizes, sizes[1:]))):
+                    raise ValueError("Lab SWD needs an odd patch size and successively halved resolutions.")
         if options["weight"] > 0:
             resolved[name] = options
     return resolved
+
+
+def texture_diagnostic_options(config):
+    supplied = (config.get("self_supervised_diagnostics") or {}).get("target_patch_swd") or {}
+    if not isinstance(supplied, dict):
+        raise ValueError("Texture diagnostic options must be a mapping.")
+    if not supplied.get("enabled", False):
+        return None
+    if supplied["enabled"] is not True or "weight" in supplied:
+        raise ValueError("Texture diagnostics use enabled: true, with no training weight.")
+    options = translation_image_options({"target_patch_swd": {
+        **{k: v for k, v in supplied.items() if k != "enabled"}, "weight": 1.}})["target_patch_swd"]
+    return {k: v for k, v in options.items() if k != "weight"}
+
+
+@torch.no_grad()
+def texture_diagnostic(generated, records, load_images, options, *, seed):
+    """Validation only; private RNG and two disjoint real reference subsets."""
+    count = len(generated)
+    if len(records) < 2 * count:
+        raise ValueError("Texture diagnostic needs two disjoint real reference subsets per decoded batch.")
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    indices = torch.randperm(len(records), generator=generator)[:2 * count].tolist()
+    selected = [records[i] for i in indices]
+    real = load_images(selected).to(generated.device)
+    distance, details = target_patch_swd(generated.detach(), real[:count], generator=generator,
+                                       real_baseline=real[count:], **options)
+    return dict(distance=float(distance), **details, training_weight=0., seed=seed,
+                reference_ids=[r["sample_id"] for r in selected[:count]],
+                baseline_ids=[r["sample_id"] for r in selected[count:]])
 
 
 def _rgb(images):
@@ -202,6 +241,9 @@ def translation_image_losses(generated, source, options, *, generator=None,
         elif name == "local_layout":
             distances, fraction = local_layout_distance(generated, source, **parameters)
             extra["contributing_pair_fraction"] = float(fraction.mean())
+        elif name == "source_lab_swd":
+            distances = source_lab_swd(generated, source, generator=generator, **parameters)
+            extra.update(color_space="D65_Lab_L100_a128_b128", target="original_source_rgb")
         elif name == "target_patch_swd":
             if real_target is None or generator is None:
                 raise ValueError("Target patch SWD requires original target RGB and a private generator.")

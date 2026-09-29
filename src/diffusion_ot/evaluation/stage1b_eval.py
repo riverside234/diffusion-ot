@@ -10,6 +10,8 @@ import warnings
 
 import torch
 
+from diffusion_ot.losses.source_selection import source_selection_options, checkpoint_source_selection
+
 from diffusion_ot.integrations.hf_snapshot import (
     effective_project_root,
     find_project_root,
@@ -118,6 +120,7 @@ class DomainEvaluationContext:
     patch_projector: Any | None = None
     code_projector: Any | None = None
     spatial_cost: Any | None = None
+    source_selection: Any | None = None
 
 
 @dataclass
@@ -150,6 +153,7 @@ class Stage1BEvaluationReport:
 def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
     """Do not label weights trained with external losses as the new control."""
     checkpoint_spatial_cost(checkpoint, alignment_config)
+    checkpoint_source_selection(checkpoint, alignment_config)
     saved = checkpoint.get("config") or {}
     current_image, saved_image = (config.get("decoded_translation") or {} for config in (alignment_config, saved))
     current_mode, saved_mode = (image.get("supervision", "external") for image in (current_image, saved_image))
@@ -161,12 +165,15 @@ def _validate_self_supervised_checkpoint(alignment_config, checkpoint):
         image.get("objective", "source_infonce") for image in (current_image, saved_image))
     if current_objective != saved_objective:
         raise ValueError("Alignment config and checkpoint decoded objective disagree.")
-    from diffusion_ot.losses.translation_image import IMAGE_LOSS_PROTOCOL, translation_image_options
+    from diffusion_ot.losses.translation_image import image_loss_protocol, translation_image_options, texture_diagnostic_options
     current_rgb, saved_rgb = (translation_image_options(image) for image in (current_image, saved_image))
     if current_rgb != saved_rgb or checkpoint.get("decoded_image_loss_options", {}) != saved_rgb:
         raise ValueError("Alignment config and checkpoint decoded image-loss options disagree.")
-    if current_rgb and checkpoint.get("decoded_image_loss_protocol") != IMAGE_LOSS_PROTOCOL:
+    if current_rgb and checkpoint.get("decoded_image_loss_protocol") != image_loss_protocol(current_rgb):
         raise ValueError("Checkpoint decoded image-loss protocol is missing or incompatible.")
+    current_texture, saved_texture = (texture_diagnostic_options(c) for c in (alignment_config, saved))
+    if current_texture != saved_texture or checkpoint.get("decoded_texture_diagnostic_options") != saved_texture:
+        raise ValueError("Checkpoint texture diagnostic protocol disagrees.")
     if current_objective == "patchnce":
         from diffusion_ot.training.decoded_translation import self_supervised_translation_options
         try:
@@ -469,6 +476,8 @@ def _direction_projection_evaluation(
     distance_scale_mode: str = "fixed_stage1a_median",
     projection_bandwidth: float | None = None,
     projection_scales: dict[str, float] | None = None,
+    source_selection=None,
+    selection_costs=None,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     bandwidth, projection_bandwidth = _evaluation_bandwidths(
         {"bandwidth_multiplier": bandwidth}, projection_bandwidth
@@ -521,6 +530,12 @@ def _direction_projection_evaluation(
     target_reference_raw = target_reference.raw_codes.to(device)
     target_projection_raw = target_projection.raw_codes.to(device)
     barycentric_codes = weighted_target_codes(plan_weights, target_reference_raw)
+    selection_metrics = None
+    if source_selection is not None:
+        log_weights, selection_metrics = source_selection.apply(
+            conditional_weights.clamp_min(torch.finfo(conditional_weights.dtype).tiny).log(), selection_costs,
+            direction=f"{source_reference.domain}_to_{target_reference.domain}", target_codes=target_projection_raw)
+        conditional_weights = log_weights.exp()
     conditional_codes = weighted_target_codes(conditional_weights, target_projection_raw)
     nearest_target_distance = pairwise_squared_distances(
         normalize_matching_features(conditional_codes), normalize_matching_features(target_projection_raw)
@@ -561,6 +576,9 @@ def _direction_projection_evaluation(
         },
         "conditional_scale_mode": "reference_ema" if projection_scales is not None else distance_scale_mode,
     }
+    if selection_metrics is not None:
+        report["source_aware_selection"] = selection_metrics
+        report["projection_method"] = "source_aware_infoot_conditional_expectation"
     tensors = {
         "conditional_weights": conditional_weights.detach().cpu(),
         "plan_weights": plan_weights.detach().cpu(),
@@ -717,12 +735,14 @@ def _load_domain_context(
     patch_projector = None
     code_projector = None
     spatial_cost = None
+    source_selection = None
     if checkpoint_path is not None:
         if matching_head_spec(joint.get("config") or {}) != matching_head_spec(alignment_config):
             raise ValueError("Alignment config and checkpoint matching_head architectures disagree.")
         matching_head = load_matching_head(joint, domain, weights=joint_weights, device=device)
         projection_rms = checkpoint_projection_rms(joint, alignment_config, weights=joint_weights)
         spatial_cost = checkpoint_spatial_cost(joint, alignment_config)
+        source_selection = checkpoint_source_selection(joint, alignment_config)
         image_options = alignment_config.get("decoded_translation") or {}
         if image_options.get("supervision") == "self_supervised" and image_options.get("objective") == "patchnce":
             from diffusion_ot.models.patch_sampler import load_patch_projector
@@ -760,6 +780,7 @@ def _load_domain_context(
         patch_projector=patch_projector,
         code_projector=code_projector,
         spatial_cost=spatial_cost,
+        source_selection=source_selection,
     )
 
 
@@ -903,6 +924,7 @@ def _save_translation_grid(
     patchnce_options: dict[str, Any] | None = None,
     teacher_free_image_options: dict[str, Any] | None = None,
     include_transport_references: bool = False,
+    texture_options: dict | None = None,
 ) -> dict[str, Any]:
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
@@ -953,10 +975,10 @@ def _save_translation_grid(
     real_target_images, real_baseline_images = None, None
     if teacher_free_image_options:
         from diffusion_ot.data.ground_truth import load_ground_truth_images
-        from diffusion_ot.losses.translation_image import IMAGE_LOSS_PROTOCOL, translation_image_losses
+        from diffusion_ot.losses.translation_image import image_loss_protocol, translation_image_losses
         original_images = load_ground_truth_images(source.data_config_path, source_query.metadata[:count]).cpu()
         image_generator = torch.Generator(device="cpu").manual_seed(seed + 30000)
-        decoded_metrics.update(image_loss_protocol=IMAGE_LOSS_PROTOCOL,
+        decoded_metrics.update(image_loss_protocol=image_loss_protocol(teacher_free_image_options),
                                image_loss_options=teacher_free_image_options,
                                source_query_ids=source_query.sample_ids[:count], image_loss_seed=seed + 30000)
         if "target_patch_swd" in teacher_free_image_options:
@@ -1037,6 +1059,13 @@ def _save_translation_grid(
                 teacher_free_image_options, generator=image_generator, real_target=real_target_images,
                 real_baseline=real_baseline_images, per_image=True)
             decoded_metrics.setdefault(row_name, {"samples": count})["image_losses"] = component_metrics
+        if texture_options is not None:
+            from diffusion_ot.losses.translation_image import texture_diagnostic
+            from diffusion_ot.data.ground_truth import load_ground_truth_images
+            diagnostic = texture_diagnostic(decoded_images, target_projection.metadata,
+                lambda records: load_ground_truth_images(target.data_config_path, records), texture_options,
+                seed=seed + 40000)
+            decoded_metrics.setdefault(row_name, {"samples": count}).setdefault("diagnostics", {})["target_patch_swd"] = diagnostic
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_image(torch.cat(rows), str(output_path), nrow=count, padding=2, pad_value=1.0)
     if original_images is not None:
@@ -1428,6 +1457,11 @@ def run_stage1b_evaluation(
     alignment_config = load_yaml_config(alignment_path)
     evaluation_config = load_yaml_config(evaluation_path)
     spatial_options = validate_spatial_training_config(alignment_config)
+    selection_options = source_selection_options(alignment_config)
+    if source_selection_options(evaluation_config) != selection_options:
+        raise ValueError("Evaluation must match the training source_aware_selection protocol.")
+    if selection_options is not None and (spatial_options is None or checkpoint_path is None):
+        raise ValueError("Source selection requires spatial descriptors and a calibrated checkpoint.")
     if spatial_correlative_options(evaluation_config) != spatial_options:
         raise ValueError("Evaluation must match the training spatial_correlative_cost protocol.")
     if spatial_options is not None and checkpoint_path is None:
@@ -1514,6 +1548,13 @@ def run_stage1b_evaluation(
         if spatial_cost is None or other is None or spatial_cost.metadata() != other.metadata():
             raise ValueError("Evaluation needs the same checkpoint spatial calibration for both domains.")
         evaluation_config["spatial_correlative_protocol"] = spatial_cost.metadata()
+    source_selection = None
+    if selection_options is not None:
+        source_selection = contexts["cat"].source_selection
+        other = contexts["dog"].source_selection
+        if source_selection is None or other is None or source_selection.state_dict() != other.state_dict():
+            raise ValueError("Evaluation needs common source selection calibration for both domains.")
+        evaluation_config["source_aware_selection_protocol"] = source_selection.state_dict()
     protocol_identifier = _protocol_identifier(
         evaluation_config,
         max_reference=max_reference,
@@ -1739,6 +1780,7 @@ def run_stage1b_evaluation(
             "projection_bandwidth": projection_bandwidth,
             **({"projection_rms": rms_report} if rms_report is not None else {}),
             **({"spatial_correlative": spatial_cost.metadata()} if spatial_cost is not None else {}),
+            **({"source_aware_selection": source_selection.state_dict()} if source_selection is not None else {}),
             "solver_algorithm": str(
                 infoot_config.get("algorithm", "official_projected_sinkhorn")
             ),
@@ -1770,8 +1812,20 @@ def run_stage1b_evaluation(
         "cat_to_dog": ("cat", "dog", solution.coupling),
         "dog_to_cat": ("dog", "cat", solution.coupling.transpose(0, 1)),
     }
+    selection_appearance = {}
+    if source_selection is not None:
+        from diffusion_ot.data.ground_truth import load_ground_truth_images
+        for d, context in contexts.items():
+            selection_appearance[d] = {kind: source_selection.appearance(load_ground_truth_images(
+                context.data_config_path, banks[d][kind].metadata)).to(alignment_device)
+                for kind in ("query", "projection")}
     for name in projection_config.get("directions", list(directions)):
         source_domain, target_domain, coupling = directions[str(name)]
+        selection_costs = (source_selection.costs(
+            banks[source_domain]["query"].spatial_descriptors.to(alignment_device),
+            banks[target_domain]["projection"].spatial_descriptors.to(alignment_device),
+            selection_appearance[source_domain]["query"], selection_appearance[target_domain]["projection"])
+            if source_selection is not None else None)
         direction_report, tensors = _direction_projection_evaluation(
             banks[source_domain]["reference"],
             banks[target_domain]["reference"],
@@ -1785,6 +1839,7 @@ def run_stage1b_evaluation(
             distance_scale_mode=distance_scale_mode,
             projection_bandwidth=projection_bandwidth,
             projection_scales=projection_scales,
+            source_selection=source_selection, selection_costs=selection_costs,
         )
         projections[str(name)] = direction_report
         direction_tensors[str(name)] = tensors
@@ -1794,6 +1849,8 @@ def run_stage1b_evaluation(
                 banks[target_domain]["projection"].spatial_descriptors.to(alignment_device),
                 tensors["conditional_weights"].to(alignment_device))
             direction_report["spatial_correlative"]["interpretation"] = (
+                "Own-encoder spatial prior; source-aware query selection is active."
+                if source_selection is not None else
                 "Own-encoder spatial prior; queries are diagnostic only, not part of transport fitting or conditional kernels.")
         if prior is not None and all(
             key in prior.index for bank in (banks[source_domain]["query"], banks[target_domain]["projection"])
@@ -1864,6 +1921,8 @@ def run_stage1b_evaluation(
         image_features = None
         patch_options = None
         fixed_image_options = None
+        from diffusion_ot.losses.translation_image import texture_diagnostic_options
+        texture_options = texture_diagnostic_options(alignment_config)
         if translation_config.get("teacher_free_image_metrics", False):
             from diffusion_ot.losses.translation_image import translation_image_options
             image_options = alignment_config.get("decoded_translation") or {}
@@ -1909,6 +1968,7 @@ def run_stage1b_evaluation(
                 **({"patchnce_options": patch_options} if patch_options is not None else {}),
                 **({"teacher_free_image_options": fixed_image_options} if fixed_image_options is not None else {}),
                 **({"include_transport_references": True} if spatial_cost is not None else {}),
+                **({"texture_options": texture_options} if texture_options is not None else {}),
             )
             if decoded_metrics:
                 projections[name]["decoded_image_diagnostics"] = decoded_metrics
@@ -2014,6 +2074,7 @@ def run_stage1b_evaluation(
                 if generator_adaptation_enabled(alignment_config) else [],
             "generator_weights": weights if checkpoint_path is not None else "stage1a",
             **({"spatial_correlative": spatial_cost.metadata()} if spatial_cost is not None else {}),
+            **({"source_aware_selection": source_selection.state_dict()} if source_selection is not None else {}),
         },
         reference_sizes={domain: len(banks[domain]["reference"].sample_ids) for domain in banks},
         projection_sizes={domain: len(banks[domain]["projection"].sample_ids) for domain in banks},

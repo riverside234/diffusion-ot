@@ -30,7 +30,10 @@ The canonical configurations are:
 - Stage 1B self-supervised PatchNCE: `configs/stage1b_infoot/self_supervised_patchnce_sit_b2.yaml`
 - Stage 1B global InfoNCE control: `configs/stage1b_infoot/self_supervised_sit_b2.yaml`
 - Stage 1B PatchNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml`
-- Stage 1B **current v4.5 spatial-cost experiment**: `configs/stage1b_infoot/self_supervised_infonce_v4_5_sit_b2.yaml`
+- Stage 1B **current v6 source-aware color experiment**: `configs/stage1b_infoot/self_supervised_infonce_v6_sit_b2.yaml`
+- Stage 1B v6 matched evaluation: `configs/stage1b_eval/self_supervised_infonce_v6_sit_b2.yaml`
+- Stage 1B v6 bandwidth-only control: `configs/stage1b_infoot/self_supervised_infonce_v6_bandwidth_control_sit_b2.yaml`
+- Stage 1B v4.5 spatial-cost control: `configs/stage1b_infoot/self_supervised_infonce_v4_5_sit_b2.yaml`
 - Stage 1B v4.5 matched evaluation: `configs/stage1b_eval/self_supervised_infonce_v4_5_sit_b2.yaml`
 - Stage 1B v4 image-loss control: `configs/stage1b_infoot/self_supervised_infonce_v4_sit_b2.yaml`
 - Stage 1B v4 matched image evaluation: `configs/stage1b_eval/self_supervised_infonce_v4_sit_b2.yaml`
@@ -49,7 +52,34 @@ unchanged `*_sit_b2_lora.yaml` configs. Experiment D uses its selected
 `*_sit_b2_dino.yaml` EMA checkpoints. Neither automatically loads the new RGB
 Stage 1A outputs; replacing checkpoint paths alone is insufficient.
 
-### Current Stage 1B v4.5: spatially-correlative transport cost
+### Current Stage 1B v6: source-aware selection and color
+
+V6 adds query-to-target spatial/appearance compatibility to the v4.5 readout.
+Fixed initial **training-only** cost scales are checkpointed. Added costs are
+detached; base conditional probabilities retain their existing gradient route.
+The source-color loss is now normalized Lab patch SWD (weight 0.04, scales
+64/32/16, patch 5, 128 directions), inspired by the training-free
+[MS-SWD implementation](https://github.com/real-hjq/MS-SWD).
+Global RGB-uv histogram and target texture **training** weights are zero.
+Target patch SWD remains a validation diagnostic, including a real-real baseline.
+Projection bandwidth is 0.25 in training/evaluation; fit bandwidth remains 0.55.
+Other v4.5 losses, rates, original Stage 1A initialization, and PCGrad are retained.
+
+```bash
+python scripts/train_joint_infoot.py --config configs/stage1b_infoot/self_supervised_infonce_v6_sit_b2.yaml
+python scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/self_supervised_infonce_v6_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_infonce_v6_sit_b2.yaml \
+  --checkpoint outputs/stage1b_nce_v6/checkpoints/latest.pt --weights ema
+```
+
+Start this experiment fresh from Stage 1A. Resume its own checkpoints with
+`--resume latest`. The paired `v6_bandwidth_control` configs change only projection
+bandwidth versus v4.5, apart from output/evaluation paths. See
+[v6 implementation, diagnostics and comparison commands](docs/analysis/stage1b_v6/implementation.md).
+The changes have CPU integration coverage; image-quality gains need a GPU run.
+
+### Retained Stage 1B v4.5: spatially-correlative transport cost
 
 The separate **v4.5** recipe implements the
 [spatial-correlative plan](docs/analysis/stage1b_v3_2500/spatial_correlative_plan.md).

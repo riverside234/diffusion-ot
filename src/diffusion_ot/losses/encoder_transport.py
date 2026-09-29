@@ -95,6 +95,8 @@ def encoder_conditional_readout(
     query_matching: dict[str, torch.Tensor] | None = None,
     differentiate_distance_scale: bool = False,
     projection_scales: dict[str, float] | None = None,
+    source_selection=None,
+    selection_costs: dict | None = None,
 ) -> EncoderConditionalReadoutResult:
     """Bidirectional Eq. 7 probabilities without a teacher or a KL objective.
 
@@ -109,6 +111,8 @@ def encoder_conditional_readout(
     """
     if not math.isfinite(bandwidth) or bandwidth <= 0:
         raise ValueError("Projection bandwidth must be finite and positive.")
+    if (source_selection is None) != (selection_costs is None):
+        raise ValueError("Supply both selection runtime and ordered costs, or neither.")
     if projection_scales is not None:
         from diffusion_ot.losses.projection_rms import validate_projection_scales
         projection_scales = validate_projection_scales(projection_scales)
@@ -156,6 +160,10 @@ def encoder_conditional_readout(
                     infoot_distance_scale(target_references, detach=not differentiate_distance_scale)),
             )
             direction = f"{source}_to_{target}"
+            selection_metrics = None
+            if source_selection is not None:
+                log_weights, selection_metrics = source_selection.apply(log_weights, selection_costs[direction],
+                    direction=direction, target_codes=references[target])
             log_distributions[direction] = log_weights
             weights[direction] = log_weights.exp()
             with torch.no_grad():
@@ -182,4 +190,6 @@ def encoder_conditional_readout(
                         / target_codes.var(0, unbiased=False).mean().clamp_min(1e-12)),
                 }
                 metrics[direction].update(conditional_variance_decomposition(probability, target_codes))
+                if selection_metrics is not None:
+                    metrics[direction]["source_aware_selection"] = selection_metrics
     return EncoderConditionalReadoutResult(metrics, weights, log_distributions)

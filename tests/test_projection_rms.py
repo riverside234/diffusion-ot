@@ -151,11 +151,18 @@ def test_checkpoint_selects_raw_or_model_ema_geometry_and_fails_on_missing_state
         checkpoint_projection_rms(cp, {}, weights="raw")
 
 
-def test_training_and_standalone_readouts_agree_with_frozen_scales():
+@pytest.mark.parametrize("selection_enabled", [False, True])
+def test_training_and_standalone_readouts_agree_with_frozen_scales(selection_enabled):
     from diffusion_ot.evaluation.stage1b_eval import LatentBank, _direction_projection_evaluation
     refs, queries, match_ref, match_query, coupling = banks()
     tracker = ReferenceRMSEMA()
     tracker.initialize(match_ref)
+    selection, costs = None, None
+    if selection_enabled:
+        from test_source_lab_selection import selection as make_selection
+        selection, _ = make_selection()
+        costs = {f"{s}_to_{t}": {k: torch.rand(len(queries[s]), len(refs[t]), generator=torch.Generator().manual_seed(seed))
+                 for k, seed in (("spatial", 2), ("appearance", 3))} for s, t in (("cat", "dog"), ("dog", "cat"))}
     def bank(domain, query=False):
         raw = (queries if query else refs)[domain].double()
         features = (match_query if query else match_ref)[domain]
@@ -164,12 +171,14 @@ def test_training_and_standalone_readouts_agree_with_frozen_scales():
                           [f"{domain}_{split}_{i}" for i in range(len(raw))],
                           [{} for _ in raw], "test_checkpoint")
     train = encoder_conditional_readout(refs, queries, coupling, bandwidth=.7,
-        reference_matching=match_ref, query_matching=match_query, projection_scales=tracker.scales())
+        reference_matching=match_ref, query_matching=match_query, projection_scales=tracker.scales(),
+        source_selection=selection, selection_costs=costs)
     for source, target in (("cat", "dog"), ("dog", "cat")):
         report, tensors = _direction_projection_evaluation(
             bank(source), bank(target), bank(source, True), (coupling if source == "cat" else coupling.T).detach(),
             source_scale=.9, target_scale=.8, bandwidth=.55, eps=1e-8,
-            distance_scale_mode="infoot_rms", projection_bandwidth=.7, projection_scales=tracker.scales())
+            distance_scale_mode="infoot_rms", projection_bandwidth=.7, projection_scales=tracker.scales(),
+            source_selection=selection, selection_costs=costs[f"{source}_to_{target}"] if costs else None)
         torch.testing.assert_close(tensors["conditional_weights"], train.weights[f"{source}_to_{target}"],
                                    atol=1e-10, rtol=1e-10)
         assert report["conditional_distance_scales"]["query_source"] == tracker.scales()[source]

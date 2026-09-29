@@ -158,19 +158,25 @@ def test_quick_eval_cli_uses_calibrated_initial_checkpoint_for_spatial_only(tmp_
 
 
 @pytest.mark.parametrize("weights", ["raw", "ema"])
-def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_grids(spatial_run, monkeypatch, tmp_path, weights):
+@pytest.mark.parametrize("v6", [False, True])
+def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_grids(spatial_run, monkeypatch, tmp_path, weights, v6):
     import diffusion_ot.data.ground_truth as gt
     import diffusion_ot.evaluation.stage1b_eval as evaluation
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec
     from diffusion_ot.models.generator_adaptation import load_joint_generator
     from diffusion_ot.losses.projection_rms import checkpoint_projection_rms
+    from diffusion_ot.losses.source_selection import checkpoint_source_selection
+    from test_stage1b_v6 import v6_recipe
     run, _, latest = spatial_run
-    checkpoint, _ = run("eval_training", steps=1, modify=recipe)
+    checkpoint, _ = run("eval_training", steps=1, modify=v6_recipe if v6 else recipe)
     config = checkpoint["config"]
     checkpoint_path = tmp_path / "eval_training/checkpoints/latest.pt"
     eval_config = yaml.safe_load((ROOT / "configs/stage1b_eval/self_supervised_infonce_v4_5_sit_b2.yaml").read_text())
     eval_config.update(project_root=str(tmp_path), output_dir="eval", alignment_device="cpu",
                        spatial_correlative_cost=config["spatial_correlative_cost"], infoot=config["infoot"])
+    if v6:
+        eval_config["source_aware_selection"] = config["source_aware_selection"]
+        eval_config["matching"]["projection_bandwidth_multiplier"] = .25
     eval_config["data"].update(reference_samples_per_domain=6, projection_samples_per_domain=8,
                                query_samples_per_domain=2, batch_size=4, num_workers=0)
     eval_config["translation"].update(samples_per_direction=2, num_steps=3)
@@ -208,6 +214,7 @@ def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_
         value.matching_head.load_state_dict(selected["matching_head_ema" if weights == "ema" else "matching_heads"][domain])
         value.projection_rms = checkpoint_projection_rms(selected, config, weights=weights)
         value.spatial_cost = checkpoint_spatial_cost(selected, config)
+        value.source_selection = checkpoint_source_selection(selected, config)
         value.branch.eval()
         value.matching_head.eval()
         return value
@@ -224,6 +231,8 @@ def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_
     assert report.baseline_comparison["status"] == "compared"
     assert Path(report.baseline_comparison["baseline_report"]).parent == Path(initial_report.output_dir)
     assert report.generation_protocol["spatial_correlative"]["calibration"] == checkpoint["spatial_correlative_cost_state"]["calibration"]
+    if v6:
+        assert report.generation_protocol["source_aware_selection"] == checkpoint["source_aware_selection_state"]
     assert report.solver["spatial_correlative"]["mixed"]["centered_rms"] > 0
     banks = {d: evaluation.load_latent_bank(Path(report.output_dir) / "banks" / f"{d}_reference.pt") for d in latest}
     runtime = checkpoint_spatial_cost(checkpoint, config)
@@ -248,10 +257,17 @@ def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_
     for direction in ("cat_to_dog", "dog_to_cat"):
         diagnostic = report.projections[direction]
         assert "spatial_correlative" in diagnostic
+        if v6:
+            assert diagnostic["source_aware_selection"]["mean_weight_l1_change"] > 0
+            decoded = diagnostic["decoded_image_diagnostics"]
+            # The same generated row supplies both active image losses and held-out texture.
+            row = next(v for v in decoded.values() if isinstance(v, dict) and "image_losses" in v)
+            assert "source_lab_swd" in row["image_losses"] and "target_patch_swd" not in row["image_losses"]
+            assert row["diagnostics"]["target_patch_swd"]["real_to_real_distance"] > 0
         grid = diagnostic["decoded_image_diagnostics"]["transport_reference_grid"]
         assert Path(grid["path"]).is_file() and len(grid["rows"]) == 4
         assert len(grid["target_ids"]) == 2 and len(grid["target_ids"][0]) == 2
-    with pytest.raises(ValueError, match="checkpoint with frozen calibration"):
+    with pytest.raises(ValueError, match="calibrated checkpoint" if v6 else "checkpoint with frozen calibration"):
         evaluation.run_stage1b_evaluation(tmp_path / "eval_training.yaml", eval_path)
     eval_config["spatial_correlative_cost"]["grid_size"] = 4
     eval_path.write_text(yaml.safe_dump(eval_config))

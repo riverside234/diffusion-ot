@@ -26,6 +26,7 @@ class Stage1BLogFormatter:
         self.full_infoot = infoot.get("feature_objective", "mi") == "full"
         self.decoder = bool(generator.get("enabled", False) and image.get("enabled", False))
         self.self_supervised = image.get("supervision", "external") == "self_supervised"
+        self.texture_diagnostics = bool(((config.get("self_supervised_diagnostics") or {}).get("target_patch_swd") or {}).get("enabled", False))
         self.patchnce = self.self_supervised and image.get("objective", "source_infonce") == "patchnce"
         self.enabled = {
             **{f"{d}_reconstruction": _positive(weights, f"{d}_reconstruction", 1.) for d in ("cat", "dog")},
@@ -50,7 +51,7 @@ class Stage1BLogFormatter:
                                      ("perceptual", 0.), ("adversarial", .01), ("code_consistency", 0.))},
             "color_histogram": self.decoder and _positive(image.get("color_histogram") or {}, "weight"),
             **{part: self.decoder and self.self_supervised and _positive(image.get(part) or {}, "weight")
-               for part in ("coarse_rgb", "local_layout", "target_patch_swd")},
+               for part in ("coarse_rgb", "local_layout", "target_patch_swd", "source_lab_swd")},
             "source_contrastive": self.decoder and self.self_supervised and not self.patchnce
                 and _positive(image, "source_contrastive_weight", .1),
             "patchnce": self.decoder and self.patchnce and _positive(image.get("patchnce") or {}, "weight", .15),
@@ -126,7 +127,7 @@ class Stage1BLogFormatter:
             "color": e["color_histogram"], "code": e["code_consistency"],
             "decoded": self.decoder, "translation": self.decoder,
             **{part: e[part] for part in ("coarse_rgb", "color_histogram", "local_layout",
-                                         "target_patch_swd", "source_contrastive", "patchnce")},
+                                         "target_patch_swd", "source_lab_swd", "source_contrastive", "patchnce")},
             "reconstruction": e["cat_reconstruction"] or e["dog_reconstruction"],
             "matching": any(e[k] for k in ("infoot_alignment", "infoot_relative", "semantic_neighborhood", "conditional_structure",
                 "projection_support", "matching_variance", "matching_covariance",
@@ -141,7 +142,7 @@ class Stage1BLogFormatter:
         if not e["code_consistency"]:
             report.pop("code_routing", None)
 
-    def _clean_self_supervised(self, values):
+    def _clean_self_supervised(self, values, *, diagnostic=False):
         """Drop inactive legacy placeholders, including nested/window fields.
 
         Keep retrieval, original-RGB checks, geometry, PCGrad and solver health:
@@ -153,7 +154,7 @@ class Stage1BLogFormatter:
                     "null_preservation", "conditioned_preservation", "matching_contrastive")
         unused = {"primary_objective", "auxiliary_objective", "infoot_restart", "code_routing",
                   "cat_fake_score", "cat_real_score", "dog_fake_score", "dog_real_score"}
-        prefixes += tuple(name for name in ("color_histogram", "coarse_rgb", "local_layout", "target_patch_swd")
+        prefixes += tuple(name for name in ("color_histogram", "coarse_rgb", "local_layout", "target_patch_swd", "source_lab_swd")
                           if not self.enabled[name])
         if self.patchnce:
             prefixes += ("source_contrastive",)
@@ -161,11 +162,13 @@ class Stage1BLogFormatter:
         else:
             prefixes += ("patchnce",)
         for key in list(values):
+            if diagnostic and key == "target_patch_swd" and self.texture_diagnostics:
+                continue
             objective_key = key.removeprefix("weighted_").removeprefix("applied_")
             if objective_key.startswith(prefixes) or key in unused:
                 del values[key]
             elif isinstance(values[key], dict):
-                self._clean_self_supervised(values[key])
+                self._clean_self_supervised(values[key], diagnostic=(key == "diagnostics"))
                 if not values[key]:
                     del values[key]
 
@@ -199,7 +202,7 @@ class Stage1BLogFormatter:
                         del contrast[key]
         if self.self_supervised:
             self._clean_self_supervised(result)
-        image_losses = any(self.enabled[name] for name in ("color_histogram", "coarse_rgb", "local_layout", "target_patch_swd"))
-        result["log_schema_version"] = (4 if image_losses else 3) if self.self_supervised else 2
+        image_losses = any(self.enabled[name] for name in ("color_histogram", "coarse_rgb", "local_layout", "target_patch_swd", "source_lab_swd"))
+        result["log_schema_version"] = (5 if self.enabled["source_lab_swd"] else 4 if image_losses else 3) if self.self_supervised else 2
         result["enabled_losses"] = [name for name, enabled in self.enabled.items() if enabled]
         return result

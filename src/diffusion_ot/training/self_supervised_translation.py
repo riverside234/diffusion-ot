@@ -18,7 +18,8 @@ from torch.utils.checkpoint import checkpoint
 
 from diffusion_ot.losses.contrastive import detached_key_contrastive_loss
 from diffusion_ot.losses.translation_image import (
-    IMAGE_LOSS_PROTOCOL, translation_image_losses, translation_image_options,
+    image_loss_protocol, translation_image_losses, translation_image_options,
+    texture_diagnostic_options, texture_diagnostic,
 )
 from diffusion_ot.models.generator_adaptation import (
     baseline_parameter_snapshot,
@@ -148,6 +149,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
             if float(self.options.get(key, 0)) != 0:
                 raise ValueError(f"Self-supervised decoder requires {key}: 0.")
         self.rgb_options = translation_image_options(self.options)
+        self.texture_options = texture_diagnostic_options(config)
         for key in ("null_preservation_weight", "conditioned_preservation_weight"):
             if float(config["generator_adaptation"].get(key, 0)) != 0:
                 raise ValueError(f"Self-supervised decoder requires {key}: 0.")
@@ -222,7 +224,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         self.patch_generators = ({d: torch.Generator(device="cpu").manual_seed(seed + 1901 + i)
                                   for i, d in enumerate(domains)} if self.patch_options else {})
         self.image_generators = ({d: torch.Generator(device="cpu").manual_seed(seed + 3901 + i)
-                                 for i, d in enumerate(domains)} if "target_patch_swd" in self.rgb_options else {})
+                                 for i, d in enumerate(domains)} if {"target_patch_swd", "source_lab_swd"} & self.rgb_options.keys() else {})
         self.code_consistency_objective = torch.zeros((), device=domains["cat"].device)
         self.image_objectives = {}
         self.diagnostic_objectives = {}
@@ -311,7 +313,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         needs_originals = save_images or image_diagnostics or bool(self.rgb_options)
         if needs_originals and (source_query_metadata is None or any(d not in source_query_metadata for d in self.domains)):
             raise ValueError("Self-supervised image objectives/diagnostics require original source metadata.")
-        if self.image_generators and (source_reference_metadata is None or any(d not in source_reference_metadata for d in self.domains)):
+        if ("target_patch_swd" in self.rgb_options or (evaluation and self.texture_options)) and (source_reference_metadata is None or any(d not in source_reference_metadata for d in self.domains)):
             raise ValueError("Target patch SWD requires original training reference metadata.")
         if source_query_codes is None:
             with torch.no_grad():
@@ -414,6 +416,11 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                                                        images, retain_graph=True)[0]
                         image_metrics[name]["weighted_rgb_gradient_norm"] = float(gradient.detach().float().norm())
                 metrics[direction]["image_losses"] = image_metrics
+            if evaluation and self.texture_options:
+                metrics[direction].setdefault("diagnostics", {})["target_patch_swd"] = texture_diagnostic(
+                    images, source_reference_metadata[target],
+                    lambda records: self.original_source_images(target, records), self.texture_options,
+                    seed=validation_seed + 40000 + offset)
             if image_diagnostics:
                 correspondence, native_metrics, native = self._validation_images(
                     source, images, originals, query_keys, source_latents[source],
@@ -449,7 +456,7 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
                 image_metrics[name] = {"loss": float(component.detach()), "weight": weight,
                     "effective_weight": ramp * weight,
                     "effective_weighted_loss": float(component.detach()) * ramp * weight}
-            metrics.update(image_losses=image_metrics, image_loss_protocol=IMAGE_LOSS_PROTOCOL,
+            metrics.update(image_losses=image_metrics, image_loss_protocol=image_loss_protocol(self.rgb_options),
                            image_loss_options=self.rgb_options,
                            decoded_conditional_weight_gradient_scale=self.projection_gradient_scale,
                            decoded_conditional_weight_gradient_scope="all_decoded_losses; conditional_weights_only")
@@ -490,9 +497,10 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
         return {
             "decoded_supervision": "self_supervised",
             "decoded_objective": self.objective,
-            **({"decoded_image_loss_protocol": IMAGE_LOSS_PROTOCOL, "decoded_image_loss_options": self.rgb_options,
+            **({"decoded_image_loss_protocol": image_loss_protocol(self.rgb_options), "decoded_image_loss_options": self.rgb_options,
                 "decoded_image_sampling_states": {d: gen.get_state().cpu() for d, gen in self.image_generators.items()}}
                if self.rgb_options else {}),
+            **({"decoded_texture_diagnostic_options": self.texture_options} if self.texture_options else {}),
             **({"decoded_source_contrastive_projection_gradient_scale": self.projection_gradient_scale}
                if self.objective == "source_infonce" else {}),
             **({"decoded_patchnce_options": self.patch_options,
@@ -519,8 +527,10 @@ class SelfSupervisedDecoderTraining(DecoderTraining):
     def load_checkpoint(self, payload):
         if payload.get("decoded_image_loss_options", {}) != self.rgb_options:
             raise ValueError("Cannot resume a different decoded image-loss protocol; start a fresh run.")
-        if self.rgb_options and payload.get("decoded_image_loss_protocol") != IMAGE_LOSS_PROTOCOL:
+        if self.rgb_options and payload.get("decoded_image_loss_protocol") != image_loss_protocol(self.rgb_options):
             raise ValueError("Missing or incompatible decoded image-loss protocol.")
+        if payload.get("decoded_texture_diagnostic_options") != self.texture_options:
+            raise ValueError("Cannot resume changed texture diagnostic options.")
         if set(payload.get("decoded_image_sampling_states", {})) != set(self.image_generators):
             raise ValueError("Missing decoded image sampling state.")
         if (payload.get("decoded_supervision") != "self_supervised"
