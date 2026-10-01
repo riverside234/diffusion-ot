@@ -65,6 +65,7 @@ translation:
   enabled: true
   decoded_structure_metrics: false
   include_source: true
+  include_top1_target: true  # Source / real top-1 target reference / conditional-mean translation.
   include_structure_teacher_mean: false
   samples_per_direction: 16
   num_steps: 20

@@ -92,11 +92,14 @@ def test_v6_and_bandwidth_control_keep_other_v45_settings_fixed():
             expected["conditional_projection"]["bandwidth_multiplier"] = .25
         else:
             expected["matching"]["projection_bandwidth_multiplier"] = .25
+            expected["projection_audit"] = {"enabled": True}
+            expected["visualization"].update(n_neighbors=15, min_dist=.1)
         assert control == expected
         expected["output_dir"] = v6["output_dir"]
         expected["source_aware_selection"] = v6["source_aware_selection"]
         if stage == "stage1b_infoot":
             expected["quick_evaluation"] = v6["quick_evaluation"]
+            expected["train"]["max_steps"] = 8000  # The supplied v6 run extends the earlier 2,500-step recipe.
             expected["decoded_translation"]["color_histogram"]["weight"] = 0.
             expected["decoded_translation"]["target_patch_swd"]["weight"] = 0.
             expected["decoded_translation"]["source_lab_swd"] = v6["decoded_translation"]["source_lab_swd"]

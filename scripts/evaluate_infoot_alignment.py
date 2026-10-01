@@ -37,6 +37,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-query", type=int, default=None)
     parser.add_argument(
+        "--evaluate-step0", action="store_true",
+        help="Evaluate the saved step_000000.pt first with identical settings, then compare the requested checkpoint.",
+    )
+    parser.add_argument(
+        "--initial-checkpoint", default=None,
+        help="Explicit saved step-0 checkpoint path; also enables --evaluate-step0.",
+    )
+    parser.add_argument(
         "--projection-bandwidth", type=float, default=None,
         help="Override the conditional-projection bandwidth multiplier; "
         "the InfoOT fitting bandwidth is unchanged.",
@@ -68,6 +76,8 @@ def main() -> int:
         max_query=args.max_query,
         projection_bandwidth=args.projection_bandwidth,
         require_stage1a_baseline=args.require_stage1a_baseline,
+        evaluate_step0=args.evaluate_step0,
+        initial_checkpoint_path=repo_path(args.initial_checkpoint) if args.initial_checkpoint else None,
     )
     print("stage1b_evaluation_report:")
     print(f"  mode: {report.mode}")

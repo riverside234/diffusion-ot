@@ -342,6 +342,11 @@ def test_standalone_self_evaluation_uses_encoder_cost_without_external_features(
         assert "lpips" not in report.reconstruction[domain]
     for direction in ("cat_to_dog", "dog_to_cat"):
         assert Path(report.translation_grids[direction]).is_file()
+        assert report.projections[direction]["translation_grid_rows"] == [
+            "source", "top_1_target_reference", "infoot_conditional_mean"]
+        top1 = report.projections[direction]["decoded_image_diagnostics"]["top1_target_reference"]
+        assert len(top1["target_ids"]) == 2 and len(top1["probabilities"]) == 2
+        assert top1["image_reference"] == "original_dataset_rgb"
         assert report.projections[direction]["projection_target_count"] == 8
         assert "structure_prior_diagnostics" not in report.projections[direction]
         if patch_mlp:

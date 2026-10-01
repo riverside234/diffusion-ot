@@ -388,6 +388,101 @@ def test_deterministic_indices_are_reproducible_and_bounded():
     assert min(first) >= 0 and max(first) < 20
 
 
+@pytest.mark.parametrize("include_source", [False, True])
+@pytest.mark.parametrize("auxiliary_grids", [False, True])
+def test_top1_reference_row_preserves_translation_and_auxiliary_grids(
+    monkeypatch, tmp_path, include_source, auxiliary_grids,
+):
+    from types import SimpleNamespace
+
+    from PIL import Image
+    import torchvision.utils
+    import diffusion_ot.data.ground_truth as originals
+    import diffusion_ot.evaluation.stage1a_eval as stage1a
+    import diffusion_ot.evaluation.stage1b_eval as stage1b
+    import diffusion_ot.losses.color_histogram as color
+
+    query = _bank("cat", "val", ["q0", "q1"])
+    target_bank = _bank("dog", "train", ["t0", "t1", "t2"])
+    target_bank.raw_codes = torch.tensor([[.1, .2], [.4, .5], [.8, .9]])
+    # The selected targets are intentionally out of bank order, and differ
+    # from the weighted mean codes used to generate the translation.
+    weights = torch.tensor([[.1, .2, .7], [.65, .3, .05]])
+    source_rgb = torch.full((2, 3, 4, 4), .55)
+    target_rgb = torch.tensor([.15, .45, .95])[:, None, None, None].expand(3, 3, 4, 4)
+    context_options = dict(device="cpu", dtype=torch.float32, vae=None, branch=None,
+                           transformer=None, training_config={})
+    source = SimpleNamespace(data_config_path=tmp_path / "cat.yaml", **context_options)
+    target = SimpleNamespace(data_config_path=tmp_path / "dog.yaml", **context_options)
+    loaded = []
+
+    def load_originals(path, records):
+        ids = [record["sample_id"] for record in records]
+        loaded.append((path, ids))
+        if path == source.data_config_path:
+            assert ids == query.sample_ids
+            return source_rgb
+        assert path == target.data_config_path
+        return target_rgb[[target_bank.sample_ids.index(value) for value in ids]]
+
+    monkeypatch.setattr(originals, "load_ground_truth_images", load_originals)
+    monkeypatch.setattr(stage1b, "_load_latents_from_bank",
+                        lambda bank, count: torch.full((count, 3, 4, 4), .25))
+    monkeypatch.setattr(stage1a, "decode_vae_latents", lambda vae, latent: latent)
+    decoder_calls = []
+
+    def generate(branch, transformer, noise, codes, **kwargs):
+        decoder_calls.append((noise.clone(), codes.clone()))
+        return codes[:, :1, None, None].expand(-1, 3, 4, 4).clone()
+
+    monkeypatch.setattr(stage1a, "integrate_pdae_flow", generate)
+    monkeypatch.setattr(color, "histogan_color_distance",
+                        lambda images, *args, **kwargs: torch.zeros(len(images)))
+    saved = {}
+    real_save = torchvision.utils.save_image
+
+    def save(images, path, **kwargs):
+        saved[str(path)] = images.clone()
+        real_save(images, path, **kwargs)
+
+    monkeypatch.setattr(torchvision.utils, "save_image", save)
+    options = dict(count=9, num_steps=2, guidance_scale=1., temperature=1., seed=7,
+                   readouts=["conditional_mean"], include_source=include_source)
+    rng_state = torch.get_rng_state().clone()
+    baseline = tmp_path / "baseline.png"
+    stage1b._save_translation_grid(source, target, query, target_bank, weights,
+                                  output_path=baseline, **options)
+    assert not loaded
+    output = tmp_path / "grid.png"
+    diagnostics = stage1b._save_translation_grid(
+        source, target, query, target_bank, weights, output_path=output,
+        include_top1_target=True, include_transport_references=auxiliary_grids,
+        color_histogram={} if auxiliary_grids else None, **options)
+    assert len(decoder_calls) == 2  # One mean rollout per call; no top-1 generation.
+    for original, current in zip(decoder_calls[0], decoder_calls[1]):
+        torch.testing.assert_close(original, current, rtol=0, atol=0)
+    torch.testing.assert_close(decoder_calls[1][1], weights @ target_bank.raw_codes)
+    torch.testing.assert_close(torch.get_rng_state(), rng_state, rtol=0, atol=0)
+    count, offset = 2, 2 * int(include_source)
+    assert saved[str(output)].shape[0] == count * (2 + int(include_source))
+    torch.testing.assert_close(saved[str(output)][offset:offset + count], target_rgb[[2, 0]])
+    torch.testing.assert_close(saved[str(output)][-count:], saved[str(baseline)][-count:])
+    with Image.open(output) as grid:
+        assert grid.height == (2 + int(include_source)) * (4 + 2) + 2
+    top1 = diagnostics["top1_target_reference"]
+    assert loaded[0] == (target.data_config_path, ["t2", "t0"])
+    assert top1["target_ids"] == ["t2", "t0"] and top1["target_indices"] == [2, 0]
+    assert top1["probabilities"] == pytest.approx([.7, .65])
+    assert top1["query_ids"] == query.sample_ids and top1["target_bank_split"] == "train"
+    assert top1["image_reference"] == "original_dataset_rgb"
+    if auxiliary_grids:
+        pairs = saved[str(tmp_path / "grid_source_pairs.png")]
+        torch.testing.assert_close(pairs[::2], source_rgb)
+        torch.testing.assert_close(pairs[1::2], saved[str(baseline)][-count:])
+        refs = saved[str(tmp_path / "grid_transport_refs.png")]
+        torch.testing.assert_close(refs[-count:], saved[str(baseline)][-count:])
+
+
 def test_full_projection_bank_keeps_stable_dataset_order():
     from diffusion_ot.evaluation.stage1b_eval import deterministic_indices
 

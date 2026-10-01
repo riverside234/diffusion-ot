@@ -207,6 +207,7 @@ def test_standalone_evaluation_uses_encoder_cost_and_no_external_features(monkey
 
     def translation(source, target, query, projection, probabilities, **kwargs):
         assert kwargs["teacher_codes"] is None
+        assert kwargs["include_top1_target"] is True
         assert "image_features" not in kwargs
         assert "color_histogram" not in kwargs
         assert probabilities.shape == (3, 6)
@@ -219,6 +220,9 @@ def test_standalone_evaluation_uses_encoder_cost_and_no_external_features(monkey
         config_path, evaluation_path, checkpoint_path=checkpoint_path)
     assert reconstruction_calls == ["cat", "dog"]
     assert translation_calls == [("cat", "dog"), ("dog", "cat")]
+    for projection in report.projections.values():
+        assert projection["translation_grid_rows"] == [
+            "source", "top_1_target_reference", "infoot_conditional_mean"]
     assert len(solved) == 1
     assert report.solver["cross_cost_source"] == "encoder"
     assert report.solver["semantic_prior_fingerprint"] is None

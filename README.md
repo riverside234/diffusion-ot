@@ -754,13 +754,19 @@ queries over the full target training bank, and uses `h_proj=0.10` by default.
 Use `--projection-bandwidth` only for an explicit sensitivity study; it does
 not change the transport-fitting bandwidth.
 
-Each translation grid contains:
+For the current self-supervised recipes (`readouts: [conditional_mean]`), each
+translation grid contains three rows, with corresponding columns:
 
-1. source image;
-2. full InfoOT conditional mean, the proposed final readout;
-3. conditional MAP target, an ablation;
-4. conditional sampled target, an ablation;
-5. direct structure-teacher mean, a diagnostic that bypasses InfoOT.
+1. source image (VAE-decoded cached input);
+2. original RGB target reference with the highest InfoOT conditional probability;
+3. full InfoOT conditional-mean translation.
+
+`translation.include_top1_target` defaults to `true`; set it to `false` to hide
+the reference row. The report records its target IDs and probabilities. This
+reference is a retrieval diagnostic, not paired ground truth. Additional MAP,
+sampled-target, or structure-teacher readouts remain selectable and add generated
+rows. The reference row requires original-image metadata in the target bank and
+does not perform an additional diffusion rollout.
 
 The report includes reconstruction drift, transport diagnostics, projected-code
 geometry, decoded DINO structure errors, and bidirectional proxy precision for
@@ -773,6 +779,50 @@ side. `framing` describes crop scale, such as close-up or full body. UMAP plots
 use translucent target-bank points and larger outlined projection markers so
 overlap remains visible. UMAP is a visualization, not the checkpoint-selection
 criterion; decoded translation quality and independent proxy metrics are needed.
+
+The v6 evaluation recipes enable the P0 projection audit. Each direction saves
+`projections/<direction>.pt` with conditional/base/barycentric codes and weights,
+ordered IDs and the effective evaluation protocol. Existing `banks/` files retain
+raw and matching codes. `evaluation_protocol.json` records settings, weight
+selection and ordered cohorts. Unlabeled plots use different colors for real
+targets and projections, with wrapped, uncropped captions.
+
+`audit/<direction>/projection_audit.pt` and its JSON summary include held-out
+real-target controls and a same-domain Eq. (7) readout using an identity reference
+plan. Its validation queries are excluded from fitting and the target gallery;
+cross-domain source-selection calibration is deliberately not reused for this
+kernel-only control. Numeric diagnostics cover raw codes, the actual checkpoint
+LayerNorm output (including affine parameters and epsilon), and full `z_proj`
+output, with norm/rank/variance and Euclidean/cosine nearest-target distributions.
+The target bank's own nearest-neighbor diagnostic excludes each point itself.
+
+With visualization enabled, the audit adds target-fitted PCA and UMAP in raw and
+decoder-transformed spaces, each with Euclidean and L2-normalized/cosine views.
+Shuffled bank subsets and exact selected target codes expose UMAP fit/transform
+displacement by ID. Raw joint UMAPs are explicitly **transductive exploratory
+plots, not checkpoint-selection scores**. Reducer parameters/version, coordinates,
+PCA bases and local reducer pickle files are saved. Only load reducer pickles
+you trust. Set `visualization.enabled: false` to keep numeric/PCA tensor controls
+without the additional UMAP fits and PNGs; set `projection_audit.enabled: false`
+to skip the extra controls entirely.
+
+Recover the matched initial comparison with the saved calibrated step-0 model:
+
+```bash
+python scripts/evaluate_infoot_alignment.py \
+  --alignment-config configs/stage1b_infoot/self_supervised_infonce_v6_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_infonce_v6_sit_b2.yaml \
+  --checkpoint outputs/stage1b_nce_v6/checkpoints/step_008000.pt \
+  --weights ema --evaluate-step0
+```
+
+This evaluates the sibling `step_000000.pt` first, then the requested model,
+using identical bandwidth overrides, sample limits, IDs, seeds and raw/EMA choice.
+Use `--initial-checkpoint PATH` if that saved checkpoint was moved. Explicit
+recovery recomputes the initial report. It checks protocol and cohort agreement
+before producing deltas; a missing initial checkpoint is reported rather than
+replaced by uncalibrated Stage 1A weights. The new audit protocol versions output
+directories, so older reports must be rerun for a matched comparison.
 
 ## Method boundary
 

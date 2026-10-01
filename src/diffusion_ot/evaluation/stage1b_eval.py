@@ -5,12 +5,14 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import textwrap
 from typing import Any
 import warnings
 
 import torch
 
 from diffusion_ot.losses.source_selection import source_selection_options, checkpoint_source_selection
+from diffusion_ot.evaluation.projection_audit import AUDIT_VERSION, save_projection_audit, save_reducer
 
 from diffusion_ot.integrations.hf_snapshot import (
     effective_project_root,
@@ -145,6 +147,7 @@ class Stage1BEvaluationReport:
     projections: dict[str, Any]
     translation_grids: dict[str, str]
     visualization_paths: dict[str, str]
+    evaluation_protocol: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -269,6 +272,8 @@ def _protocol_identifier(
         # Older reports used VAE-decoded x0 as the pixel target. Never reuse
         # their protocol ID for metrics against the original dataset image.
         "reconstruction_metric_protocol": "original_dataset_rgb_v1",
+        "translation_grid_protocol": "top1_target_reference_v1",
+        "projection_audit_protocol": AUDIT_VERSION,
         "cli_overrides": {
             "max_reference": max_reference,
             "max_projection": max_projection,
@@ -531,6 +536,7 @@ def _direction_projection_evaluation(
     target_projection_raw = target_projection.raw_codes.to(device)
     barycentric_codes = weighted_target_codes(plan_weights, target_reference_raw)
     selection_metrics = None
+    base_weights = conditional_weights
     if source_selection is not None:
         log_weights, selection_metrics = source_selection.apply(
             conditional_weights.clamp_min(torch.finfo(conditional_weights.dtype).tiny).log(), selection_costs,
@@ -580,6 +586,8 @@ def _direction_projection_evaluation(
         report["source_aware_selection"] = selection_metrics
         report["projection_method"] = "source_aware_infoot_conditional_expectation"
     tensors = {
+        "base_conditional_weights": base_weights.detach().cpu(),
+        "base_conditional_codes": weighted_target_codes(base_weights, target_projection_raw).detach().cpu(),
         "conditional_weights": conditional_weights.detach().cpu(),
         "plan_weights": plan_weights.detach().cpu(),
         "conditional_codes": conditional_codes.detach().cpu(),
@@ -920,6 +928,7 @@ def _save_translation_grid(
     image_features: Any | None = None,
     readouts: list[str] | None = None,
     include_source: bool = True,
+    include_top1_target: bool = False,
     color_histogram: dict[str, Any] | None = None,
     patchnce_options: dict[str, Any] | None = None,
     teacher_free_image_options: dict[str, Any] | None = None,
@@ -969,7 +978,28 @@ def _save_translation_grid(
     )
     class_config = _nested(target.training_config, "class_conditioning")
     rows = [source_images] if include_source else []
+    decoded_rows = []
     decoded_metrics: dict[str, Any] = {}
+    if include_top1_target:
+        from diffusion_ot.data.ground_truth import load_ground_truth_images
+
+        # Retrieve a real reference using the same conditional distribution
+        # that supplies the generator's mean code; no additional rollout.
+        target_indices = weights.argmax(dim=1).tolist()
+        rows.append(load_ground_truth_images(
+            target.data_config_path,
+            [target_projection.metadata[index] for index in target_indices],
+        ).cpu())
+        decoded_metrics["top1_target_reference"] = {
+            "selection": "argmax_infoot_conditional_probability",
+            "image_reference": "original_dataset_rgb",
+            "target_bank_split": target_projection.split,
+            "query_ids": source_query.sample_ids[:count],
+            "target_ids": [target_projection.sample_ids[index] for index in target_indices],
+            "target_indices": target_indices,
+            "probabilities": weights.max(dim=1).values.tolist(),
+            "interpretation": "Retrieved target reference for comparison; not paired ground truth.",
+        }
     source_structure = None
     original_images = None
     real_target_images, real_baseline_images = None, None
@@ -1032,6 +1062,7 @@ def _save_translation_grid(
         )
         decoded_images = decode_vae_latents(target.vae, latent).cpu()
         rows.append(decoded_images)
+        decoded_rows.append(decoded_images)
         if patchnce_options is not None:
             recovered = encode_generated_images(readout.vae, decoded_images.to(readout.device), checkpoint_encode=False)
             query_maps = readout.branch.encoder.forward_spatial_features(
@@ -1071,7 +1102,7 @@ def _save_translation_grid(
     if original_images is not None:
         # Preserve the existing grid; also save originals beside the same
         # conditional-mean images, without an additional rollout or RNG draw.
-        target_row = rows[int(include_source) + readouts.index("conditional_mean")] if "conditional_mean" in readouts else rows[int(include_source)]
+        target_row = decoded_rows[readouts.index("conditional_mean") if "conditional_mean" in readouts else 0]
         paired_path = output_path.with_name(output_path.stem + "_source_pairs.png")
         save_image(torch.stack((original_images, target_row), 1).flatten(0, 1),
                    str(paired_path), nrow=8, padding=2, pad_value=1.)
@@ -1086,7 +1117,7 @@ def _save_translation_grid(
                           [target_projection.metadata[i] for i in indices.tolist()]).cpu()
                           for indices in selected.indices.T]
         readout_index = readouts.index("conditional_mean") if "conditional_mean" in readouts else 0
-        generated = rows[int(include_source) + readout_index]
+        generated = decoded_rows[readout_index]
         reference_path = output_path.with_name(output_path.stem + "_transport_refs.png")
         save_image(torch.cat([original_images, *reference_rows, generated]), str(reference_path),
                    nrow=count, padding=2, pad_value=1.)
@@ -1150,6 +1181,9 @@ def _save_umap_visualizations(
     target_alpha: float,
     projection_alpha: float,
     output_paths: dict[str, Path],
+    artifact_path: Path | None = None,
+    n_neighbors: int = 15,
+    min_dist: float = .1,
 ) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -1170,15 +1204,30 @@ def _save_umap_visualizations(
         raise ValueError(f"UMAP output paths must contain {sorted(expected_readouts)}.")
 
     reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=min(int(n_neighbors), len(target_bank.sample_ids) - 1),
+        min_dist=float(min_dist), metric="euclidean", init="random",
         random_state=int(random_state),
         transform_seed=int(random_state),
         n_jobs=int(n_jobs),
     )
-    target_embedding = reducer.fit_transform(target_bank.raw_codes.numpy())
+    target_embedding = reducer.fit_transform(target_bank.raw_codes.numpy().copy())
     projected_embeddings = {
-        "conditional": reducer.transform(conditional_codes.numpy()),
-        "barycentric": reducer.transform(barycentric_codes.numpy()),
+        "conditional": reducer.transform(conditional_codes.numpy().copy()),
+        "barycentric": reducer.transform(barycentric_codes.numpy().copy()),
     }
+    if artifact_path is not None:
+        metadata = save_reducer(artifact_path.with_suffix(".pkl"), reducer)
+        torch.save({**metadata, "fit_group": "target_training_bank", "representation": "raw_decoder_codes",
+                    "target_ids": target_bank.sample_ids, "source_query_ids": source_query_ids,
+                    "proxy_attributes": attributes,
+                    "proxy_labels": {sample_id: {attribute: _proxy_label_value(labels, sample_id, attribute)
+                                                   for attribute in attributes}
+                                     for sample_id in target_bank.sample_ids + source_query_ids},
+                    "point_alpha": {"target": target_alpha, "projection": projection_alpha},
+                    "target_embedding": torch.from_numpy(target_embedding.copy()),
+                    "projected_embeddings": {k: torch.from_numpy(v.copy()) for k, v in projected_embeddings.items()}},
+                   artifact_path)
     plotted_attributes: list[str | None] = attributes or [None]
     direction_label = direction.replace("_to_", " to ").replace("_", " ").title()
     coverage_caption = _proxy_label_coverage_caption(
@@ -1189,7 +1238,7 @@ def _save_umap_visualizations(
     )
     caption = (
         "Color = proxy attribute when labels exist; an unlabeled panel uses blue for "
-        "the target bank and orange/green for the projected source. Marker = point "
+        "the target bank and vermilion/green for the projected source. Marker = point "
         "type. Target bank contains real target-domain codes; projected source "
         "contains mapped source-query codes.\n"
         f"{coverage_caption}"
@@ -1208,7 +1257,7 @@ def _save_umap_visualizations(
         "conditional": {
             "marker": "X",
             "label": "Projected source (conditional mean)",
-            "fallback_color": "#E45756",
+            "fallback_color": "#D55E00",
         },
         "barycentric": {
             "marker": "P",
@@ -1228,8 +1277,8 @@ def _save_umap_visualizations(
         )
         for axis, attribute in zip(axes[0], plotted_attributes):
             if attribute is None:
-                target_values = ["all"] * len(target_bank.sample_ids)
-                projected_values = ["all"] * len(source_query_ids)
+                target_values = ["unlabeled"] * len(target_bank.sample_ids)
+                projected_values = ["unlabeled"] * len(source_query_ids)
             else:
                 target_values = [
                     _proxy_label_value(labels, sample_id, attribute)
@@ -1366,12 +1415,13 @@ def _save_umap_visualizations(
             axis.set_xticks([])
             axis.set_yticks([])
         figure.suptitle(
-            f"{direction_label}: {readout.title()} projection",
+            f"{direction_label}: {readout.title()} projection (raw codes, Euclidean UMAP)",
             fontsize=14,
         )
+        caption = "\n".join(textwrap.fill(line, width=105 * len(plotted_attributes)) for line in caption.splitlines())
         figure.text(0.5, 0.012, caption, ha="center", va="bottom", fontsize=7.5)
         figure.tight_layout(rect=(0.0, 0.23, 1.0, 0.95))
-        figure.savefig(output_path, dpi=220, facecolor="white")
+        figure.savefig(output_path, dpi=220, facecolor="white", bbox_inches="tight", pad_inches=.15)
         plt.close(figure)
 
 
@@ -1438,7 +1488,7 @@ def _stage1a_baseline_required(
     return bool(comparison_config.get("require_stage1a_baseline", True))
 
 
-def run_stage1b_evaluation(
+def _run_stage1b_evaluation(
     alignment_config_path: str | Path,
     evaluation_config_path: str | Path,
     *,
@@ -1451,11 +1501,15 @@ def run_stage1b_evaluation(
     max_query: int | None = None,
     projection_bandwidth: float | None = None,
     require_stage1a_baseline: bool | None = None,
+    initial_baseline_report: Stage1BEvaluationReport | None = None,
+    is_initial_baseline: bool = False,
 ) -> Stage1BEvaluationReport:
     alignment_path = Path(alignment_config_path).resolve()
     evaluation_path = Path(evaluation_config_path).resolve()
     alignment_config = load_yaml_config(alignment_path)
     evaluation_config = load_yaml_config(evaluation_path)
+    audit_config = _nested(evaluation_config, "projection_audit")
+    audit_enabled = bool(audit_config.get("enabled", False))
     spatial_options = validate_spatial_training_config(alignment_config)
     selection_options = source_selection_options(alignment_config)
     if source_selection_options(evaluation_config) != selection_options:
@@ -1588,19 +1642,21 @@ def run_stage1b_evaluation(
     )
     output_root = output_base / identifier
     baseline_report_path = output_base / baseline_identifier / "evaluation_report.json"
+    if initial_baseline_report is not None:
+        baseline_report_path = Path(initial_baseline_report.output_dir) / "evaluation_report.json"
     baseline_required = _stage1a_baseline_required(
         evaluation_config, require_stage1a_baseline
     )
-    if spatial_cost is not None and baseline_required:
-        raise ValueError("Use require_stage1a_baseline: false for spatial evaluation; compare the saved step-0 v4.5 checkpoint explicitly.")
     if (
         resolved_checkpoint is not None
+        and contexts["cat"].checkpoint_step != 0
         and baseline_required
         and not baseline_report_path.is_file()
     ):
         raise FileNotFoundError(
-            "Matching Stage 1A + offline-InfoOT baseline is missing. Run the evaluator "
-            f"without --checkpoint first: {baseline_report_path}"
+            "Matching initial evaluation is missing. For calibrated Stage 1B use "
+            "--evaluate-step0; for a legacy offline baseline run without --checkpoint: "
+            f"{baseline_report_path}"
         )
     data_config = _nested(evaluation_config, "data")
     reference_split = str(data_config.get("reference_split", "train"))
@@ -1684,6 +1740,19 @@ def run_stage1b_evaluation(
             banks[domain]["reference"], banks[domain]["projection"], require_disjoint=False
         )
         validate_bank_compatibility(banks[domain]["projection"], banks[domain]["query"])
+
+    evaluation_protocol = {
+        "version": AUDIT_VERSION, "identifier": protocol_identifier,
+        "effective_config": evaluation_config,
+        "cli_overrides": {"max_reference": max_reference, "max_projection": max_projection, "max_query": max_query},
+        "ordered_sample_ids": {d: {k: b.sample_ids for k, b in values.items()} for d, values in banks.items()},
+        "checkpoint": str(resolved_checkpoint) if resolved_checkpoint else None,
+        "checkpoint_step": contexts["cat"].checkpoint_step if resolved_checkpoint else None,
+        "weights": weights if resolved_checkpoint else contexts["cat"].stage1a_weights,
+        "torch_version": str(torch.__version__),
+        "seed": seed,
+    }
+    _write_json(output_root / "evaluation_protocol.json", evaluation_protocol)
 
     distance_scale_mode = str(matching_config.get("distance_scale", "infoot_rms"))
     if distance_scale_mode == "infoot_rms":
@@ -1893,6 +1962,60 @@ def run_stage1b_evaluation(
                 "semantic_prior_fingerprint": prior.fingerprint,
             }
 
+    audit_visualization_paths: dict[str, str] = {}
+    visualization_config = _nested(evaluation_config, "visualization")
+    for name, tensors in direction_tensors.items():
+        source_domain, target_domain, _ = directions[name]
+        projection_path = output_root / "projections" / f"{name}.pt"
+        projection_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"version": AUDIT_VERSION, "protocol": evaluation_protocol,
+                    "source_query_ids": banks[source_domain]["query"].sample_ids,
+                    "target_projection_ids": banks[target_domain]["projection"].sample_ids,
+                    "target_reference_ids": banks[target_domain]["reference"].sample_ids,
+                    "source_reference_ids": banks[source_domain]["reference"].sample_ids,
+                    "tensors": tensors}, projection_path)
+        projections[name]["tensor_path"] = str(projection_path)
+        if not audit_enabled:
+            continue
+        reference, query, gallery = (banks[target_domain][kind] for kind in ("reference", "query", "projection"))
+        validate_bank_compatibility(reference, query)
+        validate_bank_compatibility(gallery, query)
+        identity_plan = torch.eye(len(reference.sample_ids)) / len(reference.sample_ids)
+        self_report, self_tensors = _direction_projection_evaluation(
+            reference, reference, query, identity_plan, target_projection=gallery,
+            source_scale=scales[target_domain], target_scale=scales[target_domain], bandwidth=bandwidth,
+            eps=float(infoot_config.get("numerical_epsilon", 1e-8)), distance_scale_mode=distance_scale_mode,
+            projection_bandwidth=projection_bandwidth, projection_scales=projection_scales)
+        audit_protocol = {
+            "evaluation_identifier": protocol_identifier, "weights": weights,
+            "checkpoint": evaluation_protocol["checkpoint"], "checkpoint_step": evaluation_protocol["checkpoint_step"],
+            "fit_bandwidth": bandwidth, "projection_bandwidth": projection_bandwidth,
+            "cross_domain_readout": projections[name]["projection_method"],
+            "same_domain_control": "identity_plan_eq7_without_cross_domain_source_selection",
+            "same_domain_query_split": query.split, "same_domain_references_exclude_queries": True,
+            "same_domain_projection": self_report,
+            "interpretation": "Identity-plan self-map isolates kernel/density averaging; cross-domain selection calibration is not applied to same-domain costs.",
+        }
+        groups = {"target_bank": gallery.raw_codes, "real_target_query": query.raw_codes,
+                  "conditional": tensors["conditional_codes"], "barycentric": tensors["barycentric_codes"],
+                  "same_domain_conditional": self_tensors["conditional_codes"]}
+        group_ids = {"target_bank": gallery.sample_ids, "real_target_query": query.sample_ids,
+                     "same_domain_conditional": query.sample_ids,
+                     "conditional": banks[source_domain]["query"].sample_ids,
+                     "barycentric": banks[source_domain]["query"].sample_ids}
+        audit_report, paths = save_projection_audit(
+            output_dir=output_root / "audit" / name, direction=name, groups=groups, group_ids=group_ids,
+            z_proj=contexts[target_domain].branch.semantic_transformer.z_proj,
+            tensors={**tensors, "same_domain_weights": self_tensors["conditional_weights"],
+                     "same_domain_identity_plan": identity_plan}, protocol=audit_protocol,
+            visualize=bool(visualization_config.get("enabled", True)),
+            random_state=int(visualization_config.get("random_state", seed)),
+            n_neighbors=int(visualization_config.get("n_neighbors", 15)),
+            min_dist=float(visualization_config.get("min_dist", .1)),
+            n_jobs=int(visualization_config.get("n_jobs", 1)))
+        projections[name]["audit"] = audit_report
+        audit_visualization_paths.update({f"{name}_{k}": v for k, v in paths.items()})
+
     reconstruction: dict[str, Any] = {}
     reconstruction_config = _nested(evaluation_config, "reconstruction")
     if bool(reconstruction_config.get("enabled", True)):
@@ -1918,6 +2041,7 @@ def run_stage1b_evaluation(
             if translation_config.get("include_structure_teacher_mean", False):
                 readouts.append("structure_teacher_mean")
         include_source = bool(translation_config.get("include_source", True))
+        include_top1_target = bool(translation_config.get("include_top1_target", True))
         image_features = None
         patch_options = None
         fixed_image_options = None
@@ -1962,6 +2086,7 @@ def run_stage1b_evaluation(
                 teacher_codes=teacher_codes,
                 readouts=readouts,
                 include_source=include_source,
+                include_top1_target=include_top1_target,
                 **({"image_features": image_features} if image_features is not None else {}),
                 **({"color_histogram": translation_config["color_histogram"]}
                    if translation_config.get("color_histogram") is not None else {}),
@@ -1975,12 +2100,12 @@ def run_stage1b_evaluation(
             translation_paths[name] = str(path)
             projections[name]["translation_grid_rows"] = (
                 (["source"] if include_source else [])
+                + (["top_1_target_reference"] if include_top1_target else [])
                 + [_TRANSLATION_ROW_NAMES[readout] for readout in readouts]
             )
         del image_features
 
-    visualization_paths: dict[str, str] = {}
-    visualization_config = _nested(evaluation_config, "visualization")
+    visualization_paths: dict[str, str] = dict(audit_visualization_paths)
     if bool(visualization_config.get("enabled", True)):
         for name, (source_domain, target_domain, _) in directions.items():
             if name not in direction_tensors:
@@ -2006,15 +2131,20 @@ def run_stage1b_evaluation(
                     visualization_config.get("projection_alpha", 0.90)
                 ),
                 output_paths=paths,
+                artifact_path=output_root / "visualization" / f"{name}_umap.pt",
+                n_neighbors=int(visualization_config.get("n_neighbors", 15)),
+                min_dist=float(visualization_config.get("min_dist", .1)),
             )
             for readout, path in paths.items():
                 visualization_paths[f"{name}_{readout}"] = str(path)
 
     baseline_comparison: dict[str, Any]
-    if resolved_checkpoint is None or (spatial_cost is not None and contexts["cat"].checkpoint_step == 0):
+    if resolved_checkpoint is None or is_initial_baseline or (spatial_cost is not None and contexts["cat"].checkpoint_step == 0):
         baseline_comparison = {"status": "baseline", "baseline_report": str(output_root / "evaluation_report.json")}
     elif baseline_report_path.is_file():
         baseline_payload = json.loads(baseline_report_path.read_text(encoding="utf-8"))
+        _validate_baseline_protocol(evaluation_protocol, baseline_payload.get("evaluation_protocol", {}),
+                                    require_step0=spatial_cost is not None or initial_baseline_report is not None)
         current_payload = {
             "latent_diagnostics": {
                 f"{domain}_{kind}": latent_diagnostics(bank)
@@ -2140,6 +2270,59 @@ def run_stage1b_evaluation(
         projections=projections,
         translation_grids=translation_paths,
         visualization_paths=visualization_paths,
+        evaluation_protocol=evaluation_protocol,
     )
     _write_json(output_root / "evaluation_report.json", report.to_dict())
     return report
+
+
+def _validate_baseline_protocol(current: dict, baseline: dict, *, require_step0: bool) -> None:
+    for key in ("version", "identifier", "ordered_sample_ids", "seed"):
+        if key not in baseline or baseline[key] != current[key]:
+            raise ValueError(f"Initial evaluation protocol mismatch: {key}. Rerun the baseline with identical options.")
+    if require_step0 and (baseline.get("checkpoint_step") != 0 or baseline.get("weights") != current["weights"]):
+        raise ValueError("Initial comparison requires a step-0 checkpoint with the same raw/EMA weight selection.")
+
+
+def run_stage1b_evaluation(
+    alignment_config_path: str | Path, evaluation_config_path: str | Path, *,
+    checkpoint_path: str | Path | None = None, weights: str = "ema",
+    device_cat: str | None = None, device_dog: str | None = None,
+    max_reference: int | None = None, max_projection: int | None = None, max_query: int | None = None,
+    projection_bandwidth: float | None = None, require_stage1a_baseline: bool | None = None,
+    evaluate_step0: bool = False, initial_checkpoint_path: str | Path | None = None,
+) -> Stage1BEvaluationReport:
+    """Optionally evaluate the saved initial model before loading the current one.
+
+    Sequential model lifetimes avoid keeping two pairs of GPU branches resident.
+    Explicit recovery recomputes the baseline, so stale reports cannot be reused.
+    """
+    options = dict(weights=weights, device_cat=device_cat, device_dog=device_dog,
+                   max_reference=max_reference, max_projection=max_projection, max_query=max_query,
+                   projection_bandwidth=projection_bandwidth)
+    baseline = None
+    if evaluate_step0 or initial_checkpoint_path is not None:
+        if checkpoint_path is None:
+            raise ValueError("Step-0 comparison requires --checkpoint.")
+        alignment_path = Path(alignment_config_path).resolve()
+        config = load_yaml_config(alignment_path)
+        root = effective_project_root(config, fallback=find_project_root(alignment_path.parent))
+        current_path = resolve_project_local_path(checkpoint_path, root, field_name="checkpoint_path")
+        initial_path = (resolve_project_local_path(initial_checkpoint_path, root, field_name="initial_checkpoint_path")
+                        if initial_checkpoint_path is not None else current_path.with_name("step_000000.pt"))
+        if not current_path.is_file():
+            raise FileNotFoundError(f"Stage 1B checkpoint not found: {current_path}")
+        if not initial_path.is_file():
+            raise FileNotFoundError(f"Saved step-0 checkpoint not found: {initial_path}. Supply --initial-checkpoint; Stage 1A weights cannot replace its calibration.")
+        initial = _load_joint_checkpoint(initial_path)
+        if initial.get("step") != 0:
+            raise ValueError("--initial-checkpoint must contain step 0.")
+        del initial
+        baseline = _run_stage1b_evaluation(
+            alignment_config_path, evaluation_config_path, checkpoint_path=initial_path,
+            require_stage1a_baseline=False, is_initial_baseline=True, **options)
+        if current_path.resolve() == initial_path.resolve():
+            return baseline
+    return _run_stage1b_evaluation(
+        alignment_config_path, evaluation_config_path, checkpoint_path=checkpoint_path,
+        require_stage1a_baseline=require_stage1a_baseline, initial_baseline_report=baseline, **options)

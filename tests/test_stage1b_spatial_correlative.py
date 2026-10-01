@@ -160,6 +160,7 @@ def test_quick_eval_cli_uses_calibrated_initial_checkpoint_for_spatial_only(tmp_
 @pytest.mark.parametrize("weights", ["raw", "ema"])
 @pytest.mark.parametrize("v6", [False, True])
 def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_grids(spatial_run, monkeypatch, tmp_path, weights, v6):
+    from PIL import Image
     import diffusion_ot.data.ground_truth as gt
     import diffusion_ot.evaluation.stage1b_eval as evaluation
     from diffusion_ot.models.matching_head import make_matching_head, matching_head_spec
@@ -171,7 +172,8 @@ def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_
     checkpoint, _ = run("eval_training", steps=1, modify=v6_recipe if v6 else recipe)
     config = checkpoint["config"]
     checkpoint_path = tmp_path / "eval_training/checkpoints/latest.pt"
-    eval_config = yaml.safe_load((ROOT / "configs/stage1b_eval/self_supervised_infonce_v4_5_sit_b2.yaml").read_text())
+    evaluator_name = "v6" if v6 else "v4_5"
+    eval_config = yaml.safe_load((ROOT / f"configs/stage1b_eval/self_supervised_infonce_{evaluator_name}_sit_b2.yaml").read_text())
     eval_config.update(project_root=str(tmp_path), output_dir="eval", alignment_device="cpu",
                        spatial_correlative_cost=config["spatial_correlative_cost"], infoot=config["infoot"])
     if v6:
@@ -227,7 +229,8 @@ def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_
                                               checkpoint_path=checkpoint_path.with_name("step_000000.pt"), weights=weights)
     assert initial_report.baseline_comparison["status"] == "baseline"
     report = evaluation.run_stage1b_evaluation(tmp_path / "eval_training.yaml", eval_path,
-                                              checkpoint_path=checkpoint_path, weights=weights)
+                                              checkpoint_path=checkpoint_path, weights=weights,
+                                              evaluate_step0=v6)
     assert report.baseline_comparison["status"] == "compared"
     assert Path(report.baseline_comparison["baseline_report"]).parent == Path(initial_report.output_dir)
     assert report.generation_protocol["spatial_correlative"]["calibration"] == checkpoint["spatial_correlative_cost_state"]["calibration"]
@@ -256,9 +259,29 @@ def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_
     assert float((costs["mixed"] * coupling["coupling"]).sum()) == pytest.approx(report.solver["spatial_correlative"]["mixed"]["expected_cost"])
     for direction in ("cat_to_dog", "dog_to_cat"):
         diagnostic = report.projections[direction]
+        assert diagnostic["translation_grid_rows"] == [
+            "source", "top_1_target_reference", "infoot_conditional_mean"]
+        with Image.open(report.translation_grids[direction]) as image:
+            assert image.height == 3 * (8 + 2) + 2  # Three rows of 8px fixture images.
+        top1 = diagnostic["decoded_image_diagnostics"]["top1_target_reference"]
+        assert len(top1["target_ids"]) == len(top1["probabilities"]) == 2
         assert "spatial_correlative" in diagnostic
         if v6:
             assert diagnostic["source_aware_selection"]["mean_weight_l1_change"] > 0
+            audit = diagnostic["audit"]
+            saved = torch.load(audit["tensor_path"], weights_only=True)
+            source, target = direction.split("_to_")
+            assert not set(saved["group_ids"]["real_target_query"]) & set(saved["group_ids"]["target_bank"])
+            assert audit["protocol"]["same_domain_references_exclude_queries"]
+            assert audit["protocol"]["weights"] == weights
+            torch.testing.assert_close(saved["projection_tensors"]["same_domain_weights"].sum(1), torch.ones(2))
+            codes = saved["representations"]["raw"]["conditional"]
+            z_proj = latest[target].branch.semantic_transformer.z_proj
+            torch.testing.assert_close(saved["representations"]["post_layernorm"]["conditional"], z_proj[0](codes))
+            torch.testing.assert_close(saved["representations"]["post_z_proj"]["conditional"], z_proj(codes))
+            assert len(saved["pca"]) == 6 and not audit["umap"]  # Numeric audit survives disabled plotting.
+            direction_payload = torch.load(diagnostic["tensor_path"], weights_only=True)
+            assert direction_payload["protocol"]["ordered_sample_ids"] == report.evaluation_protocol["ordered_sample_ids"]
             decoded = diagnostic["decoded_image_diagnostics"]
             # The same generated row supplies both active image losses and held-out texture.
             row = next(v for v in decoded.values() if isinstance(v, dict) and "image_losses" in v)
