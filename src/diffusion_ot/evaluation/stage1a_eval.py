@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 
+from diffusion_ot.training.native_flow import native_flow_objective, validate_stage1a_objective
+
 from diffusion_ot.integrations.hf_snapshot import (
     effective_project_root,
     find_project_root,
@@ -44,6 +46,7 @@ class Stage1ASmokeReport:
     encoder_input_space: str = "latent"
     image_reference: str = "vae_reconstruction"
     encoder_architecture: dict[str, Any] | None = None
+    native_flow_objective: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,6 +78,7 @@ class Stage1ARoundTripReport:
     encoder_input_space: str = "latent"
     image_reference: str = "vae_reconstruction"
     encoder_architecture: dict[str, Any] | None = None
+    native_flow_objective: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -183,6 +187,8 @@ def stage1a_architecture_metadata(branch: Any) -> dict[str, Any]:
     encoder_architecture = getattr(branch, "encoder_architecture", {"kind": "plain_cnn_v1"})
     if encoder_architecture["kind"] != "plain_cnn_v1":
         metadata["encoder_architecture"] = encoder_architecture
+        if hasattr(branch.encoder, "spatial_feature_spec"):
+            metadata["spatial_features"] = branch.encoder.spatial_feature_spec
     return metadata
 
 
@@ -363,6 +369,7 @@ def load_stage1a_evaluator(
         raise FileNotFoundError(f"Stage 1A checkpoint not found: {resolved_checkpoint}")
 
     checkpoint = _load_checkpoint(resolved_checkpoint)
+    validate_stage1a_objective(train_config, checkpoint)
     checkpoint_domain = str(checkpoint.get("domain", domain)).lower()
     if checkpoint_domain != domain:
         raise ValueError(
@@ -884,6 +891,7 @@ def _run_inferred_noise_roundtrip(
         encoder_input_space=str(getattr(evaluator.branch, "encoder_input_space", "latent")),
         image_reference="original_rgb" if vae_reconstruction is not None else "vae_reconstruction",
         encoder_architecture=getattr(evaluator.branch, "encoder_architecture", None),
+        native_flow_objective=native_flow_objective(evaluator.training_config),
     )
     _write_json(output_dir / "roundtrip_report.json", report.to_dict())
     return report
@@ -923,6 +931,7 @@ def run_stage1a_smoke_test(
     null_label = int(null_label_value) if null_label_value is not None else None
 
     batch = _collate(_deterministic_subset(evaluator.dataset, num_samples, seed))
+    num_samples = len(batch["sample_id"])
     x0 = batch["x0_latent"].to(
         device=evaluator.device,
         dtype=evaluator.model_dtype,
@@ -978,6 +987,17 @@ def run_stage1a_smoke_test(
     _save_grid(grid_path, rows, samples_per_row=num_samples)
 
     extra_reports: dict[str, str] = {}
+    from diffusion_ot.evaluation.input_statistics import probe_options, run_input_statistics_probe
+    input_options = probe_options(evaluator.evaluation_config)
+    if input_options is not None:
+        extra_reports["input_statistics"] = run_input_statistics_probe(
+            evaluator.branch, data_config_path=_resolve_config_path(evaluator.training_config, evaluator.project_root, "data_config"),
+            domain=evaluator.domain, project_root=evaluator.project_root, device=evaluator.device,
+            dtype=evaluator.model_dtype, options=input_options, output_dir=output_dir / "input_statistics",
+            provenance=dict(stage="stage1a", checkpoint=str(evaluator.checkpoint_path),
+                            checkpoint_step=evaluator.checkpoint_step, weights=evaluator.weights,
+                            training_config_path=str(evaluator.training_config_path),
+                            native_flow_objective=native_flow_objective(evaluator.training_config)))
     inferred_config = _nested(sampling_config, "inferred_noise")
     if bool(inferred_config.get("enabled", False)):
         roundtrip_guidance_scale = float(inferred_config.get("guidance_scale", 1.0))
@@ -1020,6 +1040,7 @@ def run_stage1a_smoke_test(
         encoder_input_space=str(getattr(evaluator.branch, "encoder_input_space", "latent")),
         image_reference=image_reference,
         encoder_architecture=getattr(evaluator.branch, "encoder_architecture", None),
+        native_flow_objective=native_flow_objective(evaluator.training_config),
     )
     _write_json(output_dir / "smoke_report.json", report.to_dict())
     return report

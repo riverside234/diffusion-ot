@@ -8,6 +8,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from diffusion_ot.config_defaults import STAGE1B_TRAIN
+
 
 def repo_path(path: str) -> Path:
     value = Path(path)
@@ -18,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train Cat/Dog InfoOT alignment, optionally with experiment D generator adaptation and decoded image losses."
     )
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", default=STAGE1B_TRAIN, help="Default: fresh v7 residual-cosmap Stage 1B recipe.")
     parser.add_argument("--device-cat", default=None)
     parser.add_argument("--device-dog", default=None)
     parser.add_argument("--max-steps", type=int, default=None)

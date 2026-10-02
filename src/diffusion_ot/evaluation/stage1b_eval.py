@@ -11,6 +11,10 @@ import warnings
 
 import torch
 
+from diffusion_ot.training.native_flow import (
+    native_flow_objective, validate_stage1a_objective, validate_joint_objective,
+)
+
 from diffusion_ot.losses.source_selection import source_selection_options, checkpoint_source_selection
 from diffusion_ot.evaluation.projection_audit import AUDIT_VERSION, save_projection_audit, save_reducer
 from diffusion_ot.evaluation.checkpoint_cache import cached, file_identity
@@ -149,6 +153,7 @@ class Stage1BEvaluationReport:
     translation_grids: dict[str, str]
     visualization_paths: dict[str, str]
     evaluation_protocol: dict[str, Any]
+    input_statistics: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -649,11 +654,17 @@ def _load_domain_context(
         domain_config["config"], root, field_name=f"stage1a.{domain}.config"
     )
     train_config = load_yaml_config(train_config_path)
+    if str(train_config.get("domain", domain)).lower() != domain:
+        raise ValueError(f"Stage 1A {domain} recipe has a mismatched domain.")
     require_latent_stage1a_encoder(train_config, source=f"Stage 1A {domain} recipe")
     stage1a_checkpoint_path = resolve_project_local_path(
         domain_config["checkpoint"], root, field_name=f"stage1a.{domain}.checkpoint"
     )
     stage1a_checkpoint = _load_checkpoint(stage1a_checkpoint_path)
+    if str(stage1a_checkpoint.get("domain", domain)).lower() != domain:
+        raise ValueError(f"Stage 1A {domain} checkpoint has a mismatched domain.")
+    validate_stage1a_objective(train_config, stage1a_checkpoint,
+                              required_type=_nested(alignment_config, "stage1a").get("require_loss_weighting"))
     require_latent_stage1a_encoder(
         stage1a_checkpoint.get("config") or {}, source=f"Stage 1A {domain} checkpoint",
         checkpoint=stage1a_checkpoint,
@@ -666,7 +677,7 @@ def _load_domain_context(
     )
     model_config = load_yaml_config(model_config_path)
     pretrained_config_path = resolve_project_local_path(
-        model_config["pretrained"], root, field_name="model.pretrained"
+        train_config.get("pretrained_config", model_config["pretrained"]), root, field_name="model.pretrained"
     )
     device = str(device_override or domain_config.get("device") or train_config.get("device", "cuda:0"))
     components = load_sit_components(
@@ -700,6 +711,7 @@ def _load_domain_context(
     selected_path = stage1a_checkpoint_path
     if checkpoint_path is not None:
         joint = _load_joint_checkpoint(checkpoint_path)
+        validate_joint_objective(joint, domain, train_config)
         _validate_self_supervised_checkpoint(alignment_config, joint)
         provenance = (joint.get("stage1a_provenance") or {}).get(domain)
         if not isinstance(provenance, dict):
@@ -1667,6 +1679,12 @@ def _run_stage1b_evaluation(
         if source_selection is None or other is None or source_selection.state_dict() != other.state_dict():
             raise ValueError("Evaluation needs common source selection calibration for both domains.")
         evaluation_config["source_aware_selection_protocol"] = source_selection.state_dict()
+    evaluation_config["native_flow_objectives"] = {
+        d: native_flow_objective(context.training_config) for d, context in contexts.items()
+    }
+    evaluation_config["stage1a_architecture_protocol"] = {
+        d: context.stage1a_architecture for d, context in contexts.items()
+    }
     protocol_identifier = _protocol_identifier(
         evaluation_config,
         max_reference=max_reference,
@@ -2249,6 +2267,7 @@ def _run_stage1b_evaluation(
             domain: context.stage1a_architecture for domain, context in contexts.items()
         },
         generation_protocol={
+            "native_flow_objectives": evaluation_config["native_flow_objectives"],
             "reconstruction_reference": "original_dataset_rgb",
             "fit_bandwidth_multiplier": bandwidth,
             "projection_bandwidth_multiplier": projection_bandwidth,
@@ -2346,6 +2365,20 @@ def _run_stage1b_evaluation(
         visualization_paths=visualization_paths,
         evaluation_protocol=evaluation_protocol,
     )
+    from diffusion_ot.evaluation.input_statistics import probe_options, run_input_statistics_probe
+    input_options = probe_options(evaluation_config)
+    if input_options is not None:
+        report.input_statistics = {}
+        for domain, context in contexts.items():
+            provenance = dict(stage="stage1b", checkpoint=str(context.checkpoint_path),
+                              checkpoint_step=context.checkpoint_step, weights=context.weights,
+                              native_flow_objective=native_flow_objective(context.training_config))
+            report.input_statistics[domain] = cached(evaluation_cache, "input_statistics",
+                dict(domain=domain, options=input_options, provenance=provenance),
+                lambda context=context, provenance=provenance, domain=domain: run_input_statistics_probe(
+                    context.branch, data_config_path=context.data_config_path, domain=domain,
+                    project_root=root, device=context.device, dtype=context.dtype, options=input_options,
+                    output_dir=output_root / "input_statistics" / domain, provenance=provenance))
     _write_json(output_root / "evaluation_report.json", report.to_dict())
     return report
 

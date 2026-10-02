@@ -8,6 +8,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from diffusion_ot.config_defaults import STAGE1B_TRAIN, STAGE1B_EVAL
+
 
 def repo_path(path: str) -> Path:
     value = Path(path)
@@ -18,8 +20,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate a Stage 1A offline-InfoOT baseline or a plain/fused Stage 1B checkpoint."
     )
-    parser.add_argument("--alignment-config", required=True)
-    parser.add_argument("--eval-config", required=True)
+    parser.add_argument("--alignment-config", default=STAGE1B_TRAIN)
+    parser.add_argument("--eval-config", default=STAGE1B_EVAL)
     parser.add_argument(
         "--checkpoint",
         default=None,

@@ -145,7 +145,10 @@ def test_joint_checkpoint_payload_contains_no_transport_plan():
                 yield from keys(child)
 
     all_keys = set(keys(payload))
-    assert "gamma" not in all_keys
+    # Native SNR provenance legitimately records scalar gamma; transport
+    # couplings must still never be serialized as reusable checkpoint state.
+    assert "gamma" not in payload
+    assert all(value["loss_weighting"]["gamma"] == .1 for value in payload["native_flow_objectives"].values())
     assert "coupling" not in all_keys
     assert payload["stage"] == "stage1b_plain_infoot"
     assert set(payload["encoders"]) == {"cat", "dog"}

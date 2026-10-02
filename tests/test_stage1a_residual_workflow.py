@@ -245,4 +245,7 @@ def test_time_weighting_recipes_change_only_objective_and_output(domain):
         outputs.add(candidate["output_dir"])
         candidate["loss_weighting"] = base["loss_weighting"]
         candidate["output_dir"] = base["output_dir"]
+        if mode == "cosmap":
+            # P1a preserves step files for reproducible fresh Stage 1B input.
+            assert candidate["train"].pop("keep_step_checkpoints") is True
         assert candidate == base

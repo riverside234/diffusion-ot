@@ -8,6 +8,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from diffusion_ot.config_defaults import STAGE1A_EVAL, stage1a_training_config
+
 
 def repo_path(path: str) -> Path:
     raw_path = Path(path)
@@ -22,9 +24,10 @@ def parse_args() -> argparse.Namespace:
             "config selects the matching semantic encoder and AdaLN/LoRA architecture."
         )
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--domain", choices=["cat", "dog"], help="Use the default residual-cosmap training recipe for this domain.")
+    selection.add_argument(
         "--train-config",
-        required=True,
         help=(
             "The exact Cat or Dog Stage 1A training config used by the checkpoint, "
             "including its plain or residual encoder and attention-LoRA settings."
@@ -32,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--eval-config",
-        required=True,
+        default=STAGE1A_EVAL,
         help="Shared Stage 1A evaluation config.",
     )
     parser.add_argument(
@@ -59,7 +62,7 @@ def main() -> int:
 
     args = parse_args()
     report = run_stage1a_smoke_test(
-        repo_path(args.train_config),
+        repo_path(args.train_config or stage1a_training_config(args.domain)),
         repo_path(args.eval_config),
         device=args.device,
         weights=args.weights,

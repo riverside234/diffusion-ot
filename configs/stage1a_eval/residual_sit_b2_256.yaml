@@ -1,7 +1,7 @@
 stage: stage1a_eval
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
 
-# Pair with configs/stage1a_pdae/{cat,dog}_sit_b2_lora_residual.yaml.
+# Default pairing: configs/stage1a_pdae/{cat,dog}_sit_b2_lora_residual_cosmap.yaml.
 # The same protocol also evaluates *_residual_uniform.yaml and
 # *_residual_cosmap.yaml. Pass the exact run's YAML as --train-config;
 # evaluation outputs are placed under that training run's output directory.
@@ -72,3 +72,13 @@ output:
   subdir: stage1a_rescnn_eval
   save_individual_images: false
   save_sample_records: true
+
+# N1 encodes disjoint train/development cohorts; it does not generate 256 images.
+# Ridge fitting, standardization and alpha selection use training data only.
+input_statistics:
+  enabled: true
+  train_samples: 1024
+  development_samples: 256
+  development_split: val
+  batch_size: 32
+  seed: 20261001

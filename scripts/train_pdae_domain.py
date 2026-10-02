@@ -8,6 +8,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from diffusion_ot.config_defaults import stage1a_training_config
+
 
 def repo_path(path: str) -> Path:
     raw_path = Path(path)
@@ -16,7 +18,9 @@ def repo_path(path: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train one Stage 1A PDAE branch with RGB or latent semantic input and cached SiT latent flow targets.")
-    parser.add_argument("--config", required=True, help="Path to a Stage 1A PDAE config.")
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--config", help="Explicit Stage 1A recipe (including historical experiments).")
+    selection.add_argument("--domain", choices=["cat", "dog"], help="Use this domain's default fresh residual-cosmap recipe.")
     parser.add_argument("--device", default=None, help="Torch device override using process-visible indices. With one GPU in CUDA_VISIBLE_DEVICES, use cuda:0; cpu is also supported.")
     parser.add_argument("--max-steps", type=int, default=None, help="Optional optimizer-update limit override.")
     parser.add_argument(
@@ -35,7 +39,7 @@ def main() -> int:
 
     args = parse_args()
     report = train_pdae_domain(
-        repo_path(args.config),
+        repo_path(args.config or stage1a_training_config(args.domain)),
         device=args.device,
         max_steps=args.max_steps,
         resume_from=args.resume,

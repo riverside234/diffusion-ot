@@ -11,6 +11,10 @@ from typing import Any
 
 import torch
 
+from diffusion_ot.training.native_flow import (
+    native_flow_objective, validate_stage1a_objective, validate_joint_objective,
+)
+
 from diffusion_ot.losses.source_selection import (
     SourceAwareSelection, source_selection_options, checkpoint_source_selection,
 )
@@ -59,6 +63,7 @@ class LoadedTrainingDomain:
     device: str
     dtype: torch.dtype
     vae: Any | None = None
+    training_config_path: Path | None = None
 
 
 class EncoderEMA:
@@ -308,6 +313,10 @@ def _load_training_domain(
         domain_config["checkpoint"], root, field_name=f"stage1a.{domain}.checkpoint"
     )
     checkpoint = _load_checkpoint(checkpoint_path)
+    if str(checkpoint.get("domain", domain)).lower() != domain:
+        raise ValueError(f"Stage 1A {domain} checkpoint has a mismatched domain.")
+    validate_stage1a_objective(train_config, checkpoint,
+                              required_type=stage1a_config.get("require_loss_weighting"))
     require_latent_stage1a_encoder(
         checkpoint.get("config") or {}, source=f"Stage 1A {domain} checkpoint", checkpoint=checkpoint,
     )
@@ -319,7 +328,7 @@ def _load_training_domain(
     )
     model_config = load_yaml_config(model_config_path)
     pretrained_config_path = resolve_project_local_path(
-        model_config["pretrained"], root, field_name="model.pretrained"
+        train_config.get("pretrained_config", model_config["pretrained"]), root, field_name="model.pretrained"
     )
     device = str(device_override or domain_config.get("device") or train_config.get("device", "cuda:0"))
     components = load_sit_components(
@@ -357,6 +366,7 @@ def _load_training_domain(
         device=device,
         dtype=dtype,
         vae=components.vae if (config.get("decoded_translation") or {}).get("enabled", False) else None,
+        training_config_path=train_config_path,
     )
 
 
@@ -447,7 +457,7 @@ def _reconstruction_loss(
 ) -> torch.Tensor:
     from diffusion_ot.losses.pdae_flow import (
         make_linear_flow_target,
-        pdae_flow_snr_weight,
+        flow_loss_weight,
         pdae_velocity_gap_loss,
     )
     from diffusion_ot.models.pdae_sit import make_null_class_labels
@@ -479,16 +489,11 @@ def _reconstruction_loss(
         from diffusion_ot.models.generator_adaptation import predict_with_parameters
         output = predict_with_parameters(domain.branch, generator_parameters,
                                           target.x_t, target.t, z, labels)
-    weight = pdae_flow_snr_weight(
-        t=target.t.float(),
-        direction=direction,
-        gamma=float(weighting.get("gamma", 0.1)),
-        normalize_mean_to=weighting.get("normalize_mean_to", 1.0),
-        normalization_mode=str(weighting.get("normalization_mode", "fixed_uniform")),
-        normalization_samples=int(weighting.get("normalization_samples", 65536)),
-        clamp_min=weighting.get("clamp_min", 0.001),
-        clamp_max=weighting.get("clamp_max"),
-    )
+    weight = flow_loss_weight(target.t.float(), weighting, direction=direction)
+    if diagnostics is not None:
+        diagnostics["weight_mean"] = float(weight.mean())
+        diagnostics["unweighted_flow_mse"] = float(
+            (output.delta_sample.float() - (target.target_v.float() - output.base_sample.float()).detach()).square().mean().detach())
     return pdae_velocity_gap_loss(
         output.delta_sample.float(),
         target.target_v.float(),
@@ -518,7 +523,9 @@ def fixed_reconstruction_probe(
                 x = inputs[domain].to(device=value.device, dtype=value.dtype)
                 z = encoder(x)
                 torch.manual_seed(seed + offset)
-                result[f"{domain}_raw_reconstruction"] = float(_reconstruction_loss(value, x, z))
+                native_diagnostics = {}
+                result[f"{domain}_raw_reconstruction"] = float(_reconstruction_loss(value, x, z, diagnostics=native_diagnostics))
+                result[f"{domain}_raw_unweighted_flow_mse"] = native_diagnostics["unweighted_flow_mse"]
                 if not include_stage1a_baseline:
                     torch.manual_seed(seed + offset)
                     result[f"{domain}_null_reconstruction"] = float(_reconstruction_loss(value, x, z, force_null=True))
@@ -580,12 +587,17 @@ def _build_checkpoint_payload(
         "ema_state": ema.state_dict() if ema is not None else None,
         "optimizer": optimizer.state_dict(),
         "config": config,
+        "native_flow_objectives": {
+            d: native_flow_objective(getattr(value, "training_config", {})) for d, value in domains.items()
+        },
         "stage1a_provenance": {
             domain: {
                 "checkpoint_path": str(value.checkpoint_path),
                 "checkpoint_step": value.checkpoint_step,
                 "weights": str(_nested(config, "stage1a").get("weights", "ema")),
                 "architecture": value.stage1a_architecture,
+                "training_config_path": str(getattr(value, "training_config_path", None)),
+                "training_config": deepcopy(getattr(value, "training_config", {})),
             }
             for domain, value in domains.items()
         },
@@ -650,6 +662,7 @@ def _validate_resume_provenance(
     provenance = checkpoint.get("stage1a_provenance") or {}
     fixed_generators = checkpoint.get("fixed_generators") or {}
     for domain, value in domains.items():
+        validate_joint_objective(checkpoint, domain, getattr(value, "training_config", {}))
         record = provenance.get(domain)
         if not isinstance(record, dict):
             raise ValueError(f"Resume checkpoint has no stage1a_provenance.{domain} record.")
@@ -1405,6 +1418,9 @@ def train_joint_infoot(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "resolved_config.json", config)
+    _write_json(output_dir / "native_flow_objectives.json", {
+        d: native_flow_objective(value.training_config) for d, value in domains.items()
+    })
     log_path = output_dir / "logs" / "train.jsonl"
     if resume_path is None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1525,6 +1541,7 @@ def train_joint_infoot(
                 + metrics.get("weighted_infoot_relative_loss", 0.)
                 + metrics["decoded_translation"]["weighted_loss"])
             metrics["loss_measurement"] = "fixed_raw_weights_full_coefficients_without_semantic_dropout"
+        metrics["native_flow_objectives"] = {d: native_flow_objective(v.training_config) for d, v in domains.items()}
         return log_formatter.format(metrics)
 
     if probe_every > 0:
@@ -2118,6 +2135,7 @@ def train_joint_infoot(
                 "loss": float(reported_total.cpu()),
                 "cat_reconstruction_loss": float(rec_losses["cat"].detach().cpu()),
                 "dog_reconstruction_loss": float(rec_losses["dog"].detach().cpu()),
+                "native_flow_objectives": {d: native_flow_objective(v.training_config) for d, v in domains.items()},
                 "cat_anchor_loss": float(anchor_losses["cat"].detach().cpu()),
                 "dog_anchor_loss": float(anchor_losses["dog"].detach().cpu()),
                 "latent_anchor_weight": anchor_weight,

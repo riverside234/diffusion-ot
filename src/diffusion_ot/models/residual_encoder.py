@@ -152,6 +152,11 @@ class PDAEResidualLatentEncoder(nn.Module):
     def spatial_feature_channels(self) -> tuple[int, ...]:
         return self.channels
 
+    @property
+    def spatial_feature_spec(self) -> dict[str, Any]:
+        return {"protocol": "residual_post_block_attention_v1",
+                "resolutions": list(self.resolutions), "channels": list(self.channels)}
+
     def _feature_maps(self, value: torch.Tensor):
         expected = (self.input_channels, self.input_size, self.input_size)
         if value.ndim != 4 or tuple(value.shape[1:]) != expected:

@@ -1,36 +1,39 @@
 # diffusion-ot
 
 Cat/Dog PDAE representations with InfoOT conditional projection and diffusion
-translation. **Original latent-input, flow-only LoRA remains the main Stage 1A
-experiment**, with its configs/checkpoints unchanged. A separate optional RGB
-encoder experiment supports a quality comparison. SiT diffusion still operates
-on VAE latents in both. Stage 1B includes self-supervised global InfoNCE/PatchNCE controls and
-the external-supervision **Experiment D**; each retains its explicitly selected
-earlier Stage 1A architecture/checkpoints pending a separate RGB migration.
+translation. **Fresh runs default to the residual latent CNN with cosmap flow
+weighting in both Stage 1A and Stage 1B (v7).** The encoder has a raw stride-1
+convolution stem; internal GroupNorm and encoder/generator LayerNorm remain.
+Earlier plain-CNN, RGB, InfoNCE/PatchNCE and external-supervision recipes remain
+available through explicit configuration paths.
 
 ## Active workflow
 
 The current pipeline has four stages:
 
-1. Train separate Cat and Dog encoders/conditioning paths with semantic CFG,
-   rank-64 LoRA and latent flow loss only using the original latent-input main
-   recipe. The optional RGB experiment runs separately for comparison.
-2. Run the selected compatible Stage 1B experiment with full InfoOT conditional
-   means. Existing recipes remain on their earlier latent-input checkpoints.
-3. Evaluate held-out queries with the recipe's specified target bank; v3 uses
-   224 references/targets for the primary comparison, with all-bank evaluation
-   retained as a separate stress test.
+1. Train Cat and Dog afresh with the residual-cosmap Stage 1A recipes; evaluate
+   their native reconstruction, conditioning controls and N1 appearance probes.
+2. Pin the selected Stage 1A step checkpoints and initialize fresh v7 Stage 1B
+   heads, optimizer/EMA and training-only calibration. Keep differentiable means
+   and the unchanged v6 loss coefficients for this architecture baseline.
+3. Evaluate against the saved calibrated Stage 1B step 0 with 224 references/
+   targets, 20 integration steps, mean/MAP panels and disjoint train/development
+   appearance probes. Use this new baseline before loss/controller ablations.
 4. Export the selected encoders, matching heads, adapted generators, kernels,
    target codes, and fitted transport for downstream inference.
 
 The canonical configurations are:
 
-- Stage 1A Cat / Dog main latent-input recipe: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora.yaml`
+- Stage 1A Cat / Dog default: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora_residual_cosmap.yaml`
+- Stage 1A default evaluation: `configs/stage1a_eval/residual_sit_b2_256.yaml`
+- Stage 1B default: `configs/stage1b_infoot/self_supervised_infonce_v7_residual_cosmap_sit_b2.yaml`
+- Stage 1B default evaluation: `configs/stage1b_eval/self_supervised_infonce_v7_residual_cosmap_sit_b2.yaml`
+- Stage 1A historical plain latent recipe: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora.yaml`
 - Stage 1A Cat / Dog optional RGB comparison: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora_rgb.yaml`
 - Stage 1B self-supervised PatchNCE: `configs/stage1b_infoot/self_supervised_patchnce_sit_b2.yaml`
 - Stage 1B global InfoNCE control: `configs/stage1b_infoot/self_supervised_sit_b2.yaml`
 - Stage 1B PatchNCE + reference-EMA RMS experiment: `configs/stage1b_infoot/self_supervised_patchnce_rms_ema_sit_b2.yaml`
-- Stage 1B **current v6 source-aware color experiment**: `configs/stage1b_infoot/self_supervised_infonce_v6_sit_b2.yaml`
+- Stage 1B historical v6 source-aware color experiment: `configs/stage1b_infoot/self_supervised_infonce_v6_sit_b2.yaml`
 - Stage 1B v6 matched evaluation: `configs/stage1b_eval/self_supervised_infonce_v6_sit_b2.yaml`
 - Stage 1B v6 bandwidth-only control: `configs/stage1b_infoot/self_supervised_infonce_v6_bandwidth_control_sit_b2.yaml`
 - Stage 1B v4.5 spatial-cost control: `configs/stage1b_infoot/self_supervised_infonce_v4_5_sit_b2.yaml`
@@ -47,12 +50,90 @@ The canonical configurations are:
 - Experiment D: `configs/stage1b_infoot/structure_decoder_sit_b2.yaml`
 - Experiment D evaluation: `configs/stage1b_eval/structure_decoder_sit_b2.yaml`
 
-The self-supervised controls use original flow-only EMA checkpoints with the
+The historical self-supervised controls use original flow-only EMA checkpoints with the
 unchanged `*_sit_b2_lora.yaml` configs. Experiment D uses its selected
 `*_sit_b2_dino.yaml` EMA checkpoints. Neither automatically loads the new RGB
 Stage 1A outputs; replacing checkpoint paths alone is insufficient.
 
-### Current Stage 1B v6: source-aware selection and color
+### Fresh residual-cosmap workflow (P1a / N1)
+
+The CLI defaults are centralized in `src/diffusion_ot/config_defaults.py`.
+Select a domain for Stage 1A; explicit `--config` / `--train-config` still select
+historical recipes. Stage 1B train/eval commands default to the paired v7 recipes.
+Use process-visible CUDA indices for your machine:
+
+```bash
+python scripts/train_pdae_domain.py --domain cat --device cuda:0
+python scripts/train_pdae_domain.py --domain dog --device cuda:0
+python scripts/evaluate_pdae_domain.py --domain cat --device cuda:0
+python scripts/evaluate_pdae_domain.py --domain dog --device cuda:0
+```
+
+These Stage 1A recipes start fresh (50,000 updates, batch 64); step checkpoints
+are retained. Evaluation uses the exact domain cosmap recipe, original RGB
+metrics, correct/shuffled-code controls and the selected raw/EMA state. It runs
+the configured **8-image smoke** and separate inferred-noise round trip, plus
+N1. The existing `dataset.num_samples: 256` / `metrics.full` fields do not launch
+a full generation benchmark; reports contain the actual sample count. Increase
+`dataset.smoke_samples` explicitly for a larger native-quality cohort.
+
+After reviewing Stage 1A, replace the v7 recipe's two `latest.pt` initialization
+paths with the selected `step_NNNNNN.pt` paths. Both must belong to the named
+residual-cosmap runs. Then:
+
+```bash
+python scripts/train_joint_infoot.py --quick-eval
+# Or evaluate a selected saved Stage 1B checkpoint afterward:
+python scripts/evaluate_infoot_alignment.py \
+  --checkpoint outputs/stage1b_nce_v7_residual_cosmap/checkpoints/latest.pt \
+  --evaluate-step0 --weights ema
+```
+
+The new output directory is `outputs/stage1b_nce_v7_residual_cosmap`. Fresh
+Stage 1A/1B runs refuse to overwrite an existing latest checkpoint; `--resume`
+is for the same architecture and objective. Stage 1B now dispatches its native
+loss through the same cosmap/uniform/SNR weighting function as Stage 1A. Both
+sample timesteps uniformly; cosmap is not multiplied by SNR. Checkpoints,
+`native_flow_objectives.json`, train/validation logs and evaluation protocols
+record the resolved objective. Resume/load rejects changes to its weighting,
+direction or timestep clamp. Historical SNR checkpoints remain supported;
+unrecorded legacy Stage 1B checkpoints cannot be relabeled as cosmap.
+
+The fresh Stage 1B run rebuilds reference banks/plans, projection RMS and frozen
+source/spatial calibration from training data. It retains `step_000000.pt` for
+matched evaluation. Residual feature stages are explicitly versioned as outputs
+after the residual blocks/attention, at 32/16/8/4 pixels. Layers `[0,1]` therefore
+use 32/16, unlike the earlier plain encoder. Fit/projection/epsilon remain
+**0.55 / 0.25 / 0.02**; separate InfoNCE MLPs, internal norms and loss coefficients
+are retained. The v6 inference finalist (0.35 MAP) is a historical comparison,
+not a hard-argmax replacement for the differentiable training mean.
+
+Both evaluation recipes enable `input_statistics`. N1 uses up to **1,024 train
+and 256 development (`val`) images** without augmentations or extra diffusion
+rollouts. It rejects overlapping/duplicate IDs, saves channel means/stds,
+original RGB/normalized-Lab summaries, codes before/after encoder LayerNorm,
+and actual generator LayerNorm/`z_proj` features. The first-convolution hook
+checks that original, offset and scaled latents reach the raw residual stem
+unchanged; subsequent feature sensitivity is measured without an invariance
+assumption.
+
+Ridge probes compare codes against codes plus the eight latent statistics, with
+statistics-only and post-normalization controls. Feature/target scaling and
+ridge-strength selection use an internal training holdout only, then refit on
+all training samples. Development data is used only for reporting. Probe gains
+measure accessibility to a linear probe, not proven loss of image information;
+VAE channels are not RGB channels. Check `added_statistics_mse_reduction` for
+RGB and Lab separately (positive means adding statistics helped).
+
+Stage 1A's `extra_reports.input_statistics` and Stage 1B's `input_statistics`
+link to each `appearance_probe.json`; adjacent `appearance_probe.pt` files save
+cohort IDs/features/targets, fitted scalers/coefficients and predictions. Options
+include cohort counts, batch size, seed, training tuning fraction and positive
+`ridge_alphas`; `enabled: false` disables N1 for a deliberate quick run. The P1
+cache reuses N1 within the same checkpoint/options across readout variants.
+Native image metrics and explicit unweighted flow diagnostics remain unweighted.
+
+### Historical Stage 1B v6: source-aware selection and color
 
 V6 adds query-to-target spatial/appearance compatibility to the v4.5 readout.
 Fixed initial **training-only** cost scales are checkpointed. Added costs are
@@ -441,8 +522,8 @@ stem, two residual blocks at each of 32/16/8/4 pixels, four-head attention at
 16x16, and a 512-dimensional code. Start fresh Cat/Dog runs:
 
 ```bash
-python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_lora_residual.yaml --device cuda:0
-python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_lora_residual.yaml --device cuda:1
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml --device cuda:0
+python3 scripts/train_pdae_domain.py --config configs/stage1a_pdae/dog_sit_b2_lora_residual_cosmap.yaml --device cuda:1
 ```
 
 These flow-only runs retain batch 64, 50,000 steps and encoder/adapter/LoRA
@@ -450,8 +531,8 @@ learning rates 1e-4/1e-4/2.5e-5. Outputs are `outputs/stage1a_{cat,dog}_rescnn`.
 Evaluate each domain using its exact training config:
 
 ```bash
-python3 scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae/cat_sit_b2_lora_residual.yaml --eval-config configs/stage1a_eval/residual_sit_b2_256.yaml --device cuda:0
-python3 scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae/dog_sit_b2_lora_residual.yaml --eval-config configs/stage1a_eval/residual_sit_b2_256.yaml --device cuda:1
+python3 scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml --eval-config configs/stage1a_eval/residual_sit_b2_256.yaml --device cuda:0
+python3 scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae/dog_sit_b2_lora_residual_cosmap.yaml --eval-config configs/stage1a_eval/residual_sit_b2_256.yaml --device cuda:1
 ```
 
 Image metrics use original RGB targets; encoder inputs remain cached VAE
@@ -848,8 +929,9 @@ generated images per direction and **three fixed categorical/noise draws**.
 Bandwidth 0.10 is excluded because the earlier visual screen found behavior
 similar to top-1 selection. Keep 0.25 as the primary existing control and 0.35 as
 the broader, blurrier control. Fit bandwidth (0.55), entropy epsilon, checkpoint
-RMS scales and source-selection calibration stay fixed. This does not implement
-tempered means, an adaptive controller, training changes or the P1a diagnostic.
+RMS scales and source-selection calibration stay fixed. This screen does not
+change training or implement tempered means/adaptive controllers. P1a/N1 is
+enabled separately by the new residual-cosmap evaluation recipes above.
 
 Use `--checkpoints PATH ...` for an explicit list (saved step 0 first), or
 `--checkpoint-steps 0 8000` to narrow a directory run. Missing requested files

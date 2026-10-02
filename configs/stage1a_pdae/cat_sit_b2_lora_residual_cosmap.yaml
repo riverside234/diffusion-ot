@@ -4,7 +4,8 @@ domain: cat
 split: train
 data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
-# Fresh residual-CNN run; resume only checkpoints from this architecture.
+# Default fresh Stage 1A recipe. Raw residual stem; internal GroupNorm retained.
+# Resume only this architecture/objective; pin saved step checkpoints for Stage 1B.
 output_dir: outputs/stage1a_cat_rescnn_cosmap
 device: cuda:0
 torch_dtype: float32
@@ -29,6 +30,7 @@ train:
   grad_clip_norm: 1.0
   log_every: 40
   save_every: 1000
+  keep_step_checkpoints: true
 
 ema:
   enabled: true

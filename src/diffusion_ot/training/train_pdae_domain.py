@@ -8,6 +8,8 @@ from pathlib import Path
 import time
 from typing import Any
 
+from diffusion_ot.training.native_flow import native_flow_objective, validate_stage1a_objective
+
 from diffusion_ot.integrations.hf_snapshot import (
     effective_project_root,
     find_project_root,
@@ -649,6 +651,7 @@ def _save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "ema": ema.state_dict() if ema is not None else None,
         "config": config,
+        "native_flow_objective": native_flow_objective(config),
         "train_state": train_state,
         "rng_state": torch.get_rng_state(),
         "dataloader_generator_state": loader_generator.get_state(),
@@ -779,6 +782,8 @@ def train_pdae_domain(
     checkpoint_path = output_dir / "checkpoints" / "latest.pt"
     requested_resume = resume_from if resume_from is not None else train_config.get("resume_from")
     resolved_resume_path = _resolve_resume_path(requested_resume, root, checkpoint_path)
+    if resolved_resume_path is None and checkpoint_path.exists() and not dry_run:
+        raise ValueError("Stage 1A output already has a checkpoint. Use --resume or a new output_dir for a fresh run.")
 
     if dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -885,6 +890,7 @@ def train_pdae_domain(
             raise FileNotFoundError(f"Resume checkpoint not found: {resolved_resume_path}")
         checkpoint = _load_torch_checkpoint(resolved_resume_path, device=device)
         validate_refinement_resume(checkpoint.get("config") or {}, config)
+        validate_stage1a_objective(config, checkpoint)
         saved_weighting = (checkpoint.get("train_state") or {}).get("loss_weighting")
         if saved_weighting is None:
             saved_weighting = _nested(checkpoint.get("config") or {}, "loss_weighting")
@@ -1029,6 +1035,7 @@ def train_pdae_domain(
         )
         # Validation deliberately stays unweighted for comparisons across recipes.
         metrics["training_loss_weighting"] = loss_weight_type
+        metrics["native_flow_objective"] = native_flow_objective(config)
         metrics["mse_weighting"] = "uniform"
         metrics["timestep_sampling"] = "uniform"
         if refinement is not None:
@@ -1232,6 +1239,7 @@ def train_pdae_domain(
                 "loss": loss_value,
                 "loss_ema": loss_ema,
                 "loss_weighting": loss_weight_type,
+                "native_flow_objective": native_flow_objective(config),
                 "timestep_sampling": "uniform",
                 "weight_mean": weight_mean_value,
                 "effective_batch_size": effective_batch_size,
