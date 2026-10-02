@@ -85,13 +85,14 @@ translation:
   enabled: true
   decoded_structure_metrics: false
   include_source: true
-  include_top1_target: true  # Three rows: source, real top-1 target, conditional-mean translation.
+  include_top1_target: true  # Four rows: source, real top-1 target, mean CFG=1, mean CFG=2.
   include_structure_teacher_mean: false
   samples_per_direction: 16
   num_steps: 20
   guidance_scale: 1.0
   readouts:
   - conditional_mean
+  - z_cfg_2  # Same mean code/noise as the preceding row; semantic guidance scale 2.
   primary_readout: conditional_mean
   temperature: 1.0
 comparison:

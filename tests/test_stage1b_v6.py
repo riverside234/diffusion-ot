@@ -105,4 +105,6 @@ def test_v6_and_bandwidth_control_keep_other_v45_settings_fixed():
             expected["decoded_translation"]["source_lab_swd"] = v6["decoded_translation"]["source_lab_swd"]
             expected["self_supervised_diagnostics"]["target_patch_swd"] = v6["self_supervised_diagnostics"]["target_patch_swd"]
             assert v6["decoded_translation"]["source_lab_swd"]["weight"] == .04
+        else:
+            expected["translation"]["readouts"] = ["conditional_mean", "z_cfg_2"]
         assert v6 == expected

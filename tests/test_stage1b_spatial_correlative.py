@@ -261,13 +261,17 @@ def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_
     for direction in ("cat_to_dog", "dog_to_cat"):
         diagnostic = report.projections[direction]
         assert diagnostic["translation_grid_rows"] == [
-            "source", "top_1_target_reference", "infoot_conditional_mean"]
+            "source", "top_1_target_reference", "infoot_conditional_mean"] + (["z_cfg_2"] if v6 else [])
         with Image.open(report.translation_grids[direction]) as image:
-            assert image.height == 3 * (8 + 2) + 2  # Three rows of 8px fixture images.
+            assert image.height == (4 if v6 else 3) * (8 + 2) + 2
         top1 = diagnostic["decoded_image_diagnostics"]["top1_target_reference"]
         assert len(top1["target_ids"]) == len(top1["probabilities"]) == 2
         assert "spatial_correlative" in diagnostic
         if v6:
+            assert report.generation_protocol["translation_readout_guidance_scales"] == {
+                "conditional_mean": 1., "z_cfg_2": 2.}
+            assert diagnostic["decoded_image_diagnostics"]["z_cfg_2"]["guidance_scale"] == 2.
+            assert "image_losses" in diagnostic["decoded_image_diagnostics"]["z_cfg_2"]
             assert diagnostic["source_aware_selection"]["mean_weight_l1_change"] > 0
             audit = diagnostic["audit"]
             saved = torch.load(audit["tensor_path"], weights_only=True)

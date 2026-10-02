@@ -761,6 +761,12 @@ translation grid contains three rows, with corresponding columns:
 2. original RGB target reference with the highest InfoOT conditional probability;
 3. full InfoOT conditional-mean translation.
 
+The v6 evaluator selects `readouts: [conditional_mean, z_cfg_2]` and adds a fourth
+row: the same conditional-mean code generated with semantic guidance scale 2.
+Both generated rows share their initial noise and sampling steps. `z_cfg_2`
+uses `v_null + 2 * (v_z - v_null)` rather than scaling the latent code. Guidance
+per readout is recorded in the report and any saved generation inputs.
+
 `translation.include_top1_target` defaults to `true`; set it to `false` to hide
 the reference row. The report records its target IDs and probabilities. This
 reference is a retrieval diagnostic, not paired ground truth. Additional MAP,
