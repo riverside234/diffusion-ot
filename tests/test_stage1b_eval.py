@@ -390,8 +390,9 @@ def test_deterministic_indices_are_reproducible_and_bounded():
 
 @pytest.mark.parametrize("include_source", [False, True])
 @pytest.mark.parametrize("auxiliary_grids", [False, True])
+@pytest.mark.parametrize("cfg2", [False, True])
 def test_top1_reference_row_preserves_translation_and_auxiliary_grids(
-    monkeypatch, tmp_path, include_source, auxiliary_grids,
+    monkeypatch, tmp_path, include_source, auxiliary_grids, cfg2,
 ):
     from types import SimpleNamespace
 
@@ -430,10 +431,12 @@ def test_top1_reference_row_preserves_translation_and_auxiliary_grids(
                         lambda bank, count: torch.full((count, 3, 4, 4), .25))
     monkeypatch.setattr(stage1a, "decode_vae_latents", lambda vae, latent: latent)
     decoder_calls = []
+    guidance_scales = []
 
     def generate(branch, transformer, noise, codes, **kwargs):
         decoder_calls.append((noise.clone(), codes.clone()))
-        return codes[:, :1, None, None].expand(-1, 3, 4, 4).clone()
+        guidance_scales.append(kwargs["guidance_scale"])
+        return kwargs["guidance_scale"] * codes[:, :1, None, None].expand(-1, 3, 4, 4).clone()
 
     monkeypatch.setattr(stage1a, "integrate_pdae_flow", generate)
     monkeypatch.setattr(color, "histogan_color_distance",
@@ -454,21 +457,35 @@ def test_top1_reference_row_preserves_translation_and_auxiliary_grids(
                                   output_path=baseline, **options)
     assert not loaded
     output = tmp_path / "grid.png"
+    if cfg2:
+        options["readouts"] = ["conditional_mean", "z_cfg_2"]
     diagnostics = stage1b._save_translation_grid(
         source, target, query, target_bank, weights, output_path=output,
         include_top1_target=True, include_transport_references=auxiliary_grids,
+        save_generation_inputs=cfg2,
         color_histogram={} if auxiliary_grids else None, **options)
-    assert len(decoder_calls) == 2  # One mean rollout per call; no top-1 generation.
+    assert len(decoder_calls) == 2 + int(cfg2)  # One additional rollout only for CFG=2.
     for original, current in zip(decoder_calls[0], decoder_calls[1]):
         torch.testing.assert_close(original, current, rtol=0, atol=0)
     torch.testing.assert_close(decoder_calls[1][1], weights @ target_bank.raw_codes)
     torch.testing.assert_close(torch.get_rng_state(), rng_state, rtol=0, atol=0)
     count, offset = 2, 2 * int(include_source)
-    assert saved[str(output)].shape[0] == count * (2 + int(include_source))
+    row_count = 2 + int(include_source) + int(cfg2)
+    assert saved[str(output)].shape[0] == count * row_count
     torch.testing.assert_close(saved[str(output)][offset:offset + count], target_rgb[[2, 0]])
-    torch.testing.assert_close(saved[str(output)][-count:], saved[str(baseline)][-count:])
+    standard_generated = saved[str(output)][offset + count:offset + 2 * count]
+    torch.testing.assert_close(standard_generated, saved[str(baseline)][-count:])
     with Image.open(output) as grid:
-        assert grid.height == (2 + int(include_source)) * (4 + 2) + 2
+        assert grid.height == row_count * (4 + 2) + 2
+    if cfg2:
+        assert guidance_scales == [1., 1., 2.]
+        for standard, guided in zip(decoder_calls[1], decoder_calls[2]):
+            torch.testing.assert_close(standard, guided, rtol=0, atol=0)
+        torch.testing.assert_close(saved[str(output)][-count:], 2 * standard_generated)
+        assert diagnostics["z_cfg_2"]["guidance_scale"] == 2.
+        inputs = torch.load(diagnostics["generation_inputs"]["path"], weights_only=True)
+        assert inputs["protocol"]["readout_guidance_scales"] == {"conditional_mean": 1., "z_cfg_2": 2.}
+        torch.testing.assert_close(inputs["codes"]["conditional_mean"], inputs["codes"]["z_cfg_2"], rtol=0, atol=0)
     top1 = diagnostics["top1_target_reference"]
     assert loaded[0] == (target.data_config_path, ["t2", "t0"])
     assert top1["target_ids"] == ["t2", "t0"] and top1["target_indices"] == [2, 0]

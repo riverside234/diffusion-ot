@@ -912,10 +912,16 @@ def _evaluate_reconstruction(
 
 _TRANSLATION_ROW_NAMES = {
     "conditional_mean": "infoot_conditional_mean",
+    "z_cfg_2": "z_cfg_2",
     "conditional_map": "selected_target",
     "conditional_sample": "sampled_target",
     "structure_teacher_mean": "structure_teacher_mean",
 }
+
+
+def _translation_readout_guidance_scales(readouts: list[str], guidance_scale: float) -> dict[str, float]:
+    """Apply CFG=2 to the additional mean-code comparison row."""
+    return {name: 2.0 if name == "z_cfg_2" else float(guidance_scale) for name in readouts}
 
 
 @torch.inference_mode()
@@ -931,7 +937,7 @@ def translation_readout_codes(weights, target_codes, readouts, *, temperature, s
         raise ValueError("The structure_teacher_mean readout requires teacher codes.")
     codes, selections = {}, {}
     for name in readouts:
-        if name == "conditional_mean":
+        if name in ("conditional_mean", "z_cfg_2"):
             codes[name] = weighted_target_codes(weights, target_codes)
         elif name == "structure_teacher_mean":
             codes[name] = teacher_codes[:len(weights)]
@@ -985,6 +991,7 @@ def _save_translation_grid(
     code_map, selections = translation_readout_codes(weights, target_projection.raw_codes, readouts,
         temperature=temperature, seed=seed, teacher_codes=teacher_codes)
     code_rows = list(code_map.values())
+    readout_guidance_scales = _translation_readout_guidance_scales(readouts, guidance_scale)
 
     source_x0 = _load_latents_from_bank(source_query, count).to(source.device, dtype=source.dtype)
     source_images = None
@@ -1001,13 +1008,16 @@ def _save_translation_grid(
     rows = [source_images] if include_source else []
     decoded_rows = []
     decoded_metrics: dict[str, Any] = {}
+    if "z_cfg_2" in readouts:
+        decoded_metrics["readout_guidance_scales"] = readout_guidance_scales
     if save_generation_inputs:
         input_path = output_path.with_name(output_path.stem + "_inputs.pt")
         input_path.parent.mkdir(parents=True, exist_ok=True)
-        generation = dict(version="matched_readouts_v1", query_ids=source_query.sample_ids[:count],
+        generation = dict(version="matched_readouts_v2", query_ids=source_query.sample_ids[:count],
                           target_ids=target_projection.sample_ids, noise_seed=int(seed),
                           categorical_seed=int(seed) + 1, num_steps=num_steps,
                           guidance_scale=guidance_scale, temperature=temperature, readouts=readouts,
+                          readout_guidance_scales=readout_guidance_scales,
                           noise_device=target.device, noise_dtype=str(noise.dtype))
         torch.save({"protocol": generation, "noise": noise.detach().cpu(), "weights": weights.cpu(),
                     "codes": {k: v.detach().cpu() for k, v in code_map.items()},
@@ -1090,13 +1100,17 @@ def _save_translation_grid(
         source_structure, _ = image_features(source_images.to(feature_device))
     for name, codes in zip(readouts, code_rows):
         row_name = _TRANSLATION_ROW_NAMES[name]
+        if name == "z_cfg_2":
+            decoded_metrics[row_name] = {
+                "samples": count, "code_readout": "conditional_mean", "guidance_scale": 2.0,
+            }
         latent = integrate_pdae_flow(
             target.branch,
             target.transformer,
             noise,
             codes.to(target.device, dtype=target.dtype),
             num_steps=num_steps,
-            guidance_scale=guidance_scale,
+            guidance_scale=readout_guidance_scales[name],
             null_label=class_config.get("null_label"),
         )
         decoded_images = decode_vae_latents(target.vae, latent).cpu()
@@ -2089,12 +2103,15 @@ def _run_stage1b_evaluation(
 
     translation_paths: dict[str, str] = {}
     translation_config = _nested(evaluation_config, "translation")
+    translation_guidance_scales: dict[str, float] = {}
     if bool(translation_config.get("enabled", True)):
         readouts = translation_config.get("readouts")
         if readouts is None:
             readouts = ["conditional_mean", "conditional_map", "conditional_sample"]
             if translation_config.get("include_structure_teacher_mean", False):
                 readouts.append("structure_teacher_mean")
+        translation_guidance_scales = _translation_readout_guidance_scales(
+            readouts, float(translation_config.get("guidance_scale", 1.0)))
         include_source = bool(translation_config.get("include_source", True))
         include_top1_target = bool(translation_config.get("include_top1_target", True))
         image_features = None
@@ -2250,6 +2267,7 @@ def _run_stage1b_evaluation(
             "translation_guidance_scale": float(
                 translation_config.get("guidance_scale", 1.0)
             ),
+            "translation_readout_guidance_scales": translation_guidance_scales,
             "stage1b_frozen_generator_components": [
                 "base_transformer",
                 "adaln_adapters",
