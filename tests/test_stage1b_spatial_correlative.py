@@ -1,5 +1,6 @@
 """v4.5: tiny real trainer/evaluator runs, calibration provenance and v4 parity."""
 from copy import deepcopy
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -292,6 +293,39 @@ def test_standalone_uses_selected_encoder_and_shared_calibration_with_reference_
         assert len(grid["target_ids"]) == 2 and len(grid["target_ids"][0]) == 2
     with pytest.raises(ValueError, match="calibrated checkpoint" if v6 else "checkpoint with frozen calibration"):
         evaluation.run_stage1b_evaluation(tmp_path / "eval_training.yaml", eval_path)
+    if v6 and weights == "ema":
+        from diffusion_ot.evaluation.checkpoint_screen import run_checkpoint_screen
+        # Real calibrated solver, both directions, existing decoder/metrics and
+        # tiny real checkpoints: four variants must encode and fit only once.
+        load_calls = []
+        def counted_context(*args, **kwargs):
+            load_calls.append(args[2])
+            return load_context(*args, **kwargs)
+        monkeypatch.setattr(evaluation, "_load_domain_context", counted_context)
+        manifest = run_checkpoint_screen(tmp_path / "eval_training.yaml", eval_path,
+            [checkpoint_path.with_name("step_000000.pt"), checkpoint_path], tmp_path / "screen",
+            bandwidths=[.25, .35], draws=2, steps=[3], samples=2, weights=weights)
+        assert manifest["status"] == "complete" and len(manifest["runs"]) == 8
+        assert load_calls == ["cat", "dog", "cat", "dog"]
+        for counters in manifest["cache_statistics"]:
+            assert counters["misses"]["contexts"] == counters["misses"]["fit"] == 1
+            assert counters["hits"]["fit"] == 3
+            assert counters["misses"]["bank"] == 4 and counters["hits"]["bank"] == 12
+        assert all(run["baseline_status"] == "compared" for run in manifest["runs"][4:])
+        screen_reports = [json.loads(Path(run["report"]).read_text()) for run in manifest["runs"]]
+        ids = screen_reports[0]["evaluation_protocol"]["ordered_sample_ids"]
+        assert all(r["evaluation_protocol"]["ordered_sample_ids"] == ids for r in screen_reports)
+        for direction in ("cat_to_dog", "dog_to_cat"):
+            def inputs(r):
+                path = r["projections"][direction]["decoded_image_diagnostics"]["generation_inputs"]["path"]
+                return torch.load(path, weights_only=True)
+            # Same draw uses the same noise across bandwidth and checkpoints.
+            for left, right in ((0, 2), (0, 4), (4, 6)):
+                torch.testing.assert_close(inputs(screen_reports[left])["noise"], inputs(screen_reports[right])["noise"], rtol=0, atol=0)
+            assert not torch.equal(inputs(screen_reports[0])["noise"], inputs(screen_reports[1])["noise"])
+            for r in screen_reports:
+                decoded = r["projections"][direction]["decoded_image_diagnostics"]
+                assert all(name in decoded for name in ("infoot_conditional_mean", "selected_target", "sampled_target"))
     eval_config["spatial_correlative_cost"]["grid_size"] = 4
     eval_path.write_text(yaml.safe_dump(eval_config))
     with pytest.raises(ValueError, match="match the training spatial"):

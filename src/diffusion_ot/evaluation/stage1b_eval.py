@@ -13,6 +13,7 @@ import torch
 
 from diffusion_ot.losses.source_selection import source_selection_options, checkpoint_source_selection
 from diffusion_ot.evaluation.projection_audit import AUDIT_VERSION, save_projection_audit, save_reducer
+from diffusion_ot.evaluation.checkpoint_cache import cached, file_identity
 
 from diffusion_ot.integrations.hf_snapshot import (
     effective_project_root,
@@ -354,7 +355,14 @@ def build_latent_bank(
     matching_head: Any | None = None,
     spatial_options: dict | None = None,
     spatial_protocol_id: str | None = None,
+    cache=None,
 ) -> LatentBank:
+    if cache is not None:
+        options = dict(domain=domain, split=split, count=count, seed=seed, batch_size=batch_size,
+                       device=device, dtype=dtype, checkpoint_id=checkpoint_id,
+                       spatial_options=spatial_options, spatial_protocol_id=spatial_protocol_id)
+        return cached(cache, "bank", {**options, "matching_id": matching_head_id(matching_head)},
+                      lambda: build_latent_bank(encoder, dataset, matching_head=matching_head, **options))
     indices = deterministic_indices(len(dataset), count, seed)
     codes: list[torch.Tensor] = []
     features: list[torch.Tensor] = []
@@ -911,6 +919,35 @@ _TRANSLATION_ROW_NAMES = {
 
 
 @torch.inference_mode()
+def translation_readout_codes(weights, target_codes, readouts, *, temperature, seed, teacher_codes=None):
+    """Existing mean/MAP/sample readouts with a private categorical RNG."""
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0:
+        raise ValueError("Translation temperature must be finite and positive.")
+    if not readouts or len(set(readouts)) != len(readouts) or any(
+        name not in _TRANSLATION_ROW_NAMES for name in readouts
+    ):
+        raise ValueError("Translation readouts must be a nonempty, unique list of supported readouts.")
+    if "structure_teacher_mean" in readouts and teacher_codes is None:
+        raise ValueError("The structure_teacher_mean readout requires teacher codes.")
+    codes, selections = {}, {}
+    for name in readouts:
+        if name == "conditional_mean":
+            codes[name] = weighted_target_codes(weights, target_codes)
+        elif name == "structure_teacher_mean":
+            codes[name] = teacher_codes[:len(weights)]
+        else:
+            if name == "conditional_map":
+                indices = weights.argmax(1)
+            else:
+                sampling_weights = torch.softmax(weights.clamp_min(1e-12).log() / float(temperature), 1)
+                rng = torch.Generator().manual_seed(int(seed) + 1)
+                indices = torch.multinomial(sampling_weights.cpu(), 1, generator=rng).squeeze(1)
+            codes[name] = target_codes[indices.to(target_codes.device)]
+            selections[name] = indices.cpu()
+    return codes, selections
+
+
+@torch.inference_mode()
 def _save_translation_grid(
     source: DomainEvaluationContext,
     target: DomainEvaluationContext,
@@ -934,6 +971,7 @@ def _save_translation_grid(
     teacher_free_image_options: dict[str, Any] | None = None,
     include_transport_references: bool = False,
     texture_options: dict | None = None,
+    save_generation_inputs: bool = False,
 ) -> dict[str, Any]:
     from diffusion_ot.evaluation.stage1a_eval import decode_vae_latents, integrate_pdae_flow
     from torchvision.utils import save_image
@@ -944,26 +982,9 @@ def _save_translation_grid(
         readouts = ["conditional_mean", "conditional_map", "conditional_sample"]
         if teacher_codes is not None:
             readouts.append("structure_teacher_mean")
-    if not readouts or len(set(readouts)) != len(readouts) or any(
-        name not in _TRANSLATION_ROW_NAMES for name in readouts
-    ):
-        raise ValueError("Translation readouts must be a nonempty, unique list of supported readouts.")
-    if "structure_teacher_mean" in readouts and teacher_codes is None:
-        raise ValueError("The structure_teacher_mean readout requires teacher codes.")
-    code_rows = []
-    for name in readouts:
-        if name == "conditional_mean":
-            codes = weighted_target_codes(weights, target_projection.raw_codes)
-        elif name == "conditional_map":
-            codes = target_projection.raw_codes[weights.argmax(dim=1)]
-        elif name == "conditional_sample":
-            sampling_weights = torch.softmax(weights.clamp_min(1.0e-12).log() / float(temperature), dim=1)
-            sample_generator = torch.Generator().manual_seed(int(seed) + 1)
-            indices = torch.multinomial(sampling_weights.cpu(), 1, generator=sample_generator).squeeze(1)
-            codes = target_projection.raw_codes[indices]
-        else:
-            codes = teacher_codes[:count]
-        code_rows.append(codes)
+    code_map, selections = translation_readout_codes(weights, target_projection.raw_codes, readouts,
+        temperature=temperature, seed=seed, teacher_codes=teacher_codes)
+    code_rows = list(code_map.values())
 
     source_x0 = _load_latents_from_bank(source_query, count).to(source.device, dtype=source.dtype)
     source_images = None
@@ -980,6 +1001,24 @@ def _save_translation_grid(
     rows = [source_images] if include_source else []
     decoded_rows = []
     decoded_metrics: dict[str, Any] = {}
+    if save_generation_inputs:
+        input_path = output_path.with_name(output_path.stem + "_inputs.pt")
+        input_path.parent.mkdir(parents=True, exist_ok=True)
+        generation = dict(version="matched_readouts_v1", query_ids=source_query.sample_ids[:count],
+                          target_ids=target_projection.sample_ids, noise_seed=int(seed),
+                          categorical_seed=int(seed) + 1, num_steps=num_steps,
+                          guidance_scale=guidance_scale, temperature=temperature, readouts=readouts,
+                          noise_device=target.device, noise_dtype=str(noise.dtype))
+        torch.save({"protocol": generation, "noise": noise.detach().cpu(), "weights": weights.cpu(),
+                    "codes": {k: v.detach().cpu() for k, v in code_map.items()},
+                    "selected_indices": selections}, input_path)
+        decoded_metrics["generation_inputs"] = {**generation, "path": str(input_path)}
+        decoded_metrics["readout_selection"] = {
+            name: {"target_ids": [target_projection.sample_ids[i] for i in indices.tolist()],
+                   "unique_targets": int(indices.unique().numel()),
+                   "target_coverage": float(indices.unique().numel() / len(target_projection.sample_ids)),
+                   "maximum_reuse": int(torch.bincount(indices).max())}
+            for name, indices in selections.items()}
     if include_top1_target:
         from diffusion_ot.data.ground_truth import load_ground_truth_images
 
@@ -1503,6 +1542,7 @@ def _run_stage1b_evaluation(
     require_stage1a_baseline: bool | None = None,
     initial_baseline_report: Stage1BEvaluationReport | None = None,
     is_initial_baseline: bool = False,
+    evaluation_cache=None,
 ) -> Stage1BEvaluationReport:
     alignment_path = Path(alignment_config_path).resolve()
     evaluation_path = Path(evaluation_config_path).resolve()
@@ -1577,7 +1617,11 @@ def _run_stage1b_evaluation(
         if not resolved_checkpoint.is_file():
             raise FileNotFoundError(f"Stage 1B checkpoint not found: {resolved_checkpoint}")
 
-    contexts = {
+    if evaluation_cache is not None:
+        evaluation_cache.bind({"alignment": alignment_config, "alignment_path": str(alignment_path),
+                               "checkpoint": file_identity(resolved_checkpoint), "weights": weights,
+                               "devices": [device_cat, device_dog], "root": str(root)})
+    contexts = cached(evaluation_cache, "contexts", {}, lambda: {
         "cat": _load_domain_context(
             alignment_config,
             root,
@@ -1594,7 +1638,7 @@ def _run_stage1b_evaluation(
             joint_weights=weights,
             device_override=device_dog,
         ),
-    }
+    })
     spatial_cost = None
     if spatial_options is not None:
         spatial_cost = contexts["cat"].spatial_cost
@@ -1669,6 +1713,7 @@ def _run_stage1b_evaluation(
     if spatial_cost is not None and (reference_split != "train" or projection_split != "train"):
         raise ValueError("Spatial transport uses training reference and projection banks only.")
     seed = int(evaluation_config.get("seed", 20260906))
+    bank_seed = int(data_config.get("bank_seed", seed))
     batch_size = int(data_config.get("batch_size", 32))
     reference_count = int(max_reference or data_config.get("reference_samples_per_domain", 512))
     configured_projection_count = data_config.get("projection_samples_per_domain")
@@ -1692,19 +1737,20 @@ def _run_stage1b_evaluation(
             domain=domain,
             split=projection_split,
             count=projection_count,
-            seed=seed + domain_index * 1000 + 50,
+            seed=bank_seed + domain_index * 1000 + 50,
             batch_size=batch_size,
             device=context.device,
             dtype=context.dtype,
             checkpoint_id=checkpoint_id,
             matching_head=getattr(context, "matching_head", None),
+            **({"cache": evaluation_cache} if evaluation_cache is not None else {}),
             **spatial_bank_options,
         )
         if reference_split == projection_split:
             banks[domain]["reference"] = subset_latent_bank(
                 banks[domain]["projection"],
                 count=reference_count,
-                seed=seed + domain_index * 1000,
+                seed=bank_seed + domain_index * 1000,
             )
         else:
             banks[domain]["reference"] = build_latent_bank(
@@ -1713,12 +1759,13 @@ def _run_stage1b_evaluation(
                 domain=domain,
                 split=reference_split,
                 count=reference_count,
-                seed=seed + domain_index * 1000,
+                seed=bank_seed + domain_index * 1000,
                 batch_size=batch_size,
                 device=context.device,
                 dtype=context.dtype,
                 checkpoint_id=checkpoint_id,
                 matching_head=getattr(context, "matching_head", None),
+                **({"cache": evaluation_cache} if evaluation_cache is not None else {}),
                 **spatial_bank_options,
             )
         banks[domain]["query"] = build_latent_bank(
@@ -1733,6 +1780,7 @@ def _run_stage1b_evaluation(
             dtype=context.dtype,
             checkpoint_id=checkpoint_id,
             matching_head=getattr(context, "matching_head", None),
+            **({"cache": evaluation_cache} if evaluation_cache is not None else {}),
             **spatial_bank_options,
         )
         validate_bank_compatibility(banks[domain]["reference"], banks[domain]["query"])
@@ -1815,7 +1863,11 @@ def _run_stage1b_evaluation(
         spatial_costs = spatial_cost.costs(reference_matching, spatial_references)
         cross_cost = spatial_costs["mixed"]
     reported_encoder_cost = spatial_costs["encoder"] if spatial_costs is not None else cross_cost
-    solution = solve_infoot(
+    fit_key = dict(reference_ids={d: banks[d]["reference"].sample_ids for d in banks},
+                   scales=scales, bandwidth=bandwidth, infoot=infoot_config, device=alignment_device,
+                   prior=prior.fingerprint if prior is not None else None,
+                   spatial=spatial_cost.metadata() if spatial_cost is not None else None)
+    solution = cached(evaluation_cache, "fit", fit_key, lambda: solve_infoot(
         cat_features,
         dog_features,
         bandwidth=bandwidth,
@@ -1824,7 +1876,7 @@ def _run_stage1b_evaluation(
         cross_cost=cross_cost,
         cross_cost_weight=float(infoot_config.get("cross_cost_weight", 1.0)),
         **solver_kwargs(infoot_config),
-    )
+    ))
 
     banks_dir = output_root / "banks"
     for domain in ("cat", "dog"):
@@ -1885,8 +1937,11 @@ def _run_stage1b_evaluation(
     if source_selection is not None:
         from diffusion_ot.data.ground_truth import load_ground_truth_images
         for d, context in contexts.items():
-            selection_appearance[d] = {kind: source_selection.appearance(load_ground_truth_images(
-                context.data_config_path, banks[d][kind].metadata)).to(alignment_device)
+            selection_appearance[d] = {kind: cached(evaluation_cache, "appearance",
+                {"domain": d, "ids": banks[d][kind].sample_ids, "selection": source_selection.state_dict(),
+                 "device": alignment_device},
+                lambda: source_selection.appearance(load_ground_truth_images(
+                    context.data_config_path, banks[d][kind].metadata)).to(alignment_device))
                 for kind in ("query", "projection")}
     for name in projection_config.get("directions", list(directions)):
         source_domain, target_domain, coupling = directions[str(name)]
@@ -2081,12 +2136,13 @@ def _run_stage1b_evaluation(
                 num_steps=int(translation_config.get("num_steps", 50)),
                 guidance_scale=float(translation_config.get("guidance_scale", 1.0)),
                 temperature=float(translation_config.get("temperature", 1.0)),
-                seed=seed + (30 if name == "cat_to_dog" else 40),
+                seed=int(translation_config.get("seed", seed)) + (30 if name == "cat_to_dog" else 40),
                 output_path=path,
                 teacher_codes=teacher_codes,
                 readouts=readouts,
                 include_source=include_source,
                 include_top1_target=include_top1_target,
+                **({"save_generation_inputs": True} if translation_config.get("save_generation_inputs", False) else {}),
                 **({"image_features": image_features} if image_features is not None else {}),
                 **({"color_histogram": translation_config["color_histogram"]}
                    if translation_config.get("color_histogram") is not None else {}),

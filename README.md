@@ -824,6 +824,83 @@ before producing deltas; a missing initial checkpoint is reported rather than
 replaced by uncalibrated Stage 1A weights. The new audit protocol versions output
 directories, so older reports must be rerun for a matched comparison.
 
+### Cached Stage 1B checkpoint/readout screen (P1)
+
+Run the E0 screen with frozen EMA checkpoints at steps 0, 2,500, 5,000 and 8,000:
+
+```bash
+python scripts/screen_infoot_checkpoints.py run \
+  --alignment-config configs/stage1b_infoot/self_supervised_infonce_v6_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_infonce_v6_sit_b2.yaml \
+  --checkpoint-dir outputs/stage1b_nce_v6/checkpoints \
+  --output-dir outputs/stage1b_v6_p1_screen
+```
+
+The default screen uses projection bandwidths **0.15, 0.20, 0.25 and 0.35**,
+the existing conditional mean/MAP/sample readouts, 20 integration steps, 16
+generated images per direction and **three fixed categorical/noise draws**.
+Bandwidth 0.10 is excluded because the earlier visual screen found behavior
+similar to top-1 selection. Keep 0.25 as the primary existing control and 0.35 as
+the broader, blurrier control. Fit bandwidth (0.55), entropy epsilon, checkpoint
+RMS scales and source-selection calibration stay fixed. This does not implement
+tempered means, an adaptive controller, training changes or the P1a diagnostic.
+
+Use `--checkpoints PATH ...` for an explicit list (saved step 0 first), or
+`--checkpoint-steps 0 8000` to narrow a directory run. Missing requested files
+fail preflight; checkpoints are never silently substituted. With step 0 first,
+every later variant receives its own protocol-matched initial comparison.
+Otherwise, the report explicitly records any missing initial comparison.
+
+Models, encoded banks, source appearance descriptors and the fitted transport
+plan are cached **within the process for one checkpoint**. Each new checkpoint
+gets fresh models/features/fit; changed reference-bank or fit settings also
+invalidate the relevant cache entries. Existing `.pt` files are not blindly
+reloaded. Query IDs and generation seeds stay fixed across checkpoints and
+bandwidths. All readouts in a draw receive the same starting noise; categorical
+selection uses a separate private generator. The model's normalization is unchanged.
+
+After image/metric review, explicitly name the finalist bandwidth/readout pairs.
+For example, the following is command syntax, **not a measured winner selection**:
+
+```bash
+python scripts/screen_infoot_checkpoints.py run \
+  --alignment-config configs/stage1b_infoot/self_supervised_infonce_v6_sit_b2.yaml \
+  --eval-config configs/stage1b_eval/self_supervised_infonce_v6_sit_b2.yaml \
+  --checkpoint-dir outputs/stage1b_nce_v6/checkpoints --checkpoint-steps 0 8000 \
+  --finalist 0.25:conditional_mean --finalist 0.20:conditional_map \
+  --output-dir outputs/stage1b_v6_p1_finalists
+```
+
+Finalists default to **64 images, 20 and 40 steps, and three fixed draws**, using
+only the named pairs. `--samples`, `--num-steps` and `--draws` override these
+settings. Optional `--bank-seeds SEED1 SEED2 SEED3` runs a separate robustness
+screen: it changes reference/gallery selection while preserving query and noise
+seeds. Bank size remains the evaluation recipe's setting (224 for v6); a larger
+bank belongs in a separate evaluation recipe and output directory.
+
+The output contains `screen_manifest.json` (axes, reports, baseline status and
+cache hit/miss counts), effective YAML recipes, and `screen_summary.json/.md`.
+Each normal evaluation directory retains the P0 tensors and numeric controls;
+repeated UMAP rendering is disabled for the sweep. Translation files named
+`*_grid_inputs.pt` record the exact starting noise, code inputs, corrected
+weights, selected target indices, ordered IDs, seeds, dtype and integration
+settings. Reports include target reuse/coverage for MAP/sample. The summary
+checks complete saved protocols before computing paired image-loss intervals
+for bandwidth or 20/40-step comparisons. Texture discrepancy is an aggregate
+diagnostic and does not receive a per-image interval.
+
+To compare copied reports without the checkpoint/data dependencies:
+
+```bash
+python scripts/screen_infoot_checkpoints.py summarize \
+  --results-dir results/v6.5-p0 \
+  --output-dir docs/analysis/stage1b_v6_8000/p1_v65_p0
+```
+
+The supplied 0.35 results improve source RGB/Lab losses while worsening texture
+and visible sharpness. Choose finalists using source fidelity, target anatomy,
+texture and target reuse together; a single scalar loss is insufficient.
+
 ## Method boundary
 
 The transport solver and density-ratio conditional readout follow the
