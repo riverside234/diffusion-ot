@@ -4,20 +4,19 @@ InfoOT solver
 # Author: Ching-Yao Chuang <cychuang@mit.edu>
 # License: MIT License
 
-import numpy as np
+import torch
 import scipy.io
 import ot
 from tqdm import tqdm
-from sklearn.metrics import pairwise_distances
 
 
 def dist(z1, z2, delta=5000):
     x1, x2 = z1[:-1], z2[:-1]
     y1, y2 = z1[-1], z2[-1]
     if y1 != y2:
-        return np.linalg.norm(x1 - x2) + delta
+        return torch.linalg.norm(x1 - x2) + delta
     else:
-        return np.linalg.norm(x1 - x2)
+        return torch.linalg.norm(x1 - x2)
 
 def ratio(P, Kx, Ky):
     '''
@@ -34,12 +33,12 @@ def ratio(P, Kx, Ky):
     '''
     f_x = Kx.sum(1) / Kx.shape[1]
     f_y = Ky.sum(1) / Ky.shape[1]
-    f_x_f_y = np.outer(f_x, f_y)
-    constC = np.zeros((len(Kx), len(Ky)))
+    f_x_f_y = torch.outer(f_x, f_y)
+    constC = Kx.new_zeros((len(Kx), len(Ky)))
     f_xy = -ot.gromov.tensor_product(constC, Kx, Ky, P)
     return f_xy / f_x_f_y
 
-def compute_kernel(Cx, Cy, h):
+def compute_kernel(Cx, Cy, h, Cx_reference=None):
     '''
     compute Gaussian kernel matrices
     Parameters
@@ -52,13 +51,14 @@ def compute_kernel(Cx, Cy, h):
     Kx: source kernel
     Ky: targer kernel
     '''
-    std1 = np.sqrt((Cx**2).mean() / 2)
-    std2 = np.sqrt((Cy**2).mean() / 2)
+    reference = Cx if Cx_reference is None else Cx_reference
+    std1 = torch.sqrt((reference**2).mean() / 2)
+    std2 = torch.sqrt((Cy**2).mean() / 2)
     h1 = h * std1
     h2 = h * std2
     # Gaussian kernel (without normalization)
-    Kx = np.exp(-(Cx / h1)**2 / 2)
-    Ky = np.exp(-(Cy / h2)**2 / 2)
+    Kx = torch.exp(-(Cx / h1)**2 / 2)
+    Ky = torch.exp(-(Cy / h2)**2 / 2)
     return Kx, Ky
 
 def migrad(P, Kx, Ky):
@@ -76,13 +76,13 @@ def migrad(P, Kx, Ky):
     '''
     f_x = Kx.sum(1) / Kx.shape[1]
     f_y = Ky.sum(1) / Ky.shape[1]
-    f_x_f_y = np.outer(f_x, f_y)
-    constC = np.zeros((len(Kx), len(Ky)))
+    f_x_f_y = torch.outer(f_x, f_y)
+    constC = Kx.new_zeros((len(Kx), len(Ky)))
     # there's a negative sign in ot.gromov.tensor_product
     f_xy = -ot.gromov.tensor_product(constC, Kx, Ky, P)
     P_f_xy = P / f_xy
     P_grad = -ot.gromov.tensor_product(constC, Kx, Ky, P_f_xy)
-    P_grad = np.log(f_xy / f_x_f_y) + P_grad
+    P_grad = torch.log(f_xy / f_x_f_y) + P_grad
     return -P_grad
 
 def projection(P, X):
@@ -97,8 +97,8 @@ def projection(P, X):
     ----------
     projected source data
     '''
-    weights = np.sum(P, axis = 1)
-    X_proj = np.matmul(P, X) / weights[:, None]
+    weights = torch.sum(P, dim = 1)
+    X_proj = torch.matmul(P, X) / weights[:, None]
     return X_proj
 
 class FusedInfoOT():
@@ -122,13 +122,13 @@ class FusedInfoOT():
         self.reg = reg
 
         # init kernel
-        self.C = pairwise_distances(Xs, Xt)
+        self.C = torch.cdist(Xs, Xt, compute_mode='donot_use_mm_for_euclid_dist')
         if Ys is not None:
-            Zs = np.concatenate((Xs, Ys.reshape(-1, 1)), axis=1)
-            self.Cs = pairwise_distances(Zs, Zs, metric=dist)
+            Zs = torch.cat((Xs, Ys.reshape(-1, 1)), dim=1)
+            self.Cs = torch.cdist(Zs[:, :-1], Zs[:, :-1], compute_mode='donot_use_mm_for_euclid_dist') + (Zs[:, -1, None] != Zs[None, :, -1]) * 5000
         else:
-            self.Cs = pairwise_distances(Xs, Xs)
-        self.Ct = pairwise_distances(Xt, Xt)
+            self.Cs = torch.cdist(Xs, Xs, compute_mode='donot_use_mm_for_euclid_dist')
+        self.Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
         self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h)
         self.P = None
 
@@ -136,21 +136,23 @@ class FusedInfoOT():
         '''
         solve projected gradient descent via sinkhorn iteration
         '''
-        p = np.zeros(len(self.Xs)) + 1. / len(self.Xs)
-        q = np.zeros(len(self.Xt)) + 1. / len(self.Xt)
-        P = np.outer(p, q)
+        p = self.Xs.new_zeros(len(self.Xs)) + 1. / len(self.Xs)
+        q = self.Xt.new_zeros(len(self.Xt)) + 1. / len(self.Xt)
+        P = torch.outer(p, q)
         if verbose:
             print('solve projected gradient descent...')
             for i in tqdm(range(numIter)):
                 grad_P = migrad(P, self.Ks, self.Kt)
-                P = ot.bregman.sinkhorn(p, q, self.C + self.lam * grad_P, reg=self.reg)
+                P = ot.bregman.sinkhorn(p, q, self.C + self.lam * grad_P,
+                                       reg=self.reg, method='sinkhorn_log', stopThr=1e-4)
         else:
             for i in range(numIter):
                 grad_P = migrad(P, self.Ks, self.Kt)
-                P = ot.bregman.sinkhorn(p, q, self.C + self.lam * grad_P, reg=self.reg)
+                P = ot.bregman.sinkhorn(p, q, self.C + self.lam * grad_P,
+                                       reg=self.reg, method='sinkhorn_log', stopThr=1e-4)
         self.P = P
         return P
-
+    """
     def project(self, X, method='barycentric', h=None):
         if method not in ['conditional', 'barycentric']:
             raise Exception('only suppot conditional or barycebtric projection')
@@ -160,7 +162,7 @@ class FusedInfoOT():
         if h is None:
             h = self.h
 
-        if np.array_equal(X, self.Xs):
+        if torch.equal(X, self.Xs):
             if method == 'conditional':
                 if h == self.h:
                     P = ratio(self.P, self.Ks, self.Kt)
@@ -172,21 +174,20 @@ class FusedInfoOT():
             return projection(P, self.Xt)
         else:
             if method == 'conditional':
-                _Cs = pairwise_distances(X, Xs)
-                _Ct = pairwise_distances(Xt, Xt)
+                _Cs = torch.cdist(X, Xs, compute_mode='donot_use_mm_for_euclid_dist')
+                _Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
                 _Ks, _Kt = compute_kernel(_Cs, _Ct, h)
 
                 P = ratio(P, _Ks, _Kt)
                 return projection(P, self.Xt)
             else:
                 raise Exception('barycentric cannot generalize to new samples')
-
+"""
     def conditional_score(self, X, h=None):
         if h is None:
             h = self.h
-        _Cs = pairwise_distances(X, self.Xs)
-        _Ct = pairwise_distances(self.Xt, self.Xt)
-        _Ks, _Kt = compute_kernel(_Cs, _Ct, h)
+        _Cs = torch.cdist(X, self.Xs, compute_mode='donot_use_mm_for_euclid_dist')
+        _Ks, _Kt = compute_kernel(_Cs, self.Ct, h, Cx_reference=self.Cs)
         return ratio(self.P, _Ks, _Kt)
 
 
@@ -207,8 +208,8 @@ class InfoOT():
         self.reg = reg
 
         # init kernel
-        self.Cs = pairwise_distances(Xs, Xs)
-        self.Ct = pairwise_distances(Xt, Xt)
+        self.Cs = torch.cdist(Xs, Xs, compute_mode='donot_use_mm_for_euclid_dist')
+        self.Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
         self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h)
         self.P = None
 
@@ -216,21 +217,23 @@ class InfoOT():
         '''
         solve projected gradient descent via sinkhorn iteration
         '''
-        p = np.zeros(len(self.Xs)) + 1. / len(self.Xs)
-        q = np.zeros(len(self.Xt)) + 1. / len(self.Xt)
-        P = np.outer(p, q)
+        p = self.Xs.new_zeros(len(self.Xs)) + 1. / len(self.Xs)
+        q = self.Xt.new_zeros(len(self.Xt)) + 1. / len(self.Xt)
+        P = torch.outer(p, q)
         if verbose:
             print('solve projected gradient descent...')
             for i in tqdm(range(numIter)):
                 grad_P = migrad(P, self.Ks, self.Kt)
-                P = ot.bregman.sinkhorn(p, q, grad_P, reg=self.reg)
+                P = ot.bregman.sinkhorn(p, q, grad_P, reg=self.reg,
+                                       method='sinkhorn_log', stopThr=1e-4)
         else:
             for i in range(numIter):
                 grad_P = migrad(P, self.Ks, self.Kt)
-                P = ot.bregman.sinkhorn(p, q, grad_P, reg=self.reg)
+                P = ot.bregman.sinkhorn(p, q, grad_P, reg=self.reg,
+                                       method='sinkhorn_log', stopThr=1e-4)
         self.P = P
         return P
-
+    """
     def project(self, X, method='barycentric', h=None):
         if method not in ['conditional', 'barycentric']:
             raise Exception('only suppot conditional or barycebtric projection')
@@ -240,7 +243,7 @@ class InfoOT():
         if h is None:
             h = self.h
 
-        if np.array_equal(X, self.Xs):
+        if torch.equal(X, self.Xs):
             if method == 'conditional':
                 if h == self.h:
                     P = ratio(self.P, self.Ks, self.Kt)
@@ -252,19 +255,19 @@ class InfoOT():
             return projection(P, self.Xt)
         else:
             if method == 'conditional':
-                _Cs = pairwise_distances(X, Xs)
-                _Ct = pairwise_distances(Xt, Xt)
+                _Cs = torch.cdist(X, Xs, compute_mode='donot_use_mm_for_euclid_dist')
+                _Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
                 _Ks, _Kt = compute_kernel(_Cs, _Ct, h)
 
                 P = ratio(P, _Ks, _Kt)
                 return projection(P, self.Xt)
             else:
                 raise Exception('barycentric cannot generalize to new samples')
+"""
 
     def conditional_score(self, X, h=None):
         if h is None:
             h = self.h
-        _Cs = pairwise_distances(X, self.Xs)
-        _Ct = pairwise_distances(self.Xt, self.Xt)
-        _Ks, _Kt = compute_kernel(_Cs, _Ct, h)
+        _Cs = torch.cdist(X, self.Xs, compute_mode='donot_use_mm_for_euclid_dist')
+        _Ks, _Kt = compute_kernel(_Cs, self.Ct, h, Cx_reference=self.Cs)
         return ratio(self.P, _Ks, _Kt)
