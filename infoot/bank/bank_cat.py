@@ -34,7 +34,7 @@ encoder = encoder.to(device).eval()
 encoder.requires_grad_(False)
 
 
-latent_dir = ROOT / "data/latents/afhq_sit_b2_256"
+latent_dir = ROOT / "data/latents/afhq_sit_b2_256/cat_train"
 latent_paths = sorted(latent_dir.glob("*.pt"))
 if not latent_paths:
     raise FileNotFoundError(f"No saved latents found in {latent_dir}")
