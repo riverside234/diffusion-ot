@@ -15,6 +15,7 @@ from diffusion_ot.evaluation.stage1a_eval import (
     decode_vae_latents,
 )
 from infoot_test_helper import generate_and_save_grid
+from diffusion_ot.data.latent_dataset import load_latent_tensor
 
 import argparse
 
@@ -80,24 +81,37 @@ solver = infoot.InfoOT(Xs, Xt, h=args.h, reg=args.reg)
 solver.P = P.to(dtype=Xs.dtype)
 assert solver.P.shape == (len(Xs), len(Xt))
 
-count = 8 #at least 8 images for test
+count = 8
+latent_dir = ROOT / "data/latents/afhq_sit_b2_256/cat_val"
+paths = sorted(latent_dir.glob("*.pt"))[:count]
+if len(paths) < count:
+    raise ValueError(f"Need {count} validation latents in {latent_dir}")
+
+cat = load_stage1a_evaluator(
+    ROOT / "configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml",
+    ROOT / "configs/stage1a_eval/residual_sit_b2_256.yaml",
+    device=device,
+    weights="raw",
+    checkpoint_path=cat_bank["checkpoint_path"],
+)
 
 with torch.no_grad():
-    scores = solver.conditional_score(Xs[:count])
+    x0 = torch.stack([load_latent_tensor(path) for path in paths])
+    x0 = x0.to(device=cat.device, dtype=cat.model_dtype)
+    v_cat = cat.branch.encode(x0).to(Xs)
+
+    scores = solver.conditional_score(v_cat)
     v_dog = infoot.projection(scores, Xt)
+
+del cat
 
 records = {
     record["sample_id"]: record
-    for record in read_jsonl(ROOT / "data/manifests/cat_train.jsonl")
+    for record in read_jsonl(ROOT / "data/manifests/cat_val.jsonl")
 }
-selected = [
-    records[Path(path).stem]
-    for path in cat_bank["latent_paths"][:count]
-]
-
 cat_images = load_ground_truth_images(
     ROOT / "configs/data/afhq_huggan.yaml",
-    selected,
+    [records[path.stem] for path in paths],
 )
 
 dog = load_stage1a_evaluator(
