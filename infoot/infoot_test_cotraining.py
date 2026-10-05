@@ -88,9 +88,11 @@ cat, dog, Xs, Xt, P = prepare_cotraining_test(
     reg=args.reg,
 )
 
-count = 8
+count = 16
 latent_dir = ROOT / "data/latents/afhq_sit_b2_256/cat_val"
 paths = sorted(latent_dir.glob("*.pt"))[:count]
+if len(paths) < count:
+    raise ValueError(f"Need {count} validation latents in {latent_dir}")
 
 with torch.no_grad():
     v_cat = encode_paths(cat, paths)

@@ -81,7 +81,7 @@ solver = infoot.InfoOT(Xs, Xt, h=args.h, reg=args.reg)
 solver.P = P.to(dtype=Xs.dtype)
 assert solver.P.shape == (len(Xs), len(Xt))
 
-count = 8
+count = 16
 latent_dir = ROOT / "data/latents/afhq_sit_b2_256/cat_val"
 paths = sorted(latent_dir.glob("*.pt"))[:count]
 if len(paths) < count:
