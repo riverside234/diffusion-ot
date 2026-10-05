@@ -66,7 +66,7 @@ def generate_and_save_grid(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_image(grid, str(output_path), nrow=2, padding=8)
+    save_image(grid, str(output_path), nrow=len(cat_image), padding=8)
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
