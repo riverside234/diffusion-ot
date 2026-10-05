@@ -6,7 +6,9 @@ from diffusion_ot.evaluation.stage1a_eval import (
     integrate_pdae_flow,
     decode_vae_latents,
 )
-
+from diffusion_ot.data.latent_dataset import load_latent_tensor
+from diffusion_ot.evaluation.stage1a_eval import load_stage1a_evaluator
+from .infoot_cotraining_helper import fit_transport
 
 @torch.inference_mode()
 def generate_and_save_grid(
@@ -39,3 +41,38 @@ def generate_and_save_grid(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_image(grid.clamp(0, 1), str(output_path), nrow=4, padding=8)
+
+#functions for co-training test (load co-training checkpoints)
+@torch.no_grad()
+def encode_paths(domain, paths, batch_size=32):
+    features = []
+    for start in range(0, len(paths), batch_size):
+        x0 = torch.stack([
+            load_latent_tensor(path)
+            for path in paths[start:start + batch_size]
+        ]).to(device=domain.device, dtype=domain.model_dtype)
+        features.append(domain.branch.encode(x0).float())
+    return torch.cat(features)
+
+
+def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02):
+    models, features = {}, {}
+
+    for name, bank in banks.items():
+        models[name] = load_stage1a_evaluator(
+            root / f"configs/stage1a_pdae/{name}_sit_b2_lora_residual_cosmap.yaml",
+            root / "configs/stage1a_eval/residual_sit_b2_256.yaml",
+            device=device,
+            weights="raw",
+            checkpoint_path=(
+                root / "outputs/infoot_cotraining"
+                / f"{name}_step_{step:06d}.pt"
+            ),
+        )
+        features[name] = encode_paths(models[name], bank["latent_paths"])
+
+    Xs, Xt = features["cat"], features["dog"]
+    P = fit_transport(
+        Xs, Xt, h=h, reg=reg, mi_weight=0.10, iterations=1200
+    )
+    return models["cat"], models["dog"], Xs, Xt, P

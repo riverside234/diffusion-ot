@@ -225,12 +225,12 @@ class InfoOT():
             for i in tqdm(range(numIter)):
                 grad_P = migrad(P, self.Ks, self.Kt)
                 P = ot.bregman.sinkhorn(p, q, grad_P, reg=self.reg,
-                                       method='sinkhorn_log', stopThr=1e-4)
+                                       method='sinkhorn_log', numItermax=3000, stopThr=1e-4)
         else:
             for i in range(numIter):
                 grad_P = migrad(P, self.Ks, self.Kt)
                 P = ot.bregman.sinkhorn(p, q, grad_P, reg=self.reg,
-                                       method='sinkhorn_log', stopThr=1e-4)
+                                       method='sinkhorn_log', numItermax=3000, stopThr=1e-4)
         self.P = P
         return P
     """

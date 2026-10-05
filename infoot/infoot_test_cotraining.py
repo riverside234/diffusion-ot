@@ -14,15 +14,25 @@ from diffusion_ot.evaluation.stage1a_eval import (
     integrate_pdae_flow,
     decode_vae_latents,
 )
-from infoot_helper.infoot_test_helper import generate_and_save_grid
+from infoot_helper.infoot_test_helper import (
+    encode_paths,
+    prepare_cotraining_test,
+    generate_and_save_grid,
+)
 from diffusion_ot.data.latent_dataset import load_latent_tensor
 
 import argparse
+
+from infoot_helper.infoot_cotraining_helper import (
+    conditional_mapping,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--h", type=float, default=0.4)
 parser.add_argument("--reg", type=float, default=0.02)
 parser.add_argument("--save", type=str, default="1")
+parser.add_argument("--step", type=int, default=2000)
+
 args = parser.parse_args()
 
 @torch.inference_mode()
@@ -68,42 +78,25 @@ cat_bank = torch.load(
 dog_bank = torch.load(
     bank_dir / "dog_bank.pt", map_location="cpu", weights_only=True
 )
-P = torch.load(
-    bank_dir / "cat_to_dog_plan.pt",
-    map_location=device,
-    weights_only=True,
+
+cat, dog, Xs, Xt, P = prepare_cotraining_test(
+    ROOT,
+    {"cat": cat_bank, "dog": dog_bank},
+    step=args.step,
+    device=device,
+    h=args.h,
+    reg=args.reg,
 )
-
-Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
-Xt = dog_bank["v_bank"].to(device=device, dtype=torch.float32)
-
-solver = infoot.InfoOT(Xs, Xt, h=args.h, reg=args.reg)
-solver.P = P.to(dtype=Xs.dtype)
-assert solver.P.shape == (len(Xs), len(Xt))
 
 count = 8
 latent_dir = ROOT / "data/latents/afhq_sit_b2_256/cat_val"
 paths = sorted(latent_dir.glob("*.pt"))[:count]
-if len(paths) < count:
-    raise ValueError(f"Need {count} validation latents in {latent_dir}")
-
-cat = load_stage1a_evaluator(
-    ROOT / "configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml",
-    ROOT / "configs/stage1a_eval/residual_sit_b2_256.yaml",
-    device=device,
-    weights="raw",
-    checkpoint_path=cat_bank["checkpoint_path"],
-)
 
 with torch.no_grad():
-    x0 = torch.stack([load_latent_tensor(path) for path in paths])
-    x0 = x0.to(device=cat.device, dtype=cat.model_dtype)
-    v_cat = cat.branch.encode(x0).to(Xs)
-
-    scores = solver.conditional_score(v_cat)
-    v_dog = infoot.projection(scores, Xt)
-
-del cat
+    v_cat = encode_paths(cat, paths)
+    v_dog = conditional_mapping(
+        v_cat, Xs, Xt, P, h=args.h
+    )
 
 records = {
     record["sample_id"]: record
@@ -122,6 +115,9 @@ dog = load_stage1a_evaluator(
     checkpoint_path=dog_bank["checkpoint_path"],
 )
 
-output_path = ROOT / f"results/infoot_test/cat_to_dog_test_{args.save}.png"
+output_path = ROOT / (
+    f"results/infoot_test/"
+    f"cotraining_step_{args.step:06d}_{args.save}.png"
+)
 generate_and_save_grid(dog, v_dog, cat_images, output_path)
 print("Saved:", output_path)
