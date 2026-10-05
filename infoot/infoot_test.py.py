@@ -14,10 +14,19 @@ from diffusion_ot.evaluation.stage1a_eval import (
     integrate_pdae_flow,
     decode_vae_latents,
 )
+from infoot_test_helper import generate_and_save_grid
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--h", type=float, default=0.4)
+parser.add_argument("--reg", type=float, default=0.02)
+parser.add_argument("--save", type=str, default="1")
+args = parser.parse_args()
 
 @torch.inference_mode()
 def generate_and_save_grid(
-    dog, v_dog, cat_image, output_path, steps=50, seed=0
+    dog, v_dog, cat_image, output_path, steps=20, seed=0
 ):
     v_dog = v_dog.to(device=dog.device, dtype=dog.model_dtype)
     generator = torch.Generator(device=dog.device).manual_seed(seed)
@@ -67,25 +76,28 @@ P = torch.load(
 Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
 Xt = dog_bank["v_bank"].to(device=device, dtype=torch.float32)
 
-solver = infoot.InfoOT(Xs, Xt, h=0.5, reg=0.05)
+solver = infoot.InfoOT(Xs, Xt, h=args.h, reg=args.reg)
 solver.P = P.to(dtype=Xs.dtype)
 assert solver.P.shape == (len(Xs), len(Xt))
 
-index = 0
+count = 8 #at least 8 images for test
 
 with torch.no_grad():
-    v_cat = Xs[index:index + 1]
-    scores = solver.conditional_score(v_cat)
+    scores = solver.conditional_score(Xs[:count])
     v_dog = infoot.projection(scores, Xt)
 
-#select a cat from bank
-sample_id = Path(cat_bank["latent_paths"][index]).stem
-records = read_jsonl(ROOT / "data/manifests/cat_train.jsonl")
-record = next(r for r in records if r["sample_id"] == sample_id)
+records = {
+    record["sample_id"]: record
+    for record in read_jsonl(ROOT / "data/manifests/cat_train.jsonl")
+}
+selected = [
+    records[Path(path).stem]
+    for path in cat_bank["latent_paths"][:count]
+]
 
-cat_image = load_ground_truth_images(
+cat_images = load_ground_truth_images(
     ROOT / "configs/data/afhq_huggan.yaml",
-    [record],
+    selected,
 )
 
 dog = load_stage1a_evaluator(
@@ -96,7 +108,6 @@ dog = load_stage1a_evaluator(
     checkpoint_path=dog_bank["checkpoint_path"],
 )
 
-output_path = ROOT / "results/infoot_test" / f"{sample_id}_cat_to_dog.png"
-generate_and_save_grid(dog, v_dog, cat_image, output_path)
-
+output_path = ROOT / f"results/infoot_test/cat_to_dog_test_{args.save}.png"
+generate_and_save_grid(dog, v_dog, cat_images, output_path)
 print("Saved:", output_path)

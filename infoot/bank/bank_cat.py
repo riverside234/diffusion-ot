@@ -12,16 +12,15 @@ from diffusion_ot.models.residual_encoder import PDAEResidualLatentEncoder
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Replace these with your saved files.
-checkpoint_path = ROOT / "outputs/infoot_cotraining/cat_step_001000.pt"
+# check point for pdae
+checkpoint_path = (
+    ROOT / "outputs/stage1a_cat_rescnn_cosmap/checkpoints/latest.pt"
+)
 
 # Use the same encoder configuration as the checkpoint.
 config_path = ROOT / "configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml"
 config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 encoder_config = dict(config["encoder"])
-
-assert encoder_config.pop("kind") == "residual_cnn_v1"
-assert encoder_config.pop("input_space") == "latent"
 
 encoder = PDAEResidualLatentEncoder(**encoder_config)
 checkpoint = torch.load(

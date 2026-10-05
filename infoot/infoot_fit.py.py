@@ -3,6 +3,14 @@ import torch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--h", type=float, default=0.4)
+parser.add_argument("--reg", type=float, default=0.02)
+args = parser.parse_args()
+
 bank_dir = ROOT / "data/infoot_test"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -17,8 +25,8 @@ Xs = cat_bank["v_bank"].float()
 Xt = dog_bank["v_bank"].float()
 
 with torch.no_grad():
-    solver = infoot.InfoOT(Xs, Xt, h=0.5, reg=0.05)
-    P = solver.solve(numIter=100, verbose=True)
+    solver = infoot.InfoOT(Xs, Xt, h=args.h, reg=args.reg)
+    P = solver.solve(numIter=1200, verbose=True)
 
 torch.save(P.cpu(), bank_dir / "cat_to_dog_plan.pt")
 print("Transport plan:", P.shape)

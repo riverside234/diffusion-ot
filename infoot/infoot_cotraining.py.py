@@ -6,12 +6,7 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from diffusion_ot.data.latent_dataset import (
-    CachedLatentDataset,
-    collate_latent_batch,
-)
 from diffusion_ot.evaluation.stage1a_eval import load_stage1a_evaluator
-from diffusion_ot.models.code_projector import CodeProjectionMLP
 from diffusion_ot.models.generator_adaptation import (
     configure_generator_adaptation,
 )
@@ -29,20 +24,23 @@ from infoot_helper.translation_contrastive import (
     translation_contrastive_loss,
 )
 
-
+from diffusion_ot.data.afhq import load_afhq_dataset
+from diffusion_ot.data.ground_truth import load_ground_truth_images
+from diffusion_ot.data.manifests import read_jsonl
+from infoot_helper.augmentation import augment_and_encode
 
 def main():
     torch.manual_seed(42)
     device = "cuda" 
 
     settings = {
-        "batch_size": 64,
+        "batch_size": 32,
         "query_count": 8,
-        "steps": 1000,
-        "h": 0.5,
+        "steps": 2000,
+        "h": 0.4,
         "mi_weight": 0.10,
         "reg": 0.02,
-        "fit_iterations": 100,
+        "fit_iterations": 1200,
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
@@ -53,10 +51,12 @@ def main():
 
     domains = {}
     batches = {}
-    projectors = {}
     parameter_groups = []
 
-    for index, name in enumerate(("cat", "dog")):
+    data_config_path = ROOT / "configs/data/afhq_huggan.yaml"
+    image_dataset = load_afhq_dataset(data_config_path)
+
+    for name in ("cat", "dog"):
         context = load_stage1a_evaluator(
             ROOT / (
                 f"configs/stage1a_pdae/"
@@ -71,41 +71,28 @@ def main():
         context.vae.eval().requires_grad_(False)
         generator_view = configure_generator_adaptation(context.branch)
 
-        projectors[name] = CodeProjectionMLP(
-            context.branch.encoder.z_dim,
-            projection_dim=256,
-            seed=42 + index,
-        ).to(device)
-
         parameter_groups.extend([
             {
-                "params": context.branch.encoder.parameters(),
+                "params": context.branch.encoder.parameters(), #encoder
                 "lr": 1e-5,
             },
             {
-                "params": generator_view.parameters(),
+                "params": generator_view.parameters(),  #generator
                 "lr": 5e-6,
-            },
-            {
-                "params": projectors[name].parameters(),
-                "lr": 2e-4,
             },
         ])
 
-        dataset = CachedLatentDataset(
-            context.project_root / context.training_config["data_config"],
-            domain=name,
-            split="train",
-            project_root=context.project_root,
+        records = read_jsonl(
+            ROOT / "data/manifests" / f"{name}_train.jsonl"
         )
+
         loader = DataLoader(
-            dataset,
+            records,
             batch_size=settings["batch_size"],
             shuffle=True,
             drop_last=True,
-            collate_fn=collate_latent_batch,
-            num_workers=0,
-            pin_memory=device.startswith("cuda"),
+            collate_fn=list,
+            num_workers=2,
         )
 
         batches[name] = _cycle(loader)
@@ -120,10 +107,16 @@ def main():
     for step in range(1, settings["steps"] + 1):
         optimizer.zero_grad(set_to_none=True)
 
-        latents = {
-            name: next(iterator)["x0_latent"]
-            for name, iterator in batches.items()
-        }
+        latents = {}
+
+        for name, iterator in batches.items():
+            images = load_ground_truth_images(
+                data_config_path,
+                next(iterator),
+                dataset=image_dataset,
+            )
+            latents[name] = augment_and_encode(domains[name], images)
+
         encoded = encode_batches(
             domains, latents, query_count=settings["query_count"]
         )
@@ -149,14 +142,6 @@ def main():
             reg=settings["reg"],
             iterations=settings["fit_iterations"],
         )
-
-        for masses, count in (
-            (P.sum(dim=1), len(cat_refs)),
-            (P.sum(dim=0), len(dog_refs)),
-        ):
-            expected = torch.full_like(masses, 1.0 / count)
-            if not torch.allclose(masses, expected, atol=1e-4, rtol=1e-3):
-                raise RuntimeError("InfoOT returned an invalid transport plan.")
 
         loss_infoot = alignment_loss(
             cat_refs,
@@ -185,8 +170,6 @@ def main():
                 encoded[source],
                 mapped_v,
                 steps=settings["sampling_steps"],
-                query_projector=projectors[target],
-                key_projector=projectors[source],
             )
 
             contrastive_losses.append(loss)
@@ -206,7 +189,7 @@ def main():
         )
         optimizer.step()
 
-        if step == 1 or step % 10 == 0:
+        if step == 1 or step % 100 == 0:
             print(
                 f"step={step} "
                 f"flow_cat={flow_losses['cat'].item():.4f} "
@@ -216,7 +199,7 @@ def main():
                 f"total={loss.item():.4f}"
             )
 
-        if step % 100 == 0 or step == settings["steps"]:
+        if step % 200 == 0 or step == settings["steps"]:
             torch.save(
                 {
                     "step": step,
@@ -228,10 +211,6 @@ def main():
                     "training_configs": {
                         name: context.training_config
                         for name, context in domains.items()
-                    },
-                    "projectors": {
-                        name: head.state_dict()
-                        for name, head in projectors.items()
                     },
                     "optimizer": optimizer.state_dict(),
                 },

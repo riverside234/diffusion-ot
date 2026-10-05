@@ -18,7 +18,7 @@ def save_domain_checkpoints(domains, output_dir, step):
 
 
 @torch.no_grad()
-def fit_transport(v_cat, v_dog, h=0.5, mi_weight=0.10,
+def fit_transport(v_cat, v_dog, h=0.4, mi_weight=0.10,
                   reg=0.02, iterations=100):
     solver = infoot.FusedInfoOT(
         v_cat,
@@ -31,7 +31,7 @@ def fit_transport(v_cat, v_dog, h=0.5, mi_weight=0.10,
 
 
 def alignment_loss(v_cat, v_dog, P, h=0.5,
-                   mi_weight=0.10, eps=1e-8):
+                   mi_weight=0.10, eps=1e-5):
     P = P.detach()
 
     C_cat = torch.cdist(
@@ -49,7 +49,7 @@ def alignment_loss(v_cat, v_dog, P, h=0.5,
     return -mi_weight * mutual_information
 
 
-def conditional_mapping(v_query, v_source, v_target, P, h=0.5):
+def conditional_mapping(v_query, v_source, v_target, P, h=0.4):
     solver = infoot.InfoOT(v_source, v_target, h=h)
     solver.P = P.detach()
 
