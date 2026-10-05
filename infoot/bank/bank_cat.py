@@ -22,6 +22,9 @@ config_path = ROOT / "configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml"
 config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 encoder_config = dict(config["encoder"])
 
+assert encoder_config.pop("kind") == "residual_cnn_v1"
+assert encoder_config.pop("input_space") == "latent"
+
 encoder = PDAEResidualLatentEncoder(**encoder_config)
 checkpoint = torch.load(
     checkpoint_path, map_location="cpu", weights_only=True
