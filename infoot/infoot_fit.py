@@ -10,6 +10,8 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--h", type=float, default=0.4)
 parser.add_argument("--reg", type=float, default=0.02)
+parser.add_argument("--lam", type=float, default=0.1)
+
 args = parser.parse_args()
 
 bank_dir = ROOT / "data/infoot_test"
@@ -30,7 +32,7 @@ with torch.no_grad():
     solver = infoot.FusedInfoOT(
         standardize(Xs, stats["cat"]),
         standardize(Xt, stats["dog"]),
-        h=args.h, reg=args.reg, lam=0.10,
+        h=args.h, reg=args.reg, lam=args.lam,
     )
     P = solver.solve(numIter=1200, verbose=True)
 
