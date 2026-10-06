@@ -29,7 +29,7 @@ Xt = dog_bank["v_bank"].float()
 stats = {"cat": feature_stats(Xs), "dog": feature_stats(Xt)}
 
 with torch.no_grad():
-    solver = infoot.InfoOT(
+    solver = infoot.FusedInfoOT(
         standardize(Xs, stats["cat"]),
         standardize(Xt, stats["dog"]),
         h=args.h, reg=args.reg
