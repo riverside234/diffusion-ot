@@ -1,6 +1,8 @@
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+import runpy
+import sys
 
 import pytest
 import torch
@@ -21,17 +23,11 @@ def local_helpers(monkeypatch):
 @pytest.mark.parametrize("h", [None, 0.8])
 def test_conditional_mapping_is_independent_of_query_batch(local_helpers, solver_name, h):
     infoot, _ = local_helpers
-    from infoot_helper.encoding import feature_stats, standardize
-
     source = torch.arange(4, dtype=torch.float64)[:, None]
     target = 10 * source
-    stats = feature_stats(source)
-    source_m = standardize(source, stats)
-    target_m = standardize(target, feature_stats(target))
-    solver = getattr(infoot, solver_name)(source_m, target_m, h=0.5)
-    solver.P = torch.eye(4) / 4
-    target = target.float()
-    query = standardize(torch.tensor([[0.5], [2.3], [6.0]]), stats)
+    solver = getattr(infoot, solver_name)(source, target, h=0.5)
+    solver.P = torch.eye(4, dtype=source.dtype) / 4
+    query = torch.tensor([[0.5], [2.3], [6.0]], dtype=source.dtype)
     together = infoot.projection(solver.conditional_score(query, h=h), target)
     separately = torch.cat([
         infoot.projection(solver.conditional_score(row[None], h=h), target)
@@ -39,26 +35,20 @@ def test_conditional_mapping_is_independent_of_query_batch(local_helpers, solver
     ])
     torch.testing.assert_close(together, separately)
     kernels = infoot.compute_kernel(
-        solver.Cs, solver.Ct, solver.h if h is None else h, solver.feature_dims
+        solver.Cs, solver.Ct, solver.h if h is None else h
     )
-    torch.testing.assert_close(solver.conditional_score(source_m, h=h),
+    torch.testing.assert_close(solver.conditional_score(source, h=h),
                                infoot.ratio(solver.P, *kernels))
 
 
 def test_conditional_mapping_retains_live_feature_gradients(local_helpers):
     _, helpers = local_helpers
-    from infoot_helper.encoding import feature_stats, standardize
-
     source = torch.tensor([[0.0], [1.0], [2.0], [3.0]], requires_grad=True)
     target = torch.tensor([[0.0], [10.0], [20.0], [30.0]], requires_grad=True)
     query = torch.tensor([[0.5], [2.3]], requires_grad=True)
     plan = (torch.eye(4) / 4).requires_grad_()
-    stats = feature_stats(source)
     helpers.conditional_mapping(
-        standardize(query, stats),
-        standardize(source, stats),
-        standardize(target, feature_stats(target)),
-        plan, v_target=target,
+        query, source, target, plan,
     ).square().mean().backward()
     for features in (query, source, target):
         assert features.grad is not None
@@ -67,7 +57,7 @@ def test_conditional_mapping_retains_live_feature_gradients(local_helpers):
     assert plan.grad is None
 
 
-def test_encoding_uses_only_references_and_preserves_raw_codes(local_helpers):
+def test_encoding_preserves_raw_codes_and_reference_split(local_helpers):
     from infoot_helper.encoding import encode_batches
 
     raw = torch.tensor([
@@ -85,48 +75,39 @@ def test_encoding_uses_only_references_and_preserves_raw_codes(local_helpers):
     for name, v in latents.items():
         torch.testing.assert_close(encoded[name]["v"], v)
         torch.testing.assert_close(encoded[name]["references"]["v"], v[2:])
-        m = encoded[name]["references"]["m"]
-        torch.testing.assert_close(m.mean(0), torch.zeros(3), atol=1e-6, rtol=0)
-        torch.testing.assert_close(m.var(0, unbiased=False), torch.tensor([1., 1., 0.]))
-        assert torch.isfinite(encoded[name]["queries"]["m"]).all()
-        assert encoded[name]["queries"]["m"][0, 0] > 40
-
-    changed = {name: v.clone() for name, v in latents.items()}
-    for v in changed.values():
-        v[1] = 10000
-    other = encode_batches(domains, changed, query_count=2)
-    for name in latents:
-        torch.testing.assert_close(encoded[name]["references"]["m"], other[name]["references"]["m"])
-        torch.testing.assert_close(encoded[name]["queries"]["m"][0], other[name]["queries"]["m"][0])
+        torch.testing.assert_close(encoded[name]["queries"]["v"], v[:2])
+        assert set(encoded[name]["references"]) == {"v"}
+        assert set(encoded[name]["queries"]) == {"x0", "v"}
 
 
-def test_kernel_uses_feature_dimension_not_reference_variance(local_helpers):
+def test_kernel_uses_reference_scale_and_preserves_global_scale_invariance(local_helpers):
     infoot, _ = local_helpers
     source = torch.tensor([[0.0, 2.0], [2.0, 0.0]])
     target = torch.tensor([[0.0, 3.0], [3.0, 0.0]])
-    Kx, Ky = infoot.compute_kernel(source, target, h=0.5, feature_dims=(4, 9))
-    expected = torch.tensor([[1.0, torch.exp(torch.tensor(-2.0))],
-                             [torch.exp(torch.tensor(-2.0)), 1.0]])
+    Kx, Ky = infoot.compute_kernel(source, target, h=0.5)
+    off_diagonal = torch.exp(torch.tensor(-8.0))
+    expected = torch.tensor([[1.0, off_diagonal], [off_diagonal, 1.0]])
     torch.testing.assert_close(Kx, expected)
     torch.testing.assert_close(Ky, expected)
+    scaled = infoot.compute_kernel(source * 10, target * 0.2, h=0.5)
+    torch.testing.assert_close((Kx, Ky), scaled)
+    query = torch.tensor([[1.0, 3.0]])
+    Kq, _ = infoot.compute_kernel(query, target, h=0.5, Cx_reference=source)
+    torch.testing.assert_close(Kq, torch.exp(torch.tensor([[-2.0, -18.0]])))
 
 
-def test_standardized_alignment_matches_fit_and_trains_encoders(local_helpers):
+def test_raw_alignment_matches_fit_and_trains_encoders(local_helpers):
     infoot, helpers = local_helpers
-    from infoot_helper.encoding import feature_stats, standardize
-
     generator = torch.Generator().manual_seed(17)
     scale = torch.logspace(-1, 1, 512)
     source = (torch.randn(24, 512, generator=generator) * scale + 30).requires_grad_()
     target = (torch.randn(24, 512, generator=generator) * scale.flip(0) - 20).requires_grad_()
-    m_source = standardize(source, feature_stats(source))
-    m_target = standardize(target, feature_stats(target))
-    plan = helpers.fit_transport(m_source, m_target, iterations=3)
+    plan = helpers.fit_transport(source, target, iterations=3)
     assert not plan.requires_grad
     plan.requires_grad_()
-    loss = helpers.alignment_loss(m_source, m_target, plan, h=0.4)
+    loss = helpers.alignment_loss(source, target, plan, h=0.4)
     with torch.no_grad():
-        solver = infoot.FusedInfoOT(m_source, m_target, h=0.4, lam=0.1, reg=0.02)
+        solver = infoot.FusedInfoOT(source, target, h=0.4, lam=0.1, reg=0.02)
         expected = infoot.fitting_loss(plan, solver.Ks, solver.Kt, 0.02, C=solver.C, mi_weight=0.1)
     torch.testing.assert_close(loss, expected)
     loss.backward()
@@ -136,37 +117,33 @@ def test_standardized_alignment_matches_fit_and_trains_encoders(local_helpers):
     assert plan.grad is None
 
 
-def test_saved_statistics_preserve_query_mapping_and_raw_target_scale(local_helpers, tmp_path):
+def test_saved_raw_plan_preserves_query_mapping_and_target_scale(local_helpers, tmp_path):
     infoot, helpers = local_helpers
-    from infoot_helper.encoding import feature_stats, standardize
-
     source = torch.tensor([[0., 1.], [1., 2.], [2., 5.], [3., 9.]])
     target = torch.tensor([[20., 100.], [40., 100.], [70., 100.], [90., 100.]])
-    stats = {"cat": feature_stats(source), "dog": feature_stats(target)}
     plan = torch.eye(4) / 4
     path = tmp_path / "plan.pt"
-    infoot.save_plan(path, plan, stats, h=0.4, reg=0.02)
+    infoot.save_plan(path, plan, h=0.4, reg=0.02, lam=0.1)
     saved = torch.load(path, weights_only=True)
     query = torch.tensor([[0.5, 1.5], [2.3, 6.0]])
 
     def mapped(rows, state):
         return helpers.conditional_mapping(
-            standardize(rows, state["stats"]["cat"]),
-            standardize(source, state["stats"]["cat"]),
-            standardize(target, state["stats"]["dog"]),
-            state["P"], v_target=target, h=state["h"],
+            rows, source, target, state["P"], h=state["h"],
         )
 
     together = mapped(query, saved)
     separately = torch.cat([mapped(row[None], saved) for row in query])
-    before = mapped(query, {"P": plan, "stats": stats, "h": 0.4})
+    before = mapped(query, {"P": plan, "h": 0.4})
     torch.testing.assert_close(together, separately)
     torch.testing.assert_close(together, before)
     torch.testing.assert_close(together[:, 1], torch.full((2,), 100.))
     assert saved["h"] == 0.4 and saved["reg"] == 0.02
+    assert saved["lam"] == 0.1 and saved["feature_space"] == "raw"
+    assert "stats" not in saved
 
 
-def test_cotraining_test_saves_stats_for_reencoded_training_banks(local_helpers, tmp_path, monkeypatch):
+def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_path, monkeypatch):
     from infoot_helper import infoot_test_helper as helper
 
     features = {
@@ -183,9 +160,8 @@ def test_cotraining_test_saves_stats_for_reencoded_training_banks(local_helpers,
         return models[name]
 
     def fit(source, target, **kwargs):
-        for matching in (source, target):
-            torch.testing.assert_close(matching.mean(0), torch.zeros(2), atol=1e-6, rtol=0)
-            torch.testing.assert_close(matching.var(0, unbiased=False), torch.ones(2))
+        torch.testing.assert_close(source, features["cat"])
+        torch.testing.assert_close(target, features["dog"])
         return torch.eye(3) / 3
 
     monkeypatch.setattr(helper, "load_stage1a_evaluator", load_model)
@@ -194,15 +170,45 @@ def test_cotraining_test_saves_stats_for_reencoded_training_banks(local_helpers,
     result = helper.prepare_cotraining_test(
         tmp_path, {name: {"latent_paths": []} for name in features}, 2000, "cpu"
     )
-    cat, dog, Xs, Xt, P, stats = result
+    cat, dog, Xs, Xt, P = result
     assert cat is models["cat"] and dog is models["dog"]
     torch.testing.assert_close(Xs, features["cat"])
     torch.testing.assert_close(Xt, features["dog"])
     saved = torch.load(output_dir / "cat_to_dog_step_002000_plan.pt", weights_only=True)
     torch.testing.assert_close(saved["P"], P)
-    for name in features:
-        torch.testing.assert_close(saved["stats"][name], stats[name])
-        torch.testing.assert_close(stats[name][0], features[name].mean(0, keepdim=True))
+    assert saved["feature_space"] == "raw" and "stats" not in saved
+
+
+def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path, monkeypatch):
+    infoot, _ = local_helpers
+    bank_dir = tmp_path / "data/infoot_test"
+    bank_dir.mkdir(parents=True)
+    source = torch.tensor([[10., 30.], [20., 40.], [30., 70.]])
+    target = source * 2 + 5
+    for name, features in (("cat", source), ("dog", target)):
+        torch.save({"v_bank": features}, bank_dir / f"{name}_bank.pt")
+    script = tmp_path / "infoot/infoot_fit.py"
+    script.parent.mkdir()
+    original = Path(__file__).resolve().parents[1] / "infoot/infoot_fit.py"
+    script.write_text(original.read_text(encoding="utf-8"), encoding="utf-8")
+
+    class Solver:
+        def __init__(self, Xs, Xt, h, reg, lam):
+            torch.testing.assert_close(Xs, source)
+            torch.testing.assert_close(Xt, target)
+            assert (h, reg, lam) == (0.4, 0.02, 0.37)
+
+        def solve(self, numIter, verbose):
+            assert numIter == 50 and verbose is True
+            return torch.eye(3) / 3
+
+    monkeypatch.setattr(infoot, "FusedInfoOT", Solver)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(sys, "argv", [str(script), "--lam", "0.37"])
+    runpy.run_path(str(script), run_name="__main__")
+    saved = torch.load(bank_dir / "cat_to_dog_plan.pt", weights_only=True)
+    assert saved["lam"] == 0.37 and saved["feature_space"] == "raw"
+    assert "stats" not in saved
 
 
 @pytest.mark.parametrize("solver_name", ["InfoOT", "FusedInfoOT"])

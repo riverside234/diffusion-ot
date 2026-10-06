@@ -1,5 +1,4 @@
 from infoot_helper import infoot
-from infoot_helper.encoding import standardize
 import torch
 import sys
 from pathlib import Path
@@ -74,18 +73,14 @@ transport = torch.load(
     map_location=device,
     weights_only=True,
 )
-if not isinstance(transport, dict) or "stats" not in transport:
-    raise ValueError("Rerun infoot_fit.py to save a plan with reference statistics.")
-
-stats = transport["stats"]
+if not isinstance(transport, dict) or transport.get("feature_space") != "raw":
+    raise ValueError("Rerun infoot_fit.py to save a plan fitted on raw features.")
 
 Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
 Xt = dog_bank["v_bank"].to(device=device, dtype=torch.float32)
 
-solver = infoot.InfoOT(
-    standardize(Xs, stats["cat"]),
-    standardize(Xt, stats["dog"]),
-    h=transport["h"], reg=transport["reg"],
+solver = infoot.FusedInfoOT(
+    Xs, Xt, h=transport["h"], reg=transport["reg"], lam=transport["lam"],
 )
 solver.P = transport["P"].to(dtype=Xs.dtype)
 assert solver.P.shape == (len(Xs), len(Xt))
@@ -109,7 +104,7 @@ with torch.no_grad():
     x0 = x0.to(device=cat.device, dtype=cat.model_dtype)
     v_cat = cat.branch.encode(x0).to(Xs)
 
-    scores = solver.conditional_score(standardize(v_cat, stats["cat"]))
+    scores = solver.conditional_score(v_cat)
     v_dog = infoot.projection(scores, Xt)
 
 del cat

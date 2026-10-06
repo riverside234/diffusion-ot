@@ -44,19 +44,17 @@ def fitting_loss(P, Kx, Ky, reg, C=None, mi_weight=1.0, eps=1e-8):
     cost = 0.0 if C is None else (P * C).sum()
     return cost - mi_weight * mi - reg * entropy
 
-def save_plan(path, P, stats, h, reg):
+def save_plan(path, P, h, reg, lam):
     torch.save({
         "P": P.detach().cpu(),
-        "stats": {
-            name: tuple(value.detach().cpu() for value in values)
-            for name, values in stats.items()
-        },
+        "feature_space": "raw",
         "h": h,
         "reg": reg,
+        "lam": lam,
     }, path)
 
 
-def compute_kernel(Cx, Cy, h, feature_dims):
+def compute_kernel(Cx, Cy, h, Cx_reference=None):
     '''
     compute Gaussian kernel matrices
     Parameters
@@ -64,14 +62,15 @@ def compute_kernel(Cx, Cy, h, feature_dims):
     Cx: source pairwise distance matrix
     Cy: target pairwise distance matrix
     h : bandwidth
-    feature_dims: source and target feature dimensions
+    Cx_reference: source reference distances for out-of-sample queries
     Returns
     ----------
     Kx: source kernel
     Ky: targer kernel
     '''
-    h1 = h * feature_dims[0] ** 0.5
-    h2 = h * feature_dims[1] ** 0.5
+    reference = Cx if Cx_reference is None else Cx_reference
+    h1 = h * torch.sqrt((reference**2).mean() / 2)
+    h2 = h * torch.sqrt((Cy**2).mean() / 2)
     # Gaussian kernel (without normalization)
     Kx = torch.exp(-(Cx / h1)**2 / 2)
     Ky = torch.exp(-(Cy / h2)**2 / 2)
@@ -136,7 +135,6 @@ class FusedInfoOT():
         self.h = h
         self.lam = lam
         self.reg = reg
-        self.feature_dims = (Xs.shape[1], Xt.shape[1])
 
         # init kernel
         self.C = torch.cdist(Xs, Xt, compute_mode='donot_use_mm_for_euclid_dist')
@@ -146,7 +144,7 @@ class FusedInfoOT():
         else:
             self.Cs = torch.cdist(Xs, Xs, compute_mode='donot_use_mm_for_euclid_dist')
         self.Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
-        self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h, self.feature_dims)
+        self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h)
         self.P = None
    
     def solve(self, numIter=50, verbose='True'):
@@ -213,7 +211,7 @@ class FusedInfoOT():
         if h is None:
             h = self.h
         _Cs = torch.cdist(X, self.Xs, compute_mode='donot_use_mm_for_euclid_dist')
-        _Ks, _Kt = compute_kernel(_Cs, self.Ct, h, self.feature_dims)
+        _Ks, _Kt = compute_kernel(_Cs, self.Ct, h, Cx_reference=self.Cs)
         return ratio(self.P, _Ks, _Kt)
 
 
@@ -232,12 +230,11 @@ class InfoOT():
         self.Xt = Xt
         self.h = h
         self.reg = reg
-        self.feature_dims = (Xs.shape[1], Xt.shape[1])
 
         # init kernel
         self.Cs = torch.cdist(Xs, Xs, compute_mode='donot_use_mm_for_euclid_dist')
         self.Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
-        self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h, self.feature_dims)
+        self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h)
         self.P = None
 
     def solve(self, numIter=100, verbose='True'):
@@ -300,5 +297,5 @@ class InfoOT():
         if h is None:
             h = self.h
         _Cs = torch.cdist(X, self.Xs, compute_mode='donot_use_mm_for_euclid_dist')
-        _Ks, _Kt = compute_kernel(_Cs, self.Ct, h, self.feature_dims)
+        _Ks, _Kt = compute_kernel(_Cs, self.Ct, h, Cx_reference=self.Cs)
         return ratio(self.P, _Ks, _Kt)

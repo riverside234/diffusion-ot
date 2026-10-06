@@ -1,5 +1,4 @@
 from infoot_helper import infoot
-from infoot_helper.encoding import standardize
 import torch
 import sys
 from pathlib import Path
@@ -80,7 +79,7 @@ dog_bank = torch.load(
     bank_dir / "dog_bank.pt", map_location="cpu", weights_only=True
 )
 
-cat, dog, Xs, Xt, P, stats = prepare_cotraining_test(
+cat, dog, Xs, Xt, P = prepare_cotraining_test(
     ROOT,
     {"cat": cat_bank, "dog": dog_bank},
     step=args.step,
@@ -88,8 +87,6 @@ cat, dog, Xs, Xt, P, stats = prepare_cotraining_test(
     h=args.h,
     reg=args.reg,
 )
-m_cat = standardize(Xs, stats["cat"])
-m_dog = standardize(Xt, stats["dog"])
 
 count = 16
 latent_dir = ROOT / "data/latents/afhq_sit_b2_256/cat_val"
@@ -100,8 +97,7 @@ if len(paths) < count:
 with torch.no_grad():
     v_cat = encode_paths(cat, paths)
     v_dog = conditional_mapping(
-        standardize(v_cat, stats["cat"]),
-        m_cat, m_dog, P, v_target=Xt, h=args.h,
+        v_cat, Xs, Xt, P, h=args.h,
     )
 
 records = {

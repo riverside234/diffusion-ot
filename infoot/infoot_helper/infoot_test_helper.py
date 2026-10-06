@@ -9,7 +9,6 @@ from diffusion_ot.evaluation.stage1a_eval import (
 from diffusion_ot.data.latent_dataset import load_latent_tensor
 from diffusion_ot.evaluation.stage1a_eval import load_stage1a_evaluator
 from . import infoot
-from .encoding import feature_stats, standardize
 from .infoot_cotraining_helper import fit_transport
 
 @torch.inference_mode()
@@ -74,14 +73,11 @@ def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02):
         features[name] = encode_paths(models[name], bank["latent_paths"])
 
     Xs, Xt = features["cat"], features["dog"]
-    stats = {name: feature_stats(v) for name, v in features.items()}
     P = fit_transport(
-        standardize(Xs, stats["cat"]),
-        standardize(Xt, stats["dog"]),
-        h=h, reg=reg, mi_weight=0.10, iterations=1200,
+        Xs, Xt, h=h, reg=reg, mi_weight=0.10, iterations=1200,
     )
     infoot.save_plan(
         root / "outputs/infoot_cotraining" / f"cat_to_dog_step_{step:06d}_plan.pt",
-        P, stats, h, reg,
+        P, h, reg, lam=0.10,
     )
-    return models["cat"], models["dog"], Xs, Xt, P, stats
+    return models["cat"], models["dog"], Xs, Xt, P

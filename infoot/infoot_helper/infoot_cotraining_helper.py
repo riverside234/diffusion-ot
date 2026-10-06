@@ -18,11 +18,11 @@ def save_domain_checkpoints(domains, output_dir, step):
 
 
 @torch.no_grad()
-def fit_transport(m_cat, m_dog, h=0.4, mi_weight=0.10,
+def fit_transport(v_cat, v_dog, h=0.4, mi_weight=0.10,
                   reg=0.02, iterations=100):
     solver = infoot.FusedInfoOT(
-        m_cat,
-        m_dog,
+        v_cat,
+        v_dog,
         h=h,
         lam=mi_weight,
         reg=reg,
@@ -31,10 +31,10 @@ def fit_transport(m_cat, m_dog, h=0.4, mi_weight=0.10,
 
 
 def alignment_loss(
-    m_cat, m_dog, P, h=0.5, mi_weight=0.10, eps=1e-5, reg=0.02
+    v_cat, v_dog, P, h=0.5, mi_weight=0.10, eps=1e-5, reg=0.02
 ):
     solver = infoot.FusedInfoOT(
-        m_cat, m_dog, h=h, lam=mi_weight, reg=reg
+        v_cat, v_dog, h=h, lam=mi_weight, reg=reg
     )
     return infoot.fitting_loss(
         P.detach(),
@@ -47,9 +47,9 @@ def alignment_loss(
     )
 
 
-def conditional_mapping(m_query, m_source, m_target, P, v_target, h=0.4):
-    solver = infoot.InfoOT(m_source, m_target, h=h)
+def conditional_mapping(v_query, v_source, v_target, P, h=0.4):
+    solver = infoot.InfoOT(v_source, v_target, h=h)
     solver.P = P.detach()
 
-    scores = solver.conditional_score(m_query)
+    scores = solver.conditional_score(v_query)
     return infoot.projection(scores, v_target)
