@@ -1,4 +1,5 @@
 from infoot_helper import infoot
+from infoot_helper.encoding import standardize
 import torch
 import sys
 from pathlib import Path
@@ -20,8 +21,8 @@ from diffusion_ot.data.latent_dataset import load_latent_tensor
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--h", type=float, default=0.4)
-parser.add_argument("--reg", type=float, default=0.02)
+parser.add_argument("--h", type=float)
+parser.add_argument("--reg", type=float)
 parser.add_argument("--save", type=str, default="1")
 args = parser.parse_args()
 
@@ -68,17 +69,28 @@ cat_bank = torch.load(
 dog_bank = torch.load(
     bank_dir / "dog_bank.pt", map_location="cpu", weights_only=True
 )
-P = torch.load(
+transport = torch.load(
     bank_dir / "cat_to_dog_plan.pt",
     map_location=device,
     weights_only=True,
 )
+if not isinstance(transport, dict) or "stats" not in transport:
+    raise ValueError("Rerun infoot_fit.py to save a plan with reference statistics.")
+for name in ("h", "reg"):
+    value = getattr(args, name)
+    if value is not None and value != transport[name]:
+        raise ValueError(f"--{name} differs from the saved plan; rerun infoot_fit.py.")
+stats = transport["stats"]
 
 Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
 Xt = dog_bank["v_bank"].to(device=device, dtype=torch.float32)
 
-solver = infoot.InfoOT(Xs, Xt, h=args.h, reg=args.reg)
-solver.P = P.to(dtype=Xs.dtype)
+solver = infoot.InfoOT(
+    standardize(Xs, stats["cat"]),
+    standardize(Xt, stats["dog"]),
+    h=transport["h"], reg=transport["reg"],
+)
+solver.P = transport["P"].to(dtype=Xs.dtype)
 assert solver.P.shape == (len(Xs), len(Xt))
 
 count = 16
@@ -100,7 +112,7 @@ with torch.no_grad():
     x0 = x0.to(device=cat.device, dtype=cat.model_dtype)
     v_cat = cat.branch.encode(x0).to(Xs)
 
-    scores = solver.conditional_score(v_cat)
+    scores = solver.conditional_score(standardize(v_cat, stats["cat"]))
     v_dog = infoot.projection(scores, Xt)
 
 del cat

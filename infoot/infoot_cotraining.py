@@ -131,8 +131,8 @@ def main():
         }
         loss_flow = torch.stack(list(flow_losses.values())).mean()
 
-        cat_refs = encoded["cat"]["references"]["v"]
-        dog_refs = encoded["dog"]["references"]["v"]
+        cat_refs = encoded["cat"]["references"]["m"]
+        dog_refs = encoded["dog"]["references"]["m"]
 
         P = fit_transport(
             cat_refs,
@@ -149,6 +149,7 @@ def main():
             P,
             h=settings["h"],
             mi_weight=settings["mi_weight"],
+            reg=settings["reg"],
         )
 
         contrastive_losses = []
@@ -158,10 +159,11 @@ def main():
             ("dog", "cat", P.T),
         ):
             mapped_v = conditional_mapping(
-                encoded[source]["queries"]["v"],
-                encoded[source]["references"]["v"],
-                encoded[target]["references"]["v"],
+                encoded[source]["queries"]["m"],
+                encoded[source]["references"]["m"],
+                encoded[target]["references"]["m"],
                 plan,
+                v_target=encoded[target]["references"]["v"],
                 h=settings["h"],
             )
 

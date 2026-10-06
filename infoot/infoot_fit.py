@@ -1,4 +1,5 @@
 from infoot_helper import infoot
+from infoot_helper.encoding import feature_stats, standardize
 import torch
 from pathlib import Path
 
@@ -23,10 +24,15 @@ dog_bank = torch.load(
 
 Xs = cat_bank["v_bank"].float()
 Xt = dog_bank["v_bank"].float()
+stats = {"cat": feature_stats(Xs), "dog": feature_stats(Xt)}
 
 with torch.no_grad():
-    solver = infoot.InfoOT(Xs, Xt, h=args.h, reg=args.reg)
+    solver = infoot.InfoOT(
+        standardize(Xs, stats["cat"]),
+        standardize(Xt, stats["dog"]),
+        h=args.h, reg=args.reg,
+    )
     P = solver.solve(numIter=1200, verbose=True)
 
-torch.save(P.cpu(), bank_dir / "cat_to_dog_plan.pt")
+infoot.save_plan(bank_dir / "cat_to_dog_plan.pt", P, stats, args.h, args.reg)
 print("Transport plan:", P.shape)
