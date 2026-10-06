@@ -76,10 +76,7 @@ transport = torch.load(
 )
 if not isinstance(transport, dict) or "stats" not in transport:
     raise ValueError("Rerun infoot_fit.py to save a plan with reference statistics.")
-for name in ("h", "reg"):
-    value = getattr(args, name)
-    if value is not None and value != transport[name]:
-        raise ValueError(f"--{name} differs from the saved plan; rerun infoot_fit.py.")
+
 stats = transport["stats"]
 
 Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
