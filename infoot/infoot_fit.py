@@ -9,7 +9,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--h", type=float, default=0.4)
 parser.add_argument("--reg", type=float, default=0.02)
-parser.add_argument("--lam", type=float, default=0.1)
+parser.add_argument("--lam", type=float, default=1)
 
 args = parser.parse_args()
 
@@ -27,10 +27,10 @@ Xs = cat_bank["v_bank"].float()
 Xt = dog_bank["v_bank"].float()
 
 with torch.no_grad():
-    solver = infoot.FusedInfoOT(
-        Xs, Xt, h=args.h, reg=args.reg,lam=args.lam,
+    solver = infoot.InfoOT(
+        Xs, Xt, h=args.h, reg=args.reg,  
     )
-    P = solver.solve(numIter=100, verbose=True)
+    P = solver.solve(numIter=50, verbose=True)
 
 infoot.save_plan(bank_dir / "cat_to_dog_plan.pt", P, args.h, args.reg, args.lam)
 print("Transport plan:", P.shape)
