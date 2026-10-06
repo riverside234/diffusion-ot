@@ -28,7 +28,7 @@ Xt = dog_bank["v_bank"].float()
 
 with torch.no_grad():
     solver = infoot.InfoOT(
-        Xs, Xt, h=args.h, reg=args.reg,  
+        Xs, Xt, h=args.h, reg=args.reg, lam=args.lam, 
     )
     P = solver.solve(numIter=50, verbose=True)
 
