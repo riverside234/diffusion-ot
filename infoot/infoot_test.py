@@ -82,7 +82,7 @@ stats = transport["stats"]
 Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
 Xt = dog_bank["v_bank"].to(device=device, dtype=torch.float32)
 
-solver = infoot.FusedInfoOT(
+solver = infoot.InfoOT(
     standardize(Xs, stats["cat"]),
     standardize(Xt, stats["dog"]),
     h=transport["h"], reg=transport["reg"],

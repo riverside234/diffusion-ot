@@ -253,6 +253,10 @@ class InfoOT():
                 grad_P = migrad(P, self.Ks, self.Kt)
                 P = ot.bregman.sinkhorn(p, q, grad_P, reg=self.reg,
                                        method='sinkhorn_log', numItermax=3000, stopThr=1e-4)
+                
+                loss = fitting_loss(P, self.Ks, self.Kt, reg=self.reg)
+
+                tqdm.write(f"Iteration {i + 1}: loss={loss.item():.6f}")
         else:
             for i in range(numIter):
                 grad_P = migrad(P, self.Ks, self.Kt)
