@@ -102,13 +102,16 @@ def test_raw_alignment_matches_fit_and_trains_encoders(local_helpers):
     scale = torch.logspace(-1, 1, 512)
     source = (torch.randn(24, 512, generator=generator) * scale + 30).requires_grad_()
     target = (torch.randn(24, 512, generator=generator) * scale.flip(0) - 20).requires_grad_()
-    plan = helpers.fit_transport(source, target, iterations=3)
+    diagnostics = {}
+    plan = helpers.fit_transport(source, target, iterations=3, diagnostics=diagnostics)
     assert not plan.requires_grad
     plan.requires_grad_()
     loss = helpers.alignment_loss(source, target, plan, h=0.4)
     with torch.no_grad():
         solver = infoot.FusedInfoOT(source, target, h=0.4, lam=0.1, reg=0.02)
+        torch.testing.assert_close(plan, solver.solve(numIter=3, verbose=False), rtol=0, atol=0)
         expected = infoot.fitting_loss(plan, solver.Ks, solver.Kt, 0.02, C=solver.C, mi_weight=0.1)
+    assert diagnostics["initialization"] == "uniform"
     torch.testing.assert_close(loss, expected)
     loss.backward()
     for features in (source, target):
@@ -165,8 +168,9 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
     def fit(source, target, **kwargs):
         torch.testing.assert_close(source, features["cat"])
         torch.testing.assert_close(target, features["dog"])
-        assert kwargs["restarts"] == 6
-        kwargs["diagnostics"].update(solver="FusedInfoOT", selected="uniform")
+        assert kwargs == {"h": 0.4, "reg": 0.02, "mi_weight": 0.1,
+                          "iterations": 1200, "diagnostics": {}}
+        kwargs["diagnostics"].update(solver="FusedInfoOT", initialization="uniform")
         return torch.eye(3) / 3
 
     monkeypatch.setattr(helper, "load_stage1a_evaluator", load_model)
@@ -186,7 +190,6 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
 
 def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path, monkeypatch):
     infoot, _ = local_helpers
-    from infoot_helper.transport import multistart
     bank_dir = tmp_path / "data/infoot_test"
     bank_dir.mkdir(parents=True)
     source = torch.tensor([[10., 30.], [20., 40.], [30., 70.]])
@@ -198,30 +201,28 @@ def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path
     original = Path(__file__).resolve().parents[1] / "infoot/infoot_fit.py"
     script.write_text(original.read_text(encoding="utf-8"), encoding="utf-8")
 
+    calls = []
+
     class Solver:
         def __init__(self, Xs, Xt, h, reg, lam):
             torch.testing.assert_close(Xs, source)
             torch.testing.assert_close(Xt, target)
             assert (h, reg, lam) == (0.4, 0.02, 0.37)
 
-    def fit(solver, **kwargs):
-        assert kwargs == {"numIter": 50, "restarts": 4, "seed": 8,
-                          "continuation": True, "sinkhorn_iter": 5000,
-                          "marginal_tol": 1e-4}
-        solver.diagnostics_ = {"solver": "FusedInfoOT", "selected": "random_4"}
-        return torch.eye(3) / 3
+        def solve(self, **kwargs):
+            calls.append(kwargs)
+            self.diagnostics_ = {"solver": "FusedInfoOT", "initialization": "uniform"}
+            return torch.eye(3) / 3
 
     monkeypatch.setattr(infoot, "FusedInfoOT", Solver)
-    monkeypatch.setattr(multistart, "solve_multistart", fit)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(sys, "argv", [str(script), "--lam", "0.37",
-                                     "--restarts", "4", "--seed", "8",
-                                     "--continuation"])
+    monkeypatch.setattr(sys, "argv", [str(script), "--lam", "0.37"])
     runpy.run_path(str(script), run_name="__main__")
+    assert calls == [{"numIter": 50, "sinkhorn_iter": 5000, "marginal_tol": 1e-4}]
     saved = torch.load(bank_dir / "cat_to_dog_plan.pt", weights_only=True)
     assert saved["lam"] == 0.37 and saved["feature_space"] == "raw"
     assert "stats" not in saved
-    assert saved["optimization"]["selected"] == "random_4"
+    assert saved["optimization"]["initialization"] == "uniform"
     assert saved["banks"]["cat"]["sha256"]
 
 

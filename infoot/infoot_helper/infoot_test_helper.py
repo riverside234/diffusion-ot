@@ -58,7 +58,7 @@ def encode_paths(domain, paths, batch_size=32):
 
 
 def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02,
-                           restarts=6, iterations=1200, seed=0):
+                           iterations=1200):
     models, features = {}, {}
 
     for name, bank in banks.items():
@@ -77,8 +77,7 @@ def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02,
     Xs, Xt = features["cat"], features["dog"]
     diagnostics = {}
     P = fit_transport(Xs, Xt, h=h, reg=reg, mi_weight=0.10,
-                      iterations=iterations, restarts=restarts, seed=seed,
-                      diagnostics=diagnostics)
+                      iterations=iterations, diagnostics=diagnostics)
     references = {
         name: {"latent_paths": banks[name]["latent_paths"],
                "checkpoint_at_fit": file_identity(model.checkpoint_path)}

@@ -1,5 +1,4 @@
 from infoot_helper import infoot
-from infoot_helper.transport.multistart import solve_multistart
 from infoot_helper.transport.plan_io import bank_metadata
 import torch
 from pathlib import Path
@@ -12,12 +11,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--h", type=float, default=0.4)
 parser.add_argument("--reg", type=float, default=0.02)
 parser.add_argument("--lam", type=float, default=1)
-parser.add_argument("--restarts", type=int, default=6)
-parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max-iter", type=int, default=50)
 parser.add_argument("--sinkhorn-iter", type=int, default=5000)
 parser.add_argument("--marginal-tol", type=float, default=1e-4)
-parser.add_argument("--continuation", action="store_true")
 
 args = parser.parse_args()
 
@@ -42,9 +38,8 @@ with torch.no_grad():
     solver = infoot.FusedInfoOT(
         Xs, Xt, h=args.h, reg=args.reg, lam=args.lam,
     )
-    P = solve_multistart(
-        solver, numIter=args.max_iter, restarts=args.restarts, seed=args.seed,
-        continuation=args.continuation, sinkhorn_iter=args.sinkhorn_iter,
+    P = solver.solve(
+        numIter=args.max_iter, sinkhorn_iter=args.sinkhorn_iter,
         marginal_tol=args.marginal_tol,
     )
 

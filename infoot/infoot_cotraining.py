@@ -41,8 +41,6 @@ def main():
         "mi_weight": 0.10,
         "reg": 0.02,
         "fit_iterations": 1200,
-        "fit_restarts": 2,
-        "fit_seed": 42,
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
@@ -144,8 +142,6 @@ def main():
             mi_weight=settings["mi_weight"],
             reg=settings["reg"],
             iterations=settings["fit_iterations"],
-            restarts=settings["fit_restarts"],
-            seed=settings["fit_seed"] + step,
             diagnostics=fit_diagnostics,
         )
 
@@ -202,7 +198,7 @@ def main():
                 f"flow_cat={flow_losses['cat'].item():.4f} "
                 f"flow_dog={flow_losses['dog'].item():.4f} "
                 f"infoot={loss_infoot.item():.4f} "
-                f"fit={fit_diagnostics['selected']}/{fit_diagnostics['status']} "
+                f"fit={fit_diagnostics['status']} "
                 f"contrastive={loss_contrastive.item():.4f} "
                 f"total={loss.item():.4f}"
             )

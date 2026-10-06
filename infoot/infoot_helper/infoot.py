@@ -87,8 +87,8 @@ class FusedInfoOT():
         self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h)
         self.P = None
    
-    def solve(self, numIter=50, verbose=True, P0=None, **options):
-        return optimize_plan(self, numIter, verbose, P0, **options)
+    def solve(self, numIter=50, verbose=True, **options):
+        return optimize_plan(self, numIter, verbose, **options)
   
 
     """
@@ -153,8 +153,8 @@ class InfoOT():
         self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h)
         self.P = None
 
-    def solve(self, numIter=100, verbose=True, P0=None, **options):
-        return optimize_plan(self, numIter, verbose, P0, **options)
+    def solve(self, numIter=100, verbose=True, **options):
+        return optimize_plan(self, numIter, verbose, **options)
     """
     def project(self, X, method='barycentric', h=None):
         if method not in ['conditional', 'barycentric']:

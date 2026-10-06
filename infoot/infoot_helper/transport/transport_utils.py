@@ -40,16 +40,3 @@ def sinkhorn_plan(cost, reg, marginal_tol=1e-4, sinkhorn_iter=5000,
     raise FloatingPointError(
         f"Sinkhorn marginal tolerance not met: {marginal_error(P):.2e}."
     )
-
-
-def backtrack(P, Q, loss_fn, current_loss, marginal_tol, attempts=20):
-    threshold = torch.finfo(P.dtype).eps * max(1.0, abs(current_loss))
-    alpha = 1.0
-    for _ in range(attempts):
-        candidate = (1 - alpha) * P + alpha * Q
-        value = loss_fn(candidate).item()
-        if (math.isfinite(value) and value < current_loss - threshold
-                and is_feasible(candidate, marginal_tol)):
-            return candidate, value, alpha
-        alpha *= 0.5
-    return P, current_loss, 0.0
