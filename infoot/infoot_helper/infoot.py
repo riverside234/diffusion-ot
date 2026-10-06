@@ -161,7 +161,7 @@ class FusedInfoOT():
             for i in tqdm(range(numIter)):
                 grad_P = migrad(P, self.Ks, self.Kt)
                 P = ot.bregman.sinkhorn(p, q, self.C + self.lam * grad_P,
-                                       reg=self.reg, method='sinkhorn_log', stopThr=1e-4)
+                                       reg=self.reg, method='sinkhorn_log', numItermax=3000, stopThr=1e-4)
             loss = fitting_loss(
                     P, self.Ks, self.Kt, self.reg,
                     C=self.C, mi_weight=self.lam,
