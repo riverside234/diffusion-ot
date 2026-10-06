@@ -10,7 +10,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--h", type=float, default=0.4)
 parser.add_argument("--reg", type=float, default=0.02)
-parser.add_argument("--lam", type=float, default=0.1)
+parser.add_argument("--lam", type=float, default=1)
 
 args = parser.parse_args()
 
@@ -34,7 +34,7 @@ with torch.no_grad():
         standardize(Xt, stats["dog"]),
         h=args.h, reg=args.reg, lam=args.lam,
     )
-    P = solver.solve(numIter=, verbose=True)
+    P = solver.solve(numIter=50, verbose=True)
 
 infoot.save_plan(bank_dir / "cat_to_dog_plan.pt", P, stats, args.h, args.reg)
 print("Transport plan:", P.shape)
