@@ -80,7 +80,8 @@ Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
 Xt = dog_bank["v_bank"].to(device=device, dtype=torch.float32)
 
 solver = infoot.FusedInfoOT(
-    Xs, Xt, h=args.h, reg=transport["reg"], lam=transport["lam"]
+    Xs, Xt, h=transport["h"] if args.h is None else args.h,
+    reg=transport["reg"], lam=transport["lam"],
 )
 solver.P = transport["P"].to(dtype=Xs.dtype)
 assert solver.P.shape == (len(Xs), len(Xt))

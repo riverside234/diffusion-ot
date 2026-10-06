@@ -1,6 +1,7 @@
 import torch
 from diffusion_ot.training.native_flow import native_flow_objective
 from . import infoot
+from .transport.multistart import solve_multistart
 
 
 def save_domain_checkpoints(domains, output_dir, step):
@@ -19,7 +20,8 @@ def save_domain_checkpoints(domains, output_dir, step):
 
 @torch.no_grad()
 def fit_transport(v_cat, v_dog, h=0.4, mi_weight=0.10,
-                  reg=0.02, iterations=100):
+                  reg=0.02, iterations=100, restarts=2, seed=0,
+                  diagnostics=None):
     solver = infoot.FusedInfoOT(
         v_cat,
         v_dog,
@@ -27,11 +29,16 @@ def fit_transport(v_cat, v_dog, h=0.4, mi_weight=0.10,
         lam=mi_weight,
         reg=reg,
     )
-    return solver.solve(numIter=iterations, verbose=False)
+    P = solve_multistart(
+        solver, numIter=iterations, restarts=restarts, seed=seed, verbose=False,
+    )
+    if diagnostics is not None:
+        diagnostics.update(solver.diagnostics_)
+    return P
 
 
 def alignment_loss(
-    v_cat, v_dog, P, h=0.5, mi_weight=0.10, eps=1e-5, reg=0.02
+    v_cat, v_dog, P, h=0.5, mi_weight=0.10, eps=1e-8, reg=0.02
 ):
     solver = infoot.FusedInfoOT(
         v_cat, v_dog, h=h, lam=mi_weight, reg=reg

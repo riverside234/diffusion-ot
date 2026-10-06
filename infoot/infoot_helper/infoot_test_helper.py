@@ -10,6 +10,7 @@ from diffusion_ot.data.latent_dataset import load_latent_tensor
 from diffusion_ot.evaluation.stage1a_eval import load_stage1a_evaluator
 from . import infoot
 from .infoot_cotraining_helper import fit_transport
+from .transport.plan_io import file_identity
 
 @torch.inference_mode()
 def generate_and_save_grid(
@@ -56,7 +57,8 @@ def encode_paths(domain, paths, batch_size=32):
     return torch.cat(features)
 
 
-def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02):
+def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02,
+                           restarts=6, iterations=1200, seed=0):
     models, features = {}, {}
 
     for name, bank in banks.items():
@@ -73,11 +75,18 @@ def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02):
         features[name] = encode_paths(models[name], bank["latent_paths"])
 
     Xs, Xt = features["cat"], features["dog"]
-    P = fit_transport(
-        Xs, Xt, h=h, reg=reg, mi_weight=0.10, iterations=1200,
-    )
+    diagnostics = {}
+    P = fit_transport(Xs, Xt, h=h, reg=reg, mi_weight=0.10,
+                      iterations=iterations, restarts=restarts, seed=seed,
+                      diagnostics=diagnostics)
+    references = {
+        name: {"latent_paths": banks[name]["latent_paths"],
+               "checkpoint_at_fit": file_identity(model.checkpoint_path)}
+        for name, model in models.items()
+    }
     infoot.save_plan(
         root / "outputs/infoot_cotraining" / f"cat_to_dog_step_{step:06d}_plan.pt",
         P, h, reg, lam=0.10,
+        optimization=diagnostics, banks=references,
     )
     return models["cat"], models["dog"], Xs, Xt, P

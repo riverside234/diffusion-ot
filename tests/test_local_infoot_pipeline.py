@@ -153,6 +153,9 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
     models = {name: SimpleNamespace(name=name) for name in features}
     output_dir = tmp_path / "outputs/infoot_cotraining"
     output_dir.mkdir(parents=True)
+    for name, model in models.items():
+        model.checkpoint_path = output_dir / f"{name}_step_002000.pt"
+        model.checkpoint_path.write_bytes(name.encode())
 
     def load_model(config, evaluation, **kwargs):
         name = config.name.split("_")[0]
@@ -162,6 +165,8 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
     def fit(source, target, **kwargs):
         torch.testing.assert_close(source, features["cat"])
         torch.testing.assert_close(target, features["dog"])
+        assert kwargs["restarts"] == 6
+        kwargs["diagnostics"].update(solver="FusedInfoOT", selected="uniform")
         return torch.eye(3) / 3
 
     monkeypatch.setattr(helper, "load_stage1a_evaluator", load_model)
@@ -181,6 +186,7 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
 
 def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path, monkeypatch):
     infoot, _ = local_helpers
+    from infoot_helper.transport import multistart
     bank_dir = tmp_path / "data/infoot_test"
     bank_dir.mkdir(parents=True)
     source = torch.tensor([[10., 30.], [20., 40.], [30., 70.]])
@@ -198,17 +204,25 @@ def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path
             torch.testing.assert_close(Xt, target)
             assert (h, reg, lam) == (0.4, 0.02, 0.37)
 
-        def solve(self, numIter, verbose):
-            assert numIter == 50 and verbose is True
-            return torch.eye(3) / 3
+    def fit(solver, **kwargs):
+        assert kwargs == {"numIter": 50, "restarts": 4, "seed": 8,
+                          "continuation": True, "sinkhorn_iter": 5000,
+                          "marginal_tol": 1e-4}
+        solver.diagnostics_ = {"solver": "FusedInfoOT", "selected": "random_4"}
+        return torch.eye(3) / 3
 
     monkeypatch.setattr(infoot, "FusedInfoOT", Solver)
+    monkeypatch.setattr(multistart, "solve_multistart", fit)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(sys, "argv", [str(script), "--lam", "0.37"])
+    monkeypatch.setattr(sys, "argv", [str(script), "--lam", "0.37",
+                                     "--restarts", "4", "--seed", "8",
+                                     "--continuation"])
     runpy.run_path(str(script), run_name="__main__")
     saved = torch.load(bank_dir / "cat_to_dog_plan.pt", weights_only=True)
     assert saved["lam"] == 0.37 and saved["feature_space"] == "raw"
     assert "stats" not in saved
+    assert saved["optimization"]["selected"] == "random_4"
+    assert saved["banks"]["cat"]["sha256"]
 
 
 @pytest.mark.parametrize("solver_name", ["InfoOT", "FusedInfoOT"])

@@ -32,6 +32,9 @@ parser.add_argument("--h", type=float, default=0.4)
 parser.add_argument("--reg", type=float, default=0.02)
 parser.add_argument("--save", type=str, default="1")
 parser.add_argument("--step", type=int, default=2000)
+parser.add_argument("--restarts", type=int, default=6)
+parser.add_argument("--fit-iterations", type=int, default=1200)
+parser.add_argument("--seed", type=int, default=0)
 
 args = parser.parse_args()
 
@@ -86,6 +89,9 @@ cat, dog, Xs, Xt, P = prepare_cotraining_test(
     device=device,
     h=args.h,
     reg=args.reg,
+    restarts=args.restarts,
+    iterations=args.fit_iterations,
+    seed=args.seed,
 )
 
 count = 16

@@ -41,6 +41,8 @@ def main():
         "mi_weight": 0.10,
         "reg": 0.02,
         "fit_iterations": 1200,
+        "fit_restarts": 2,
+        "fit_seed": 42,
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
@@ -134,6 +136,7 @@ def main():
         cat_refs = encoded["cat"]["references"]["v"]
         dog_refs = encoded["dog"]["references"]["v"]
 
+        fit_diagnostics = {}
         P = fit_transport(
             cat_refs,
             dog_refs,
@@ -141,6 +144,9 @@ def main():
             mi_weight=settings["mi_weight"],
             reg=settings["reg"],
             iterations=settings["fit_iterations"],
+            restarts=settings["fit_restarts"],
+            seed=settings["fit_seed"] + step,
+            diagnostics=fit_diagnostics,
         )
 
         loss_infoot = alignment_loss(
@@ -196,6 +202,7 @@ def main():
                 f"flow_cat={flow_losses['cat'].item():.4f} "
                 f"flow_dog={flow_losses['dog'].item():.4f} "
                 f"infoot={loss_infoot.item():.4f} "
+                f"fit={fit_diagnostics['selected']}/{fit_diagnostics['status']} "
                 f"contrastive={loss_contrastive.item():.4f} "
                 f"total={loss.item():.4f}"
             )
@@ -214,6 +221,7 @@ def main():
                         for name, context in domains.items()
                     },
                     "optimizer": optimizer.state_dict(),
+                    "transport_fit": fit_diagnostics,
                 },
                 output_dir / f"step_{step:06d}.pt",
             )
