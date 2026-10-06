@@ -30,7 +30,7 @@ with torch.no_grad():
     solver = infoot.FusedInfoOT(
         standardize(Xs, stats["cat"]),
         standardize(Xt, stats["dog"]),
-        h=args.h, reg=args.reg,
+        h=args.h, reg=args.reg, lam=0.10,
     )
     P = solver.solve(numIter=1200, verbose=True)
 
