@@ -79,8 +79,8 @@ if not isinstance(transport, dict) or transport.get("feature_space") != "raw":
 Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
 Xt = dog_bank["v_bank"].to(device=device, dtype=torch.float32)
 
-solver = infoot.InfoOT(
-    Xs, Xt, h=transport["h"], reg=transport["reg"],
+solver = infoot.FusedInfoOT(
+    Xs, Xt, h=transport["h"], reg=transport["reg"], lam=transport["lam"],
 )
 solver.P = transport["P"].to(dtype=Xs.dtype)
 assert solver.P.shape == (len(Xs), len(Xt))
