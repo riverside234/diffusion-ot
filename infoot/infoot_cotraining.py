@@ -20,6 +20,7 @@ from infoot_helper.infoot_cotraining_helper import (
     save_domain_checkpoints,
 )
 from infoot_helper.native_flow import native_flow_loss
+from infoot_helper.reference_rms import ReferenceRMSEMA
 from infoot_helper.translation_contrastive import (
     translation_contrastive_loss,
 )
@@ -44,6 +45,7 @@ def main():
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
+        "rms_decay": 0.99,
     }
 
     output_dir = ROOT / "outputs/infoot_cotraining"
@@ -98,6 +100,7 @@ def main():
         batches[name] = _cycle(loader)
 
     optimizer = torch.optim.Adam(parameter_groups)
+    projection_rms = ReferenceRMSEMA(decay=settings["rms_decay"])
     parameters = [
         parameter
         for group in optimizer.param_groups
@@ -133,6 +136,9 @@ def main():
 
         cat_refs = encoded["cat"]["references"]["v"]
         dog_refs = encoded["dog"]["references"]["v"]
+        projection_scales = projection_rms.update(
+            {"cat": cat_refs, "dog": dog_refs}, step=step,
+        )
 
         fit_diagnostics = {}
         P = fit_transport(
@@ -166,6 +172,7 @@ def main():
                 encoded[target]["references"]["v"],
                 plan,
                 h=settings["h"],
+                scales=(projection_scales[source], projection_scales[target]),
             )
 
             loss, metrics = translation_contrastive_loss(
@@ -199,6 +206,8 @@ def main():
                 f"flow_dog={flow_losses['dog'].item():.4f} "
                 f"infoot={loss_infoot.item():.4f} "
                 f"fit={fit_diagnostics['status']} "
+                f"rms_cat={projection_scales['cat']:.4f} "
+                f"rms_dog={projection_scales['dog']:.4f} "
                 f"contrastive={loss_contrastive.item():.4f} "
                 f"total={loss.item():.4f}"
             )
@@ -218,10 +227,11 @@ def main():
                     },
                     "optimizer": optimizer.state_dict(),
                     "transport_fit": fit_diagnostics,
+                    "projection_rms": projection_rms.state_dict(),
                 },
                 output_dir / f"step_{step:06d}.pt",
             )
-            save_domain_checkpoints(domains, output_dir, step)
+            save_domain_checkpoints(domains, output_dir, step, projection_rms)
 
 
 if __name__ == "__main__":

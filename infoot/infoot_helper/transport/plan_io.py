@@ -21,7 +21,7 @@ def bank_metadata(path, bank):
     return metadata
 
 
-def save_plan(path, P, h, reg, lam, *, optimization=None, banks=None):
+def save_plan(path, P, h, reg, lam, *, optimization=None, banks=None, projection_scales=None):
     state = {"P": P.detach().cpu(), "feature_space": "raw",
              "h": h, "reg": reg, "lam": lam}
     if optimization is not None:
@@ -29,4 +29,6 @@ def save_plan(path, P, h, reg, lam, *, optimization=None, banks=None):
         state["optimization"] = optimization
     if banks is not None:
         state["banks"] = banks
+    if projection_scales is not None:
+        state["projection_scales"] = projection_scales
     torch.save(state, path)

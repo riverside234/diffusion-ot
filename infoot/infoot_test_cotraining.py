@@ -80,7 +80,7 @@ dog_bank = torch.load(
     bank_dir / "dog_bank.pt", map_location="cpu", weights_only=True
 )
 
-cat, dog, Xs, Xt, P = prepare_cotraining_test(
+cat, dog, Xs, Xt, P, projection_scales = prepare_cotraining_test(
     ROOT,
     {"cat": cat_bank, "dog": dog_bank},
     step=args.step,
@@ -100,6 +100,7 @@ with torch.no_grad():
     v_cat = encode_paths(cat, paths)
     v_dog = conditional_mapping(
         v_cat, Xs, Xt, P, h=args.h,
+        scales=(projection_scales["cat"], projection_scales["dog"]),
     )
 
 records = {

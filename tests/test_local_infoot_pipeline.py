@@ -148,6 +148,7 @@ def test_saved_raw_plan_preserves_query_mapping_and_target_scale(local_helpers, 
 
 def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_path, monkeypatch):
     from infoot_helper import infoot_test_helper as helper
+    from infoot_helper.reference_rms import ReferenceRMSEMA
 
     features = {
         "cat": torch.tensor([[1., 3.], [2., 7.], [4., 9.]]),
@@ -156,9 +157,13 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
     models = {name: SimpleNamespace(name=name) for name in features}
     output_dir = tmp_path / "outputs/infoot_cotraining"
     output_dir.mkdir(parents=True)
+    tracker = ReferenceRMSEMA()
+    tracker.update({name: v * 2 for name, v in features.items()}, step=1)
+    tracker.num_updates.fill_(2000)
     for name, model in models.items():
         model.checkpoint_path = output_dir / f"{name}_step_002000.pt"
-        model.checkpoint_path.write_bytes(name.encode())
+        torch.save({"step": 2000, "domain": name, "projection_rms": tracker.state_dict()},
+                   model.checkpoint_path)
 
     def load_model(config, evaluation, **kwargs):
         name = config.name.split("_")[0]
@@ -179,13 +184,14 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
     result = helper.prepare_cotraining_test(
         tmp_path, {name: {"latent_paths": []} for name in features}, 2000, "cpu"
     )
-    cat, dog, Xs, Xt, P = result
+    cat, dog, Xs, Xt, P, scales = result
     assert cat is models["cat"] and dog is models["dog"]
     torch.testing.assert_close(Xs, features["cat"])
     torch.testing.assert_close(Xt, features["dog"])
     saved = torch.load(output_dir / "cat_to_dog_step_002000_plan.pt", weights_only=True)
     torch.testing.assert_close(saved["P"], P)
     assert saved["feature_space"] == "raw" and "stats" not in saved
+    assert saved["projection_scales"] == scales == tracker.scales()
 
 
 def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path, monkeypatch):

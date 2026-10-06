@@ -11,6 +11,7 @@ from diffusion_ot.evaluation.stage1a_eval import load_stage1a_evaluator
 from . import infoot
 from .infoot_cotraining_helper import fit_transport
 from .transport.plan_io import file_identity
+from .reference_rms import load_projection_scales
 
 @torch.inference_mode()
 def generate_and_save_grid(
@@ -60,6 +61,11 @@ def encode_paths(domain, paths, batch_size=32):
 def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02,
                            iterations=1200):
     models, features = {}, {}
+    checkpoint_paths = {
+        name: root / "outputs/infoot_cotraining" / f"{name}_step_{step:06d}.pt"
+        for name in banks
+    }
+    projection_scales = load_projection_scales(checkpoint_paths, step=step)
 
     for name, bank in banks.items():
         models[name] = load_stage1a_evaluator(
@@ -67,10 +73,7 @@ def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02,
             root / "configs/stage1a_eval/residual_sit_b2_256.yaml",
             device=device,
             weights="raw",
-            checkpoint_path=(
-                root / "outputs/infoot_cotraining"
-                / f"{name}_step_{step:06d}.pt"
-            ),
+            checkpoint_path=checkpoint_paths[name],
         )
         features[name] = encode_paths(models[name], bank["latent_paths"])
 
@@ -87,5 +90,6 @@ def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02,
         root / "outputs/infoot_cotraining" / f"cat_to_dog_step_{step:06d}_plan.pt",
         P, h, reg, lam=0.10,
         optimization=diagnostics, banks=references,
+        projection_scales=projection_scales,
     )
-    return models["cat"], models["dog"], Xs, Xt, P
+    return models["cat"], models["dog"], Xs, Xt, P, projection_scales

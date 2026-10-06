@@ -1,9 +1,10 @@
 import torch
 from diffusion_ot.training.native_flow import native_flow_objective
 from . import infoot
+from .reference_rms.mapping import rms_conditional_mapping
 
 
-def save_domain_checkpoints(domains, output_dir, step):
+def save_domain_checkpoints(domains, output_dir, step, projection_rms=None):
     for name, domain in domains.items():
         torch.save(
             {
@@ -12,6 +13,7 @@ def save_domain_checkpoints(domains, output_dir, step):
                 "model": domain.branch.pdae_state_dict(),
                 "config": domain.training_config,
                 "native_flow_objective": native_flow_objective(domain.training_config),
+                "projection_rms": None if projection_rms is None else projection_rms.state_dict(),
             },
             output_dir / f"{name}_step_{step:06d}.pt",
         )
@@ -50,7 +52,9 @@ def alignment_loss(
     )
 
 
-def conditional_mapping(v_query, v_source, v_target, P, h=0.4):
+def conditional_mapping(v_query, v_source, v_target, P, h=0.4, scales=None):
+    if scales is not None:
+        return rms_conditional_mapping(v_query, v_source, v_target, P, h, scales)
     solver = infoot.InfoOT(v_source, v_target, h=h)
     solver.P = P.detach()
 
