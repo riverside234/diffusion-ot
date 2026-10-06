@@ -8,7 +8,7 @@ import torch
 import scipy.io
 import ot
 from tqdm import tqdm
-
+import warnings
 
 def dist(z1, z2, delta=5000):
     x1, x2 = z1[:-1], z2[:-1]
@@ -148,7 +148,7 @@ class FusedInfoOT():
         self.Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
         self.Ks, self.Kt = compute_kernel(self.Cs, self.Ct, h, self.feature_dims)
         self.P = None
-
+    """
     def solve(self, numIter=50, verbose='True'):
         '''
         solve projected gradient descent via sinkhorn iteration
@@ -175,6 +175,59 @@ class FusedInfoOT():
                                        reg=self.reg, method='sinkhorn_log', numItermax=3000, stopThr=1e-4)
         self.P = P
         return P
+    """
+    @torch.no_grad()
+    def solve(self, numIter=50, verbose=True, tol=1e-5,
+              marginal_tol=1e-4, patience=3, sinkhorn_iter=3000):
+        p = self.Xs.new_full((len(self.Xs),), 1 / len(self.Xs))
+        q = self.Xt.new_full((len(self.Xt),), 1 / len(self.Xt))
+        P = torch.outer(p, q)
+        warmstart, stable = None, 0
+        self.converged_ = False
+
+        for i in tqdm(range(numIter), disable=not verbose):
+            previous = P
+            cost = self.C + self.lam * migrad(P, self.Ks, self.Kt)
+
+            P, log = ot.bregman.sinkhorn(
+                p, q, cost, reg=self.reg,
+                method="sinkhorn_log",
+                numItermax=sinkhorn_iter,
+                stopThr=marginal_tol / len(q) ** 0.5,
+                warmstart=warmstart, log=True,
+            )
+            if not torch.isfinite(P).all():
+                raise FloatingPointError("Non-finite transport plan")
+
+            warmstart = (log["log_u"], log["log_v"])
+            change = (P - previous).abs().sum().item()
+            marginal = max(
+                (P.sum(1) - p).abs().sum().item(),
+                (P.sum(0) - q).abs().sum().item(),
+            )
+            stable = stable + 1 if (
+                change < tol and marginal < marginal_tol
+            ) else 0
+
+            if verbose:
+                loss = fitting_loss(
+                    P, self.Ks, self.Kt, self.reg,
+                    C=self.C, mi_weight=self.lam,
+                )
+                tqdm.write(
+                    f"{i + 1}: loss={loss.item():.6f} "
+                    f"change={change:.2e} marginal={marginal:.2e}"
+                )
+
+            if stable >= patience:
+                self.converged_ = True
+                break
+
+        self.P = P
+        if not self.converged_:
+            warnings.warn("Outer fitting limit reached before convergence.")
+        return P
+
     """
     def project(self, X, method='barycentric', h=None):
         if method not in ['conditional', 'barycentric']:
@@ -205,7 +258,8 @@ class FusedInfoOT():
                 return projection(P, self.Xt)
             else:
                 raise Exception('barycentric cannot generalize to new samples')
-"""
+    """
+
     def conditional_score(self, X, h=None):
         if h is None:
             h = self.h
