@@ -34,7 +34,7 @@ with torch.no_grad():
         standardize(Xt, stats["dog"]),
         h=args.h, reg=args.reg, lam=args.lam,
     )
-    P = solver.solve(numIter=30, verbose=True)
+    P = solver.solve(numIter=, verbose=True)
 
 infoot.save_plan(bank_dir / "cat_to_dog_plan.pt", P, stats, args.h, args.reg)
 print("Transport plan:", P.shape)
