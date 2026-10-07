@@ -3,10 +3,7 @@ from torch.nn.functional import mse_loss
 
 
 def covariance_loss(v):
-    """||Cov(v)-I||_F^2 / D, including diagonal and off-diagonal entries.
-
-    Population covariance uses 1/N. Rank <= min(N-1, D), so the loss cannot
-    reach zero when N <= D. Call separately per domain, then average.
+    """||Cov(v)-I||_F^2 / D
     """
     if v.ndim != 2 or len(v) < 2 or not v.shape[1]:
         raise ValueError("Covariance needs at least two nonempty reference feature rows.")

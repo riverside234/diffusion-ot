@@ -38,13 +38,15 @@ def main():
     device = "cuda" 
 
     settings = {
-        "batch_size": 32,
-        "query_count": 8,
+        "batch_size": 1024,
+        "flow_batch_size": 16,
+        "query_count": 32,
         "steps": 2000,
         "h": 0.4,
         "mi_weight": 0.10,
         "reg": 0.02,
-        "fit_iterations": 1200,
+        "infoOT_loss_weight": 0.10,
+        "fit_iterations": 100,
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
@@ -52,6 +54,8 @@ def main():
         "batchnorm": {"affine": False, "momentum": 0.1, "eps": 1e-5},
         "batchnorm_lr": 1e-5,
     }
+    if not 1 <= settings["flow_batch_size"] <= settings["batch_size"]:
+        raise ValueError("flow_batch_size must be between 1 and batch_size.")
 
     output_dir = ROOT / "outputs/infoot_cotraining"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -140,8 +144,8 @@ def main():
         flow_losses = {
             name: native_flow_loss(
                 domains[name],
-                encoded[name]["x0"],
-                encoded[name]["v"],
+                encoded[name]["x0"][:settings["flow_batch_size"]],
+                encoded[name]["v"][:settings["flow_batch_size"]],
             )
             for name in domains
         }
@@ -203,7 +207,7 @@ def main():
 
         loss = (
             settings["flow_weight"] * loss_flow
-            + loss_infoot
+            + settings["infoOT_loss_weight"] * loss_infoot
             + settings["contrastive_weight"] * loss_contrastive
             + settings["covariance_weight"] * loss_covariance
         )

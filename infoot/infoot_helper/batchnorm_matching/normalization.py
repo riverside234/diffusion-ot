@@ -2,7 +2,7 @@ import torch
 
 
 def add_matching_features(encoded, batch_norms):
-    """Attach m without changing v; training queries share live reference statistics."""
+
     for name, batch in encoded.items():
         norm = batch_norms[name]
         references, queries = batch["references"], batch["queries"]

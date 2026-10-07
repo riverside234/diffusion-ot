@@ -167,7 +167,12 @@ class FusedInfoOT():
                     P, self.Ks, self.Kt, self.reg,
                     C=self.C, mi_weight=self.lam,
                 )
-                tqdm.write(f"Iteration {i + 1}: loss={loss.item():.6f}")
+                rows = P.detach() / P.detach().sum(1, keepdim=True).clamp_min(1e-30)
+                effective_targets = (-(rows * rows.clamp_min(1e-30).log()).sum(1)).exp().mean()
+                tqdm.write(
+                    f"Iteration {i + 1}: loss={loss.item():.6f} "
+                    f"mean_row_effective_targets={effective_targets.item():.3f}"
+                )
 
         else:
             for i in range(numIter):
