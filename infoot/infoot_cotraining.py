@@ -13,6 +13,7 @@ from diffusion_ot.models.generator_adaptation import (
 from diffusion_ot.training.train_joint_infoot import _cycle
 
 from infoot_helper.encoding import encode_batches
+from infoot_helper.diagnostics import representation_log
 from infoot_helper.infoot_cotraining_helper import (
     fit_transport,
     alignment_loss,
@@ -200,6 +201,7 @@ def main():
         optimizer.step()
 
         if step == 1 or step % 100 == 0:
+            geometry = representation_log({"cat": cat_refs, "dog": dog_refs})
             print(
                 f"step={step} "
                 f"flow_cat={flow_losses['cat'].item():.4f} "
@@ -208,6 +210,7 @@ def main():
                 f"fit={fit_diagnostics['status']} "
                 f"rms_cat={projection_scales['cat']:.4f} "
                 f"rms_dog={projection_scales['dog']:.4f} "
+                f"{geometry} "
                 f"contrastive={loss_contrastive.item():.4f} "
                 f"total={loss.item():.4f}"
             )

@@ -107,6 +107,35 @@ def test_ema_scale_controls_both_directions_without_reestimating(helpers, refere
         assert not torch.allclose(actual, old)
 
 
+def test_clustered_float32_mapping_matches_float64_and_single_queries(helpers):
+    helper, Tracker, _ = helpers
+    generator = torch.Generator().manual_seed(34)
+    base = torch.randn(1, 512, generator=generator)
+    source = torch.nn.functional.layer_norm(
+        base + .001 * torch.randn(24, 512, generator=generator), (512,),
+    )
+    target = torch.nn.functional.layer_norm(
+        torch.randn(24, 512, generator=generator), (512,),
+    )
+    query = torch.nn.functional.layer_norm(
+        source[:8] + .0001 * torch.randn(8, 512, generator=generator), (512,),
+    )
+    tracker = Tracker()
+    scales = tracker.update({"cat": source, "dog": target}, step=1)
+    scales = (scales["cat"], scales["dog"])
+    plan = torch.eye(24) / 24
+    together = helper.conditional_mapping(query, source, target, plan, scales=scales)
+    separate = torch.cat([
+        helper.conditional_mapping(row[None], source, target, plan, scales=scales)
+        for row in query
+    ])
+    expected = helper.conditional_mapping(
+        query.double(), source.double(), target.double(), plan.double(), scales=scales,
+    )
+    torch.testing.assert_close(together, expected.float(), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(together, separate, rtol=1e-5, atol=1e-6)
+
+
 def test_rms_checkpoint_roundtrip_and_frozen_mapping(helpers, references, tmp_path):
     helper, Tracker, load_scales = helpers
     tracker = Tracker(decay=.8)
