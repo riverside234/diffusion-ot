@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
@@ -66,14 +67,24 @@ class FrozenSiglipPatchEncoder(nn.Module):
         from transformers import AutoImageProcessor, SiglipVisionModel
 
         # This FixRes checkpoint is model_type=siglip, not the NaFlex Siglip2 model.
+        # The backend API arrived during Transformers 5.x. Keep PIL processing
+        # on both APIs; allowing the new torchvision default changes the pixels.
+        has_backend_api = "image_processor_classes" in inspect.signature(AutoImageProcessor.register).parameters
+        processor_options = {"backend": "pil"} if has_backend_api else {"use_fast": False}
         processor = AutoImageProcessor.from_pretrained(
-            directory, local_files_only=True, use_fast=False, trust_remote_code=False,
+            directory, local_files_only=True, trust_remote_code=False, **processor_options,
         )
-        vision, loading = SiglipVisionModel.from_pretrained(
+
+        class VisionOnlySiglipModel(SiglipVisionModel):
+            # Official snapshots also contain the unused text tower and scoring
+            # scalars. Scope these exceptions to our loader, not the global class.
+            _keys_to_ignore_on_load_unexpected = [r"^text_model\.", r"^logit_(scale|bias)$"]
+
+        vision, loading = VisionOnlySiglipModel.from_pretrained(
             directory, local_files_only=True, output_loading_info=True,
         )
-        if loading.get("missing_keys") or loading.get("mismatched_keys") or loading.get("error_msgs"):
-            raise ValueError(f"Incomplete SigLIP vision weights in {directory}: {loading}")
+        if any(loading.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
+            raise ValueError(f"Incomplete or incompatible SigLIP vision weights in {directory}: {loading}")
         return cls(vision, processor, identity)
 
     def train(self, mode: bool = True):

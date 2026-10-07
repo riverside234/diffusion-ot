@@ -96,6 +96,12 @@ Existing local SiT/VAE artifacts and AFHQ cached latents/original RGB are also
 required. Change `project_root` in both training and evaluation YAMLs for a
 different checkout.
 
+The official SigLIP snapshot includes a text tower and similarity-scoring
+parameters. V2 loads only the vision tower and excludes those expected unused
+keys from its loading report; missing, mismatched, or unknown vision weights
+still fail. The loader selects PIL preprocessing with `backend="pil"` on newer
+Transformers and `use_fast=False` on versions with the older API.
+
 LR warmup resumes from the saved optimizer step. For an older constant-LR v2
 run, retain its original schedule (omit `train.lr_schedule`) when resuming.
 To use the new recipe as a separate warm-start experiment, use

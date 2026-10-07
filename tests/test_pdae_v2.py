@@ -243,7 +243,8 @@ def test_real_transformers_processor_and_dense_patch_output(tmp_path):
     config = transformers.SiglipVisionConfig(hidden_size=768, intermediate_size=64,
         num_hidden_layers=1, num_attention_heads=12, image_size=224, patch_size=16)
     vision = transformers.SiglipVisionModel(config)
-    processor = transformers.SiglipImageProcessor(size={'height': 224, 'width': 224})
+    processor_class = getattr(transformers, 'SiglipImageProcessorPil', None) or transformers.SiglipImageProcessor
+    processor = processor_class(size={'height': 224, 'width': 224})
     encoder = FrozenSiglipPatchEncoder(vision, processor, {'revision': 'test'})
     encoder.train()
     assert not encoder.training and not vision.training
@@ -258,7 +259,8 @@ def test_real_transformers_processor_and_dense_patch_output(tmp_path):
         encoder(images + 3)
 
 
-def test_local_loading_from_composite_siglip_checkpoint(tmp_path):
+@pytest.mark.parametrize('damage', [None, 'missing_vision', 'mismatched_vision', 'unexpected_vision'])
+def test_local_loading_from_composite_siglip_checkpoint(tmp_path, monkeypatch, damage):
     transformers = pytest.importorskip('transformers')
     # Official downloads contain both towers. Exercise actual key-prefix loading.
     config = transformers.SiglipConfig(vision_config=dict(hidden_size=768, intermediate_size=64,
@@ -266,15 +268,49 @@ def test_local_loading_from_composite_siglip_checkpoint(tmp_path):
         text_config=dict(vocab_size=32, hidden_size=32, intermediate_size=32,
                          num_hidden_layers=1, num_attention_heads=4))
     original = transformers.SiglipModel(config).eval()
-    original.save_pretrained(tmp_path)
-    transformers.SiglipImageProcessor(size={'height': 224, 'width': 224}).save_pretrained(tmp_path)
+    weights = original.state_dict()
+    vision_key = 'vision_model.embeddings.patch_embedding.weight'
+    if damage == 'missing_vision':
+        del weights[vision_key]
+    elif damage == 'mismatched_vision':
+        weights[vision_key] = weights[vision_key][:1].clone()
+    elif damage == 'unexpected_vision':
+        weights['vision_model.unexpected_probe'] = torch.zeros(1)
+    original.save_pretrained(tmp_path, state_dict=weights)
+    processor_class = getattr(transformers, 'SiglipImageProcessorPil', None) or transformers.SiglipImageProcessor
+    expected_processor = processor_class(size={'height': 224, 'width': 224})
+    expected_processor.save_pretrained(tmp_path)
     files = [tmp_path / name for name in ('config.json', 'preprocessor_config.json', 'model.safetensors')]
     manifest = dict(model_id=MODEL_ID, revision='local-fixture', files={p.name: file_sha256(p) for p in files})
     (tmp_path / MANIFEST_NAME).write_text(json.dumps(manifest))
+    # Capture the real HF loading report before our strict validation. Expected
+    # text/scoring keys should be absent; vision problems must still be visible.
+    loading = {}
+    original_loader = transformers.SiglipVisionModel.from_pretrained.__func__
+    global_ignore_patterns = deepcopy(transformers.SiglipVisionModel._keys_to_ignore_on_load_unexpected)
+    def capture_loader(cls, *args, **kwargs):
+        model, report = original_loader(cls, *args, **kwargs)
+        loading.update(report)
+        return model, report
+    monkeypatch.setattr(transformers.SiglipVisionModel, 'from_pretrained', classmethod(capture_loader))
+    if damage:
+        # A size mismatch can be rejected inside Transformers before our check.
+        with pytest.raises((ValueError, RuntimeError), match='vision|size mismatch|ignore_mismatched_sizes'):
+            FrozenSiglipPatchEncoder.from_local(tmp_path)
+        if damage == 'missing_vision':
+            assert vision_key in loading['missing_keys']
+        elif damage == 'unexpected_vision':
+            assert 'vision_model.unexpected_probe' in loading['unexpected_keys']
+        return
     loaded = FrozenSiglipPatchEncoder.from_local(tmp_path)
+    assert not loading['unexpected_keys'] and not loading['missing_keys']
+    assert transformers.SiglipVisionModel._keys_to_ignore_on_load_unexpected == global_ignore_patterns
     images = torch.rand(1, 3, 256, 256) * 2 - 1
     pixels = loaded.processor(images=list(((images + 1) / 2).numpy()), do_rescale=False,
                               return_tensors='pt', input_data_format='channels_first')['pixel_values']
+    expected_pixels = expected_processor(images=list(((images + 1) / 2).numpy()), do_rescale=False,
+                                        return_tensors='pt', input_data_format='channels_first')['pixel_values']
+    torch.testing.assert_close(pixels, expected_pixels, atol=0, rtol=0)
     with torch.no_grad():
         expected = original.vision_model(pixel_values=pixels).last_hidden_state
     torch.testing.assert_close(loaded(images), expected)
