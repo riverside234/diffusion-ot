@@ -22,7 +22,7 @@ dataloader:
   drop_last: true
 
 train:
-  max_steps: 50000  # Budget cap; review fixed-noise image quality at 5k and 10k.
+  max_steps: 10000  # Budget cap; review fixed-noise image quality at 5k and 10k.
   initialize_from: null
   resume_from: null
   seed: 20260901
