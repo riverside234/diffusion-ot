@@ -38,11 +38,13 @@ def ratio(P, Kx, Ky):
     f_xy = -ot.gromov.tensor_product(constC, Kx, Ky, P)
     return f_xy / f_x_f_y
 
-def fitting_loss(P, Kx, Ky, reg, C=None, mi_weight=1.0, eps=1e-8):
+def fitting_loss(P, Kx, Ky, reg, C=None, mi_weight=1.0, eps=1e-8,
+                 return_terms=False):
     mi = (P * ratio(P, Kx, Ky).clamp_min(eps).log()).sum()
     entropy = -(P * P.clamp_min(eps).log()).sum()
     cost = 0.0 if C is None else (P * C).sum()
-    return cost - mi_weight * mi - reg * entropy
+    loss = cost - mi_weight * mi - reg * entropy
+    return (loss, (cost, -mi_weight * mi, -reg * entropy)) if return_terms else loss
 
 def save_plan(path, P, h, reg, lam, *, feature_space="raw", matching_batchnorm=None):
     state = {
@@ -163,14 +165,16 @@ class FusedInfoOT():
                 grad_P = migrad(P, self.Ks, self.Kt)
                 P = ot.bregman.sinkhorn(p, q, self.C + self.lam * grad_P,
                                        reg=self.reg, method='sinkhorn_log', numItermax=5000, stopThr=1e-4)
-                loss = fitting_loss(
+                loss, (cost, mi_term, entropy_term) = fitting_loss(
                     P, self.Ks, self.Kt, self.reg,
-                    C=self.C, mi_weight=self.lam,
+                    C=self.C, mi_weight=self.lam, return_terms=True,
                 )
                 rows = P.detach() / P.detach().sum(1, keepdim=True).clamp_min(1e-30)
                 effective_targets = (-(rows * rows.clamp_min(1e-30).log()).sum(1)).exp().mean()
                 tqdm.write(
                     f"Iteration {i + 1}: loss={loss.item():.6f} "
+                    f"cost={cost.item():.6f} mi_term={mi_term.item():.6f} "
+                    f"entropy_term={entropy_term.item():.6f} "
                     f"mean_row_effective_targets={effective_targets.item():.3f}"
                 )
 
