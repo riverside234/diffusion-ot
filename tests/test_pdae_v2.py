@@ -1,0 +1,378 @@
+"""Offline checks of v2 conditioning, pretrained equivalence, and the Stage 1A loop."""
+from copy import deepcopy
+import importlib.util
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from test_pdae_sit_shapes import FakeSiT, FakeAttention
+from test_stage1a_refinement import setup as latent_training_setup
+from test_decoded_translation import TinyVAE
+from diffusion_ot.models.pdae_sit import build_pdae_sit_branch
+from diffusion_ot.models.pdae_v2.branch import PDAEV2Branch, TokenConditionedSiT
+from diffusion_ot.models.pdae_v2.cross_attention import ImageCrossAttention
+from diffusion_ot.models.pdae_v2.encoder import (
+    FrozenSiglipPatchEncoder, MANIFEST_NAME, MODEL_ID, file_sha256, snapshot_identity,
+)
+from diffusion_ot.training.train_pdae_domain import TrainableEMA, _optimizer_groups
+
+
+@pytest.fixture(autouse=True)
+def limited_cpu_threads():
+    old = torch.get_num_threads()
+    torch.set_num_threads(2)
+    yield
+    torch.set_num_threads(old)
+
+
+class NativeSiTBlock(nn.Module):
+    """The existing SiT's six-way AdaLN block, with nonzero gates/weights."""
+    def __init__(self):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(8, elementwise_affine=False, eps=1e-6)
+        self.attn = FakeAttention(8)
+        self.norm2 = nn.LayerNorm(8, elementwise_affine=False, eps=1e-6)
+        self.mlp = nn.Sequential(nn.Linear(8, 16), nn.GELU(approximate="tanh"), nn.Linear(16, 8))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(8, 48))
+
+    def forward(self, x, c):
+        a, b, g, d, e, h = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = x + g.unsqueeze(1) * self.attn(self.norm1(x) * (1 + b.unsqueeze(1)) + a.unsqueeze(1))
+        return x + h.unsqueeze(1) * self.mlp(self.norm2(x) * (1 + e.unsqueeze(1)) + d.unsqueeze(1))
+
+
+def base_model():
+    model = FakeSiT()
+    model.blocks = nn.ModuleList([NativeSiTBlock(), NativeSiTBlock()])
+    nn.init.normal_(model.pos_embed, std=.1)
+    return model
+
+
+class TinyFrozenEncoder(nn.Module):
+    """Small RGB stand-in for expensive pretrained tokens in loop tests only."""
+    architecture_spec = {"kind": "siglip2_vit_b16", "token_dim": 768, "frozen": True}
+    snapshot_identity = {"model_id": MODEL_ID, "revision": "offline-test-snapshot"}
+
+    def __init__(self):
+        super().__init__()
+        self.patch = nn.Conv2d(3, 768, 4, 4).requires_grad_(False)
+        self.train(False)
+
+    def train(self, mode=True):
+        return super().train(False)
+
+    @torch.no_grad()
+    def forward(self, rgb):
+        return self.patch(rgb).flatten(2).transpose(1, 2)
+
+
+def branch(base=None):
+    return PDAEV2Branch(TinyFrozenEncoder(), TokenConditionedSiT(
+        base or base_model(), num_heads=2, lora_rank=2, lora_alpha=2), image_size=8)
+
+
+def inputs():
+    return dict(x0_latent=torch.randn(2, 4, 8, 8), x_t=torch.randn(2, 4, 8, 8),
+                timestep=torch.tensor([.05, .8]), class_labels=torch.tensor([1, 10]),
+                encoder_image=torch.rand(2, 3, 8, 8) * 2 - 1)
+
+
+def activate_cross_attention(model):
+    for attention in model.semantic_transformer.image_attention:
+        nn.init.normal_(attention.out.weight, std=.1)
+        nn.init.constant_(attention.out.bias, .3)
+
+
+def test_full_width_attention_accepts_sit_grid_and_siglip_patch_lengths():
+    attention = ImageCrossAttention(768, token_dim=768, num_heads=12)
+    nn.init.normal_(attention.out.weight, std=.02)
+    hidden = torch.randn(1, 256, 768, requires_grad=True)
+    tokens = torch.randn(1, 196, 768, requires_grad=True)
+    output = attention(hidden, tokens)
+    assert output.shape == (1, 256, 768) and torch.isfinite(output).all()
+    output.square().mean().backward()
+    assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum() > 0
+    assert torch.isfinite(tokens.grad).all() and tokens.grad.abs().sum() > 0
+
+
+def test_pretrained_equivalence_and_zero_only_new_output_projections():
+    torch.manual_seed(32)
+    original = base_model().eval()
+    model = branch(deepcopy(original)).eval()
+    args = inputs()
+    expected = original(args['x_t'], args['timestep'], args['class_labels']).sample
+    output = model(**args)
+    assert expected.abs().sum() > 0 and output.z.shape == (2, 4, 768)
+    # Frozen/LoRA GEMMs can differ in last-bit rounding from the original GEMM.
+    torch.testing.assert_close(output.sample, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(output.delta_sample, torch.zeros_like(expected), atol=1e-6, rtol=0)
+    assert not hasattr(model.semantic_transformer, 'z_proj')
+    assert not hasattr(model.semantic_transformer, 'final_adapter')
+    for index, attention in enumerate(model.semantic_transformer.image_attention):
+        assert torch.count_nonzero(attention.out.weight) == torch.count_nonzero(attention.out.bias) == 0
+        assert attention.q.weight.abs().sum() > 0 and attention.k.weight.abs().sum() > 0
+        assert attention.norm.weight.abs().sum() > 0
+        if index:
+            assert attention.q.weight is not model.semantic_transformer.image_attention[0].q.weight
+    assert model.semantic_conditioner.null_token.abs().sum() > 0
+
+
+def test_two_step_gradient_flow_train_modes_and_optimizer_groups():
+    torch.manual_seed(6)
+    model = branch().train()
+    groups = _optimizer_groups(model, dict(lr_adapter=.001, lr_lora=.001))
+    assert [g['group_name'] for g in groups] == ['adapter', 'lora']
+    assert not model.encoder.training and not model.semantic_transformer.base.training
+    frozen = {name: p.detach().clone() for name, p in model.named_parameters() if not p.requires_grad}
+    optimizer = torch.optim.AdamW(groups)
+    args = inputs()
+    args['semantic_drop_mask'] = torch.tensor([False, True])
+    for step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        output = model(**args)
+        assert torch.isfinite(output.sample).all()
+        loss = (output.sample - torch.randn_like(output.sample)).square().mean()
+        loss.backward()
+        trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in trainable.values())
+        attention = model.semantic_transformer.image_attention[0]
+        assert attention.out.weight.grad.abs().sum() > 0
+        if step == 0:
+            assert attention.q.weight.grad.abs().sum() == 0
+            assert model.semantic_transformer.feature_projector[1].weight.grad.abs().sum() == 0
+        else:
+            assert attention.q.weight.grad.abs().sum() > 0
+            assert attention.k.weight.grad.abs().sum() > 0
+            assert attention.norm.weight.grad.abs().sum() > 0
+            assert model.semantic_transformer.feature_projector[1].weight.grad.abs().sum() > 0
+            assert model.semantic_conditioner.null_token.grad.abs().sum() > 0
+            assert any(p.grad.abs().sum() > 0 for n, p in trainable.items() if '.lora_down.' in n)
+        optimizer.step()
+    for name, p in model.named_parameters():
+        if name in frozen:
+            assert p.grad is None
+            torch.testing.assert_close(p, frozen[name], atol=0, rtol=0)
+
+
+def test_masked_padding_permutation_empty_rows_and_cfg():
+    model = branch().eval()
+    activate_cross_attention(model)
+    args = inputs()
+    z = torch.randn(2, 7, 768)  # different source/query lengths; no grid inferred
+    mask = torch.tensor([[False, False, True, True, True, True, True], [True] * 7])
+    predict = lambda code, padding, scale=1.: model.predict_cfg_with_z(
+        args['x_t'], args['timestep'], code, class_labels=args['class_labels'],
+        guidance_scale=scale, condition_padding_mask=padding).sample
+    expected = predict(z, mask)
+    dirty = z.masked_fill(mask[..., None], float('nan')).requires_grad_()
+    actual = predict(dirty, mask)
+    torch.testing.assert_close(actual, expected)
+    actual.square().mean().backward()
+    assert torch.isfinite(dirty.grad).all() and dirty.grad[mask].abs().sum() == 0
+    original = model.semantic_transformer.base(args['x_t'], args['timestep'], args['class_labels']).sample
+    torch.testing.assert_close(actual[1], original[1])  # all-padding residual incl. trained bias is zero
+    order = torch.randperm(7)
+    torch.testing.assert_close(predict(z[:, order], mask[:, order]), expected, atol=1e-6, rtol=1e-5)
+    unconditional = predict(z, mask, 0)
+    torch.testing.assert_close(unconditional, predict(model.semantic_null_like(z), mask))
+    torch.testing.assert_close(predict(z, mask, 2), unconditional + 2 * (expected - unconditional))
+    for bad in (mask.float(), mask[:, :3]):
+        with pytest.raises(ValueError, match='padding_mask'):
+            predict(z, bad)
+
+
+def test_shared_projector_runs_once_and_cross_attention_precedes_ffn():
+    model = branch().eval()
+    order = []
+    hooks = [model.semantic_transformer.feature_projector.register_forward_hook(lambda *a: order.append('project'))]
+    for index, block in enumerate(model.semantic_transformer.base.blocks):
+        hooks.append(model.semantic_transformer.image_attention[index].register_forward_hook(
+            lambda *a, i=index: order.append(f'cross{i}')))
+        hooks.append(block.mlp.register_forward_hook(lambda *a, i=index: order.append(f'ffn{i}')))
+    model(**inputs())
+    for hook in hooks:
+        hook.remove()
+    assert order == ['project', 'ffn0', 'cross0', 'ffn0', 'ffn1', 'cross1', 'ffn1']
+
+
+def test_raw_ema_and_optimizer_roundtrip_and_mismatch_guards(tmp_path):
+    torch.manual_seed(9)
+    original_base = base_model()
+    model = branch(deepcopy(original_base)).eval()
+    optim = torch.optim.AdamW(_optimizer_groups(model, {'lr': .001}))
+    ema = TrainableEMA(model, decay=.9)
+    args = inputs()
+    model(**args).sample.square().mean().backward()
+    optim.step()
+    ema.update(model)
+    path = tmp_path / 'checkpoint.pt'
+    torch.save(dict(model=model.pdae_state_dict(), optimizer=optim.state_dict(), ema=ema.state_dict(), step=1), path)
+    saved = torch.load(path, weights_only=False)
+    assert 'encoder' not in saved['model'] and saved['model']['format_version'] == 6
+    restored = branch(deepcopy(original_base)).eval()
+    # This test's frozen substitute, like the real model, must come from identical weights.
+    restored.encoder.load_state_dict(model.encoder.state_dict())
+    restored.load_pdae_state_dict(saved['model'])
+    restored_optim = torch.optim.AdamW(_optimizer_groups(restored, {'lr': .001}))
+    restored_optim.load_state_dict(saved['optimizer'])
+    assert all(s['step'] == 1 for s in restored_optim.state.values())
+    torch.testing.assert_close(restored(**args).sample, model(**args).sample, atol=0, rtol=0)
+    restored_ema = TrainableEMA(restored, decay=.9)
+    restored_ema.load_state_dict(saved['ema'], restored)
+    with ema.average_parameters(model), restored_ema.average_parameters(restored):
+        torch.testing.assert_close(restored(**args).sample, model(**args).sample, atol=0, rtol=0)
+    bad = deepcopy(saved['model'])
+    bad['frozen_encoder']['revision'] = 'different'
+    with pytest.raises(ValueError, match='frozen_encoder'):
+        restored.load_pdae_state_dict(bad)
+    bad = deepcopy(saved['model'])
+    bad['generator']['semantic_transformer']['architecture']['num_heads'] = 1
+    with pytest.raises(ValueError, match='architecture mismatch'):
+        restored.load_pdae_state_dict(bad)
+    with pytest.raises(ValueError, match='format_version'):
+        restored.load_pdae_state_dict({'format_version': 5})
+
+
+def test_real_transformers_processor_and_dense_patch_output(tmp_path):
+    transformers = pytest.importorskip('transformers')
+    # Real Transformers classes, randomly initialized, small depth; no remote weights.
+    config = transformers.SiglipVisionConfig(hidden_size=768, intermediate_size=64,
+        num_hidden_layers=1, num_attention_heads=12, image_size=224, patch_size=16)
+    vision = transformers.SiglipVisionModel(config)
+    processor = transformers.SiglipImageProcessor(size={'height': 224, 'width': 224})
+    encoder = FrozenSiglipPatchEncoder(vision, processor, {'revision': 'test'})
+    encoder.train()
+    assert not encoder.training and not vision.training
+    images = torch.rand(1, 3, 256, 256) * 2 - 1
+    tokens = encoder(images)
+    assert tokens.shape == (1, 196, 768) and not tokens.requires_grad
+    pixels = processor(images=list(((images + 1) / 2).numpy()), do_rescale=False,
+                       return_tensors='pt', input_data_format='channels_first')['pixel_values']
+    with torch.no_grad():
+        torch.testing.assert_close(tokens, vision(pixel_values=pixels).last_hidden_state)
+    with pytest.raises(ValueError, match=r'in \[-1,1\]'):
+        encoder(images + 3)
+
+
+def test_local_loading_from_composite_siglip_checkpoint(tmp_path):
+    transformers = pytest.importorskip('transformers')
+    # Official downloads contain both towers. Exercise actual key-prefix loading.
+    config = transformers.SiglipConfig(vision_config=dict(hidden_size=768, intermediate_size=64,
+        num_hidden_layers=1, num_attention_heads=12, image_size=224, patch_size=16),
+        text_config=dict(vocab_size=32, hidden_size=32, intermediate_size=32,
+                         num_hidden_layers=1, num_attention_heads=4))
+    original = transformers.SiglipModel(config).eval()
+    original.save_pretrained(tmp_path)
+    transformers.SiglipImageProcessor(size={'height': 224, 'width': 224}).save_pretrained(tmp_path)
+    files = [tmp_path / name for name in ('config.json', 'preprocessor_config.json', 'model.safetensors')]
+    manifest = dict(model_id=MODEL_ID, revision='local-fixture', files={p.name: file_sha256(p) for p in files})
+    (tmp_path / MANIFEST_NAME).write_text(json.dumps(manifest))
+    loaded = FrozenSiglipPatchEncoder.from_local(tmp_path)
+    images = torch.rand(1, 3, 256, 256) * 2 - 1
+    pixels = loaded.processor(images=list(((images + 1) / 2).numpy()), do_rescale=False,
+                              return_tensors='pt', input_data_format='channels_first')['pixel_values']
+    with torch.no_grad():
+        expected = original.vision_model(pixel_values=pixels).last_hidden_state
+    torch.testing.assert_close(loaded(images), expected)
+    assert not any('text_model' in name for name, _ in loaded.named_parameters())
+
+
+def test_manifest_hash_verification_and_download_token_handling(tmp_path, monkeypatch):
+    hub = pytest.importorskip('huggingface_hub')
+    calls = {}
+    def info(self, repo, **kwargs):
+        calls['info'] = repo, kwargs
+        return SimpleNamespace(sha='immutable-sha')
+    def download(**kwargs):
+        calls['download'] = kwargs
+        (tmp_path / 'config.json').write_text(json.dumps({'model_type': 'siglip'}))
+        (tmp_path / 'preprocessor_config.json').write_text('{}')
+        (tmp_path / 'model.safetensors').write_bytes(b'offline fixture')
+    monkeypatch.setattr(hub.HfApi, 'model_info', info)
+    monkeypatch.setattr(hub, 'snapshot_download', download)
+    monkeypatch.setenv('HF_TOKEN', 'test-token')
+    script = Path(__file__).resolve().parents[1] / 'scripts/download_siglip2.py'
+    spec = importlib.util.spec_from_file_location('download_siglip2_test', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    manifest = module.download(tmp_path)
+    assert manifest['revision'] == calls['download']['revision'] == 'immutable-sha'
+    assert calls['download']['token'] == 'test-token'
+    assert 'test-token' not in (tmp_path / MANIFEST_NAME).read_text()
+    assert snapshot_identity(tmp_path) == manifest
+    (tmp_path / 'model.safetensors').write_bytes(b'changed')
+    with pytest.raises(ValueError, match='changed'):
+        snapshot_identity(tmp_path)
+
+
+@pytest.fixture
+def v2_training_setup(latent_training_setup, monkeypatch):
+    import diffusion_ot.data.ground_truth as ground_truth
+    import diffusion_ot.integrations.sit_diffusers as sit
+    import diffusion_ot.models.pdae_sit as pdae
+    run, config, latest, root, _, _, source = latent_training_setup
+    config['train']['initialize_from'] = None
+    config['refinement'] = {'enabled': False}
+    config['encoder'] = dict(kind='siglip2_vit_b16', input_space='rgb', image_size=8,
+                             local_dir='artifacts/siglip')
+    config['adapter'] = dict(kind='pdae_v2_cross_attention', cross_attention_heads=2,
+                             lora=True, lora_rank=2, lora_alpha=2)
+    config['semantic_cfg'] = dict(enabled=True, dropout_probability=.1)
+    torch.manual_seed(19)
+    original, encoder = base_model(), TinyFrozenEncoder()
+    monkeypatch.setattr(ground_truth, 'load_afhq_dataset', lambda *a, **k: source)
+    monkeypatch.setattr(FrozenSiglipPatchEncoder, 'from_local', lambda *a: deepcopy(encoder))
+    def components(*a, **kw):
+        vae = TinyVAE().requires_grad_(False)
+        latest['vae'] = vae
+        return SimpleNamespace(transformer=deepcopy(original), vae=vae)
+    def build(*a, **kw):
+        latest['branch'] = build_pdae_sit_branch(*a, **kw)
+        return latest['branch']
+    monkeypatch.setattr(sit, 'load_sit_components', components)
+    monkeypatch.setattr(pdae, 'build_pdae_sit_branch', build)
+    return run, config, latest, root
+
+
+def test_real_training_loop_validation_and_resume(v2_training_setup):
+    run, _, latest, root = v2_training_setup
+    first, logs, report = run('v2', steps=1)
+    assert report.initial_step == 0 and report.final_step == 1
+    assert first['model']['format_version'] == 6 and 'encoder' not in first['model']
+    assert first['train_state']['refinement'] is None
+    assert logs['refinement'] == []
+    assert logs['train'][0]['encoder_grad_norm_pre_clip'] == 0
+    assert logs['train'][0]['adapter_grad_norm_pre_clip'] > 0
+    resumed, logs, report = run('v2', steps=2, resume=True)
+    assert report.initial_step == 1 and report.final_step == 2
+    assert resumed['ema']['num_updates'] == 2
+    assert [row['step'] for row in logs['validation']] == [0, 1, 2]
+    assert latest['branch'].training and not latest['branch'].encoder.training
+    assert all(p.grad is None for p in latest['vae'].parameters())
+    assert all(not name.startswith('encoder.') for name in resumed['ema']['shadow'])
+
+
+def test_real_evaluation_cfg_grid_and_roundtrip(v2_training_setup):
+    import yaml
+    from diffusion_ot.evaluation.stage1a_eval import run_stage1a_smoke_test
+    run, _, _, root = v2_training_setup
+    run('v2_eval', steps=1)
+    config = dict(project_root=str(root), split='val', weights='ema',
+        dataset=dict(smoke_samples=2, batch_size=2, num_workers=0),
+        architecture=dict(require_encoder_kind='siglip2_vit_b16', require_encoder_input_space='rgb'),
+        sampling=dict(smoke_num_steps=2, guidance_scales=[0., 1., 2.],
+            variants=['correct_z', 'shuffled_z', 'null_z'],
+            inferred_noise=dict(enabled=True, num_steps=2, variants=['correct_z'])),
+        metrics=dict(image_reference='original_rgb'), input_statistics=dict(enabled=False))
+    path = root / 'eval.yaml'
+    path.write_text(yaml.safe_dump(config))
+    report = run_stage1a_smoke_test(root / 'v2_eval.yaml', path, device='cpu')
+    assert report.checkpoint_step == 1 and report.weights == 'ema'
+    assert Path(report.grid_path).is_file()
+    stats = json.loads(Path(report.extra_reports['condition_tokens']).read_text())
+    assert stats['dim'] == 768 and stats['tokens_per_image'] == 4
+    assert any('roundtrip' in key or 'inferred' in key for key in report.extra_reports)

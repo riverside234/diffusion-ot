@@ -354,6 +354,14 @@ class SemanticSiTWrapper(nn.Module):
             out_dim=_final_patch_dim(transformer),
             bottleneck_dim=bottleneck_dim,
         )
+        self._configure_attention_lora(
+            depth, attention_lora, lora_rank, lora_alpha, lora_dropout, lora_layers
+        )
+
+    def _configure_attention_lora(
+        self, depth, attention_lora, lora_rank, lora_alpha, lora_dropout, lora_layers
+    ) -> None:
+        """Shared LoRA setup for vector adapters and PDAE v2 token conditioning."""
         self.attention_lora_enabled = bool(attention_lora)
         default_lora_layers = self.injection_layers
         requested_lora_layers = _as_list(lora_layers, default=default_lora_layers)
@@ -655,6 +663,7 @@ class PDAESiTBranch(nn.Module):
         class_labels: torch.Tensor | None = None,
         force_drop_ids=None,
         return_dict: bool = True,
+        condition_padding_mask: torch.Tensor | None = None,
     ):
         return self.semantic_transformer(
             hidden_states=x_t,
@@ -663,6 +672,8 @@ class PDAESiTBranch(nn.Module):
             class_labels=class_labels,
             force_drop_ids=force_drop_ids,
             return_dict=return_dict,
+            **({"condition_padding_mask": condition_padding_mask}
+               if condition_padding_mask is not None else {}),
         )
 
     def predict_cfg_with_z(
@@ -675,10 +686,14 @@ class PDAESiTBranch(nn.Module):
         class_labels: torch.Tensor | None = None,
         force_drop_ids=None,
         return_dict: bool = True,
+        condition_padding_mask: torch.Tensor | None = None,
     ):
         """Predict base + G(null) + scale * (G(z) - G(null))."""
+        mask_kwargs = ({"condition_padding_mask": condition_padding_mask}
+                       if condition_padding_mask is not None else {})
         if not self.semantic_cfg_enabled:
             output = self.predict_with_z(
+                **mask_kwargs,
                 x_t=x_t,
                 timestep=timestep,
                 z=z,
@@ -698,6 +713,7 @@ class PDAESiTBranch(nn.Module):
             if float(guidance_scale) == 0.0:
                 null_z = self.semantic_null_like(z)
                 unconditional = self.predict_with_z(
+                    **mask_kwargs,
                     x_t=x_t,
                     timestep=timestep,
                     z=null_z,
@@ -716,6 +732,7 @@ class PDAESiTBranch(nn.Module):
                     unconditional.delta_sample,
                 )
             conditional = self.predict_with_z(
+                **mask_kwargs,
                 x_t=x_t,
                 timestep=timestep,
                 z=z,
@@ -735,6 +752,7 @@ class PDAESiTBranch(nn.Module):
                 )
             null_z = self.semantic_null_like(z)
             unconditional = self.predict_with_z(
+                **mask_kwargs,
                 x_t=x_t,
                 timestep=timestep,
                 z=null_z,
@@ -767,6 +785,7 @@ class PDAESiTBranch(nn.Module):
         semantic_drop_mask: torch.Tensor | None = None,
         return_dict: bool = True,
         encoder_image: torch.Tensor | None = None,
+        condition_padding_mask: torch.Tensor | None = None,
     ):
         z = self.encode(x0_latent, encoder_image=encoder_image)
         conditioned_z, drop_mask = self.condition_semantic_z(
@@ -781,6 +800,8 @@ class PDAESiTBranch(nn.Module):
             class_labels=class_labels,
             force_drop_ids=force_drop_ids,
             return_dict=True,
+            **({"condition_padding_mask": condition_padding_mask}
+               if condition_padding_mask is not None else {}),
         )
         output.z = z
         output.conditioned_z = conditioned_z
@@ -879,8 +900,14 @@ def build_pdae_sit_branch(
     transformer: Any,
     model_config: dict[str, Any] | None = None,
     stage_config: dict[str, Any] | None = None,
+    *,
+    project_root=None,
 ) -> PDAESiTBranch:
     encoder_config = dict((stage_config or {}).get("encoder") or {})
+    if encoder_config.get("kind") == "siglip2_vit_b16":
+        from diffusion_ot.models.pdae_v2.branch import build_pdae_v2_branch
+
+        return build_pdae_v2_branch(transformer, stage_config, project_root=project_root)
     adapter_config = dict((stage_config or {}).get("adapter") or {})
     semantic_cfg_config = dict((stage_config or {}).get("semantic_cfg") or {})
     input_space = str(encoder_config.get("input_space", "latent"))

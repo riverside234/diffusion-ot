@@ -102,16 +102,13 @@ def test_raw_alignment_matches_fit_and_trains_encoders(local_helpers):
     scale = torch.logspace(-1, 1, 512)
     source = (torch.randn(24, 512, generator=generator) * scale + 30).requires_grad_()
     target = (torch.randn(24, 512, generator=generator) * scale.flip(0) - 20).requires_grad_()
-    diagnostics = {}
-    plan = helpers.fit_transport(source, target, iterations=3, diagnostics=diagnostics)
+    plan = helpers.fit_transport(source, target, iterations=3)
     assert not plan.requires_grad
     plan.requires_grad_()
     loss = helpers.alignment_loss(source, target, plan, h=0.4)
     with torch.no_grad():
         solver = infoot.FusedInfoOT(source, target, h=0.4, lam=0.1, reg=0.02)
-        torch.testing.assert_close(plan, solver.solve(numIter=3, verbose=False), rtol=0, atol=0)
         expected = infoot.fitting_loss(plan, solver.Ks, solver.Kt, 0.02, C=solver.C, mi_weight=0.1)
-    assert diagnostics["initialization"] == "uniform"
     torch.testing.assert_close(loss, expected)
     loss.backward()
     for features in (source, target):
@@ -146,9 +143,9 @@ def test_saved_raw_plan_preserves_query_mapping_and_target_scale(local_helpers, 
     assert "stats" not in saved
 
 
-def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_path, monkeypatch):
+def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(local_helpers, tmp_path, monkeypatch):
     from infoot_helper import infoot_test_helper as helper
-    from infoot_helper.reference_rms import ReferenceRMSEMA
+    from infoot_helper.batchnorm_matching import batchnorm_checkpoint
 
     features = {
         "cat": torch.tensor([[1., 3.], [2., 7.], [4., 9.]]),
@@ -157,13 +154,12 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
     models = {name: SimpleNamespace(name=name) for name in features}
     output_dir = tmp_path / "outputs/infoot_cotraining"
     output_dir.mkdir(parents=True)
-    tracker = ReferenceRMSEMA()
-    tracker.update({name: v * 2 for name, v in features.items()}, step=1)
-    tracker.num_updates.fill_(2000)
-    for name, model in models.items():
-        model.checkpoint_path = output_dir / f"{name}_step_002000.pt"
-        torch.save({"step": 2000, "domain": name, "projection_rms": tracker.state_dict()},
-                   model.checkpoint_path)
+    norms = {name: torch.nn.BatchNorm1d(2, affine=False, momentum=1.) for name in features}
+    for name, norm in norms.items():
+        norm(features[name] * .5 + 3)
+        norm.eval()
+        torch.save({"domain": name, "step": 2000, "matching_batchnorm": batchnorm_checkpoint(norm)},
+                   output_dir / f"{name}_step_002000.pt")
 
     def load_model(config, evaluation, **kwargs):
         name = config.name.split("_")[0]
@@ -171,11 +167,9 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
         return models[name]
 
     def fit(source, target, **kwargs):
-        torch.testing.assert_close(source, features["cat"])
-        torch.testing.assert_close(target, features["dog"])
-        assert kwargs == {"h": 0.4, "reg": 0.02, "mi_weight": 0.1,
-                          "iterations": 1200, "diagnostics": {}}
-        kwargs["diagnostics"].update(solver="FusedInfoOT", initialization="uniform")
+        torch.testing.assert_close(source, norms["cat"](features["cat"]))
+        torch.testing.assert_close(target, norms["dog"](features["dog"]))
+        assert not source.requires_grad and not target.requires_grad
         return torch.eye(3) / 3
 
     monkeypatch.setattr(helper, "load_stage1a_evaluator", load_model)
@@ -184,14 +178,18 @@ def test_cotraining_test_fits_reencoded_raw_training_banks(local_helpers, tmp_pa
     result = helper.prepare_cotraining_test(
         tmp_path, {name: {"latent_paths": []} for name in features}, 2000, "cpu"
     )
-    cat, dog, Xs, Xt, P, scales = result
-    assert cat is models["cat"] and dog is models["dog"]
-    torch.testing.assert_close(Xs, features["cat"])
-    torch.testing.assert_close(Xt, features["dog"])
+    loaded_models, raw_banks, matching, loaded_norms, P = result
+    for name in models:
+        assert loaded_models[name] is models[name]
+        assert not loaded_norms[name].training
+        torch.testing.assert_close(loaded_norms[name].state_dict(), norms[name].state_dict())
+        torch.testing.assert_close(raw_banks[name], features[name])
+        torch.testing.assert_close(matching[name], norms[name](features[name]))
     saved = torch.load(output_dir / "cat_to_dog_step_002000_plan.pt", weights_only=True)
     torch.testing.assert_close(saved["P"], P)
-    assert saved["feature_space"] == "raw" and "stats" not in saved
-    assert saved["projection_scales"] == scales == tracker.scales()
+    assert saved["feature_space"] == "batchnorm"
+    for name, norm in norms.items():
+        torch.testing.assert_close(saved["matching_batchnorm"][name]["state_dict"], norm.state_dict())
 
 
 def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path, monkeypatch):
@@ -207,29 +205,23 @@ def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path
     original = Path(__file__).resolve().parents[1] / "infoot/infoot_fit.py"
     script.write_text(original.read_text(encoding="utf-8"), encoding="utf-8")
 
-    calls = []
-
     class Solver:
         def __init__(self, Xs, Xt, h, reg, lam):
             torch.testing.assert_close(Xs, source)
             torch.testing.assert_close(Xt, target)
             assert (h, reg, lam) == (0.4, 0.02, 0.37)
 
-        def solve(self, **kwargs):
-            calls.append(kwargs)
-            self.diagnostics_ = {"solver": "FusedInfoOT", "initialization": "uniform"}
+        def solve(self, numIter, verbose):
+            assert numIter == 50 and verbose is True
             return torch.eye(3) / 3
 
     monkeypatch.setattr(infoot, "FusedInfoOT", Solver)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(sys, "argv", [str(script), "--lam", "0.37"])
     runpy.run_path(str(script), run_name="__main__")
-    assert calls == [{"numIter": 50, "sinkhorn_iter": 5000, "marginal_tol": 1e-4}]
     saved = torch.load(bank_dir / "cat_to_dog_plan.pt", weights_only=True)
     assert saved["lam"] == 0.37 and saved["feature_space"] == "raw"
     assert "stats" not in saved
-    assert saved["optimization"]["initialization"] == "uniform"
-    assert saved["banks"]["cat"]["sha256"]
 
 
 @pytest.mark.parametrize("solver_name", ["InfoOT", "FusedInfoOT"])

@@ -14,6 +14,9 @@ from diffusion_ot.training.train_joint_infoot import _cycle
 
 from infoot_helper.encoding import encode_batches
 from infoot_helper.diagnostics import representation_log
+from infoot_helper.batchnorm_matching import (
+    add_matching_features, batchnorm_checkpoint, covariance_loss,
+)
 from infoot_helper.infoot_cotraining_helper import (
     fit_transport,
     alignment_loss,
@@ -21,7 +24,6 @@ from infoot_helper.infoot_cotraining_helper import (
     save_domain_checkpoints,
 )
 from infoot_helper.native_flow import native_flow_loss
-from infoot_helper.reference_rms import ReferenceRMSEMA
 from infoot_helper.translation_contrastive import (
     translation_contrastive_loss,
 )
@@ -46,13 +48,16 @@ def main():
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
-        "rms_decay": 0.99,
+        "covariance_weight": 0.01,
+        "batchnorm": {"affine": False, "momentum": 0.1, "eps": 1e-5},
+        "batchnorm_lr": 1e-5,
     }
 
     output_dir = ROOT / "outputs/infoot_cotraining"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     domains = {}
+    batch_norms = torch.nn.ModuleDict()
     batches = {}
     parameter_groups = []
 
@@ -70,6 +75,13 @@ def main():
             weights="raw",
         )
         domains[name] = context
+        batch_norms[name] = torch.nn.BatchNorm1d(
+            context.training_config["encoder"]["z_dim"], **settings["batchnorm"],
+        ).to(context.device)
+        if batch_norms[name].affine:
+            parameter_groups.append({
+                "params": batch_norms[name].parameters(), "lr": settings["batchnorm_lr"],
+            })
 
         context.vae.eval().requires_grad_(False)
         generator_view = configure_generator_adaptation(context.branch)
@@ -101,7 +113,6 @@ def main():
         batches[name] = _cycle(loader)
 
     optimizer = torch.optim.Adam(parameter_groups)
-    projection_rms = ReferenceRMSEMA(decay=settings["rms_decay"])
     parameters = [
         parameter
         for group in optimizer.param_groups
@@ -124,6 +135,7 @@ def main():
         encoded = encode_batches(
             domains, latents, query_count=settings["query_count"]
         )
+        add_matching_features(encoded, batch_norms)
 
         flow_losses = {
             name: native_flow_loss(
@@ -137,24 +149,26 @@ def main():
 
         cat_refs = encoded["cat"]["references"]["v"]
         dog_refs = encoded["dog"]["references"]["v"]
-        projection_scales = projection_rms.update(
-            {"cat": cat_refs, "dog": dog_refs}, step=step,
-        )
+        cat_matching = encoded["cat"]["references"]["m"]
+        dog_matching = encoded["dog"]["references"]["m"]
+        covariance_losses = {
+            name: covariance_loss(batch["references"]["v"])
+            for name, batch in encoded.items()
+        }
+        loss_covariance = torch.stack(list(covariance_losses.values())).mean()
 
-        fit_diagnostics = {}
         P = fit_transport(
-            cat_refs,
-            dog_refs,
+            cat_matching,
+            dog_matching,
             h=settings["h"],
             mi_weight=settings["mi_weight"],
             reg=settings["reg"],
             iterations=settings["fit_iterations"],
-            diagnostics=fit_diagnostics,
         )
 
         loss_infoot = alignment_loss(
-            cat_refs,
-            dog_refs,
+            cat_matching,
+            dog_matching,
             P,
             h=settings["h"],
             mi_weight=settings["mi_weight"],
@@ -168,12 +182,12 @@ def main():
             ("dog", "cat", P.T),
         ):
             mapped_v = conditional_mapping(
-                encoded[source]["queries"]["v"],
-                encoded[source]["references"]["v"],
-                encoded[target]["references"]["v"],
+                encoded[source]["queries"]["m"],
+                encoded[source]["references"]["m"],
+                encoded[target]["references"]["m"],
                 plan,
                 h=settings["h"],
-                scales=(projection_scales[source], projection_scales[target]),
+                target_v=encoded[target]["references"]["v"],
             )
 
             loss, metrics = translation_contrastive_loss(
@@ -191,6 +205,7 @@ def main():
             settings["flow_weight"] * loss_flow
             + loss_infoot
             + settings["contrastive_weight"] * loss_contrastive
+            + settings["covariance_weight"] * loss_covariance
         )
 
 
@@ -207,10 +222,10 @@ def main():
                 f"flow_cat={flow_losses['cat'].item():.4f} "
                 f"flow_dog={flow_losses['dog'].item():.4f} "
                 f"infoot={loss_infoot.item():.4f} "
-                f"fit={fit_diagnostics['status']} "
-                f"rms_cat={projection_scales['cat']:.4f} "
-                f"rms_dog={projection_scales['dog']:.4f} "
                 f"{geometry} "
+                f"cov_cat={covariance_losses['cat'].item():.4f} "
+                f"cov_dog={covariance_losses['dog'].item():.4f} "
+                f"cov_weighted={settings['covariance_weight'] * loss_covariance.item():.4f} "
                 f"contrastive={loss_contrastive.item():.4f} "
                 f"total={loss.item():.4f}"
             )
@@ -229,12 +244,13 @@ def main():
                         for name, context in domains.items()
                     },
                     "optimizer": optimizer.state_dict(),
-                    "transport_fit": fit_diagnostics,
-                    "projection_rms": projection_rms.state_dict(),
+                    "matching_batchnorm": {
+                        name: batchnorm_checkpoint(norm) for name, norm in batch_norms.items()
+                    },
                 },
                 output_dir / f"step_{step:06d}.pt",
             )
-            save_domain_checkpoints(domains, output_dir, step, projection_rms)
+            save_domain_checkpoints(domains, output_dir, step, batch_norms)
 
 
 if __name__ == "__main__":

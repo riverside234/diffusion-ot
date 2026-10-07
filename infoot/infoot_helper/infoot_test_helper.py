@@ -10,8 +10,7 @@ from diffusion_ot.data.latent_dataset import load_latent_tensor
 from diffusion_ot.evaluation.stage1a_eval import load_stage1a_evaluator
 from . import infoot
 from .infoot_cotraining_helper import fit_transport
-from .transport.plan_io import file_identity
-from .reference_rms import load_projection_scales
+from .batchnorm_matching import batchnorm_checkpoint, load_batchnorm
 
 @torch.inference_mode()
 def generate_and_save_grid(
@@ -58,38 +57,32 @@ def encode_paths(domain, paths, batch_size=32):
     return torch.cat(features)
 
 
-def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02,
-                           iterations=1200):
+def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02):
     models, features = {}, {}
-    checkpoint_paths = {
-        name: root / "outputs/infoot_cotraining" / f"{name}_step_{step:06d}.pt"
-        for name in banks
-    }
-    projection_scales = load_projection_scales(checkpoint_paths, step=step)
+    matching, batch_norms = {}, {}
 
     for name, bank in banks.items():
+        checkpoint = root / "outputs/infoot_cotraining" / f"{name}_step_{step:06d}.pt"
+        batch_norms[name] = load_batchnorm(checkpoint, domain=name, step=step, device=device)
         models[name] = load_stage1a_evaluator(
             root / f"configs/stage1a_pdae/{name}_sit_b2_lora_residual_cosmap.yaml",
             root / "configs/stage1a_eval/residual_sit_b2_256.yaml",
             device=device,
             weights="raw",
-            checkpoint_path=checkpoint_paths[name],
+            checkpoint_path=checkpoint,
         )
         features[name] = encode_paths(models[name], bank["latent_paths"])
+        with torch.no_grad():
+            matching[name] = batch_norms[name](features[name])
 
-    Xs, Xt = features["cat"], features["dog"]
-    diagnostics = {}
-    P = fit_transport(Xs, Xt, h=h, reg=reg, mi_weight=0.10,
-                      iterations=iterations, diagnostics=diagnostics)
-    references = {
-        name: {"latent_paths": banks[name]["latent_paths"],
-               "checkpoint_at_fit": file_identity(model.checkpoint_path)}
-        for name, model in models.items()
-    }
+    Xs, Xt = matching["cat"], matching["dog"]
+    P = fit_transport(
+        Xs, Xt, h=h, reg=reg, mi_weight=0.10, iterations=1200,
+    )
     infoot.save_plan(
         root / "outputs/infoot_cotraining" / f"cat_to_dog_step_{step:06d}_plan.pt",
         P, h, reg, lam=0.10,
-        optimization=diagnostics, banks=references,
-        projection_scales=projection_scales,
+        feature_space="batchnorm",
+        matching_batchnorm={name: batchnorm_checkpoint(norm) for name, norm in batch_norms.items()},
     )
-    return models["cat"], models["dog"], Xs, Xt, P, projection_scales
+    return models, features, matching, batch_norms, P

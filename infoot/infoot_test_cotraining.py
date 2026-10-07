@@ -22,7 +22,6 @@ parser.add_argument("--h", type=float, default=0.4)
 parser.add_argument("--reg", type=float, default=0.02)
 parser.add_argument("--save", type=str, default="1")
 parser.add_argument("--step", type=int, default=2000)
-parser.add_argument("--fit-iterations", type=int, default=1200)
 
 args = parser.parse_args()
 
@@ -36,15 +35,15 @@ dog_bank = torch.load(
     bank_dir / "dog_bank.pt", map_location="cpu", weights_only=True
 )
 
-cat, dog, Xs, Xt, P, projection_scales = prepare_cotraining_test(
+domains, raw_banks, matching, batch_norms, P = prepare_cotraining_test(
     ROOT,
     {"cat": cat_bank, "dog": dog_bank},
     step=args.step,
     device=device,
     h=args.h,
     reg=args.reg,
-    iterations=args.fit_iterations,
 )
+cat, dog = domains["cat"], domains["dog"]
 
 count = 16
 latent_dir = ROOT / "data/latents/afhq_sit_b2_256/cat_val"
@@ -55,8 +54,8 @@ if len(paths) < count:
 with torch.no_grad():
     v_cat = encode_paths(cat, paths)
     v_dog = conditional_mapping(
-        v_cat, Xs, Xt, P, h=args.h,
-        scales=(projection_scales["cat"], projection_scales["dog"]),
+        batch_norms["cat"](v_cat), matching["cat"], matching["dog"], P,
+        h=args.h, target_v=raw_banks["dog"],
     )
 
 records = {

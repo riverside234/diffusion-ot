@@ -1,10 +1,10 @@
 import torch
 from diffusion_ot.training.native_flow import native_flow_objective
 from . import infoot
-from .reference_rms.mapping import rms_conditional_mapping
+from .batchnorm_matching import batchnorm_checkpoint
 
 
-def save_domain_checkpoints(domains, output_dir, step, projection_rms=None):
+def save_domain_checkpoints(domains, output_dir, step, batch_norms=None):
     for name, domain in domains.items():
         torch.save(
             {
@@ -13,7 +13,9 @@ def save_domain_checkpoints(domains, output_dir, step, projection_rms=None):
                 "model": domain.branch.pdae_state_dict(),
                 "config": domain.training_config,
                 "native_flow_objective": native_flow_objective(domain.training_config),
-                "projection_rms": None if projection_rms is None else projection_rms.state_dict(),
+                "matching_batchnorm": (
+                    batchnorm_checkpoint(batch_norms[name]) if batch_norms is not None else None
+                ),
             },
             output_dir / f"{name}_step_{step:06d}.pt",
         )
@@ -21,7 +23,7 @@ def save_domain_checkpoints(domains, output_dir, step, projection_rms=None):
 
 @torch.no_grad()
 def fit_transport(v_cat, v_dog, h=0.4, mi_weight=0.10,
-                  reg=0.02, iterations=100, diagnostics=None):
+                  reg=0.02, iterations=100):
     solver = infoot.FusedInfoOT(
         v_cat,
         v_dog,
@@ -29,14 +31,11 @@ def fit_transport(v_cat, v_dog, h=0.4, mi_weight=0.10,
         lam=mi_weight,
         reg=reg,
     )
-    P = solver.solve(numIter=iterations, verbose=False)
-    if diagnostics is not None:
-        diagnostics.update(solver.diagnostics_)
-    return P
+    return solver.solve(numIter=iterations, verbose=False)
 
 
 def alignment_loss(
-    v_cat, v_dog, P, h=0.5, mi_weight=0.10, eps=1e-8, reg=0.02
+    v_cat, v_dog, P, h=0.5, mi_weight=0.10, eps=1e-5, reg=0.02
 ):
     solver = infoot.FusedInfoOT(
         v_cat, v_dog, h=h, lam=mi_weight, reg=reg
@@ -52,11 +51,9 @@ def alignment_loss(
     )
 
 
-def conditional_mapping(v_query, v_source, v_target, P, h=0.4, scales=None):
-    if scales is not None:
-        return rms_conditional_mapping(v_query, v_source, v_target, P, h, scales)
-    solver = infoot.InfoOT(v_source, v_target, h=h)
+def conditional_mapping(m_query, m_source, m_target, P, h=0.4, target_v=None):
+    solver = infoot.InfoOT(m_source, m_target, h=h)
     solver.P = P.detach()
 
-    scores = solver.conditional_score(v_query)
-    return infoot.projection(scores, v_target)
+    scores = solver.conditional_score(m_query)
+    return infoot.projection(scores, m_target if target_v is None else target_v)

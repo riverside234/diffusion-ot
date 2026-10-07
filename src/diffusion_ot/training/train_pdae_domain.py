@@ -355,6 +355,10 @@ def _z_statistics(z_values) -> dict[str, float | int]:
     import torch
 
     z = torch.cat(z_values, dim=0).float()
+    if z.ndim == 3:
+        from diffusion_ot.models.pdae_v2.encoder import patch_token_statistics
+
+        return patch_token_statistics(z)
     if not bool(torch.isfinite(z).all()):
         raise FloatingPointError("Non-finite semantic latent encountered during validation.")
     centered = z - z.mean(dim=0, keepdim=True)
@@ -824,7 +828,9 @@ def train_pdae_domain(
             + "\n".join(f"  - {item}" for item in mismatches)
         )
 
-    branch = build_pdae_sit_branch(transformer, model_config=model_config, stage_config=config)
+    branch = build_pdae_sit_branch(
+        transformer, model_config=model_config, stage_config=config, project_root=root
+    )
     model_dtype = _torch_dtype_from_model(transformer, torch.float32)
     branch.to(device=device, dtype=model_dtype)
     branch.train()

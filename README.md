@@ -26,6 +26,8 @@ The canonical configurations are:
 
 - Stage 1A Cat / Dog default: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora_residual_cosmap.yaml`
 - Stage 1A default evaluation: `configs/stage1a_eval/residual_sit_b2_256.yaml`
+- Separate PDAE v2 Stage 1A: `configs/stage1a_pdae_v2/{cat,dog}.yaml`
+- PDAE v2 evaluation: `configs/stage1a_eval/pdae_v2.yaml`
 - Stage 1B default: `configs/stage1b_infoot/self_supervised_infonce_v7_residual_cosmap_sit_b2.yaml`
 - Stage 1B default evaluation: `configs/stage1b_eval/self_supervised_infonce_v7_residual_cosmap_sit_b2.yaml`
 - Stage 1A historical plain latent recipe: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora.yaml`
@@ -54,6 +56,44 @@ The historical self-supervised controls use original flow-only EMA checkpoints w
 unchanged `*_sit_b2_lora.yaml` configs. Experiment D uses its selected
 `*_sit_b2_dino.yaml` EMA checkpoints. Neither automatically loads the new RGB
 Stage 1A outputs; replacing checkpoint paths alone is insufficient.
+
+### PDAE v2: frozen SigLIP 2 patch conditioning
+
+This separate Stage 1A experiment uses original RGB and frozen
+`google/siglip2-base-patch16-224` dense features `[B,196,768]`. A shared
+LayerNorm/MLP feeds independent image cross-attention between self-attention
+and the FFN in every SiT block. The new output projections start at zero;
+native timestep/class conditioning and frozen SiT weights are preserved.
+Trainable parameters are the projector, image-attention branches, learned
+CFG null token, and existing rank-64 attention LoRA. Training uses the current
+cosmap-weighted flow objective, with no refinement losses.
+
+From the lab project root (the YAMLs specify `/data/not_backed_up/yxu209/diffusion-ot/`):
+
+```bash
+# Install the repository requirements first. HF_TOKEN is read from the environment if needed.
+python scripts/download_siglip2.py --output-dir artifacts/siglip2_base_patch16_224
+python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml
+python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/dog.yaml
+python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml --resume latest
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/cat.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/dog.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml
+```
+
+Checkpoints are separate: `outputs/pdae_v2_cat` and `outputs/pdae_v2_dog`.
+They store trainable weights, optimizer/EMA/resume state, and a verified frozen
+encoder manifest. The downloader pins the Hub commit and hashes the model and
+processor files; subsequent training/evaluation is local-only. Keep that
+snapshot unchanged for resume, or reproduce it with `--revision <saved SHA>`.
+Existing local SiT/VAE artifacts and AFHQ cached latents/original RGB are also
+required. Change `project_root` in both training and evaluation YAMLs for a
+different checkout.
+
+Evaluation produces an 8-image fixed-noise CFG grid, a separate inferred-noise
+round trip, original-RGB reconstruction metrics, and patch-token statistics.
+It disables the vector-only N1 ridge probe. **Stage 1B token transport is not
+implemented for v2.** The existing experiment defaults remain unchanged.
+See [the design and implementation record](docs/pdae_v2_plan.md).
 
 ### Fresh residual-cosmap workflow (P1a / N1)
 

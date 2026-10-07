@@ -396,6 +396,7 @@ def load_stage1a_evaluator(
         components.transformer,
         model_config=model_config,
         stage_config=train_config,
+        project_root=root,
     )
     validate_stage1a_architecture(branch, _nested(eval_config, "architecture"))
     model_dtype = _torch_dtype_from_model(components.transformer)
@@ -987,9 +988,17 @@ def run_stage1a_smoke_test(
     _save_grid(grid_path, rows, samples_per_row=num_samples)
 
     extra_reports: dict[str, str] = {}
+    if z.ndim == 3:
+        from diffusion_ot.models.pdae_v2.encoder import patch_token_statistics
+
+        token_report = output_dir / "condition_tokens.json"
+        token_report.write_text(json.dumps(patch_token_statistics(z.detach().cpu()), indent=2) + "\n", encoding="utf-8")
+        extra_reports["condition_tokens"] = str(token_report)
     from diffusion_ot.evaluation.input_statistics import probe_options, run_input_statistics_probe
     input_options = probe_options(evaluator.evaluation_config)
     if input_options is not None:
+        if z.ndim != 2:
+            raise ValueError("input_statistics requires vector codes; disable it for PDAE v2 patch tokens.")
         extra_reports["input_statistics"] = run_input_statistics_probe(
             evaluator.branch, data_config_path=_resolve_config_path(evaluator.training_config, evaluator.project_root, "data_config"),
             domain=evaluator.domain, project_root=evaluator.project_root, device=evaluator.device,

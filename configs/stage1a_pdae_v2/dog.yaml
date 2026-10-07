@@ -1,0 +1,89 @@
+stage: stage1a_pdae
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+domain: dog
+split: train
+data_config: configs/data/afhq_huggan.yaml
+model_config: configs/model/sit_b2_256.yaml
+output_dir: outputs/pdae_v2_dog
+device: cuda:0
+torch_dtype: float32
+
+dataloader:
+  batch_size: 64
+  gradient_accumulation_steps: 1
+  random_horizontal_flip: 0.5
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+
+train:
+  max_steps: 50000
+  initialize_from: null
+  resume_from: null
+  seed: 20260901
+  # No encoder parameter group: SigLIP stays frozen.
+  lr_adapter: 0.0001
+  lr_lora: 0.000025
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  log_every: 40
+  save_every: 1000
+  keep_step_checkpoints: true
+
+ema:
+  enabled: true
+  decay: 0.9999
+  warmup_steps: 1000
+  update_every: 1
+
+evaluation:
+  enabled: true
+  split: val
+  batch_size: 16
+  num_batches: 4
+  num_time_bins: 10
+  every_steps: 1000
+  evaluate_at_start: true
+  use_ema: true
+  seed: 20260902
+
+flow:
+  direction: noise_to_data
+  time_eps: 0.00001
+
+class_conditioning:
+  mode: null
+  null_label: 1000
+
+semantic_cfg:
+  enabled: true
+  dropout_probability: 0.10
+  drop_granularity: sample
+  null_condition: learned_token
+
+encoder:
+  kind: siglip2_vit_b16
+  input_space: rgb
+  input_channels: 3
+  image_size: 256  # Original crop matching the VAE target; processor resizes to 224.
+  frozen: true
+  token_dim: 768
+  local_dir: artifacts/siglip2_base_patch16_224
+
+adapter:
+  kind: pdae_v2_cross_attention
+  freeze_base: true
+  cross_attention_heads: 12
+  # New projector/cross-attention train fully; LoRA adapts existing SiT attention.
+  lora: true
+  lora_rank: 64
+  lora_alpha: 64
+  lora_dropout: 0.0
+  lora_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+loss_weighting:
+  type: cosmap
+
+refinement:
+  enabled: false
