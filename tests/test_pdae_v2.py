@@ -356,6 +356,28 @@ def test_real_training_loop_validation_and_resume(v2_training_setup):
     assert all(not name.startswith('encoder.') for name in resumed['ema']['shadow'])
 
 
+def test_lr_warmup_accumulation_resume_and_legacy_schedule_guard(v2_training_setup):
+    run, config, _, _ = v2_training_setup
+    config['train'].update(lr_adapter=1e-4, lr_lora=2.5e-5, weight_decay=.01,
+        lr_schedule=dict(type='constant_with_warmup', warmup_steps=4))
+    # Fixture uses two microbatches/update; LR still advances only once/update.
+    first, logs, _ = run('v2_warmup', steps=1)
+    assert logs['train'][0]['lr_factor'] == .25
+    assert logs['train'][0]['learning_rates'] == pytest.approx({'adapter': 2.5e-5, 'lora': 6.25e-6})
+    assert all(group['weight_decay'] == .01 for group in first['optimizer']['param_groups'])
+    resumed, logs, report = run('v2_warmup', steps=4, resume=True)
+    assert report.initial_step == 1
+    assert [row['lr_factor'] for row in logs['train']] == [.25, .5, .75, 1.]
+    assert logs['train'][-1]['learning_rates'] == pytest.approx({'adapter': 1e-4, 'lora': 2.5e-5})
+    assert resumed['train_state']['lr_schedule'] == config['train']['lr_schedule']
+    with pytest.raises(ValueError, match='LR schedule changed on resume'):
+        run('v2_warmup', steps=5, resume=True,
+            modify=lambda c: c['train'].update(lr_schedule={'type': 'constant'}))
+    run('v2_legacy_lr', steps=1, modify=lambda c: c['train'].pop('lr_schedule'))
+    with pytest.raises(ValueError, match='LR schedule changed on resume'):
+        run('v2_legacy_lr', steps=2, resume=True)
+
+
 def test_real_evaluation_cfg_grid_and_roundtrip(v2_training_setup):
     import yaml
     from diffusion_ot.evaluation.stage1a_eval import run_stage1a_smoke_test

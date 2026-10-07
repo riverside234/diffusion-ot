@@ -1,3 +1,5 @@
+# Frozen SigLIP 2 -> trainable image cross-attention + SiT LoRA.
+# Matched cat/dog recipe; research rationale: docs/pdae_v2_plan.md, section 11.
 stage: stage1a_pdae
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
 domain: dog
@@ -6,9 +8,12 @@ data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
 output_dir: outputs/pdae_v2_dog
 device: cuda:0
+# This trainer casts model/optimizer parameters to this dtype; it is not AMP.
 torch_dtype: float32
 
 dataloader:
+  # Effective batch 64 on one GPU. If needed, use batch 32 + accumulation 2
+  # with the SAME peak LRs; 196 image tokens do not count as 196 images.
   batch_size: 64
   gradient_accumulation_steps: 1
   random_horizontal_flip: 0.5
@@ -17,31 +22,35 @@ dataloader:
   drop_last: true
 
 train:
-  max_steps: 50000
+  max_steps: 50000  # Budget cap; review fixed-noise image quality at 5k and 10k.
   initialize_from: null
   resume_from: null
   seed: 20260901
-  # No encoder parameter group: SigLIP stays frozen.
+  # Peak rates. New projector/cross-attention/null parameters use lr_adapter.
+  # No encoder optimizer group: pretrained SigLIP stays frozen and in eval mode.
   lr_adapter: 0.0001
   lr_lora: 0.000025
-  weight_decay: 0.0
+  lr_schedule:
+    type: constant_with_warmup
+    warmup_steps: 500  # Optimizer updates, independent of gradient accumulation.
+  weight_decay: 0.01
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
-  log_every: 40
+  log_every: 20
   save_every: 1000
   keep_step_checkpoints: true
 
 ema:
   enabled: true
   decay: 0.9999
-  warmup_steps: 1000
+  warmup_steps: 1000  # EMA averaging warmup, separate from train.lr_schedule.
   update_every: 1
 
 evaluation:
   enabled: true
   split: val
   batch_size: 16
-  num_batches: 4
+  num_batches: 2  # 32 fixed validation images; no random horizontal flips.
   num_time_bins: 10
   every_steps: 1000
   evaluate_at_start: true
@@ -58,7 +67,7 @@ class_conditioning:
 
 semantic_cfg:
   enabled: true
-  dropout_probability: 0.10
+  dropout_probability: 0.10  # Whole-image condition dropout for CFG, not ViT dropout.
   drop_granularity: sample
   null_condition: learned_token
 
@@ -83,6 +92,7 @@ adapter:
   lora_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
 loss_weighting:
+  # Weight velocity MSE directly; do not copy epsilon/SNR weighting from SD recipes.
   type: cosmap
 
 refinement:

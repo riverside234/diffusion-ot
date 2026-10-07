@@ -68,6 +68,13 @@ Trainable parameters are the projector, image-attention branches, learned
 CFG null token, and existing rank-64 attention LoRA. Training uses the current
 cosmap-weighted flow objective, with no refinement losses.
 
+Both domain configs use effective batch 64, peak learning rates `1e-4` for new
+conditioning layers and `2.5e-5` for LoRA, 500 optimizer updates of linear LR
+warmup, then constant rates, and AdamW weight decay `0.01`. Training validation
+uses **32 fixed images every 1,000 steps**, plus step 0; checkpoints save every
+1,000 steps. SigLIP stays frozen. See the
+[settings and research rationale](docs/pdae_v2_plan.md#11-research-backed-config-polish-2026-10-07).
+
 From the lab project root (the YAMLs specify `/data/not_backed_up/yxu209/diffusion-ot/`):
 
 ```bash
@@ -88,6 +95,11 @@ snapshot unchanged for resume, or reproduce it with `--revision <saved SHA>`.
 Existing local SiT/VAE artifacts and AFHQ cached latents/original RGB are also
 required. Change `project_root` in both training and evaluation YAMLs for a
 different checkout.
+
+LR warmup resumes from the saved optimizer step. For an older constant-LR v2
+run, retain its original schedule (omit `train.lr_schedule`) when resuming.
+To use the new recipe as a separate warm-start experiment, use
+`train.initialize_from` and a new `output_dir`.
 
 Evaluation produces an 8-image fixed-noise CFG grid, a separate inferred-noise
 round trip, original-RGB reconstruction metrics, and patch-token statistics.

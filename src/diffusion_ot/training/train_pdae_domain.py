@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from diffusion_ot.training.native_flow import native_flow_objective, validate_stage1a_objective
+from diffusion_ot.training.learning_rate import apply_step_learning_rates, resolve_lr_schedule
 
 from diffusion_ot.integrations.hf_snapshot import (
     effective_project_root,
@@ -719,6 +720,7 @@ def train_pdae_domain(
     config, resolved_config_path, root = _load_stage_config(config_path)
     validate_refinement_config(config)
     train_config = _nested(config, "train")
+    lr_schedule = resolve_lr_schedule(train_config.get("lr_schedule"))
     dataloader_config = _nested(config, "dataloader")
     flow_config = _nested(config, "flow")
     class_config = _nested(config, "class_conditioning")
@@ -895,6 +897,14 @@ def train_pdae_domain(
         if not resolved_resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resolved_resume_path}")
         checkpoint = _load_torch_checkpoint(resolved_resume_path, device=device)
+        saved_lr_schedule = (checkpoint.get("train_state") or {}).get("lr_schedule")
+        if saved_lr_schedule is None:
+            saved_lr_schedule = _nested(checkpoint.get("config") or {}, "train").get("lr_schedule")
+        if resolve_lr_schedule(saved_lr_schedule) != lr_schedule:
+            raise ValueError(
+                "Stage 1A LR schedule changed on resume. Keep the checkpoint's schedule, "
+                "or use train.initialize_from with a new output_dir for a new experiment."
+            )
         validate_refinement_resume(checkpoint.get("config") or {}, config)
         validate_stage1a_objective(config, checkpoint)
         saved_weighting = (checkpoint.get("train_state") or {}).get("loss_weighting")
@@ -941,6 +951,9 @@ def train_pdae_domain(
         )
 
     grad_clip_norm = train_config.get("grad_clip_norm", 1.0)
+    # After resume the configured peak LRs have been restored by
+    # _apply_optimizer_hyperparameters; don't use the saved warmup-scaled rates.
+    base_lrs = [group["lr"] for group in optimizer.param_groups]
     flow_direction = str(flow_config.get("direction", "noise_to_data"))
     time_eps = float(flow_config.get("time_eps", 1.0e-5))
     null_label_value = class_config.get("null_label")
@@ -991,6 +1004,7 @@ def train_pdae_domain(
         return {"loss_ema": loss_ema, "clip_events": clip_events, "clip_checks": clip_checks,
                 "training_seconds": training_seconds, "initialization": initialization,
                 "loss_weighting": loss_weight_config,
+                "lr_schedule": lr_schedule,
                 "refinement": refinement.state_dict() if refinement is not None else None}
 
     if resolved_resume_path is None:
@@ -1115,6 +1129,7 @@ def train_pdae_domain(
 
     for step in range(initial_step + 1, final_step + 1):
         step_started = time.perf_counter()
+        lr_factor = apply_step_learning_rates(optimizer, base_lrs, lr_schedule, step)
         should_log = step == initial_step + 1 or step % log_every == 0
         optimizer.zero_grad(set_to_none=True)
         loss_sum = None
@@ -1247,6 +1262,9 @@ def train_pdae_domain(
                 "loss_weighting": loss_weight_type,
                 "native_flow_objective": native_flow_objective(config),
                 "timestep_sampling": "uniform",
+                "lr_schedule": lr_schedule,
+                "lr_factor": lr_factor,
+                "learning_rates": {group["group_name"]: group["lr"] for group in optimizer.param_groups},
                 "weight_mean": weight_mean_value,
                 "effective_batch_size": effective_batch_size,
                 "gradient_accumulation_steps": accumulation_steps,
