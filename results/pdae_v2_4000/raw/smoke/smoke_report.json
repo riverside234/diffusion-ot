@@ -1,0 +1,175 @@
+{
+  "protocol": "fixed_noise_smoke",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae_v2/cat.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/pdae_v2.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/checkpoints/latest.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_040000/raw/smoke",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 40000,
+  "weights": "raw",
+  "semantic_cfg_enabled": true,
+  "attention_lora": {
+    "enabled": true,
+    "rank": 64,
+    "alpha": 64.0,
+    "dropout": 0.0,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "targets": [
+      "qkv",
+      "proj"
+    ]
+  },
+  "seed": 20260902,
+  "num_samples": 8,
+  "num_steps": 50,
+  "guidance_scales": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "vae_reconstruction",
+    "correct_z_cfg_0",
+    "shuffled_z_cfg_0",
+    "null_z_cfg_0",
+    "correct_z_cfg_1",
+    "shuffled_z_cfg_1",
+    "null_z_cfg_1",
+    "correct_z_cfg_1.5",
+    "shuffled_z_cfg_1.5",
+    "null_z_cfg_1.5",
+    "correct_z_cfg_2",
+    "shuffled_z_cfg_2",
+    "null_z_cfg_2"
+  ],
+  "metrics": {
+    "correct_z_cfg_0": {
+      "latent_mse": 1.2150521278381348,
+      "pixel_mse": 0.12106041610240936,
+      "pixel_psnr": 9.169978376870574
+    },
+    "shuffled_z_cfg_0": {
+      "latent_mse": 1.2150521278381348,
+      "pixel_mse": 0.12106041610240936,
+      "pixel_psnr": 9.169978376870574
+    },
+    "null_z_cfg_0": {
+      "latent_mse": 1.2150521278381348,
+      "pixel_mse": 0.12106041610240936,
+      "pixel_psnr": 9.169978376870574
+    },
+    "correct_z_cfg_1": {
+      "latent_mse": 0.4548148512840271,
+      "pixel_mse": 0.012365824542939663,
+      "pixel_psnr": 19.07776919940791
+    },
+    "shuffled_z_cfg_1": {
+      "latent_mse": 1.0579524040222168,
+      "pixel_mse": 0.09972427785396576,
+      "pixel_psnr": 10.011990999183318
+    },
+    "null_z_cfg_1": {
+      "latent_mse": 1.2150521278381348,
+      "pixel_mse": 0.12106041610240936,
+      "pixel_psnr": 9.169978376870574
+    },
+    "correct_z_cfg_1.5": {
+      "latent_mse": 0.4534183144569397,
+      "pixel_mse": 0.011981959454715252,
+      "pixel_psnr": 19.214721543353072
+    },
+    "shuffled_z_cfg_1.5": {
+      "latent_mse": 1.1235840320587158,
+      "pixel_mse": 0.10346081107854843,
+      "pixel_psnr": 9.852241212724103
+    },
+    "null_z_cfg_1.5": {
+      "latent_mse": 1.2150521278381348,
+      "pixel_mse": 0.12106018513441086,
+      "pixel_psnr": 9.1699866626692
+    },
+    "correct_z_cfg_2": {
+      "latent_mse": 0.46739065647125244,
+      "pixel_mse": 0.012527468614280224,
+      "pixel_psnr": 19.02136676644714
+    },
+    "shuffled_z_cfg_2": {
+      "latent_mse": 1.1654804944992065,
+      "pixel_mse": 0.10427819192409515,
+      "pixel_psnr": 9.818065076551845
+    },
+    "null_z_cfg_2": {
+      "latent_mse": 1.2150521278381348,
+      "pixel_mse": 0.12106018513441086,
+      "pixel_psnr": 9.1699866626692
+    },
+    "vae_reconstruction": {
+      "pixel_mse": 0.0016538286581635475,
+      "pixel_psnr": 27.8150948672341
+    }
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_040000/raw/smoke/reconstruction_grid.png",
+  "extra_reports": {
+    "condition_tokens": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_040000/raw/smoke/condition_tokens.json"
+  },
+  "encoder_input_space": "rgb",
+  "image_reference": "original_rgb",
+  "encoder_architecture": {
+    "kind": "siglip2_vit_b16",
+    "model_id": "google/siglip2-base-patch16-224",
+    "token_dim": 768,
+    "tokens": 196,
+    "image_size": 224,
+    "frozen": true,
+    "features": "last_hidden_state_post_layernorm"
+  },
+  "native_flow_objective": {
+    "protocol": "native_velocity_uniform_time_v1",
+    "direction": "noise_to_data",
+    "time_eps": 1e-05,
+    "timestep_sampling": "uniform",
+    "loss_weighting": {
+      "type": "cosmap"
+    }
+  },
+  "checkpoint_ema": {
+    "decay": 0.999,
+    "warmup_steps": 1000,
+    "num_updates": 40000,
+    "last_reset": {
+      "step": 10000,
+      "source": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/checkpoints/latest.pt",
+      "weights": "raw",
+      "decay": 0.999,
+      "num_updates": 10000,
+      "warmup_steps": 1000
+    }
+  },
+  "roundtrip_enabled": false
+}
