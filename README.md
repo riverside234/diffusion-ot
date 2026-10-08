@@ -70,14 +70,22 @@ cosmap-weighted flow objective, with no refinement losses.
 
 Both domain configs use effective batch 64, peak learning rates `1e-4` for new
 conditioning layers and `2.5e-5` for LoRA, 500 optimizer updates of linear LR
-warmup, then constant rates, and AdamW weight decay `0.01`. The budget is 20,000
+warmup, then constant rates, and AdamW weight decay `0.01`. The budget is 50,000
 updates with EMA decay `0.999`. Training validation uses raw as the primary
 weight state and compares raw and EMA on
 **the same 32 fixed images every 1,000 steps**, plus step 0; checkpoints save
-every 1,000 steps. SigLIP stays frozen. The
-[raw/EMA follow-up](docs/analysis/pdae_v2_cat_10000/raw_ema_review.md) confirms
-that raw greatly outperforms the old EMA at 10k. See the
-[settings and research rationale](docs/pdae_v2_plan.md#11-research-backed-config-polish-2026-10-07).
+every 5,000 steps, with training logs every 500 (also the first/final update).
+SigLIP stays frozen. The [40k review](docs/analysis/pdae_v2_cat_40000/review.md)
+finds that raw/EMA now agree closely, while fixed flow validation plateaus.
+
+Training applies a matched RGB augmentation: flip probability 0.5, mild color
+jitter probability 0.25 (brightness/contrast 0.1, saturation 0.05, hue 0), and
+affine probability 0.2 (3% translation, scale 0.97–1.03, no rotation). The same
+transformed RGB feeds SigLIP and a frozen VAE to build a fresh flow target.
+VAE encoding is chunked at 16 images. The old cached-latent flip is bypassed
+on this path; disabling `augmentation.enabled` restores the old data path.
+Validation is unaugmented. Logs include augmentation fractions and
+`loss_interval_mean`, and checkpoints record data-recipe changes on resume.
 
 From the lab project root (the YAMLs specify `/data/not_backed_up/yxu209/diffusion-ot/`):
 
@@ -86,6 +94,9 @@ From the lab project root (the YAMLs specify `/data/not_backed_up/yxu209/diffusi
 python scripts/download_siglip2.py --output-dir artifacts/siglip2_base_patch16_224
 python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml
 python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/dog.yaml
+# First continuation from the old run into the new augmentation output directory:
+python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml --resume outputs/pdae_v2_cat/checkpoints/step_040000.pt
+# Subsequent continuation of the new run:
 python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml --resume latest
 python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/cat.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --weights both
 python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/dog.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --weights both
@@ -104,19 +115,30 @@ Validation logs use raw primary metrics (`use_ema: false`) and add
 Changing EMA decay on resume preserves its shadow history and applies the new
 decay to future updates; it does not change existing saved EMA weights.
 
-For the reviewed 10k checkpoint, discard the stale average once when resuming:
+The historical 10k stale average was reset once; the supplied 40k checkpoint
+already contains that reset. Continue its EMA history normally. The
+`--reset-ema-on-resume` option remains available for explicitly resetting a stale
+average, but is not part of the current continuation recipe.
+
+Compare sampling at the same saved checkpoint, images, and noise:
 
 ```bash
-python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml --resume latest --reset-ema-on-resume --max-steps 13000
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/cat.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --checkpoint outputs/pdae_v2_cat/checkpoints/step_040000.pt --weights both --solver euler --num-steps 100
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/cat.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --checkpoint outputs/pdae_v2_cat/checkpoints/step_040000.pt --weights both --solver heun --num-steps 50
 ```
 
-This copies restored raw trainable weights into EMA, preserving optimizer,
-training step, LR schedule and EMA update count. Subsequent ordinary resumes
-retain this new averaging history; omit the reset flag on them. The reset is
-recorded in checkpoints and validation metadata. Learning rates and model
-architecture remain unchanged for this comparison.
+Heun uses two velocity evaluations per step; the default remains Euler-50.
+The legacy midpoint *time* convention is first-order Euler, not a midpoint
+Runge–Kutta solver. `--solver heun` selects endpoint predictor/corrector times.
+Reports include solver work counts, timing, and per-image errors. Override
+`--noise-seed` to vary noise while retaining the same IDs. Sampling overrides
+automatically create distinct output subdirectories; `--output-subdir` can
+name one explicitly. See the review for equal-cost comparisons and separate
+unchanged-data / half-LR continuation configs.
 
-Checkpoints are separate: `outputs/pdae_v2_cat` and `outputs/pdae_v2_dog`.
+New checkpoints are separate: `outputs/pdae_v2_cat_aug` and `outputs/pdae_v2_dog_aug`.
+Old run directories are preserved. Use an explicit old checkpoint for the first
+resume; `--resume latest` resolves inside the configured new output directory.
 They store trainable weights, optimizer/EMA/resume state, and a verified frozen
 encoder manifest. The downloader pins the Hub commit and hashes the model and
 processor files; subsequent training/evaluation is local-only. Keep that
@@ -136,8 +158,12 @@ run, retain its original schedule (omit `train.lr_schedule`) when resuming.
 To use the new recipe as a separate warm-start experiment, use
 `train.initialize_from` and a new `output_dir`.
 
-Evaluation produces an 8-image fixed-noise CFG grid, a separate inferred-noise
-round trip, original-RGB reconstruction metrics, and patch-token statistics.
+Evaluation produces a 16-image fixed-noise grid in batches of eight, original-RGB
+metrics, and patch-token statistics. Rows are original, VAE reconstruction, then
+correct/shuffled conditions at CFG 1, 1.5, and 2. Null and CFG-0 rows are removed;
+the internal learned-null CFG path remains. Round-trip grids are optional.
+Fixed noise is drawn in blocks of eight to retain the previous cohort's prefix
+on the same device/dtype. Shuffled conditions use the full cohort before chunking.
 It disables the vector-only N1 ridge probe. **Stage 1B token transport is not
 implemented for v2.** The existing experiment defaults remain unchanged.
 See [the design and implementation record](docs/pdae_v2_plan.md).

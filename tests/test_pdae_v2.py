@@ -393,6 +393,48 @@ def test_real_training_loop_validation_and_resume(v2_training_setup):
     assert all(not name.startswith('encoder.') for name in resumed['ema']['shadow'])
 
 
+def test_matched_augmentation_training_resume_and_validation_rng(v2_training_setup, monkeypatch, capsys):
+    run, config, latest, _ = v2_training_setup
+    first, _, _ = run('v2_aug_resume', steps=1)
+
+    def encode(self, image):
+        assert not torch.is_grad_enabled() and not self.training
+        return SimpleNamespace(latent_dist=SimpleNamespace(mean=torch.cat(
+            [image, image.mean(1, keepdim=True)], 1)))
+    monkeypatch.setattr(TinyVAE, 'encode', encode, raising=False)
+    original = PDAEV2Branch.forward
+    observed = []
+    def forward(self, *args, **kwargs):
+        if self.training:
+            rgb = kwargs['encoder_image']
+            torch.testing.assert_close(kwargs['x0_latent'], torch.cat([rgb, rgb.mean(1, keepdim=True)], 1))
+            observed.append(rgb.detach().clone())
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(PDAEV2Branch, 'forward', forward)
+    config['augmentation'] = dict(enabled=True, vae_batch_size=2,
+        horizontal_flip_probability=1., color_jitter=dict(probability=1.), affine=dict(probability=0.))
+    config['evaluation']['compare_raw_ema'] = True
+    resumed, logs, report = run('v2_aug_resume', steps=2, resume=True)
+    assert report.initial_step == 1 and resumed['ema']['num_updates'] == first['ema']['num_updates'] + 1
+    assert resumed['train_state']['ema_reset'] is None
+    assert resumed['train_state']['data_recipe_change']['step'] == 1
+    assert 'data_recipe_changed_on_resume' in capsys.readouterr().out
+    assert all(state['step'] == 2 for state in resumed['optimizer']['state'].values())
+    assert len(observed) == 2  # Two accumulated microbatches; legacy flip was bypassed.
+    row = logs['train'][-1]
+    assert row['augmentation']['fractions']['horizontal_flip'] == 1.
+    assert row['adapter_grad_norm_pre_clip'] > 0 and row['lora_grad_norm_pre_clip'] > 0
+    assert row['loss_interval_mean'] == pytest.approx(row['loss'])
+    assert all(p.grad is None for p in latest['vae'].parameters())
+    assert all(p.grad is None for p in latest['branch'].encoder.parameters())
+    paired, _, _ = run('v2_aug_paired', steps=2)
+    single, _, _ = run('v2_aug_single', steps=2,
+                       modify=lambda c: c['evaluation'].update(compare_raw_ema=False))
+    torch.testing.assert_close(paired['rng_state'], single['rng_state'], atol=0, rtol=0)
+    for name in paired['ema']['shadow']:
+        torch.testing.assert_close(paired['ema']['shadow'][name], single['ema']['shadow'][name], atol=0, rtol=0)
+
+
 def test_lr_warmup_accumulation_resume_and_legacy_schedule_guard(v2_training_setup):
     run, config, _, _ = v2_training_setup
     config['train'].update(lr_adapter=1e-4, lr_lora=2.5e-5, weight_decay=.01,

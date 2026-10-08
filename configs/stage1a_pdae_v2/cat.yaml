@@ -1,12 +1,12 @@
 # Frozen SigLIP 2 -> trainable image cross-attention + SiT LoRA.
-# Matched cat/dog recipe; research and cat review: docs/pdae_v2_plan.md, sections 11-12.
+# Matched augmentation recipe; review: docs/analysis/pdae_v2_cat_40000/review.md.
 stage: stage1a_pdae
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
 domain: cat
 split: train
 data_config: configs/data/afhq_huggan.yaml
 model_config: configs/model/sit_b2_256.yaml
-output_dir: outputs/pdae_v2_cat
+output_dir: outputs/pdae_v2_cat_aug
 device: cuda:0
 # This trainer casts model/optimizer parameters to this dtype; it is not AMP.
 torch_dtype: float32
@@ -16,13 +16,13 @@ dataloader:
   # with the SAME peak LRs; 196 image tokens do not count as 196 images.
   batch_size: 64
   gradient_accumulation_steps: 1
-  random_horizontal_flip: 0.5
+  random_horizontal_flip: 0.5  # Legacy fallback, skipped with matched RGB augmentation.
   num_workers: 4
   pin_memory: true
   drop_last: true
 
 train:
-  max_steps: 20000  # Loss is still improving at 10k; review raw/EMA images before continuing.
+  max_steps: 50000  # Total optimizer steps, including resumed steps.
   initialize_from: null
   resume_from: null
   seed: 20260901
@@ -36,8 +36,8 @@ train:
   weight_decay: 0.01
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
-  log_every: 20
-  save_every: 1000
+  log_every: 500
+  save_every: 5000
   keep_step_checkpoints: true
 
 ema:
@@ -55,7 +55,7 @@ evaluation:
   num_time_bins: 10
   every_steps: 1000
   evaluate_at_start: true
-  use_ema: false  # Raw is primary; the old 10k EMA substantially lagged raw.
+  use_ema: false  # Raw primary; EMA lag has cleared at 40k, so retain the paired check.
   compare_raw_ema: true  # Both weight states on the SAME 32 images/noise/timesteps.
   seed: 20260902
 
@@ -99,3 +99,19 @@ loss_weighting:
 
 refinement:
   enabled: false
+
+# Same transformed RGB feeds frozen SigLIP and fresh frozen-VAE targets.
+augmentation:
+  enabled: true
+  vae_batch_size: 16
+  horizontal_flip_probability: 0.5
+  color_jitter:
+    probability: 0.25
+    brightness: 0.10
+    contrast: 0.10
+    saturation: 0.05
+    hue: 0.0  # Preserve coat color.
+  affine:
+    probability: 0.20
+    translate: [0.03, 0.03]
+    scale: [0.97, 1.03]  # No rotation; reflected borders.

@@ -96,6 +96,49 @@ def _install_smoke_mocks(monkeypatch, evaluator):
     return grids
 
 
+@pytest.mark.parametrize('solver', ['euler', 'heun'])
+def test_sixteen_image_v2_grid_and_sampling_overrides(tmp_path, monkeypatch, solver):
+    from copy import deepcopy
+    import yaml
+    import diffusion_ot.evaluation.stage1a_eval as evaluation
+
+    evaluator = _evaluator(tmp_path)
+    template = evaluator.dataset[0]
+    evaluator.dataset = [{**template, 'sample_id': f'cat-{i}'} for i in range(24)]
+    path = Path(__file__).resolve().parents[1] / 'configs/stage1a_eval/pdae_v2.yaml'
+    evaluator.evaluation_config = yaml.safe_load(path.read_text())
+    evaluator.evaluation_config['sampling']['smoke_num_steps'] = 2
+    evaluator.evaluation_config['sampling']['inferred_noise']['num_steps'] = 2
+    evaluator.evaluation_config['architecture'] = {}
+    original_config = deepcopy(evaluator.evaluation_config)
+    def load(*args, **kwargs):
+        value = deepcopy(evaluator)
+        value.weights = kwargs.get('weights') or 'raw'
+        return value
+    monkeypatch.setattr(evaluation, 'load_stage1a_evaluator', load)
+    comparison = evaluation.run_stage1a_weight_comparison(
+        'train.yaml', 'eval.yaml', solver=solver, num_steps=3, noise_seed=42, roundtrip=True)
+    raw, ema = comparison['reports']['raw'], comparison['reports']['ema']
+    assert raw['sample_ids'] == ema['sample_ids'] and len(set(raw['sample_ids'])) == 16
+    assert raw['row_order'] == ['original', 'vae_reconstruction'] + [
+        f'{variant}_cfg_{scale}' for scale in ('1', '1.5', '2') for variant in ('correct_z', 'shuffled_z')]
+    assert raw['sampling']['solver'] == solver and raw['sampling']['noise_seed'] == 42
+    assert raw['sampling']['velocity_evaluations_per_sample_per_output'] == (6 if solver == 'heun' else 3)
+    assert len(raw['per_image_metrics']) == 16 and raw['num_steps'] == 3
+    assert raw['metrics'] == ema['metrics']
+    for report in (raw, ema):
+        assert Path(report['grid_path']).is_file()
+        roundtrip = json.loads(Path(report['extra_reports']['inferred_noise_roundtrip']).read_text())
+        assert roundtrip['row_order'] == ['original', 'vae_reconstruction', 'correct_z', 'shuffled_z']
+        assert roundtrip['sampling']['solver'] == solver
+    assert evaluator.evaluation_config == original_config
+
+    # Noise overrides change the seed, not the selected images.
+    changed = evaluation.run_stage1a_smoke_test('train.yaml', 'eval.yaml', noise_seed=43)
+    assert changed.sample_ids == raw['sample_ids'] and changed.metrics != raw['metrics']
+    assert not changed.roundtrip_enabled
+
+
 def test_rgb_smoke_and_roundtrip_use_original_rgb_for_condition_and_metrics(tmp_path, monkeypatch):
     from diffusion_ot.evaluation.stage1a_eval import run_stage1a_smoke_test
 

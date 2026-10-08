@@ -27,6 +27,60 @@ class TinyTransformer:
     config = SimpleNamespace(num_classes=3)
 
 
+def test_heun_accuracy_endpoints_reverse_direction_and_work_counts():
+    import math
+    from diffusion_ot.evaluation.stage1a_eval import integrate_pdae_flow
+
+    class ExponentialField:
+        semantic_cfg_enabled = True
+        def __init__(self):
+            self.calls = []
+        def predict_cfg_with_z(self, x_t, timestep, **kwargs):
+            self.calls.append((len(x_t), float(timestep[0])))
+            return SimpleNamespace(sample=x_t)
+
+    branch = ExponentialField()
+    initial, z = torch.ones(5, 1, 2, 2), torch.zeros(5, 4)
+    euler = integrate_pdae_flow(branch, TinyTransformer(), initial, z, num_steps=8)
+    branch.calls.clear()
+    stats = {}
+    heun = integrate_pdae_flow(branch, TinyTransformer(), initial, z, num_steps=8,
+                               solver="heun", batch_size=2, sampling_stats=stats, guidance_scale=1.5)
+    assert (heun - math.e).abs().max() < (euler - math.e).abs().max() / 10
+    assert len(branch.calls) == stats["velocity_batch_calls"] == 48
+    assert stats["sample_velocity_evaluations"] == 80
+    assert stats["conditional_prediction_batch_calls"] == stats["null_prediction_batch_calls"] == 48
+    assert max(n for n, _ in branch.calls) == 2
+    assert min(t for _, t in branch.calls) == pytest.approx(1e-5)
+    assert max(t for _, t in branch.calls) == pytest.approx(1 - 1e-5)
+    reverse = integrate_pdae_flow(branch, TinyTransformer(), initial * math.e, z,
+                                  num_steps=16, solver="heun", start_time=1., end_time=0.)
+    torch.testing.assert_close(reverse, initial, atol=.001, rtol=0)
+
+
+def test_chunking_preserves_global_shuffled_conditions_and_noise_prefix():
+    from diffusion_ot.evaluation.stage1a_eval import reconstruct_cfg_sweep, _noise_like
+
+    class ConditionField:
+        semantic_cfg_enabled = True
+        def predict_cfg_with_z(self, x_t, timestep, z, **kwargs):
+            return SimpleNamespace(sample=z[:, :1, None, None].expand_as(x_t))
+
+    x = torch.zeros(16, 1, 2, 2)
+    noise = _noise_like(x, 41, block_size=8)
+    torch.testing.assert_close(noise[:8], _noise_like(x[:8], 41), atol=0, rtol=0)
+    z = torch.arange(16.).reshape(16, 1)
+    kwargs = dict(num_steps=3, solver="heun")
+    whole = reconstruct_cfg_sweep(ConditionField(), TinyTransformer(), noise, z,
+                                  ["correct_z", "shuffled_z"], [1.], **kwargs)
+    chunks = reconstruct_cfg_sweep(ConditionField(), TinyTransformer(), noise, z,
+                                   ["correct_z", "shuffled_z"], [1.], batch_size=3, **kwargs)
+    for key in whole:
+        torch.testing.assert_close(whole[key], chunks[key], atol=0, rtol=0)
+    torch.testing.assert_close(chunks["shuffled_z_cfg_1"] - noise,
+                               z.roll(1, 0)[:, :, None, None].expand_as(noise))
+
+
 def test_ema_checkpoint_loading_updates_only_trainable_parameters(tmp_path):
     from diffusion_ot.evaluation.stage1a_eval import _apply_ema_weights, _load_checkpoint
 

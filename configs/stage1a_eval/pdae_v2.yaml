@@ -1,7 +1,7 @@
 stage: stage1a_eval
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
 device: cuda:0
-weights: raw  # Cat 10k: raw outperforms the old EMA; --weights both compares them.
+weights: raw  # At 40k raw/EMA are close; --weights both compares them.
 split: val
 seed: 20260902
 
@@ -14,7 +14,7 @@ architecture:
   require_attention_lora_alpha: 64
 
 dataset:
-  smoke_samples: 8
+  smoke_samples: 16
   batch_size: 8
   num_workers: 4
 
@@ -23,14 +23,15 @@ sampling:
   direction: noise_to_data
   time_evaluation: midpoint
   smoke_num_steps: 50
-  guidance_scales: [0.0, 1.0, 1.5, 2.0]
-  variants: [correct_z, shuffled_z, null_z]
+  guidance_scales: [1.0, 1.5, 2.0]
+  variants: [correct_z, shuffled_z]
   fixed_starting_noise: true
+  noise_batch_size: 8  # Preserve the old eight-image CUDA noise prefix.
   inferred_noise:
     enabled: false  # Optional inversion/reconstruction diagnostic: pass --roundtrip to run it.
     num_steps: 100
     guidance_scale: 1.0
-    variants: [correct_z, shuffled_z, null_z]
+    variants: [correct_z, shuffled_z]
 
 metrics:
   image_reference: original_rgb

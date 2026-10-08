@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,8 @@ class Stage1ASmokeReport:
     native_flow_objective: dict[str, Any] | None = None
     checkpoint_ema: dict[str, Any] | None = None
     roundtrip_enabled: bool = False
+    sampling: dict[str, Any] = field(default_factory=dict)
+    per_image_metrics: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -82,6 +85,7 @@ class Stage1ARoundTripReport:
     encoder_architecture: dict[str, Any] | None = None
     native_flow_objective: dict[str, Any] | None = None
     checkpoint_ema: dict[str, Any] | None = None
+    sampling: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -270,12 +274,14 @@ def _validate_eval_config(config: dict[str, Any]) -> None:
     _evaluation_image_reference(None, config)
     sampling = _nested(config, "sampling")
     _configured_guidance_scales(sampling)
-    if str(sampling.get("solver", "euler")) != "euler":
-        raise ValueError("The first Stage 1A evaluator supports sampling.solver=euler only.")
+    solver = str(sampling.get("solver", "euler"))
+    if solver not in {"euler", "heun"}:
+        raise ValueError("sampling.solver must be euler or heun.")
     if str(sampling.get("direction", "noise_to_data")) != "noise_to_data":
         raise ValueError("Stage 1A evaluation must match the trained noise_to_data field.")
-    if str(sampling.get("time_evaluation", "midpoint")) != "midpoint":
-        raise ValueError("The first Stage 1A evaluator supports midpoint time evaluation only.")
+    expected_time = "midpoint" if solver == "euler" else "endpoints"
+    if str(sampling.get("time_evaluation", expected_time)) != expected_time:
+        raise ValueError(f"sampling.time_evaluation must be {expected_time} for {solver}.")
     if not bool(sampling.get("fixed_starting_noise", True)):
         raise ValueError("Fixed starting noise is required for fair z-variant comparisons.")
 
@@ -464,14 +470,40 @@ def integrate_pdae_flow(
     end_time: float = 1.0,
     guidance_scale: float = 1.0,
     null_label: int | None = None,
+    solver: str = "euler",
+    time_eps: float = 1.0e-5,
+    batch_size: int | None = None,
+    sampling_stats: dict | None = None,
 ) -> torch.Tensor:
-    """Euler-integrate the Stage 1A velocity field using midpoint time samples."""
+    """Integrate velocity: legacy Euler at midpoint times, or endpoint Heun.
+
+    Heun clamps network times to the training interval while integrating the
+    full requested interval. Chunking never changes conditions or random noise.
+    """
     from diffusion_ot.models.pdae_sit import make_null_class_labels
 
     if num_steps <= 0:
         raise ValueError("num_steps must be positive.")
     if not math.isfinite(guidance_scale):
         raise ValueError("guidance_scale must be finite.")
+    if solver not in {"euler", "heun"}:
+        raise ValueError("solver must be euler or heun.")
+    if not 0 <= time_eps < .5:
+        raise ValueError("time_eps must be in [0,0.5).")
+    if not all(math.isfinite(t) and 0 <= t <= 1 for t in (start_time, end_time)):
+        raise ValueError("Integration times must be finite and in [0,1].")
+    if z.shape[0] != initial_state.shape[0]:
+        raise ValueError("Conditions and states must have matching batch dimensions.")
+    if batch_size is not None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if len(initial_state) > batch_size:
+            return torch.cat([integrate_pdae_flow(
+                branch, transformer, initial_state[i:i + batch_size], z[i:i + batch_size],
+                num_steps=num_steps, start_time=start_time, end_time=end_time,
+                guidance_scale=guidance_scale, null_label=null_label, solver=solver,
+                time_eps=time_eps, sampling_stats=sampling_stats)
+                for i in range(0, len(initial_state), batch_size)])
 
     state = initial_state.clone()
     dt = (float(end_time) - float(start_time)) / int(num_steps)
@@ -481,8 +513,9 @@ def integrate_pdae_flow(
         device=state.device,
         null_label=null_label,
     )
-    for index in range(int(num_steps)):
-        time_value = float(start_time) + (index + 0.5) * dt
+    def velocity_at(value, time_value):
+        if solver == "heun":
+            time_value = min(1 - time_eps, max(time_eps, time_value))
         timestep = torch.full(
             (state.shape[0],),
             time_value,
@@ -491,7 +524,7 @@ def integrate_pdae_flow(
         )
         if bool(getattr(branch, "semantic_cfg_enabled", False)):
             output = branch.predict_cfg_with_z(
-                x_t=state,
+                x_t=value,
                 timestep=timestep,
                 z=z,
                 guidance_scale=guidance_scale,
@@ -501,13 +534,29 @@ def integrate_pdae_flow(
         else:
             # Compatibility path for Stage 1A checkpoints trained before learned-null CFG.
             output = branch.predict_with_z(
-                x_t=state,
+                x_t=value,
                 timestep=timestep,
                 z=z,
                 class_labels=class_labels,
             )
             velocity = output.base_sample + float(guidance_scale) * output.delta_sample
-        state = state + dt * velocity
+        if sampling_stats is not None:
+            semantic = bool(getattr(branch, "semantic_cfg_enabled", False))
+            counts = {"velocity_batch_calls": 1, "sample_velocity_evaluations": len(value),
+                      "conditional_prediction_batch_calls": int(not semantic or guidance_scale != 0),
+                      "null_prediction_batch_calls": int(semantic and guidance_scale != 1)}
+            for key, count in counts.items():
+                sampling_stats[key] = sampling_stats.get(key, 0) + count
+        return velocity
+
+    for index in range(int(num_steps)):
+        t = float(start_time) + index * dt
+        if solver == "euler":
+            state = state + dt * velocity_at(state, float(start_time) + (index + .5) * dt)
+        else:
+            first = velocity_at(state, t)
+            second = velocity_at(state + dt * first, t + dt)
+            state = state + .5 * dt * (first + second)
     return state
 
 
@@ -521,6 +570,7 @@ def infer_starting_noise(
     num_steps: int,
     guidance_scale: float = 1.0,
     null_label: int | None = None,
+    **sampling_kwargs,
 ) -> torch.Tensor:
     """Invert data to t=0; this protocol is reported separately from fixed noise."""
     return integrate_pdae_flow(
@@ -533,11 +583,17 @@ def infer_starting_noise(
         end_time=0.0,
         guidance_scale=guidance_scale,
         null_label=null_label,
+        **sampling_kwargs,
     )
 
 
 @torch.inference_mode()
-def decode_vae_latents(vae: Any, latents: torch.Tensor) -> torch.Tensor:
+def decode_vae_latents(vae: Any, latents: torch.Tensor, *, batch_size: int | None = None) -> torch.Tensor:
+    if batch_size is not None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if len(latents) > batch_size:
+            return torch.cat([decode_vae_latents(vae, chunk) for chunk in latents.split(batch_size)])
     scaling_factor = float(getattr(vae.config, "scaling_factor", 1.0))
     vae_dtype = _torch_dtype_from_model(vae)
     decoded = vae.decode((latents / scaling_factor).to(dtype=vae_dtype))
@@ -589,15 +645,16 @@ def _evaluation_encoder_image(
     return image.to(device=evaluator.device, dtype=torch.float32)
 
 
-def _noise_like(value: torch.Tensor, seed: int) -> torch.Tensor:
+def _noise_like(value: torch.Tensor, seed: int, *, block_size: int | None = None) -> torch.Tensor:
     generator = torch.Generator(device=value.device)
     generator.manual_seed(int(seed))
-    return torch.randn(
-        value.shape,
-        generator=generator,
-        device=value.device,
-        dtype=value.dtype,
-    )
+    if block_size is not None and block_size <= 0:
+        raise ValueError("noise_batch_size must be positive.")
+    # Fixed-size RNG draws retain the old eight-image CUDA noise when expanding
+    # the cohort; CUDA randn can change its prefix when the draw shape changes.
+    chunks = value.split(block_size) if block_size is not None else [value]
+    return torch.cat([torch.randn(chunk.shape, generator=generator,
+                                 device=value.device, dtype=value.dtype) for chunk in chunks])
 
 
 def _variant_z(branch: Any, z: torch.Tensor, variant: str) -> torch.Tensor:
@@ -627,6 +684,7 @@ def reconstruct_z_variants(
     num_steps: int,
     guidance_scale: float = 1.0,
     null_label: int | None = None,
+    **sampling_kwargs,
 ) -> dict[str, torch.Tensor]:
     """Reconstruct z variants from one immutable starting-noise batch."""
     outputs: dict[str, torch.Tensor] = {}
@@ -639,6 +697,7 @@ def reconstruct_z_variants(
             num_steps=num_steps,
             guidance_scale=guidance_scale,
             null_label=null_label,
+            **sampling_kwargs,
         )
     return outputs
 
@@ -658,6 +717,7 @@ def reconstruct_cfg_sweep(
     *,
     num_steps: int,
     null_label: int | None = None,
+    **sampling_kwargs,
 ) -> dict[str, torch.Tensor]:
     """Evaluate every z variant and semantic-CFG scale from identical noise."""
     outputs: dict[str, torch.Tensor] = {}
@@ -677,6 +737,7 @@ def reconstruct_cfg_sweep(
                 num_steps=num_steps,
                 guidance_scale=guidance_scale,
                 null_label=null_label,
+                **sampling_kwargs,
             )
             if guidance_scale == 0.0:
                 scale_zero_output = outputs[key]
@@ -806,6 +867,18 @@ def _image_and_latent_metrics(
     return metrics
 
 
+def _sampling_kwargs(evaluator, batch_size: int, stats: dict) -> dict:
+    sampling = _nested(evaluator.evaluation_config, "sampling")
+    return {"solver": str(sampling.get("solver", "euler")), "batch_size": batch_size,
+            "time_eps": float(_nested(evaluator.training_config, "flow").get("time_eps", 1e-5)),
+            "sampling_stats": stats}
+
+
+def _synchronize(value: torch.Tensor) -> None:
+    if value.device.type == "cuda":
+        torch.cuda.synchronize(value.device)
+
+
 def _inferred_noise_stats(inferred_noise: torch.Tensor) -> dict[str, float]:
     value = inferred_noise.float()
     return {
@@ -834,6 +907,11 @@ def _run_inferred_noise_roundtrip(
     backward_num_steps = int(inferred_config.get("backward_num_steps", shared_num_steps))
     forward_num_steps = int(inferred_config.get("forward_num_steps", shared_num_steps))
     variants = list(inferred_config.get("variants") or ["correct_z"])
+    batch_size = int(_nested(evaluator.evaluation_config, "dataset").get("batch_size", len(x0)))
+    stats = {}
+    sampling_kwargs = _sampling_kwargs(evaluator, batch_size, stats)
+    _synchronize(x0)
+    started = time.perf_counter()
 
     inferred_noise = infer_starting_noise(
         evaluator.branch,
@@ -841,6 +919,7 @@ def _run_inferred_noise_roundtrip(
         x0,
         z,
         num_steps=backward_num_steps,
+        **sampling_kwargs,
         guidance_scale=guidance_scale,
         null_label=null_label,
     )
@@ -851,11 +930,12 @@ def _run_inferred_noise_roundtrip(
         z,
         variants,
         num_steps=forward_num_steps,
+        **sampling_kwargs,
         guidance_scale=guidance_scale,
         null_label=null_label,
     )
     decoded_outputs = {
-        name: decode_vae_latents(evaluator.vae, value)
+        name: decode_vae_latents(evaluator.vae, value, batch_size=batch_size)
         for name, value in latent_outputs.items()
     }
     metrics = _image_and_latent_metrics(
@@ -864,6 +944,9 @@ def _run_inferred_noise_roundtrip(
         x0,
         original_images,
     )
+    _synchronize(x0)
+    stats.update(solver=sampling_kwargs["solver"], time_eps=sampling_kwargs["time_eps"],
+                 seconds_including_decode=time.perf_counter() - started)
 
     row_order = ["original", *latent_outputs.keys()]
     rows = [original_images, *[decoded_outputs[name] for name in latent_outputs]]
@@ -905,6 +988,7 @@ def _run_inferred_noise_roundtrip(
         encoder_architecture=getattr(evaluator.branch, "encoder_architecture", None),
         native_flow_objective=native_flow_objective(evaluator.training_config),
         checkpoint_ema=evaluator.checkpoint_ema,
+        sampling=stats,
     )
     _write_json(output_dir / "roundtrip_report.json", report.to_dict())
     return report
@@ -919,6 +1003,10 @@ def run_stage1a_smoke_test(
     weights: str | None = None,
     checkpoint_path: str | Path | None = None,
     roundtrip: bool | None = None,
+    solver: str | None = None,
+    num_steps: int | None = None,
+    noise_seed: int | None = None,
+    output_subdir: str | None = None,
 ) -> Stage1ASmokeReport:
     """Generate fixed-noise images; roundtrip overrides the opt-in YAML setting."""
     evaluator = load_stage1a_evaluator(
@@ -930,8 +1018,25 @@ def run_stage1a_smoke_test(
     )
     dataset_config = _nested(evaluator.evaluation_config, "dataset")
     sampling_config = _nested(evaluator.evaluation_config, "sampling")
+    if solver is not None:
+        sampling_config.update(solver=solver, time_evaluation="midpoint" if solver == "euler" else "endpoints")
+    if num_steps is not None:
+        sampling_config["smoke_num_steps"] = num_steps
+    if noise_seed is not None:
+        sampling_config["noise_seed"] = noise_seed
+    if output_subdir is not None:
+        evaluator.evaluation_config.setdefault("output", {})["subdir"] = output_subdir
+    elif any(value is not None for value in (solver, num_steps, noise_seed)):
+        output = evaluator.evaluation_config.setdefault("output", {})
+        output["subdir"] = (str(output.get("subdir", "stage1a_eval"))
+                            + f"_{sampling_config.get('solver', 'euler')}{sampling_config.get('smoke_num_steps', 50)}"
+                            + f"_noise{sampling_config.get('noise_seed', int(evaluator.evaluation_config.get('seed', 20260902)) + 1)}")
+    _validate_eval_config(evaluator.evaluation_config)
     seed = int(evaluator.evaluation_config.get("seed", 20260902))
     num_samples = int(dataset_config.get("smoke_samples", 8))
+    batch_size = int(dataset_config.get("batch_size", num_samples))
+    if batch_size <= 0:
+        raise ValueError("dataset.batch_size must be positive.")
     num_steps = int(sampling_config.get("smoke_num_steps", 50))
     guidance_scales = _configured_guidance_scales(sampling_config)
     variants = list(
@@ -953,12 +1058,17 @@ def run_stage1a_smoke_test(
     encoder_image = _evaluation_encoder_image(evaluator, batch)
     image_reference = _evaluation_image_reference(evaluator.branch, evaluator.evaluation_config)
     uses_rgb_encoder = getattr(evaluator.branch, "encoder_input_space", "latent") == "rgb"
-    z = (
-        evaluator.branch.encode(x0, encoder_image=encoder_image.to(dtype=evaluator.model_dtype))
-        if uses_rgb_encoder
-        else evaluator.branch.encode(x0)
-    )
-    starting_noise = _noise_like(x0, seed + 1)
+    z = torch.cat([evaluator.branch.encode(
+        x0[i:i + batch_size], **({"encoder_image": encoder_image[i:i + batch_size].to(dtype=evaluator.model_dtype)}
+                                 if uses_rgb_encoder else {}))
+        for i in range(0, len(x0), batch_size)])
+    noise_seed = int(sampling_config.get("noise_seed", seed + 1))
+    noise_batch_size = sampling_config.get("noise_batch_size")
+    starting_noise = _noise_like(x0, noise_seed, block_size=noise_batch_size)
+    stats = {}
+    sampling_kwargs = _sampling_kwargs(evaluator, batch_size, stats)
+    _synchronize(x0)
+    started = time.perf_counter()
 
     latent_outputs = reconstruct_cfg_sweep(
         evaluator.branch,
@@ -969,15 +1079,23 @@ def run_stage1a_smoke_test(
         guidance_scales,
         num_steps=num_steps,
         null_label=null_label,
+        **sampling_kwargs,
     )
+    _synchronize(x0)
+    stats.update(solver=sampling_kwargs["solver"], time_eps=sampling_kwargs["time_eps"],
+                 time_evaluation="midpoint" if sampling_kwargs["solver"] == "euler" else "endpoints",
+                 generation_seconds=time.perf_counter() - started, batch_size=batch_size,
+                 noise_seed=noise_seed, noise_batch_size=noise_batch_size,
+                 velocity_evaluations_per_sample_per_output=num_steps * (2 if sampling_kwargs["solver"] == "heun" else 1),
+                 counting="Prediction calls include the branch's base/residual computation; CFG 1 uses one conditioned prediction, CFG >1 uses conditioned and null predictions.")
 
-    vae_images = decode_vae_latents(evaluator.vae, x0)
+    vae_images = decode_vae_latents(evaluator.vae, x0, batch_size=batch_size)
     original_images = (
         ((encoder_image + 1.0) / 2.0).clamp(0.0, 1.0)
         if image_reference == "original_rgb" else vae_images
     )
     decoded_outputs = {
-        name: decode_vae_latents(evaluator.vae, value)
+        name: decode_vae_latents(evaluator.vae, value, batch_size=batch_size)
         for name, value in latent_outputs.items()
     }
     metrics = _image_and_latent_metrics(
@@ -1066,6 +1184,14 @@ def run_stage1a_smoke_test(
         native_flow_objective=native_flow_objective(evaluator.training_config),
         checkpoint_ema=evaluator.checkpoint_ema,
         roundtrip_enabled=roundtrip_enabled,
+        sampling=stats,
+        per_image_metrics=[{
+            "sample_id": sample_id,
+            "metrics": _image_and_latent_metrics(
+                {key: value[i:i + 1] for key, value in latent_outputs.items()},
+                {key: value[i:i + 1] for key, value in decoded_outputs.items()},
+                x0[i:i + 1], original_images[i:i + 1]),
+        } for i, sample_id in enumerate(batch["sample_id"])],
     )
     _write_json(output_dir / "smoke_report.json", report.to_dict())
     return report
@@ -1078,17 +1204,23 @@ def run_stage1a_weight_comparison(
     device: str | None = None,
     checkpoint_path: str | Path | None = None,
     roundtrip: bool | None = None,
+    **sampling_overrides,
 ) -> dict[str, Any]:
     """Compare raw/EMA with identical samples, starting noise and CFG settings."""
     raw = run_stage1a_smoke_test(training_config_path, evaluation_config_path,
-                                device=device, weights="raw", checkpoint_path=checkpoint_path, roundtrip=roundtrip)
+                                device=device, weights="raw", checkpoint_path=checkpoint_path, roundtrip=roundtrip,
+                                **sampling_overrides)
     averaged = run_stage1a_smoke_test(training_config_path, evaluation_config_path,
-                                     device=device, weights="ema", checkpoint_path=raw.checkpoint_path, roundtrip=roundtrip)
+                                     device=device, weights="ema", checkpoint_path=raw.checkpoint_path, roundtrip=roundtrip,
+                                     **sampling_overrides)
     for field in ("checkpoint_path", "checkpoint_step", "domain", "split", "seed", "sample_ids",
                   "num_samples", "num_steps", "guidance_scales", "row_order", "image_reference",
                   "checkpoint_ema", "roundtrip_enabled"):
         if getattr(raw, field) != getattr(averaged, field):
             raise ValueError(f"Raw/EMA smoke comparison changed {field}; use a fixed step checkpoint.")
+    for key in ("solver", "time_eps", "time_evaluation", "batch_size", "noise_seed", "noise_batch_size"):
+        if raw.sampling.get(key) != averaged.sampling.get(key):
+            raise ValueError(f"Raw/EMA smoke comparison changed sampling.{key}.")
     comparison_path = Path(averaged.output_dir).parent.parent / "raw_ema_comparison.json"
     result = {
         "protocol": "matched_raw_ema_smoke",

@@ -749,6 +749,16 @@ def train_pdae_domain(
     data_config_path = _resolve_config_path(config, root, "data_config")
     model_config_path = _resolve_config_path(config, root, "model_config")
     model_config = load_yaml_config(model_config_path)
+    from diffusion_ot.data.pdae_v2_augmentation import augmentation_options, MatchedRGBAugmentation
+
+    augmentation_config = augmentation_options(config)
+    augmentation = (MatchedRGBAugmentation(augmentation_config, use_posterior_mean=bool(
+        (model_config.get("latent_cache") or {}).get("use_posterior_mean", True)))
+        if augmentation_config is not None else None)
+    data_recipe = {"augmentation": augmentation_config,
+                   "latent_target_source": "augmented_rgb_frozen_vae" if augmentation else "cached",
+                   "posterior_statistic": ("mean" if augmentation.use_posterior_mean else "sample")
+                   if augmentation else None}
     encoder_config = _nested(config, "encoder")
     encoder_input_space = str(encoder_config.get("input_space", "latent"))
     if encoder_input_space not in {"latent", "rgb"}:
@@ -787,7 +797,7 @@ def train_pdae_domain(
         project_root=root,
         limit=int(limit) if limit is not None else None,
         validate_exists=not dry_run,
-        random_horizontal_flip=random_horizontal_flip,
+        random_horizontal_flip=0.0 if augmentation else random_horizontal_flip,
         include_original_images=use_original_images,
     )
 
@@ -908,6 +918,7 @@ def train_pdae_domain(
     clip_checks = 0
     training_seconds = 0.0
     ema_reset = None
+    data_recipe_change = None
     if resolved_resume_path is not None:
         if not resolved_resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resolved_resume_path}")
@@ -950,6 +961,12 @@ def train_pdae_domain(
                 ema.reset(branch)
         initial_step = int(checkpoint.get("step", 0))
         saved_train_state = checkpoint.get("train_state") or {}
+        data_recipe_change = saved_train_state.get("data_recipe_change")
+        saved_augmentation = augmentation_options(checkpoint.get("config") or {})
+        if saved_augmentation != augmentation_config:
+            data_recipe_change = {"step": initial_step, "source": str(resolved_resume_path),
+                                  "previous_augmentation": saved_augmentation, "current": data_recipe}
+            print(json.dumps({"event": "data_recipe_changed_on_resume", **data_recipe_change}, sort_keys=True))
         ema_reset = saved_train_state.get("ema_reset")
         if reset_ema_on_resume:
             # Reset only the stale average. The restored model, optimizer,
@@ -1040,6 +1057,7 @@ def train_pdae_domain(
                 "training_seconds": training_seconds, "initialization": initialization,
                 "loss_weighting": loss_weight_config,
                 "lr_schedule": lr_schedule, "ema_reset": ema_reset,
+                "data_recipe": data_recipe, "data_recipe_change": data_recipe_change,
                 "refinement": refinement.state_dict() if refinement is not None else None}
 
     if resolved_resume_path is None:
@@ -1180,11 +1198,13 @@ def train_pdae_domain(
     interval_semantic_drop_sum = torch.tensor(0.0, device=device)
     interval_semantic_drop_count = 0
     last_logged_step = initial_step
+    interval_loss_sum = torch.zeros((), device=device)
+    augmentation_counts: dict[str, int] = {}
 
     for step in range(initial_step + 1, final_step + 1):
         step_started = time.perf_counter()
         lr_factor = apply_step_learning_rates(optimizer, base_lrs, lr_schedule, step)
-        should_log = step == initial_step + 1 or step % log_every == 0
+        should_log = step == initial_step + 1 or step % log_every == 0 or step == final_step
         optimizer.zero_grad(set_to_none=True)
         loss_sum = None
         weight_mean_sum = None
@@ -1193,6 +1213,11 @@ def train_pdae_domain(
 
         for _ in range(accumulation_steps):
             batch = next(batch_iter)
+            if augmentation is not None:
+                batch, augmentation_stats = augmentation.prepare_batch(
+                    batch, components.vae, device=device, dtype=model_dtype)
+                for key, value in augmentation_stats.items():
+                    augmentation_counts[key] = augmentation_counts.get(key, 0) + value
             x0 = batch["x0_latent"].to(
                 device=device,
                 dtype=model_dtype,
@@ -1292,6 +1317,7 @@ def train_pdae_domain(
         step_training_seconds = time.perf_counter() - step_started
         training_seconds += step_training_seconds
         interval_training_seconds += step_training_seconds
+        interval_loss_sum.add_(loss_sum / accumulation_steps)
         if should_log:
             if loss_sum is None or weight_mean_sum is None:
                 raise RuntimeError("No microbatches were processed for this optimizer update.")
@@ -1312,6 +1338,7 @@ def train_pdae_domain(
                 "step": step,
                 "encoder_kind": getattr(branch, "encoder_architecture", {"kind": "plain_cnn_v1"})["kind"],
                 "loss": loss_value,
+                "loss_interval_mean": float(interval_loss_sum.cpu()) / logged_steps,
                 "loss_ema": loss_ema,
                 "loss_weighting": loss_weight_type,
                 "native_flow_objective": native_flow_objective(config),
@@ -1360,6 +1387,14 @@ def train_pdae_domain(
                 metrics["refinement"] = refinement_metrics
                 metrics["total_loss"] = loss_value + (refinement_metrics["weighted_loss"]
                                                        if refinement_metrics else 0.0)
+            if augmentation is not None:
+                metrics["augmentation"] = {
+                    "target_source": data_recipe["latent_target_source"],
+                    "samples": augmentation_counts.get("samples", 0),
+                    "fractions": {key: value / max(augmentation_counts.get("samples", 0), 1)
+                                  for key, value in augmentation_counts.items() if key != "samples"}}
+                if torch.device(device).type == "cuda":
+                    metrics["peak_memory_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
             metrics.update(
                 {
                     name: value / accumulation_steps
@@ -1371,6 +1406,8 @@ def train_pdae_domain(
             interval_training_seconds = 0.0
             interval_semantic_drop_sum.zero_()
             interval_semantic_drop_count = 0
+            interval_loss_sum.zero_()
+            augmentation_counts.clear()
             last_logged_step = step
 
         if step % save_every == 0 or step == final_step:

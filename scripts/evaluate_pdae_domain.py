@@ -59,6 +59,10 @@ def parse_args() -> argparse.Namespace:
         "--roundtrip", action=argparse.BooleanOptionalAction, default=None,
         help="Enable/disable inferred-noise round-trip evaluation; follows YAML when omitted (PDAE v2 defaults off).",
     )
+    parser.add_argument("--solver", choices=["euler", "heun"], default=None, help="Override the velocity ODE solver.")
+    parser.add_argument("--num-steps", type=int, default=None, help="Smoke integration steps (Heun uses two field evaluations per step).")
+    parser.add_argument("--noise-seed", type=int, default=None, help="Change starting noise while preserving the selected image IDs.")
+    parser.add_argument("--output-subdir", default=None, help="Output subdirectory under the training run; sampling overrides otherwise create a distinct subdirectory.")
     return parser.parse_args()
 
 
@@ -66,11 +70,14 @@ def main() -> int:
     from diffusion_ot.evaluation.stage1a_eval import run_stage1a_smoke_test, run_stage1a_weight_comparison
 
     args = parse_args()
+    sampling_overrides = dict(solver=args.solver, num_steps=args.num_steps,
+                              noise_seed=args.noise_seed, output_subdir=args.output_subdir)
     if args.weights == "both":
         comparison = run_stage1a_weight_comparison(
             repo_path(args.train_config or stage1a_training_config(args.domain)),
             repo_path(args.eval_config), device=args.device, checkpoint_path=args.checkpoint,
             roundtrip=args.roundtrip,
+            **sampling_overrides,
         )
         print(json.dumps({"comparison_path": comparison["comparison_path"],
                           "grids": {name: report["grid_path"] for name, report in comparison["reports"].items()},
@@ -83,6 +90,7 @@ def main() -> int:
         weights=args.weights,
         checkpoint_path=args.checkpoint,
         roundtrip=args.roundtrip,
+        **sampling_overrides,
     )
     print("stage1a_smoke_report:")
     for key, value in sorted(report.to_dict().items()):
