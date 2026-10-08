@@ -55,7 +55,7 @@ evaluation:
   num_time_bins: 10
   every_steps: 1000
   evaluate_at_start: true
-  use_ema: true
+  use_ema: false  # Matched cat-derived policy; still compare both weight states.
   compare_raw_ema: true  # Both weight states on the SAME 32 images/noise/timesteps.
   seed: 20260902
 

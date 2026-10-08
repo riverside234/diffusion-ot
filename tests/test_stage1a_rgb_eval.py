@@ -123,6 +123,53 @@ def test_rgb_smoke_and_roundtrip_use_original_rgb_for_condition_and_metrics(tmp_
     torch.testing.assert_close(grids["roundtrip_grid.png"][0], torch.full((2, 3, 4, 4), 0.2))
 
 
+@pytest.mark.parametrize('configured,override,expected', [
+    (None, None, False), (False, None, False), (True, None, True),
+    (False, True, True), (True, False, False),
+])
+def test_roundtrip_is_opt_in_and_explicit_override_wins(tmp_path, monkeypatch, configured, override, expected):
+    import diffusion_ot.evaluation.stage1a_eval as evaluation
+
+    evaluator = _evaluator(tmp_path, roundtrip=configured)
+    if configured is None:
+        del evaluator.evaluation_config['sampling']['inferred_noise']['enabled']
+    grids = _install_smoke_mocks(monkeypatch, evaluator)
+    if not expected:
+        monkeypatch.setattr(evaluation, '_run_inferred_noise_roundtrip',
+                            lambda *a, **kw: pytest.fail('Disabled roundtrip must do no inversion work.'))
+    report = evaluation.run_stage1a_smoke_test('train.yaml', 'eval.yaml', roundtrip=override)
+    assert report.roundtrip_enabled == expected
+    assert ('inferred_noise_roundtrip' in report.extra_reports) == expected
+    assert ('roundtrip_grid.png' in grids) == expected
+
+
+@pytest.mark.parametrize('weights', ['raw', 'both'])
+@pytest.mark.parametrize('flag,expected', [(None, None), ('--roundtrip', True), ('--no-roundtrip', False)])
+def test_roundtrip_cli_reaches_single_and_paired_evaluation(monkeypatch, weights, flag, expected):
+    import importlib.util
+    import sys
+    import diffusion_ot.evaluation.stage1a_eval as evaluation
+
+    script = Path(__file__).resolve().parents[1] / 'scripts' / 'evaluate_pdae_domain.py'
+    spec = importlib.util.spec_from_file_location('stage1a_eval_cli', script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    args = ['evaluate_pdae_domain.py', '--domain', 'cat', '--weights', weights]
+    if flag:
+        args.append(flag)
+    monkeypatch.setattr(sys, 'argv', args)
+    captured = {}
+    def run(*args, **kwargs):
+        captured.update(kwargs)
+        if weights == 'both':
+            return dict(comparison_path='comparison.json', reports={}, ema_minus_raw={})
+        return SimpleNamespace(to_dict=lambda: {}, extra_reports={})
+    monkeypatch.setattr(evaluation, 'run_stage1a_smoke_test', run)
+    monkeypatch.setattr(evaluation, 'run_stage1a_weight_comparison', run)
+    assert cli.main() == 0
+    assert captured['roundtrip'] is expected
+
+
 def test_latent_smoke_keeps_legacy_condition_and_metric_reference(tmp_path, monkeypatch):
     from diffusion_ot.evaluation.stage1a_eval import run_stage1a_smoke_test
 

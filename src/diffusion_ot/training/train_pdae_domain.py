@@ -73,12 +73,14 @@ class TrainableEMA:
         progress = min(1.0, self.num_updates / self.warmup_steps)
         return self.decay * progress
 
-    def reset(self, model) -> None:
+    def reset(self, model, *, reset_updates: bool = True) -> None:
+        """Copy current weights; optionally keep the averaging age on resume."""
         self.shadow = {
             name: parameter.detach().clone()
             for name, parameter in self._parameters(model).items()
         }
-        self.num_updates = 0
+        if reset_updates:
+            self.num_updates = 0
 
     def update(self, model) -> None:
         import torch
@@ -704,6 +706,7 @@ def train_pdae_domain(
     max_steps: int | None = None,
     resume_from: str | Path | None = None,
     dry_run: bool = False,
+    reset_ema_on_resume: bool = False,
 ) -> PDAETrainReport:
     import torch
     from torch.utils.data import DataLoader
@@ -735,6 +738,8 @@ def train_pdae_domain(
     compare_raw_ema = bool(evaluation_config.get("compare_raw_ema", False))
     if compare_raw_ema and not ema_config.get("enabled", True):
         raise ValueError("evaluation.compare_raw_ema requires ema.enabled.")
+    if reset_ema_on_resume and not ema_config.get("enabled", True):
+        raise ValueError("reset_ema_on_resume requires ema.enabled.")
 
     domain = str(config.get("domain", "")).lower()
     if not domain:
@@ -795,6 +800,8 @@ def train_pdae_domain(
     checkpoint_path = output_dir / "checkpoints" / "latest.pt"
     requested_resume = resume_from if resume_from is not None else train_config.get("resume_from")
     resolved_resume_path = _resolve_resume_path(requested_resume, root, checkpoint_path)
+    if reset_ema_on_resume and resolved_resume_path is None:
+        raise ValueError("reset_ema_on_resume requires a resume checkpoint (--resume).")
     if resolved_resume_path is None and checkpoint_path.exists() and not dry_run:
         raise ValueError("Stage 1A output already has a checkpoint. Use --resume or a new output_dir for a fresh run.")
 
@@ -900,6 +907,7 @@ def train_pdae_domain(
     clip_events = 0
     clip_checks = 0
     training_seconds = 0.0
+    ema_reset = None
     if resolved_resume_path is not None:
         if not resolved_resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resolved_resume_path}")
@@ -936,11 +944,23 @@ def train_pdae_domain(
                     print(json.dumps({"event": "ema_settings_changed_on_resume",
                         "saved_decay": saved_ema.get("decay"), "new_decay": ema.decay,
                         "saved_warmup_steps": saved_ema.get("warmup_steps"), "new_warmup_steps": ema.warmup_steps,
-                        "shadow_action": "preserved; new settings apply to future updates"}, sort_keys=True))
+                        "shadow_action": ("reset from raw by explicit request" if reset_ema_on_resume
+                                          else "preserved; new settings apply to future updates")}, sort_keys=True))
             else:
                 ema.reset(branch)
         initial_step = int(checkpoint.get("step", 0))
         saved_train_state = checkpoint.get("train_state") or {}
+        ema_reset = saved_train_state.get("ema_reset")
+        if reset_ema_on_resume:
+            # Reset only the stale average. The restored model, optimizer,
+            # training step, EMA age and random state remain intact.
+            ema.reset(branch, reset_updates=False)
+            ema_reset = {
+                "step": initial_step, "source": str(resolved_resume_path),
+                "weights": "raw", "decay": ema.decay,
+                "num_updates": ema.num_updates, "warmup_steps": ema.warmup_steps,
+            }
+            print(json.dumps({"event": "ema_reset_from_raw_on_resume", **ema_reset}, sort_keys=True))
         initialization = saved_train_state.get("initialization")
         if refinement is not None:
             refinement.load_state_dict(saved_train_state.get("refinement"))
@@ -964,6 +984,8 @@ def train_pdae_domain(
         )
 
     grad_clip_norm = train_config.get("grad_clip_norm", 1.0)
+    if reset_ema_on_resume and initial_step == final_step:
+        raise ValueError("reset_ema_on_resume requires max_steps greater than the checkpoint step.")
     # After resume the configured peak LRs have been restored by
     # _apply_optimizer_hyperparameters; don't use the saved warmup-scaled rates.
     base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -1017,7 +1039,7 @@ def train_pdae_domain(
         return {"loss_ema": loss_ema, "clip_events": clip_events, "clip_checks": clip_checks,
                 "training_seconds": training_seconds, "initialization": initialization,
                 "loss_weighting": loss_weight_config,
-                "lr_schedule": lr_schedule,
+                "lr_schedule": lr_schedule, "ema_reset": ema_reset,
                 "refinement": refinement.state_dict() if refinement is not None else None}
 
     if resolved_resume_path is None:
@@ -1068,6 +1090,8 @@ def train_pdae_domain(
         if ema is not None:
             metrics["ema_settings"] = {"decay": ema.decay, "effective_decay": ema.effective_decay,
                                        "warmup_steps": ema.warmup_steps, "num_updates": ema.num_updates}
+        if ema is not None and ema_reset is not None:
+            metrics["ema_settings"]["last_reset"] = ema_reset
         if compare_raw_ema:
             alternate = _evaluate_z_dependence(branch, transformer, validation_loader,
                                                use_ema=not primary_ema, **validation_kwargs)

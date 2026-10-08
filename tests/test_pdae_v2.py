@@ -415,10 +415,12 @@ def test_lr_warmup_accumulation_resume_and_legacy_schedule_guard(v2_training_set
         run('v2_legacy_lr', steps=2, resume=True)
 
 
-def test_paired_validation_preserves_updates_and_uses_same_inputs(v2_training_setup):
+@pytest.mark.parametrize('primary_ema', [True, False])
+def test_paired_validation_preserves_updates_and_uses_same_inputs(v2_training_setup, primary_ema):
     run, config, _, _ = v2_training_setup
     config['ema'].update(decay=.9, warmup_steps=0)
     config['evaluation']['compare_raw_ema'] = True
+    config['evaluation']['use_ema'] = primary_ema
     paired, logs, _ = run('v2_paired', steps=2)
     single, _, _ = run('v2_single', steps=2,
                         modify=lambda c: c['evaluation'].update(compare_raw_ema=False))
@@ -431,7 +433,8 @@ def test_paired_validation_preserves_updates_and_uses_same_inputs(v2_training_se
     for row in rows:
         comparison = row['weight_comparison']
         assert row['num_samples'] == 4 and len(row['sample_ids']) == 4
-        assert row['correct_z'] == comparison['ema']['correct_z']
+        assert row['use_ema'] == primary_ema
+        assert row['correct_z'] == comparison['ema' if primary_ema else 'raw']['correct_z']
         assert comparison['raw']['correct_z']['count'] == 4
         assert [b['count'] for b in comparison['raw']['time_bins']] == [b['count'] for b in row['time_bins']]
         assert comparison['ema_minus_raw_correct_z_mse'] == pytest.approx(
@@ -460,7 +463,11 @@ def test_real_evaluation_raw_ema_grids_and_roundtrip(v2_training_setup):
     import yaml
     from diffusion_ot.evaluation.stage1a_eval import run_stage1a_weight_comparison
     run, _, _, root = v2_training_setup
-    run('v2_eval', steps=1)
+    checkpoint, _, _ = run('v2_eval', steps=1)
+    train_path = root / 'v2_eval.yaml'
+    updated_config = yaml.safe_load(train_path.read_text())
+    updated_config['ema']['decay'] = .123  # The report must use the saved schedule.
+    train_path.write_text(yaml.safe_dump(updated_config))
     config = dict(project_root=str(root), split='val', weights='ema',
         dataset=dict(smoke_samples=2, batch_size=2, num_workers=0),
         architecture=dict(require_encoder_kind='siglip2_vit_b16', require_encoder_input_space='rgb'),
@@ -481,7 +488,75 @@ def test_real_evaluation_raw_ema_grids_and_roundtrip(v2_training_setup):
     assert comparison['ema_minus_raw']['correct_z_cfg_1']['pixel_mse'] == pytest.approx(
         report.metrics['correct_z_cfg_1']['pixel_mse'] - raw['metrics']['correct_z_cfg_1']['pixel_mse'])
     assert report.checkpoint_step == 1 and report.weights == 'ema'
+    assert report.checkpoint_ema['decay'] == checkpoint['ema']['decay'] != .123
+    assert report.checkpoint_ema == raw['checkpoint_ema']
+    assert report.roundtrip_enabled and raw['roundtrip_enabled']
     assert Path(report.grid_path).is_file()
     stats = json.loads(Path(report.extra_reports['condition_tokens']).read_text())
     assert stats['dim'] == 768 and stats['tokens_per_image'] == 4
     assert any('roundtrip' in key or 'inferred' in key for key in report.extra_reports)
+
+    # An explicit skip must reach both passes even when the YAML enables inversion.
+    without_roundtrip = run_stage1a_weight_comparison(train_path, path, device='cpu', roundtrip=False)
+    for weights, saved_report in without_roundtrip['reports'].items():
+        assert not saved_report['roundtrip_enabled']
+        assert 'inferred_noise_roundtrip' not in saved_report['extra_reports']
+        assert saved_report['metrics'] == comparison['reports'][weights]['metrics']
+
+
+def test_reset_ema_on_resume_uses_raw_without_changing_training(v2_training_setup, capsys):
+    import yaml
+    from diffusion_ot.training.train_pdae_domain import train_pdae_domain
+
+    run, config, latest, root = v2_training_setup
+    config['ema'].update(decay=.9, warmup_steps=0)
+    first, _, _ = run('v2_ema_reset', steps=2)
+    before = {name: parameter.detach().clone() for name, parameter in latest['branch'].named_parameters()
+              if parameter.requires_grad}
+    source = root / 'saved_step_2.pt'
+    torch.save(first, source)
+    path = root / 'v2_ema_reset.yaml'
+    config = yaml.safe_load(path.read_text())
+    config['ema']['decay'] = .8
+    config['evaluation'].update(compare_raw_ema=True, use_ema=False)
+    path.write_text(yaml.safe_dump(config))
+
+    normal = train_pdae_domain(path, max_steps=3, resume_from=source)
+    normal_checkpoint = torch.load(normal.checkpoint_path, weights_only=False)
+    normal_raw = {name: parameter.detach().clone() for name, parameter in latest['branch'].named_parameters()
+                  if parameter.requires_grad}
+    reset = train_pdae_domain(path, max_steps=3, resume_from=source, reset_ema_on_resume=True)
+    saved = torch.load(reset.checkpoint_path, weights_only=False)
+    assert reset.initial_step == 2 and reset.final_step == 3
+    assert saved['ema']['num_updates'] == 3 and saved['ema']['decay'] == .8
+    for name, parameter in latest['branch'].named_parameters():
+        if parameter.requires_grad:
+            torch.testing.assert_close(parameter.detach(), normal_raw[name], atol=0, rtol=0)
+            torch.testing.assert_close(saved['ema']['shadow'][name], before[name] * .8 + parameter.detach() * .2)
+    assert any(not torch.equal(saved['ema']['shadow'][name], normal_checkpoint['ema']['shadow'][name])
+               for name in before)
+    torch.testing.assert_close(saved['rng_state'], normal_checkpoint['rng_state'], atol=0, rtol=0)
+    assert all(state['step'] == 3 for state in saved['optimizer']['state'].values())
+    event = saved['train_state']['ema_reset']
+    assert event['step'] == 2 and event['weights'] == 'raw' and event['num_updates'] == 2
+    assert 'ema_reset_from_raw_on_resume' in capsys.readouterr().out
+    validation = [json.loads(line) for line in Path(reset.validation_log_path).read_text().splitlines()]
+    assert validation[-1]['ema_settings']['last_reset'] == event
+
+    # Ordinary later resumes preserve the new history; the flag is not sticky.
+    followup = train_pdae_domain(path, max_steps=4, resume_from='latest')
+    continued = torch.load(followup.checkpoint_path, weights_only=False)
+    assert continued['train_state']['ema_reset'] == event
+    for name, parameter in latest['branch'].named_parameters():
+        if parameter.requires_grad:
+            torch.testing.assert_close(continued['ema']['shadow'][name],
+                                       saved['ema']['shadow'][name] * .8 + parameter.detach() * .2)
+    with pytest.raises(ValueError, match='requires a resume checkpoint'):
+        train_pdae_domain(path, max_steps=5, reset_ema_on_resume=True)
+    with pytest.raises(ValueError, match='greater than the checkpoint step'):
+        train_pdae_domain(path, max_steps=4, resume_from='latest', reset_ema_on_resume=True)
+    config['ema']['enabled'] = False
+    config['evaluation']['compare_raw_ema'] = False
+    path.write_text(yaml.safe_dump(config))
+    with pytest.raises(ValueError, match='requires ema.enabled'):
+        train_pdae_domain(path, resume_from='latest', reset_ema_on_resume=True)

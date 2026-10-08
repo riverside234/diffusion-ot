@@ -71,11 +71,12 @@ cosmap-weighted flow objective, with no refinement losses.
 Both domain configs use effective batch 64, peak learning rates `1e-4` for new
 conditioning layers and `2.5e-5` for LoRA, 500 optimizer updates of linear LR
 warmup, then constant rates, and AdamW weight decay `0.01`. The budget is 20,000
-updates with EMA decay `0.999`. Training validation compares raw and EMA on
+updates with EMA decay `0.999`. Training validation uses raw as the primary
+weight state and compares raw and EMA on
 **the same 32 fixed images every 1,000 steps**, plus step 0; checkpoints save
 every 1,000 steps. SigLIP stays frozen. The
-[10k cat review](docs/analysis/pdae_v2_cat_10000/review.md) explains the shorter
-EMA and recommends a raw/EMA image comparison before further training. See the
+[raw/EMA follow-up](docs/analysis/pdae_v2_cat_10000/raw_ema_review.md) confirms
+that raw greatly outperforms the old EMA at 10k. See the
 [settings and research rationale](docs/pdae_v2_plan.md#11-research-backed-config-polish-2026-10-07).
 
 From the lab project root (the YAMLs specify `/data/not_backed_up/yxu209/diffusion-ot/`):
@@ -92,11 +93,28 @@ python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/do
 
 `--weights both` writes separate raw/EMA grids and a `raw_ema_comparison.json`
 using the same samples, noise, and guidance sweep. Use `--checkpoint` with a
-numbered step checkpoint when training is running. Validation logs preserve
-the primary EMA metrics and add `weight_comparison`; a positive
+numbered step checkpoint when training is running. The v2 evaluation YAML
+defaults to raw weights and disables inferred-noise round trips. Pass
+`--roundtrip` to include that diagnostic or `--no-roundtrip` to override an
+older YAML that enables it; both flags work with `--weights both`. Reports
+record `roundtrip_enabled` and the EMA settings saved in the checkpoint.
+Validation logs use raw primary metrics (`use_ema: false`) and add
+`weight_comparison`; a positive
 `ema_minus_raw_correct_z_mse` means EMA is worse on that fixed flow probe.
 Changing EMA decay on resume preserves its shadow history and applies the new
 decay to future updates; it does not change existing saved EMA weights.
+
+For the reviewed 10k checkpoint, discard the stale average once when resuming:
+
+```bash
+python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml --resume latest --reset-ema-on-resume --max-steps 13000
+```
+
+This copies restored raw trainable weights into EMA, preserving optimizer,
+training step, LR schedule and EMA update count. Subsequent ordinary resumes
+retain this new averaging history; omit the reset flag on them. The reset is
+recorded in checkpoints and validation metadata. Learning rates and model
+architecture remain unchanged for this comparison.
 
 Checkpoints are separate: `outputs/pdae_v2_cat` and `outputs/pdae_v2_dog`.
 They store trainable weights, optimizer/EMA/resume state, and a verified frozen

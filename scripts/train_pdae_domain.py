@@ -31,6 +31,10 @@ def parse_args() -> argparse.Namespace:
         help="Resume from a checkpoint path, or from this run's latest.pt when passed without a path.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Resolve config/dataset paths without loading SiT.")
+    parser.add_argument(
+        "--reset-ema-on-resume", action="store_true",
+        help="With --resume, replace saved EMA with restored raw weights once; keep optimizer, step and EMA age.",
+    )
     return parser.parse_args()
 
 
@@ -44,6 +48,7 @@ def main() -> int:
         max_steps=args.max_steps,
         resume_from=args.resume,
         dry_run=args.dry_run,
+        reset_ema_on_resume=args.reset_ema_on_resume,
     )
     print("pdae_train_report:")
     for key, value in sorted(report.to_dict().items()):

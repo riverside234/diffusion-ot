@@ -55,6 +55,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional checkpoint override; defaults to the training run's latest.pt.",
     )
+    parser.add_argument(
+        "--roundtrip", action=argparse.BooleanOptionalAction, default=None,
+        help="Enable/disable inferred-noise round-trip evaluation; follows YAML when omitted (PDAE v2 defaults off).",
+    )
     return parser.parse_args()
 
 
@@ -66,6 +70,7 @@ def main() -> int:
         comparison = run_stage1a_weight_comparison(
             repo_path(args.train_config or stage1a_training_config(args.domain)),
             repo_path(args.eval_config), device=args.device, checkpoint_path=args.checkpoint,
+            roundtrip=args.roundtrip,
         )
         print(json.dumps({"comparison_path": comparison["comparison_path"],
                           "grids": {name: report["grid_path"] for name, report in comparison["reports"].items()},
@@ -77,6 +82,7 @@ def main() -> int:
         device=args.device,
         weights=args.weights,
         checkpoint_path=args.checkpoint,
+        roundtrip=args.roundtrip,
     )
     print("stage1a_smoke_report:")
     for key, value in sorted(report.to_dict().items()):

@@ -47,6 +47,8 @@ class Stage1ASmokeReport:
     image_reference: str = "vae_reconstruction"
     encoder_architecture: dict[str, Any] | None = None
     native_flow_objective: dict[str, Any] | None = None
+    checkpoint_ema: dict[str, Any] | None = None
+    roundtrip_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,6 +81,7 @@ class Stage1ARoundTripReport:
     image_reference: str = "vae_reconstruction"
     encoder_architecture: dict[str, Any] | None = None
     native_flow_objective: dict[str, Any] | None = None
+    checkpoint_ema: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -102,6 +105,7 @@ class LoadedStage1AEvaluator:
     device: str
     model_dtype: torch.dtype
     weights: str
+    checkpoint_ema: dict[str, Any] | None = None
 
 
 def _nested(config: dict[str, Any], key: str) -> dict[str, Any]:
@@ -421,6 +425,12 @@ def load_stage1a_evaluator(
             or _evaluation_image_reference(branch, eval_config) == "original_rgb"
         ),
     )
+    # Describe the saved average, not the current YAML's future EMA schedule.
+    saved_ema = checkpoint.get("ema")
+    checkpoint_ema = None
+    if saved_ema is not None:
+        checkpoint_ema = {key: saved_ema.get(key) for key in ("decay", "warmup_steps", "num_updates")}
+        checkpoint_ema["last_reset"] = (checkpoint.get("train_state") or {}).get("ema_reset")
     return LoadedStage1AEvaluator(
         branch=branch,
         transformer=components.transformer,
@@ -438,6 +448,7 @@ def load_stage1a_evaluator(
         device=selected_device,
         model_dtype=model_dtype,
         weights=selected_weights,
+        checkpoint_ema=checkpoint_ema,
     )
 
 
@@ -893,6 +904,7 @@ def _run_inferred_noise_roundtrip(
         image_reference="original_rgb" if vae_reconstruction is not None else "vae_reconstruction",
         encoder_architecture=getattr(evaluator.branch, "encoder_architecture", None),
         native_flow_objective=native_flow_objective(evaluator.training_config),
+        checkpoint_ema=evaluator.checkpoint_ema,
     )
     _write_json(output_dir / "roundtrip_report.json", report.to_dict())
     return report
@@ -906,8 +918,9 @@ def run_stage1a_smoke_test(
     device: str | None = None,
     weights: str | None = None,
     checkpoint_path: str | Path | None = None,
+    roundtrip: bool | None = None,
 ) -> Stage1ASmokeReport:
-    """Run the first eight-image reconstruction gate and save a comparison grid."""
+    """Generate fixed-noise images; roundtrip overrides the opt-in YAML setting."""
     evaluator = load_stage1a_evaluator(
         training_config_path,
         evaluation_config_path,
@@ -1008,7 +1021,8 @@ def run_stage1a_smoke_test(
                             training_config_path=str(evaluator.training_config_path),
                             native_flow_objective=native_flow_objective(evaluator.training_config)))
     inferred_config = _nested(sampling_config, "inferred_noise")
-    if bool(inferred_config.get("enabled", False)):
+    roundtrip_enabled = bool(inferred_config.get("enabled", False)) if roundtrip is None else roundtrip
+    if roundtrip_enabled:
         roundtrip_guidance_scale = float(inferred_config.get("guidance_scale", 1.0))
         roundtrip_report = _run_inferred_noise_roundtrip(
             evaluator,
@@ -1050,6 +1064,8 @@ def run_stage1a_smoke_test(
         image_reference=image_reference,
         encoder_architecture=getattr(evaluator.branch, "encoder_architecture", None),
         native_flow_objective=native_flow_objective(evaluator.training_config),
+        checkpoint_ema=evaluator.checkpoint_ema,
+        roundtrip_enabled=roundtrip_enabled,
     )
     _write_json(output_dir / "smoke_report.json", report.to_dict())
     return report
@@ -1061,14 +1077,16 @@ def run_stage1a_weight_comparison(
     *,
     device: str | None = None,
     checkpoint_path: str | Path | None = None,
+    roundtrip: bool | None = None,
 ) -> dict[str, Any]:
     """Compare raw/EMA with identical samples, starting noise and CFG settings."""
     raw = run_stage1a_smoke_test(training_config_path, evaluation_config_path,
-                                device=device, weights="raw", checkpoint_path=checkpoint_path)
+                                device=device, weights="raw", checkpoint_path=checkpoint_path, roundtrip=roundtrip)
     averaged = run_stage1a_smoke_test(training_config_path, evaluation_config_path,
-                                     device=device, weights="ema", checkpoint_path=raw.checkpoint_path)
+                                     device=device, weights="ema", checkpoint_path=raw.checkpoint_path, roundtrip=roundtrip)
     for field in ("checkpoint_path", "checkpoint_step", "domain", "split", "seed", "sample_ids",
-                  "num_samples", "num_steps", "guidance_scales", "row_order", "image_reference"):
+                  "num_samples", "num_steps", "guidance_scales", "row_order", "image_reference",
+                  "checkpoint_ema", "roundtrip_enabled"):
         if getattr(raw, field) != getattr(averaged, field):
             raise ValueError(f"Raw/EMA smoke comparison changed {field}; use a fixed step checkpoint.")
     comparison_path = Path(averaged.output_dir).parent.parent / "raw_ema_comparison.json"
