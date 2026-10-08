@@ -35,9 +35,7 @@ from infoot_helper.augmentation import augment_and_encode
 
 def main():
     torch.manual_seed(42)
-    if torch.cuda.device_count() < 2:
-        raise RuntimeError("Co-training requires two visible GPUs; set CUDA_VISIBLE_DEVICES to a GPU pair.")
-    device, infoot_device = "cuda:0", "cuda:1"
+    device = "cuda:0"
 
     settings = {
         "batch_size": 1024,
@@ -162,7 +160,7 @@ def main():
         cat_refs = encoded["cat"]["references"]["v"]
         dog_refs = encoded["dog"]["references"]["v"]
         matching = {
-            name: batch["references"]["m"].to(infoot_device)
+            name: batch["references"]["m"]
             for name, batch in encoded.items()
         }
         covariance_losses = {
@@ -187,7 +185,7 @@ def main():
             h=settings["fit_h"],
             mi_weight=settings["mi_weight"],
             reg=settings["reg"],
-        ).to(device)
+        )
 
         contrastive_losses = []
 
@@ -196,13 +194,13 @@ def main():
             ("dog", "cat", P.T),
         ):
             mapped_v = conditional_mapping(
-                encoded[source]["queries"]["m"].to(infoot_device),
+                encoded[source]["queries"]["m"],
                 matching[source],
                 matching[target],
                 plan,
                 h=settings["projection_h"],
-                target_v=encoded[target]["references"]["v"].to(infoot_device),
-            ).to(device)
+                target_v=encoded[target]["references"]["v"],
+            )
 
             loss, metrics = translation_contrastive_loss(
                 domains[target],
