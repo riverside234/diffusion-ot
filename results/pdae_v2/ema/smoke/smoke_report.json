@@ -1,0 +1,162 @@
+{
+  "protocol": "fixed_noise_smoke",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae_v2/cat.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/pdae_v2.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/checkpoints/step_010000.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_010000/ema/smoke",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 10000,
+  "weights": "ema",
+  "semantic_cfg_enabled": true,
+  "attention_lora": {
+    "enabled": true,
+    "rank": 64,
+    "alpha": 64.0,
+    "dropout": 0.0,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "targets": [
+      "qkv",
+      "proj"
+    ]
+  },
+  "seed": 20260902,
+  "num_samples": 8,
+  "num_steps": 50,
+  "guidance_scales": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "vae_reconstruction",
+    "correct_z_cfg_0",
+    "shuffled_z_cfg_0",
+    "null_z_cfg_0",
+    "correct_z_cfg_1",
+    "shuffled_z_cfg_1",
+    "null_z_cfg_1",
+    "correct_z_cfg_1.5",
+    "shuffled_z_cfg_1.5",
+    "null_z_cfg_1.5",
+    "correct_z_cfg_2",
+    "shuffled_z_cfg_2",
+    "null_z_cfg_2"
+  ],
+  "metrics": {
+    "correct_z_cfg_0": {
+      "latent_mse": 1.2126007080078125,
+      "pixel_mse": 0.11829975247383118,
+      "pixel_psnr": 9.270161640733521
+    },
+    "shuffled_z_cfg_0": {
+      "latent_mse": 1.2126007080078125,
+      "pixel_mse": 0.11829975247383118,
+      "pixel_psnr": 9.270161640733521
+    },
+    "null_z_cfg_0": {
+      "latent_mse": 1.2126007080078125,
+      "pixel_mse": 0.11829975247383118,
+      "pixel_psnr": 9.270161640733521
+    },
+    "correct_z_cfg_1": {
+      "latent_mse": 0.7855042219161987,
+      "pixel_mse": 0.04986513778567314,
+      "pixel_psnr": 13.02202976594118
+    },
+    "shuffled_z_cfg_1": {
+      "latent_mse": 1.0733639001846313,
+      "pixel_mse": 0.09851901978254318,
+      "pixel_psnr": 10.064799178352724
+    },
+    "null_z_cfg_1": {
+      "latent_mse": 1.2126007080078125,
+      "pixel_mse": 0.11829975247383118,
+      "pixel_psnr": 9.270161640733521
+    },
+    "correct_z_cfg_1.5": {
+      "latent_mse": 0.7739647626876831,
+      "pixel_mse": 0.04645911604166031,
+      "pixel_psnr": 13.3292905759823
+    },
+    "shuffled_z_cfg_1.5": {
+      "latent_mse": 1.1280704736709595,
+      "pixel_mse": 0.10426952689886093,
+      "pixel_psnr": 9.81842596974868
+    },
+    "null_z_cfg_1.5": {
+      "latent_mse": 1.2126007080078125,
+      "pixel_mse": 0.11830019950866699,
+      "pixel_psnr": 9.27014522950767
+    },
+    "correct_z_cfg_2": {
+      "latent_mse": 0.7928491830825806,
+      "pixel_mse": 0.04650455713272095,
+      "pixel_psnr": 13.325044870967176
+    },
+    "shuffled_z_cfg_2": {
+      "latent_mse": 1.1865150928497314,
+      "pixel_mse": 0.10810412466526031,
+      "pixel_psnr": 9.661577354159004
+    },
+    "null_z_cfg_2": {
+      "latent_mse": 1.2126007080078125,
+      "pixel_mse": 0.11830019950866699,
+      "pixel_psnr": 9.27014522950767
+    },
+    "vae_reconstruction": {
+      "pixel_mse": 0.0016538286581635475,
+      "pixel_psnr": 27.8150948672341
+    }
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_010000/ema/smoke/reconstruction_grid.png",
+  "extra_reports": {
+    "condition_tokens": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_010000/ema/smoke/condition_tokens.json",
+    "inferred_noise_roundtrip": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_010000/ema/roundtrip/roundtrip_report.json"
+  },
+  "encoder_input_space": "rgb",
+  "image_reference": "original_rgb",
+  "encoder_architecture": {
+    "kind": "siglip2_vit_b16",
+    "model_id": "google/siglip2-base-patch16-224",
+    "token_dim": 768,
+    "tokens": 196,
+    "image_size": 224,
+    "frozen": true,
+    "features": "last_hidden_state_post_layernorm"
+  },
+  "native_flow_objective": {
+    "protocol": "native_velocity_uniform_time_v1",
+    "direction": "noise_to_data",
+    "time_eps": 1e-05,
+    "timestep_sampling": "uniform",
+    "loss_weighting": {
+      "type": "cosmap"
+    }
+  }
+}

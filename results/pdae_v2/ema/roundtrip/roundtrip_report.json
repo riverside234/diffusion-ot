@@ -1,0 +1,105 @@
+{
+  "protocol": "inferred_noise_roundtrip",
+  "training_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae_v2/cat.yaml",
+  "evaluation_config_path": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_eval/pdae_v2.yaml",
+  "checkpoint_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/checkpoints/step_010000.pt",
+  "output_dir": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_010000/ema/roundtrip",
+  "domain": "cat",
+  "split": "val",
+  "checkpoint_step": 10000,
+  "weights": "ema",
+  "semantic_cfg_enabled": true,
+  "attention_lora": {
+    "enabled": true,
+    "rank": 64,
+    "alpha": 64.0,
+    "dropout": 0.0,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "targets": [
+      "qkv",
+      "proj"
+    ]
+  },
+  "seed": 20260902,
+  "num_samples": 8,
+  "backward_num_steps": 100,
+  "forward_num_steps": 100,
+  "guidance_scale": 1.0,
+  "sample_ids": [
+    "afhq_cat_010805",
+    "afhq_cat_013491",
+    "afhq_cat_009651",
+    "afhq_cat_011085",
+    "afhq_cat_010733",
+    "afhq_cat_010824",
+    "afhq_cat_013770",
+    "afhq_cat_010216"
+  ],
+  "row_order": [
+    "original",
+    "vae_reconstruction",
+    "correct_z",
+    "shuffled_z",
+    "null_z"
+  ],
+  "metrics": {
+    "correct_z": {
+      "latent_mse": 0.0005981416325084865,
+      "pixel_mse": 0.001698867417871952,
+      "pixel_psnr": 27.69840512792728
+    },
+    "shuffled_z": {
+      "latent_mse": 0.4445980191230774,
+      "pixel_mse": 0.06637205928564072,
+      "pixel_psnr": 11.780147075573506
+    },
+    "null_z": {
+      "latent_mse": 0.49119672179222107,
+      "pixel_mse": 0.07213055342435837,
+      "pixel_psnr": 11.418807356565587
+    },
+    "vae_reconstruction": {
+      "pixel_mse": 0.0016538286581635475,
+      "pixel_psnr": 27.8150948672341
+    }
+  },
+  "inferred_noise_stats": {
+    "mean": -0.009823593311011791,
+    "std": 0.9887697696685791,
+    "rms": 0.9888185262680054
+  },
+  "grid_path": "/data/not_backed_up/yxu209/diffusion-ot/outputs/pdae_v2_cat/pdae_v2_eval/step_010000/ema/roundtrip/roundtrip_grid.png",
+  "encoder_input_space": "rgb",
+  "image_reference": "original_rgb",
+  "encoder_architecture": {
+    "kind": "siglip2_vit_b16",
+    "model_id": "google/siglip2-base-patch16-224",
+    "token_dim": 768,
+    "tokens": 196,
+    "image_size": 224,
+    "frozen": true,
+    "features": "last_hidden_state_post_layernorm"
+  },
+  "native_flow_objective": {
+    "protocol": "native_velocity_uniform_time_v1",
+    "direction": "noise_to_data",
+    "time_eps": 1e-05,
+    "timestep_sampling": "uniform",
+    "loss_weighting": {
+      "type": "cosmap"
+    }
+  }
+}

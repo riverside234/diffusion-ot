@@ -1,0 +1,11 @@
+{
+  "count": 8,
+  "dim": 768,
+  "tokens_per_image": 196,
+  "statistics_space": "patch_token_population",
+  "rank_sample_count": 1568,
+  "norm_mean": 47.336639404296875,
+  "norm_std": 4.791261672973633,
+  "feature_std_mean": 1.1986093521118164,
+  "effective_rank": 66.5166015625
+}
