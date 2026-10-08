@@ -1,7 +1,10 @@
 from pathlib import Path
+import logging
 import torch
+import torch.distributed as dist
 
 from .batchnorm_matching import batchnorm_checkpoint
+from .distributed.checkpoint import restore_random_state
 
 
 def latest_checkpoint(output_dir):
@@ -10,8 +13,12 @@ def latest_checkpoint(output_dir):
     return max(paths, key=lambda path: int(path.stem[5:]), default=None)
 
 
-def resume_latest(output_dir, domains, batch_norms, optimizer):
+def resume_latest(output_dir, domains, batch_norms, optimizer, device=None):
     path = latest_checkpoint(output_dir)
+    if dist.is_initialized():
+        chosen = [str(path) if path is not None and dist.get_rank() == 0 else None]
+        dist.broadcast_object_list(chosen, src=0)
+        path = Path(chosen[0]) if chosen[0] is not None else None
     if path is None:
         return 0
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
@@ -24,10 +31,7 @@ def resume_latest(output_dir, domains, batch_norms, optimizer):
         norm.load_state_dict(saved["state_dict"])
         norm.train()
     optimizer.load_state_dict(checkpoint["optimizer"])
-    if checkpoint.get("rng_state") is not None:
-        torch.set_rng_state(checkpoint["rng_state"])
-    for index, state in enumerate(checkpoint.get("cuda_rng_state_all", [])[:torch.cuda.device_count()]):
-        torch.cuda.set_rng_state(state, device=index)
+    restore_random_state(checkpoint, device)
     step = int(checkpoint["step"])
-    print(f"Resumed {path.name}; next training step: {step + 1}")
+    logging.info("Resumed %s; next training step: %s", path.name, step + 1)
     return step
