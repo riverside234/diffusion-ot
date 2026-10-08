@@ -42,15 +42,16 @@ def main():
         "flow_batch_size": 16,
         "query_count": 32,
         "steps": 2000,
-        "h": 0.4,
-        "mi_weight": 0.10,
-        "reg": 0.02,
+        "fit_h": 0.4,
+        "projection_h": 0.2,
+        "mi_weight": 1.59,
+        "reg": 0.74,
         "infoOT_loss_weight": 0.10,
         "fit_iterations": 100,
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
-        "covariance_weight": 0.01,
+        "covariance_weight": 0.3,
         "batchnorm": {"affine": False, "momentum": 0.1, "eps": 1e-5},
         "batchnorm_lr": 1e-5,
     }
@@ -164,7 +165,7 @@ def main():
         P = fit_transport(
             cat_matching,
             dog_matching,
-            h=settings["h"],
+            h=settings["fit_h"],
             mi_weight=settings["mi_weight"],
             reg=settings["reg"],
             iterations=settings["fit_iterations"],
@@ -174,7 +175,7 @@ def main():
             cat_matching,
             dog_matching,
             P,
-            h=settings["h"],
+            h=settings["fit_h"],
             mi_weight=settings["mi_weight"],
             reg=settings["reg"],
         )
@@ -190,7 +191,7 @@ def main():
                 encoded[source]["references"]["m"],
                 encoded[target]["references"]["m"],
                 plan,
-                h=settings["h"],
+                h=settings["projection_h"],
                 target_v=encoded[target]["references"]["v"],
             )
 
