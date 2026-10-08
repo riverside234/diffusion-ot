@@ -10,10 +10,11 @@ from diffusion_ot.evaluation.stage1a_eval import load_stage1a_evaluator
 from diffusion_ot.models.generator_adaptation import (
     configure_generator_adaptation,
 )
-from diffusion_ot.training.train_joint_infoot import _cycle
+from diffusion_ot.training.train_joint_infoot import _cycle, _save_checkpoint
 
 from infoot_helper.encoding import encode_batches
 from infoot_helper.diagnostics import representation_log
+from infoot_helper.cotraining_checkpoint import resume_latest
 from infoot_helper.batchnorm_matching import (
     add_matching_features, batchnorm_checkpoint, covariance_loss,
 )
@@ -119,13 +120,17 @@ def main():
         batches[name] = _cycle(loader)
 
     optimizer = torch.optim.Adam(parameter_groups)
+    start_step = resume_latest(output_dir, domains, batch_norms, optimizer)
+    if start_step >= settings["steps"]:
+        print(f"Already at step {start_step}; increase settings['steps'] to continue.")
+        return
     parameters = [
         parameter
         for group in optimizer.param_groups
         for parameter in group["params"]
     ]
 
-    for step in range(1, settings["steps"] + 1):
+    for step in range(start_step + 1, settings["steps"] + 1):
         optimizer.zero_grad(set_to_none=True)
 
         latents = {}
@@ -243,7 +248,9 @@ def main():
             )
 
         if step % 200 == 0 or step == settings["steps"]:
-            torch.save(
+            save_domain_checkpoints(domains, output_dir, step, batch_norms)
+            _save_checkpoint(
+                output_dir / f"step_{step:06d}.pt",
                 {
                     "step": step,
                     "settings": settings,
@@ -256,13 +263,13 @@ def main():
                         for name, context in domains.items()
                     },
                     "optimizer": optimizer.state_dict(),
+                    "rng_state": torch.get_rng_state(),
+                    "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
                     "matching_batchnorm": {
                         name: batchnorm_checkpoint(norm) for name, norm in batch_norms.items()
                     },
                 },
-                output_dir / f"step_{step:06d}.pt",
             )
-            save_domain_checkpoints(domains, output_dir, step, batch_norms)
 
 
 if __name__ == "__main__":
