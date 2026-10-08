@@ -16,16 +16,17 @@ def repo_path(path: str | None) -> Path | None:
     return raw_path if raw_path.is_absolute() else ROOT / raw_path
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cache VAE latents for AFHQ manifests using SiT-B-2-256 VAE.")
+def parse_args(argv=None, *, default_data_config="configs/data/afhq_huggan.yaml",
+               default_model_config="configs/model/sit_b2_256.yaml") -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Cache VAE latents for AFHQ manifests using the configured SiT VAE.")
     parser.add_argument(
         "--data-config",
-        default="configs/data/afhq_huggan.yaml",
+        default=default_data_config,
         help="Path to AFHQ data config.",
     )
     parser.add_argument(
         "--model-config",
-        default="configs/model/sit_b2_256.yaml",
+        default=default_model_config,
         help="Path to SiT model config.",
     )
     parser.add_argument(
@@ -37,13 +38,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None, help="Override VAE batch size.")
     parser.add_argument("--limit", type=int, default=None, help="Optional per-manifest record limit.")
     parser.add_argument("--dry-run", action="store_true", help="Build latent manifest without encoding latents.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
+def main(argv=None, *, default_data_config="configs/data/afhq_huggan.yaml",
+         default_model_config="configs/model/sit_b2_256.yaml") -> int:
     from diffusion_ot.data.latent_cache import cache_vae_latents
 
-    args = parse_args()
+    args = parse_args(argv, default_data_config=default_data_config,
+                      default_model_config=default_model_config)
     report = cache_vae_latents(
         data_config_path=repo_path(args.data_config),
         model_config_path=repo_path(args.model_config),

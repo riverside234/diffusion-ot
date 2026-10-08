@@ -31,13 +31,14 @@ def limited_cpu_threads():
 
 class NativeSiTBlock(nn.Module):
     """The existing SiT's six-way AdaLN block, with nonzero gates/weights."""
-    def __init__(self):
+    def __init__(self, hidden_size=8):
         super().__init__()
-        self.norm1 = nn.LayerNorm(8, elementwise_affine=False, eps=1e-6)
-        self.attn = FakeAttention(8)
-        self.norm2 = nn.LayerNorm(8, elementwise_affine=False, eps=1e-6)
-        self.mlp = nn.Sequential(nn.Linear(8, 16), nn.GELU(approximate="tanh"), nn.Linear(16, 8))
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(8, 48))
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = FakeAttention(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.mlp = nn.Sequential(nn.Linear(hidden_size, 2 * hidden_size), nn.GELU(approximate="tanh"),
+                                 nn.Linear(2 * hidden_size, hidden_size))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
 
     def forward(self, x, c):
         a, b, g, d, e, h = self.adaLN_modulation(c).chunk(6, dim=1)
@@ -87,13 +88,14 @@ def activate_cross_attention(model):
         nn.init.constant_(attention.out.bias, .3)
 
 
-def test_full_width_attention_accepts_sit_grid_and_siglip_patch_lengths():
-    attention = ImageCrossAttention(768, token_dim=768, num_heads=12)
+@pytest.mark.parametrize("hidden_size,num_heads", [(768, 12), (1024, 16)])
+def test_full_width_attention_accepts_sit_grid_and_siglip_patch_lengths(hidden_size, num_heads):
+    attention = ImageCrossAttention(hidden_size, token_dim=768, num_heads=num_heads)
     nn.init.normal_(attention.out.weight, std=.02)
-    hidden = torch.randn(1, 256, 768, requires_grad=True)
+    hidden = torch.randn(1, 256, hidden_size, requires_grad=True)
     tokens = torch.randn(1, 196, 768, requires_grad=True)
     output = attention(hidden, tokens)
-    assert output.shape == (1, 256, 768) and torch.isfinite(output).all()
+    assert output.shape == (1, 256, hidden_size) and torch.isfinite(output).all()
     output.square().mean().backward()
     assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum() > 0
     assert torch.isfinite(tokens.grad).all() and tokens.grad.abs().sum() > 0

@@ -196,6 +196,7 @@ def _download_snapshot_to_parent(config: dict[str, Any], local_dir: Path) -> Non
         repo_id=repo_id,
         revision=revision,
         allow_patterns=allow_patterns,
+        ignore_patterns=config.get("ignore_patterns"),
         local_dir=str(local_dir.parent),
     )
 

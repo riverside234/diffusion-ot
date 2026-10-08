@@ -28,6 +28,7 @@ The canonical configurations are:
 - Stage 1A default evaluation: `configs/stage1a_eval/residual_sit_b2_256.yaml`
 - Separate PDAE v2 Stage 1A: `configs/stage1a_pdae_v2/{cat,dog}.yaml`
 - PDAE v2 evaluation: `configs/stage1a_eval/pdae_v2.yaml`
+- Separate PDAE v2-L Stage 1A: `configs/stage1a_pdae_v2_l/{cat,dog}.yaml` (same v2 evaluator)
 - Stage 1B default: `configs/stage1b_infoot/self_supervised_infonce_v7_residual_cosmap_sit_b2.yaml`
 - Stage 1B default evaluation: `configs/stage1b_eval/self_supervised_infonce_v7_residual_cosmap_sit_b2.yaml`
 - Stage 1A historical plain latent recipe: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora.yaml`
@@ -167,6 +168,90 @@ on the same device/dtype. Shuffled conditions use the full cohort before chunkin
 It disables the vector-only N1 ridge probe. **Stage 1B token transport is not
 implemented for v2.** The existing experiment defaults remain unchanged.
 See [the design and implementation record](docs/pdae_v2_plan.md).
+
+### PDAE v2-L: SiT-L/2 backbone
+
+This separate experiment loads the requested
+[BiliSakura SiT-L-2-256 snapshot](https://huggingface.co/BiliSakura/SiT-diffusers/tree/2f02393a3079dfa6210c10302cc927f59d2cb142/SiT-L-2-256),
+pinned to commit `2f02393a3079dfa6210c10302cc927f59d2cb142`. Its transformer has
+24 blocks, width 1024, and 16 heads; these dimensions also match the
+[official SiT-L/2 definition](https://github.com/willisma/SiT/blob/main/models.py).
+Frozen SigLIP 2 still supplies `[B,196,768]` tokens. The existing v2
+cross-attention projects keys/values to SiT's hidden width and uses 16 heads;
+rank-64 attention LoRA now covers all 24 blocks. The projector, image-attention
+branches and learned null token train fully. No separate model or trainer
+implementation is needed.
+
+| Setting | v2-B augmentation recipe | v2-L starting recipe |
+| --- | --- | --- |
+| Microbatch × accumulation | 64 × 1 | 16 × 4 |
+| Effective images per optimizer update | 64 | 64 |
+| Projector / new cross-attention LR | `1e-4` | `5e-5` |
+| LoRA LR | `2.5e-5` | `1.25e-5` |
+| Linear LR warmup | 500 updates | 1,000 updates |
+| Parameter / optimizer dtype | float32 | float32 |
+
+The lower rates and longer warmup are a conservative starting experiment for
+more, wider adapted blocks, **not a measured optimum or a model-size scaling
+rule**. The [official IP-Adapter recipe](https://github.com/tencent-ailab/IP-Adapter#how-to-train)
+provides precedent for training new image-conditioning layers at `1e-4`, but
+does not establish the best rate for this SiT-L + LoRA setup. If the first
+5k–10k updates are stable but learn too slowly, compare raising the adapter
+rate to `1e-4` while holding LoRA at `1.25e-5`. Judge held-out flow loss,
+correct/shuffled condition separation, clipping, and the fixed-image grids.
+Do not increase rates just because parameter count increased.
+
+Both domains retain the cosmap flow loss, frozen SigLIP, semantic dropout 0.1,
+mild matched RGB augmentation, AdamW weight decay 0.01, gradient clipping 1.0,
+and EMA 0.999. Train for 50k optimizer updates; log every 500 and save every
+5k. Validation remains **32 images every 1k** with paired raw/EMA weights.
+On a smaller memory budget, batch 8 with accumulation 8 keeps effective batch
+64 and the same learning rates. GPU memory/throughput must be measured on the
+lab machine; no new mixed-precision or distributed-training path is introduced.
+
+Run from the lab project root; these YAMLs use
+`/data/not_backed_up/yxu209/diffusion-ot/` like the existing recipes:
+
+```bash
+# Uses the official huggingface_hub downloader and existing snapshot verifier.
+# HF_TOKEN is read by Hugging Face when set; it is never written into config/logs.
+# Downloads transformer, its custom Diffusers code, scheduler, AND bundled VAE.
+python scripts/download_sit_l.py
+# Only needed if the shared frozen SigLIP snapshot has not been downloaded:
+python scripts/download_siglip2.py
+
+# Only if the existing cat/dog split manifests have not already been prepared:
+python scripts/prepare_afhq.py --config configs/data/afhq_pdae_v2_l.yaml
+# Encodes all cat/dog train + val images, reusing the existing Diffusers VAE cache code.
+python scripts/cache_pdae_v2_l_latents.py --device cuda:0 --batch-size 16
+
+# Fresh training from pretrained SiT-L, with new image-conditioning layers and LoRA:
+python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2_l/cat.yaml
+python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2_l/dog.yaml
+# Continue this L experiment later:
+python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2_l/cat.yaml --resume latest
+
+# Reuse the v2 evaluator: 16 images, original/VAE + correct/shuffled CFG 1/1.5/2,
+# paired raw/EMA, no null_z or CFG-0 rows, round trips disabled by default.
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2_l/cat.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --weights both
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2_l/dog.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --weights both
+```
+
+The bundled VAE is `sd-vae-ft-mse`: center-cropped 256px RGB in `[-1,1]` becomes
+a posterior-mean `[4,32,32]` latent multiplied by **0.18215 once**. The new
+cache uses float32 encoding/storage to match augmented online targets and saves
+to `data/latents/afhq_sit_l2_256`, including `latent_manifest.jsonl` and
+`cache_report.json`. Existing deterministic image manifests/RGB are shared;
+the SiT-B latent cache is untouched. During augmented training the same
+transformed RGB feeds SigLIP and fresh VAE encoding; cached latents supply
+unaugmented validation/evaluation targets and the existing dataset interface.
+
+Assets are stored under `artifacts/pretrained/SiT-L-2-256`. Outputs/checkpoints
+are isolated in `outputs/pdae_v2_l_cat` and `outputs/pdae_v2_l_dog`.
+**Do not initialize or resume SiT-L from a v2-B PDAE checkpoint**: attention
+width, depth, and LoRA shapes differ. `--resume latest` selects the new domain's
+L output directory. Existing v2-B and Stage 1B configs stay unchanged; v2-L is
+currently a Stage 1A experiment, with the same v2 token-transport limitation.
 
 ### Fresh residual-cosmap workflow (P1a / N1)
 

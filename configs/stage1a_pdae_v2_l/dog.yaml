@@ -1,0 +1,113 @@
+# PDAE v2-L: frozen SigLIP 2 -> cross-attention + SiT-L/2 LoRA.
+# Fresh experiment; SiT-B PDAE checkpoints are not shape-compatible.
+stage: stage1a_pdae
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+domain: dog
+split: train
+data_config: configs/data/afhq_pdae_v2_l.yaml
+model_config: configs/model/sit_l2_256.yaml
+output_dir: outputs/pdae_v2_l_dog
+device: cuda:0
+# Parameter/optimizer dtype, not AMP. Retain float32 for the first L comparison.
+torch_dtype: float32
+
+dataloader:
+  # Effective batch 64. For less memory use batch 8 + accumulation 8, same LRs.
+  batch_size: 16
+  gradient_accumulation_steps: 4
+  random_horizontal_flip: 0.5  # Legacy fallback; matched augmentation bypasses it.
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+
+train:
+  max_steps: 50000
+  initialize_from: null
+  resume_from: null
+  seed: 20260901
+  # Conservative starting rates for twice as many, wider adapted blocks.
+  # Half the v2-B peaks; larger models do not imply linear LR scaling.
+  lr_adapter: 0.00005
+  lr_lora: 0.0000125
+  lr_schedule:
+    type: constant_with_warmup
+    warmup_steps: 1000  # Optimizer updates, not microbatches.
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  log_every: 500
+  save_every: 5000
+  keep_step_checkpoints: true
+
+ema:
+  enabled: true
+  decay: 0.999
+  warmup_steps: 1000
+  update_every: 1
+
+evaluation:
+  enabled: true
+  split: val
+  batch_size: 16
+  num_batches: 2  # Keep 32 unaugmented validation images every 1,000 updates.
+  num_time_bins: 10
+  every_steps: 1000
+  evaluate_at_start: true
+  use_ema: false
+  compare_raw_ema: true
+  seed: 20260902
+
+flow:
+  direction: noise_to_data
+  time_eps: 0.00001
+
+class_conditioning:
+  mode: null
+  null_label: 1000
+
+semantic_cfg:
+  enabled: true
+  dropout_probability: 0.10
+  drop_granularity: sample
+  null_condition: learned_token
+
+encoder:
+  kind: siglip2_vit_b16
+  input_space: rgb
+  input_channels: 3
+  image_size: 256
+  frozen: true
+  token_dim: 768  # Keep native SigLIP features; attention K/V handle SiT's 1024 width.
+  local_dir: artifacts/siglip2_base_patch16_224
+
+adapter:
+  kind: pdae_v2_cross_attention
+  freeze_base: true
+  cross_attention_heads: 16  # 1024 / 16 = 64 channels per head.
+  lora: true
+  lora_rank: 64
+  lora_alpha: 64
+  lora_dropout: 0.0
+  lora_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+
+loss_weighting:
+  type: cosmap
+
+refinement:
+  enabled: false
+
+# Same mild recipe as v2-B. RGB condition and freshly encoded VAE target match.
+augmentation:
+  enabled: true
+  vae_batch_size: 16
+  horizontal_flip_probability: 0.5
+  color_jitter:
+    probability: 0.25
+    brightness: 0.10
+    contrast: 0.10
+    saturation: 0.05
+    hue: 0.0
+  affine:
+    probability: 0.20
+    translate: [0.03, 0.03]
+    scale: [0.97, 1.03]

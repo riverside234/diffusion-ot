@@ -1,0 +1,22 @@
+name: afhq_pdae_v2_l
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+dataset_id: huggan/AFHQ
+split: train
+cache_dir: data/hf_cache/afhq_huggan
+download_dir: data/downloads/afhq_huggan
+image_column: image
+label_column: label
+domains: [cat, dog, wild]
+active_domains: [cat, dog]
+heldout_domains: [wild]
+seed: 20260901
+val_fraction: 0.1
+max_samples_per_domain: null
+image_size: 256
+center_crop: true
+# Reuse the existing deterministic image IDs and train/validation splits.
+manifest_dir: data/manifests
+# Cache the bundled SiT-L VAE separately; never overwrite the SiT-B cache.
+latent_dir: data/latents/afhq_sit_l2_256
+latent_manifest_name: latent_manifest.jsonl
+write_processed_images: false

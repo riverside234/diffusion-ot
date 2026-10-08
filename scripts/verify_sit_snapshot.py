@@ -14,16 +14,18 @@ def repo_path(path: str) -> Path:
     return raw_path if raw_path.is_absolute() else ROOT / raw_path
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Verify the local SiT-B-2-256 Diffusers snapshot.")
+def parse_args(argv=None, *, default_config="configs/pretrained/bilisakura_sit_b2_256.yaml",
+               download_by_default=False) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Verify or download a local SiT Diffusers snapshot (transformer + VAE).")
     parser.add_argument(
         "--config",
-        default="configs/pretrained/bilisakura_sit_b2_256.yaml",
+        default=default_config,
         help="Path to the pretrained snapshot config.",
     )
     parser.add_argument(
         "--download-if-missing",
         action="store_true",
+        default=download_by_default,
         help="Optionally download the HF snapshot if required files are missing.",
     )
     parser.add_argument(
@@ -31,13 +33,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not write snapshot_report.json.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
+def main(argv=None, *, default_config="configs/pretrained/bilisakura_sit_b2_256.yaml",
+         download_by_default=False) -> int:
     from diffusion_ot.integrations.hf_snapshot import format_snapshot_report, verify_sit_snapshot
 
-    args = parse_args()
+    args = parse_args(argv, default_config=default_config, download_by_default=download_by_default)
     report = verify_sit_snapshot(
         repo_path(args.config),
         project_root=ROOT,

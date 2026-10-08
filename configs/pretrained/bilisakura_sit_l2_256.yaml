@@ -1,0 +1,28 @@
+name: bilisakura_sit_l2_256
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+repo_id: BiliSakura/SiT-diffusers
+subfolder: SiT-L-2-256
+# Verified Hub commit: keep diffusion, VAE, and custom model code from one snapshot.
+revision: 2f02393a3079dfa6210c10302cc927f59d2cb142
+trust_remote_code: true
+local_dir: artifacts/pretrained/SiT-L-2-256
+download_if_missing: false
+allow_patterns:
+  - SiT-L-2-256/**
+ignore_patterns:
+  - '**/__pycache__/**'
+  - '*.pyc'
+expected_files:
+  - pipeline.py
+  - model_index.json
+  - transformer/config.json
+  - transformer/transformer_sit.py
+  - transformer/diffusion_pytorch_model.safetensors
+  - scheduler/scheduler_config.json
+  - vae/config.json
+  - vae/diffusion_pytorch_model.safetensors
+metadata_file: artifacts/pretrained/SiT-L-2-256/snapshot_report.json
+notes:
+  - Run scripts/download_sit_l.py once; training reads this local snapshot.
+  - This is the BiliSakura Diffusers conversion of SiT-L/2, not a new model implementation.
+  - The included VAE is sd-vae-ft-mse with scaling_factor 0.18215.
