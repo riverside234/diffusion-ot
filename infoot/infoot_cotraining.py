@@ -39,9 +39,9 @@ def main():
 
     settings = {
         "batch_size": 1024,
-        "encode_batch_size": 32,
-        "flow_batch_size": 8,
-        "query_count": 16,
+        "encode_batch_size": 128,
+        "flow_batch_size": 16,
+        "query_count": 32,
         "steps": 2000,
         "fit_h": 0.4,
         "projection_h": 0.2,
