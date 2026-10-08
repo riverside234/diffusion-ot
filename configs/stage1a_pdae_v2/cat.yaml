@@ -1,5 +1,5 @@
 # Frozen SigLIP 2 -> trainable image cross-attention + SiT LoRA.
-# Matched cat/dog recipe; research rationale: docs/pdae_v2_plan.md, section 11.
+# Matched cat/dog recipe; research and cat review: docs/pdae_v2_plan.md, sections 11-12.
 stage: stage1a_pdae
 project_root: /data/not_backed_up/yxu209/diffusion-ot/
 domain: cat
@@ -22,7 +22,7 @@ dataloader:
   drop_last: true
 
 train:
-  max_steps: 10000  # Budget cap; review fixed-noise image quality at 5k and 10k.
+  max_steps: 20000  # Loss is still improving at 10k; review raw/EMA images before continuing.
   initialize_from: null
   resume_from: null
   seed: 20260901
@@ -42,7 +42,8 @@ train:
 
 ema:
   enabled: true
-  decay: 0.9999
+  # ~693-update half-life. 0.9999 retained 41% of the 1k EMA at step 10k.
+  decay: 0.999
   warmup_steps: 1000  # EMA averaging warmup, separate from train.lr_schedule.
   update_every: 1
 
@@ -55,6 +56,7 @@ evaluation:
   every_steps: 1000
   evaluate_at_start: true
   use_ema: true
+  compare_raw_ema: true  # Both weight states on the SAME 32 images/noise/timesteps.
   seed: 20260902
 
 flow:

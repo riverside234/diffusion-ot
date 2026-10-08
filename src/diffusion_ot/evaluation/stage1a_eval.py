@@ -1053,3 +1053,34 @@ def run_stage1a_smoke_test(
     )
     _write_json(output_dir / "smoke_report.json", report.to_dict())
     return report
+
+
+def run_stage1a_weight_comparison(
+    training_config_path: str | Path,
+    evaluation_config_path: str | Path,
+    *,
+    device: str | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Compare raw/EMA with identical samples, starting noise and CFG settings."""
+    raw = run_stage1a_smoke_test(training_config_path, evaluation_config_path,
+                                device=device, weights="raw", checkpoint_path=checkpoint_path)
+    averaged = run_stage1a_smoke_test(training_config_path, evaluation_config_path,
+                                     device=device, weights="ema", checkpoint_path=raw.checkpoint_path)
+    for field in ("checkpoint_path", "checkpoint_step", "domain", "split", "seed", "sample_ids",
+                  "num_samples", "num_steps", "guidance_scales", "row_order", "image_reference"):
+        if getattr(raw, field) != getattr(averaged, field):
+            raise ValueError(f"Raw/EMA smoke comparison changed {field}; use a fixed step checkpoint.")
+    comparison_path = Path(averaged.output_dir).parent.parent / "raw_ema_comparison.json"
+    result = {
+        "protocol": "matched_raw_ema_smoke",
+        "reports": {"raw": raw.to_dict(), "ema": averaged.to_dict()},
+        "ema_minus_raw": {
+            variant: {key: value - raw.metrics[variant][key] for key, value in values.items()}
+            for variant, values in averaged.metrics.items()
+        },
+        "interpretation": "Positive EMA-minus-raw MSE or negative PSNR favors raw on reconstruction metrics; inspect both grids for realism and detail.",
+        "comparison_path": str(comparison_path),
+    }
+    _write_json(comparison_path, result)
+    return result

@@ -70,9 +70,12 @@ cosmap-weighted flow objective, with no refinement losses.
 
 Both domain configs use effective batch 64, peak learning rates `1e-4` for new
 conditioning layers and `2.5e-5` for LoRA, 500 optimizer updates of linear LR
-warmup, then constant rates, and AdamW weight decay `0.01`. Training validation
-uses **32 fixed images every 1,000 steps**, plus step 0; checkpoints save every
-1,000 steps. SigLIP stays frozen. See the
+warmup, then constant rates, and AdamW weight decay `0.01`. The budget is 20,000
+updates with EMA decay `0.999`. Training validation compares raw and EMA on
+**the same 32 fixed images every 1,000 steps**, plus step 0; checkpoints save
+every 1,000 steps. SigLIP stays frozen. The
+[10k cat review](docs/analysis/pdae_v2_cat_10000/review.md) explains the shorter
+EMA and recommends a raw/EMA image comparison before further training. See the
 [settings and research rationale](docs/pdae_v2_plan.md#11-research-backed-config-polish-2026-10-07).
 
 From the lab project root (the YAMLs specify `/data/not_backed_up/yxu209/diffusion-ot/`):
@@ -83,9 +86,17 @@ python scripts/download_siglip2.py --output-dir artifacts/siglip2_base_patch16_2
 python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml
 python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/dog.yaml
 python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2/cat.yaml --resume latest
-python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/cat.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml
-python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/dog.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/cat.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --weights both
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2/dog.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --weights both
 ```
+
+`--weights both` writes separate raw/EMA grids and a `raw_ema_comparison.json`
+using the same samples, noise, and guidance sweep. Use `--checkpoint` with a
+numbered step checkpoint when training is running. Validation logs preserve
+the primary EMA metrics and add `weight_comparison`; a positive
+`ema_minus_raw_correct_z_mse` means EMA is worse on that fixed flow probe.
+Changing EMA decay on resume preserves its shadow history and applies the new
+decay to future updates; it does not change existing saved EMA weights.
 
 Checkpoints are separate: `outputs/pdae_v2_cat` and `outputs/pdae_v2_dog`.
 They store trainable weights, optimizer/EMA/resume state, and a verified frozen

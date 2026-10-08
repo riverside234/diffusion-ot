@@ -360,10 +360,11 @@ def v2_training_setup(latent_training_setup, monkeypatch):
     config['semantic_cfg'] = dict(enabled=True, dropout_probability=.1)
     torch.manual_seed(19)
     original, encoder = base_model(), TinyFrozenEncoder()
+    original_vae = TinyVAE().requires_grad_(False)
     monkeypatch.setattr(ground_truth, 'load_afhq_dataset', lambda *a, **k: source)
     monkeypatch.setattr(FrozenSiglipPatchEncoder, 'from_local', lambda *a: deepcopy(encoder))
     def components(*a, **kw):
-        vae = TinyVAE().requires_grad_(False)
+        vae = deepcopy(original_vae)
         latest['vae'] = vae
         return SimpleNamespace(transformer=deepcopy(original), vae=vae)
     def build(*a, **kw):
@@ -414,9 +415,50 @@ def test_lr_warmup_accumulation_resume_and_legacy_schedule_guard(v2_training_set
         run('v2_legacy_lr', steps=2, resume=True)
 
 
-def test_real_evaluation_cfg_grid_and_roundtrip(v2_training_setup):
+def test_paired_validation_preserves_updates_and_uses_same_inputs(v2_training_setup):
+    run, config, _, _ = v2_training_setup
+    config['ema'].update(decay=.9, warmup_steps=0)
+    config['evaluation']['compare_raw_ema'] = True
+    paired, logs, _ = run('v2_paired', steps=2)
+    single, _, _ = run('v2_single', steps=2,
+                        modify=lambda c: c['evaluation'].update(compare_raw_ema=False))
+    # The additional evaluation must not alter the following training update.
+    for key in paired['ema']['shadow']:
+        torch.testing.assert_close(paired['ema']['shadow'][key], single['ema']['shadow'][key], atol=0, rtol=0)
+    torch.testing.assert_close(paired['rng_state'], single['rng_state'], atol=0, rtol=0)
+    rows = logs['validation']
+    assert all(row['sample_ids'] == rows[0]['sample_ids'] for row in rows)
+    for row in rows:
+        comparison = row['weight_comparison']
+        assert row['num_samples'] == 4 and len(row['sample_ids']) == 4
+        assert row['correct_z'] == comparison['ema']['correct_z']
+        assert comparison['raw']['correct_z']['count'] == 4
+        assert [b['count'] for b in comparison['raw']['time_bins']] == [b['count'] for b in row['time_bins']]
+        assert comparison['ema_minus_raw_correct_z_mse'] == pytest.approx(
+            comparison['ema']['correct_z']['mse'] - comparison['raw']['correct_z']['mse'])
+        assert row['ema_settings']['decay'] == .9
+    assert rows[0]['weight_comparison']['ema_minus_raw_correct_z_mse'] == 0
+    with pytest.raises(ValueError, match='requires ema.enabled'):
+        run('no_ema', steps=1, modify=lambda c: c['ema'].update(enabled=False))
+
+
+def test_ema_decay_change_on_resume_preserves_history(v2_training_setup, capsys):
+    run, config, latest, _ = v2_training_setup
+    config['ema'].update(decay=.9, warmup_steps=0)
+    first, _, _ = run('v2_ema_resume', steps=1)
+    resumed, _, _ = run('v2_ema_resume', steps=2, resume=True,
+                         modify=lambda c: c['ema'].update(decay=.8))
+    assert resumed['ema']['decay'] == .8 and resumed['ema']['num_updates'] == 2
+    raw = dict(latest['branch'].named_parameters())
+    for name, value in resumed['ema']['shadow'].items():
+        expected = first['ema']['shadow'][name] * .8 + raw[name].detach().cpu() * .2
+        torch.testing.assert_close(value, expected)
+    assert 'ema_settings_changed_on_resume' in capsys.readouterr().out
+
+
+def test_real_evaluation_raw_ema_grids_and_roundtrip(v2_training_setup):
     import yaml
-    from diffusion_ot.evaluation.stage1a_eval import run_stage1a_smoke_test
+    from diffusion_ot.evaluation.stage1a_eval import run_stage1a_weight_comparison
     run, _, _, root = v2_training_setup
     run('v2_eval', steps=1)
     config = dict(project_root=str(root), split='val', weights='ema',
@@ -428,7 +470,16 @@ def test_real_evaluation_cfg_grid_and_roundtrip(v2_training_setup):
         metrics=dict(image_reference='original_rgb'), input_statistics=dict(enabled=False))
     path = root / 'eval.yaml'
     path.write_text(yaml.safe_dump(config))
-    report = run_stage1a_smoke_test(root / 'v2_eval.yaml', path, device='cpu')
+    comparison = run_stage1a_weight_comparison(root / 'v2_eval.yaml', path, device='cpu')
+    report = SimpleNamespace(**comparison['reports']['ema'])
+    raw = comparison['reports']['raw']
+    assert raw['sample_ids'] == report.sample_ids and raw['seed'] == report.seed
+    assert raw['row_order'] == report.row_order and raw['num_steps'] == report.num_steps
+    assert Path(raw['grid_path']).is_file() and raw['grid_path'] != report.grid_path
+    assert Path(comparison['comparison_path']).is_file()
+    assert raw['metrics']['vae_reconstruction'] == report.metrics['vae_reconstruction']
+    assert comparison['ema_minus_raw']['correct_z_cfg_1']['pixel_mse'] == pytest.approx(
+        report.metrics['correct_z_cfg_1']['pixel_mse'] - raw['metrics']['correct_z_cfg_1']['pixel_mse'])
     assert report.checkpoint_step == 1 and report.weights == 'ema'
     assert Path(report.grid_path).is_file()
     stats = json.loads(Path(report.extra_reports['condition_tokens']).read_text())

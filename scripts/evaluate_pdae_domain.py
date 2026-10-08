@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -45,9 +46,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--weights",
-        choices=["ema", "raw"],
+        choices=["ema", "raw", "both"],
         default=None,
-        help="Checkpoint weights override; the evaluation config defaults to EMA.",
+        help="Checkpoint weights override; 'both' saves matched raw/EMA grids and a comparison report.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -58,9 +59,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    from diffusion_ot.evaluation.stage1a_eval import run_stage1a_smoke_test
+    from diffusion_ot.evaluation.stage1a_eval import run_stage1a_smoke_test, run_stage1a_weight_comparison
 
     args = parse_args()
+    if args.weights == "both":
+        comparison = run_stage1a_weight_comparison(
+            repo_path(args.train_config or stage1a_training_config(args.domain)),
+            repo_path(args.eval_config), device=args.device, checkpoint_path=args.checkpoint,
+        )
+        print(json.dumps({"comparison_path": comparison["comparison_path"],
+                          "grids": {name: report["grid_path"] for name, report in comparison["reports"].items()},
+                          "ema_minus_raw": comparison["ema_minus_raw"]}, indent=2))
+        return 0
     report = run_stage1a_smoke_test(
         repo_path(args.train_config or stage1a_training_config(args.domain)),
         repo_path(args.eval_config),

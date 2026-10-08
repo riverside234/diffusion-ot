@@ -431,6 +431,7 @@ def _evaluate_z_dependence(
         for _ in range(num_time_bins)
     ]
     z_values = []
+    sample_ids = []
 
     device_object = torch.device(device)
     noise_generator = (
@@ -457,6 +458,7 @@ def _evaluate_z_dependence(
                     dtype=model_dtype,
                     non_blocking=True,
                 )
+                sample_ids.extend(batch.get("sample_id", [None] * len(x0)))
                 noise = torch.randn(
                     x0.shape,
                     generator=noise_generator,
@@ -580,6 +582,8 @@ def _evaluate_z_dependence(
         "flow_target_space": "vae_latent",
         "use_ema": bool(use_ema and ema is not None),
         "num_samples": int(finalized["correct_z"]["count"]),
+        "seed": int(seed),
+        "sample_ids": sample_ids,
         "z_gain": shuffled_mse / max(correct_mse, 1.0e-12) - 1.0,
         "zero_z_gain": zero_mse / max(correct_mse, 1.0e-12) - 1.0,
         "correct_z": finalized["correct_z"],
@@ -728,6 +732,9 @@ def train_pdae_domain(
     loss_weight_type = loss_weight_config["type"]
     ema_config = _nested(config, "ema")
     evaluation_config = _nested(config, "evaluation")
+    compare_raw_ema = bool(evaluation_config.get("compare_raw_ema", False))
+    if compare_raw_ema and not ema_config.get("enabled", True):
+        raise ValueError("evaluation.compare_raw_ema requires ema.enabled.")
 
     domain = str(config.get("domain", "")).lower()
     if not domain:
@@ -924,6 +931,12 @@ def train_pdae_domain(
         if ema is not None:
             if checkpoint.get("ema") is not None:
                 ema.load_state_dict(checkpoint["ema"], branch)
+                saved_ema = checkpoint["ema"]
+                if (saved_ema.get("decay"), saved_ema.get("warmup_steps")) != (ema.decay, ema.warmup_steps):
+                    print(json.dumps({"event": "ema_settings_changed_on_resume",
+                        "saved_decay": saved_ema.get("decay"), "new_decay": ema.decay,
+                        "saved_warmup_steps": saved_ema.get("warmup_steps"), "new_warmup_steps": ema.warmup_steps,
+                        "shadow_action": "preserved; new settings apply to future updates"}, sort_keys=True))
             else:
                 ema.reset(branch)
         initial_step = int(checkpoint.get("step", 0))
@@ -1037,10 +1050,7 @@ def train_pdae_domain(
             return
         print(json.dumps({"event": "validation_start", "step": step}, sort_keys=True))
         validation_started = time.perf_counter()
-        metrics = _evaluate_z_dependence(
-            branch,
-            transformer,
-            validation_loader,
+        validation_kwargs = dict(
             device=device,
             model_dtype=model_dtype,
             flow_direction=flow_direction,
@@ -1051,8 +1061,28 @@ def train_pdae_domain(
             num_time_bins=int(evaluation_config.get("num_time_bins", 10)),
             seed=int(evaluation_config.get("seed", seed + 1)),
             ema=ema,
-            use_ema=bool(evaluation_config.get("use_ema", True)),
         )
+        primary_ema = bool(evaluation_config.get("use_ema", True))
+        metrics = _evaluate_z_dependence(branch, transformer, validation_loader,
+                                         use_ema=primary_ema, **validation_kwargs)
+        if ema is not None:
+            metrics["ema_settings"] = {"decay": ema.decay, "effective_decay": ema.effective_decay,
+                                       "warmup_steps": ema.warmup_steps, "num_updates": ema.num_updates}
+        if compare_raw_ema:
+            alternate = _evaluate_z_dependence(branch, transformer, validation_loader,
+                                               use_ema=not primary_ema, **validation_kwargs)
+            if any(metrics[key] != alternate[key] for key in ("sample_ids", "seed", "num_samples")):
+                raise ValueError("Raw/EMA validation must use the same images and random seed.")
+            raw, averaged = (alternate, metrics) if primary_ema else (metrics, alternate)
+            # Preserve existing top-level metrics; report both states without
+            # duplicating the unchanged raw token statistics.
+            fields = ("correct_z", "shuffled_z", "null_z", "zero_z", "z_gain", "null_z_gain", "zero_z_gain", "time_bins")
+            metrics["weight_comparison"] = {
+                "raw": {key: raw[key] for key in fields if key in raw},
+                "ema": {key: averaged[key] for key in fields if key in averaged},
+                "ema_minus_raw_correct_z_mse": averaged["correct_z"]["mse"] - raw["correct_z"]["mse"],
+                "interpretation": "Positive MSE difference means EMA is worse on this fixed flow probe; compare generated images too.",
+            }
         # Validation deliberately stays unweighted for comparisons across recipes.
         metrics["training_loss_weighting"] = loss_weight_type
         metrics["native_flow_objective"] = native_flow_objective(config)
