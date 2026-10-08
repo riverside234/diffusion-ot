@@ -1,6 +1,12 @@
-def encode_batches(domains, latents, query_count=8):
+import torch
+from torch.utils.checkpoint import checkpoint
+
+
+def encode_batches(domains, latents, query_count=8, encode_batch_size=16):
     if query_count < 1:
         raise ValueError("query_count must be positive.")
+    if encode_batch_size < 1:
+        raise ValueError("encode_batch_size must be positive.")
 
     encoded = {}
 
@@ -11,7 +17,10 @@ def encode_batches(domains, latents, query_count=8):
             dtype=context.model_dtype,
         )
 
-        v = context.branch.encode(x0).float()
+        v = torch.cat([
+            checkpoint(context.branch.encode, chunk, use_reentrant=False)
+            for chunk in x0.split(encode_batch_size)
+        ]).float()
         references = v[query_count:]
         if len(references) < 2:
             raise ValueError("Need at least two reference images per domain.")

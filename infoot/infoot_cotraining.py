@@ -39,6 +39,7 @@ def main():
 
     settings = {
         "batch_size": 1024,
+        "encode_batch_size": 16,
         "flow_batch_size": 16,
         "query_count": 32,
         "steps": 2000,
@@ -135,10 +136,14 @@ def main():
                 next(iterator),
                 dataset=image_dataset,
             )
-            latents[name] = augment_and_encode(domains[name], images)
+            latents[name] = torch.cat([
+                augment_and_encode(domains[name], chunk)
+                for chunk in images.split(settings["encode_batch_size"])
+            ])
 
         encoded = encode_batches(
-            domains, latents, query_count=settings["query_count"]
+            domains, latents, query_count=settings["query_count"],
+            encode_batch_size=settings["encode_batch_size"],
         )
         add_matching_features(encoded, batch_norms)
 
