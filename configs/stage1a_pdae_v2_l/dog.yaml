@@ -13,20 +13,21 @@ torch_dtype: float32
 
 dataloader:
   # Effective batch 64. For less memory use batch 8 + accumulation 8, same LRs.
-  batch_size: 16
-  gradient_accumulation_steps: 4
+  batch_size: 64
+  gradient_accumulation_steps: 1
   random_horizontal_flip: 0.5  # Legacy fallback; matched augmentation bypasses it.
   num_workers: 4
   pin_memory: true
   drop_last: true
 
 train:
-  max_steps: 50000
+  # Match the cat recipe's total budget; use --resume latest for continuation.
+  max_steps: 30000
   initialize_from: null
   resume_from: null
   seed: 20260901
-  # Conservative starting rates for twice as many, wider adapted blocks.
-  # Half the v2-B peaks; larger models do not imply linear LR scaling.
+  # Match the rates retained after the cat 10k review.
+  # Extend the run before testing a higher LR as a separate comparison.
   lr_adapter: 0.00005
   lr_lora: 0.0000125
   lr_schedule:

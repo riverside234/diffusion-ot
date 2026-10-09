@@ -444,6 +444,37 @@ def test_matched_augmentation_training_resume_and_validation_rng(v2_training_set
         torch.testing.assert_close(paired['ema']['shadow'][name], single['ema']['shadow'][name], atol=0, rtol=0)
 
 
+def test_loss_smoothing_is_independent_of_logging_and_survives_resume(v2_training_setup, capsys):
+    run, config, _, _ = v2_training_setup
+    config['evaluation']['enabled'] = False
+    dense, dense_logs, _ = run('dense_loss', steps=6)
+    config['train']['log_every'] = 4
+    sparse, sparse_logs, report = run('sparse_loss', steps=6)
+    assert [row['step'] for row in sparse_logs['train']] == [1, 4, 6]
+    assert sparse['train_state']['loss_ema_update_unit'] == 'optimizer_step'
+    assert sparse['train_state']['loss_ema'] == pytest.approx(dense['train_state']['loss_ema'])
+    expected = dense_logs['train'][0]['loss']
+    for row in dense_logs['train'][1:]:
+        expected = .98 * expected + .02 * row['loss']
+    assert sparse_logs['train'][-1]['loss_ema'] == pytest.approx(expected)
+    for key in dense['ema']['shadow']:
+        torch.testing.assert_close(dense['ema']['shadow'][key], sparse['ema']['shadow'][key], atol=0, rtol=0)
+
+    resumed, logs, _ = run('sparse_loss', steps=8, resume=True)
+    for row in logs['train'][-2:]:
+        expected = .98 * expected + .02 * row['loss']
+    assert resumed['train_state']['loss_ema'] == pytest.approx(expected)
+
+    # Old, log-event-smoothed values must not seed the new per-update statistic.
+    resumed['train_state'].pop('loss_ema_update_unit')
+    resumed['train_state']['loss_ema'] = 1000.
+    torch.save(resumed, report.checkpoint_path)
+    legacy, logs, _ = run('sparse_loss', steps=9, resume=True)
+    assert legacy['train_state']['loss_ema'] == pytest.approx(logs['train'][-1]['loss'])
+    assert legacy['ema']['num_updates'] == resumed['ema']['num_updates'] + 1
+    assert 'loss_ema_statistic_reset' in capsys.readouterr().out
+
+
 def test_lr_warmup_accumulation_resume_and_legacy_schedule_guard(v2_training_setup):
     run, config, _, _ = v2_training_setup
     config['train'].update(lr_adapter=1e-4, lr_lora=2.5e-5, weight_decay=.01,

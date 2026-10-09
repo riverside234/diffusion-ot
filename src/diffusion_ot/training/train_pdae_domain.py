@@ -913,7 +913,8 @@ def train_pdae_domain(
     )
 
     initial_step = 0
-    loss_ema: float | None = None
+    # A detached device scalar avoids a CPU/GPU sync on every optimizer update.
+    loss_ema = None
     clip_events = 0
     clip_checks = 0
     training_seconds = 0.0
@@ -981,7 +982,15 @@ def train_pdae_domain(
         initialization = saved_train_state.get("initialization")
         if refinement is not None:
             refinement.load_state_dict(saved_train_state.get("refinement"))
-        loss_ema = saved_train_state.get("loss_ema")
+        saved_loss_ema = saved_train_state.get("loss_ema")
+        if saved_loss_ema is not None:
+            if saved_train_state.get("loss_ema_update_unit") == "optimizer_step":
+                loss_ema = torch.tensor(saved_loss_ema, device=device, dtype=torch.float32)
+            else:
+                # Old checkpoints smoothed only logged minibatches. Restart this
+                # statistic, not the model EMA, rather than mix different units.
+                print(json.dumps({"event": "loss_ema_statistic_reset", "step": initial_step,
+                                  "reason": "legacy log-event smoothing; now per optimizer step"}))
         clip_events = int(saved_train_state.get("clip_events", 0))
         clip_checks = int(saved_train_state.get("clip_checks", 0))
         training_seconds = float(saved_train_state.get("training_seconds", 0.0))
@@ -1053,7 +1062,9 @@ def train_pdae_domain(
     validation_metrics_path = logs_dir / "validation.jsonl"
 
     def current_train_state():
-        return {"loss_ema": loss_ema, "clip_events": clip_events, "clip_checks": clip_checks,
+        return {"loss_ema": float(loss_ema.cpu()) if loss_ema is not None else None,
+                "loss_ema_update_unit": "optimizer_step",
+                "clip_events": clip_events, "clip_checks": clip_checks,
                 "training_seconds": training_seconds, "initialization": initialization,
                 "loss_weighting": loss_weight_config,
                 "lr_schedule": lr_schedule, "ema_reset": ema_reset,
@@ -1314,10 +1325,15 @@ def train_pdae_domain(
         if ema is not None and step % ema_update_every == 0:
             ema.update(branch)
 
+        step_loss = loss_sum / accumulation_steps
+        if loss_ema is None:
+            loss_ema = step_loss.clone()
+        else:
+            loss_ema.mul_(0.98).add_(step_loss, alpha=0.02)
         step_training_seconds = time.perf_counter() - step_started
         training_seconds += step_training_seconds
         interval_training_seconds += step_training_seconds
-        interval_loss_sum.add_(loss_sum / accumulation_steps)
+        interval_loss_sum.add_(step_loss)
         if should_log:
             if loss_sum is None or weight_mean_sum is None:
                 raise RuntimeError("No microbatches were processed for this optimizer update.")
@@ -1331,7 +1347,6 @@ def train_pdae_domain(
                 else _gradient_norm(trainable_parameters)
             )
             clip_events = int(clip_events_tensor.detach().cpu())
-            loss_ema = loss_value if loss_ema is None else 0.98 * loss_ema + 0.02 * loss_value
             logged_steps = step - last_logged_step
             metrics: dict[str, Any] = {
                 "event": "train",
@@ -1339,7 +1354,8 @@ def train_pdae_domain(
                 "encoder_kind": getattr(branch, "encoder_architecture", {"kind": "plain_cnn_v1"})["kind"],
                 "loss": loss_value,
                 "loss_interval_mean": float(interval_loss_sum.cpu()) / logged_steps,
-                "loss_ema": loss_ema,
+                "loss_ema": float(loss_ema.cpu()),
+                "loss_ema_update_unit": "optimizer_step",
                 "loss_weighting": loss_weight_type,
                 "native_flow_objective": native_flow_objective(config),
                 "timestep_sampling": "uniform",

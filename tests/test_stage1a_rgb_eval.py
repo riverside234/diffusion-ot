@@ -97,7 +97,8 @@ def _install_smoke_mocks(monkeypatch, evaluator):
 
 
 @pytest.mark.parametrize('solver', ['euler', 'heun'])
-def test_sixteen_image_v2_grid_and_sampling_overrides(tmp_path, monkeypatch, solver):
+@pytest.mark.parametrize('recipe', ['pdae_v2', 'pdae_v2_l'])
+def test_sixteen_image_v2_grid_and_sampling_overrides(tmp_path, monkeypatch, solver, recipe):
     from copy import deepcopy
     import yaml
     import diffusion_ot.evaluation.stage1a_eval as evaluation
@@ -105,7 +106,7 @@ def test_sixteen_image_v2_grid_and_sampling_overrides(tmp_path, monkeypatch, sol
     evaluator = _evaluator(tmp_path)
     template = evaluator.dataset[0]
     evaluator.dataset = [{**template, 'sample_id': f'cat-{i}'} for i in range(24)]
-    path = Path(__file__).resolve().parents[1] / 'configs/stage1a_eval/pdae_v2.yaml'
+    path = Path(__file__).resolve().parents[1] / f'configs/stage1a_eval/{recipe}.yaml'
     evaluator.evaluation_config = yaml.safe_load(path.read_text())
     evaluator.evaluation_config['sampling']['smoke_num_steps'] = 2
     evaluator.evaluation_config['sampling']['inferred_noise']['num_steps'] = 2
@@ -120,7 +121,8 @@ def test_sixteen_image_v2_grid_and_sampling_overrides(tmp_path, monkeypatch, sol
         'train.yaml', 'eval.yaml', solver=solver, num_steps=3, noise_seed=42, roundtrip=True)
     raw, ema = comparison['reports']['raw'], comparison['reports']['ema']
     assert raw['sample_ids'] == ema['sample_ids'] and len(set(raw['sample_ids'])) == 16
-    assert raw['row_order'] == ['original', 'vae_reconstruction'] + [
+    reference_rows = ['original', 'vae_reconstruction'] if recipe == 'pdae_v2' else ['original']
+    assert raw['row_order'] == reference_rows + [
         f'{variant}_cfg_{scale}' for scale in ('1', '1.5', '2') for variant in ('correct_z', 'shuffled_z')]
     assert raw['sampling']['solver'] == solver and raw['sampling']['noise_seed'] == 42
     assert raw['sampling']['velocity_evaluations_per_sample_per_output'] == (6 if solver == 'heun' else 3)
@@ -128,8 +130,11 @@ def test_sixteen_image_v2_grid_and_sampling_overrides(tmp_path, monkeypatch, sol
     assert raw['metrics'] == ema['metrics']
     for report in (raw, ema):
         assert Path(report['grid_path']).is_file()
+        assert report['row_order'].count('original') == 1
+        assert 'vae_reconstruction' in report['metrics']
         roundtrip = json.loads(Path(report['extra_reports']['inferred_noise_roundtrip']).read_text())
-        assert roundtrip['row_order'] == ['original', 'vae_reconstruction', 'correct_z', 'shuffled_z']
+        assert roundtrip['row_order'] == reference_rows + ['correct_z', 'shuffled_z']
+        assert 'vae_reconstruction' in roundtrip['metrics']
         assert roundtrip['sampling']['solver'] == solver
     assert evaluator.evaluation_config == original_config
 

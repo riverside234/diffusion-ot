@@ -41,6 +41,7 @@ metrics:
 
 output:
   subdir: pdae_v2_l_eval
+  show_vae_reconstruction: false  # Keep original RGB once; VAE baseline stays in JSON metrics.
   save_individual_images: false
   save_sample_records: true
 

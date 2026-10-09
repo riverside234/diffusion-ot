@@ -185,7 +185,7 @@ implementation is needed.
 
 | Setting | v2-B augmentation recipe | v2-L starting recipe |
 | --- | --- | --- |
-| Microbatch × accumulation | 64 × 1 | 16 × 4 |
+| Microbatch × accumulation | 64 × 1 | cat: 64 × 1; dog: 16 × 4 |
 | Effective images per optimizer update | 64 | 64 |
 | Projector / new cross-attention LR | `1e-4` | `5e-5` |
 | LoRA LR | `2.5e-5` | `1.25e-5` |
@@ -196,16 +196,27 @@ The lower rates and longer warmup are a conservative starting experiment for
 more, wider adapted blocks, **not a measured optimum or a model-size scaling
 rule**. The [official IP-Adapter recipe](https://github.com/tencent-ailab/IP-Adapter#how-to-train)
 provides precedent for training new image-conditioning layers at `1e-4`, but
-does not establish the best rate for this SiT-L + LoRA setup. If the first
-5k–10k updates are stable but learn too slowly, compare raising the adapter
-rate to `1e-4` while holding LoRA at `1.25e-5`. Judge held-out flow loss,
+does not establish the best rate for this SiT-L + LoRA setup. If the continued
+run later stalls, compare raising the adapter rate to `7.5e-5` while holding
+LoRA at `1.25e-5`, starting both comparisons from the same checkpoint. Judge held-out flow loss,
 correct/shuffled condition separation, clipping, and the fixed-image grids.
 Do not increase rates just because parameter count increased.
 
+The cat 10k review found continued learning: raw validation MSE fell from
+0.62470 at 5k to 0.59766 at 10k, with no recorded clipping. The cat config now
+targets **30k total updates** at the same rates; continue with `--resume latest`
+and compare numbered 15k/20k checkpoints before committing to the full budget.
+EMA at CFG 1.5 had the best aggregate reconstruction score on the 16-image
+smoke probe. See [the review and curves](docs/analysis/pdae_v2_l_cat_10000/review.md).
+There is no new dog evidence; its existing 50k budget remains.
+
 Both domains retain the cosmap flow loss, frozen SigLIP, semantic dropout 0.1,
 mild matched RGB augmentation, AdamW weight decay 0.01, gradient clipping 1.0,
-and EMA 0.999. Train for 50k optimizer updates; log every 500 and save every
-5k. Validation remains **32 images every 1k** with paired raw/EMA weights.
+and EMA 0.999. Log every 500 and save every 5k. Validation remains **32 images
+every 1k** with paired raw/EMA weights. `loss_interval_mean` covers all updates
+since the previous log. `loss_ema` now smooths every optimizer update, using
+decay 0.98, instead of only logged batches. Resuming an older checkpoint
+restarts this loss statistic once; the model EMA and optimizer are preserved.
 On a smaller memory budget, batch 8 with accumulation 8 keeps effective batch
 64 and the same learning rates. GPU memory/throughput must be measured on the
 lab machine; no new mixed-precision or distributed-training path is introduced.
@@ -246,6 +257,12 @@ equivalent). Raw/EMA grids and reports are saved under each run's
 `pdae_v2_l_eval/step_NNNNNN/ema/smoke`; the comparison report is in
 `pdae_v2_l_eval/step_NNNNNN/raw_ema_comparison.json`. Add `--roundtrip` to enable inversion,
 or `--solver heun --num-steps 50` for the existing Heun sampler.
+
+The L evaluation grid keeps **one original RGB row** followed by the six
+correct/shuffled outputs at CFG 1, 1.5 and 2. Its
+`output.show_vae_reconstruction: false` hides the VAE reconstruction row in both
+raw/EMA grids and optional roundtrip grids. VAE reconstruction metrics remain
+in the JSON reports. Other evaluation recipes retain their existing rows.
 
 If evaluation reports missing `pdae_v2_snapshot.json`, this is the repository's
 SigLIP identity manifest, not a missing SiT-L/VAE download. Successful v2

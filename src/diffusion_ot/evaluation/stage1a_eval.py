@@ -272,6 +272,8 @@ def _configured_guidance_scales(sampling: dict[str, Any]) -> list[float]:
 
 def _validate_eval_config(config: dict[str, Any]) -> None:
     _evaluation_image_reference(None, config)
+    if not isinstance(_nested(config, "output").get("show_vae_reconstruction", True), bool):
+        raise ValueError("output.show_vae_reconstruction must be a boolean.")
     sampling = _nested(config, "sampling")
     _configured_guidance_scales(sampling)
     solver = str(sampling.get("solver", "euler"))
@@ -971,8 +973,9 @@ def _run_inferred_noise_roundtrip(
     row_order = ["original", *latent_outputs.keys()]
     rows = [original_images, *[decoded_outputs[name] for name in latent_outputs]]
     if vae_reconstruction is not None:
-        row_order.insert(1, "vae_reconstruction")
-        rows.insert(1, vae_reconstruction)
+        if _nested(evaluator.evaluation_config, "output").get("show_vae_reconstruction", True):
+            row_order.insert(1, "vae_reconstruction")
+            rows.insert(1, vae_reconstruction)
         vae_metrics = _mse_and_psnr(vae_reconstruction, original_images)
         metrics["vae_reconstruction"] = {
             "pixel_mse": vae_metrics["mse"], "pixel_psnr": vae_metrics["psnr"],
@@ -1128,8 +1131,9 @@ def run_stage1a_smoke_test(
     row_order = ["original", *latent_outputs.keys()]
     rows = [original_images, *[decoded_outputs[name] for name in latent_outputs]]
     if image_reference == "original_rgb":
-        row_order.insert(1, "vae_reconstruction")
-        rows.insert(1, vae_images)
+        if _nested(evaluator.evaluation_config, "output").get("show_vae_reconstruction", True):
+            row_order.insert(1, "vae_reconstruction")
+            rows.insert(1, vae_images)
         vae_metrics = _mse_and_psnr(vae_images, original_images)
         metrics["vae_reconstruction"] = {
             "pixel_mse": vae_metrics["mse"], "pixel_psnr": vae_metrics["psnr"],

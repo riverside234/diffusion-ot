@@ -21,12 +21,13 @@ dataloader:
   drop_last: true
 
 train:
-  max_steps: 10000
+  # The 10k run is still improving. Continue with --resume latest; review at 15k/20k.
+  max_steps: 30000
   initialize_from: null
   resume_from: null
   seed: 20260901
-  # Conservative starting rates for twice as many, wider adapted blocks.
-  # Half the v2-B peaks; larger models do not imply linear LR scaling.
+  # Retain the measured 10k rates: held-out MSE is still falling without clipping.
+  # Extend the run before testing a higher LR as a separate comparison.
   lr_adapter: 0.00005
   lr_lora: 0.0000125
   lr_schedule:
