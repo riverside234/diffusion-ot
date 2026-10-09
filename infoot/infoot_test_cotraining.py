@@ -19,8 +19,9 @@ from infoot_helper.infoot_cotraining_helper import (
 from infoot_helper.cotraining_checkpoint import latest_checkpoint
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--h", type=float, default=0.4)
-parser.add_argument("--reg", type=float, default=0.02)
+parser.add_argument("--h", type=float, default=0.2)
+parser.add_argument("--reg", type=float, default=0.74)
+parser.add_argument("--lam", type=float, default=1.95)
 parser.add_argument("--save", type=str, default="1")
 parser.add_argument("--step", type=int, help="Checkpoint step (default: latest).")
 
@@ -50,6 +51,7 @@ domains, raw_banks, matching, batch_norms, P = prepare_cotraining_test(
     device=device,
     h=args.h,
     reg=args.reg,
+    lam=args.lam
 )
 cat, dog = domains["cat"], domains["dog"]
 

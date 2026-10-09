@@ -57,7 +57,7 @@ def encode_paths(domain, paths, batch_size=32):
     return torch.cat(features)
 
 
-def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02):
+def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02, lam=0.1):
     models, features = {}, {}
     matching, batch_norms = {}, {}
 
@@ -77,11 +77,11 @@ def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02):
 
     Xs, Xt = matching["cat"], matching["dog"]
     P = fit_transport(
-        Xs, Xt, h=h, reg=reg, mi_weight=0.10, iterations=1200,
+        Xs, Xt, h=h, reg=reg, mi_weight=lam, iterations=1200,
     )
     infoot.save_plan(
         root / "outputs/infoot_cotraining" / f"cat_to_dog_step_{step:06d}_plan.pt",
-        P, h, reg, lam=0.10,
+        P, h, reg, lam=lam,
         feature_space="batchnorm",
         matching_batchnorm={name: batchnorm_checkpoint(norm) for name, norm in batch_norms.items()},
     )

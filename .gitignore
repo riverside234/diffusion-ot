@@ -222,11 +222,7 @@ __marimo__/
 /tmp/
 
 # Project-local generated data and model artifacts
-/artifacts/pretrained/SiT-B-2-256/
-/artifacts/pretrained/*
-/artifacts/latent_banks/
-/artifacts/infoot/
-/artifacts/reports/
+/artifacts/
 /outputs/
 /data/hf_cache/
 /data/downloads/
