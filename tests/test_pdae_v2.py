@@ -362,6 +362,13 @@ def v2_training_setup(latent_training_setup, monkeypatch):
     config['semantic_cfg'] = dict(enabled=True, dropout_probability=.1)
     torch.manual_seed(19)
     original, encoder = base_model(), TinyFrozenEncoder()
+    directory = root / config['encoder']['local_dir']
+    directory.mkdir(parents=True)
+    for name in ('config.json', 'preprocessor_config.json', 'model.safetensors'):
+        (directory / name).write_bytes(b'offline encoder fixture')
+    encoder.snapshot_identity = dict(encoder.snapshot_identity,
+        files={p.name: file_sha256(p) for p in directory.iterdir()})
+    (directory / MANIFEST_NAME).write_text(json.dumps(encoder.snapshot_identity))
     original_vae = TinyVAE().requires_grad_(False)
     monkeypatch.setattr(ground_truth, 'load_afhq_dataset', lambda *a, **k: source)
     monkeypatch.setattr(FrozenSiglipPatchEncoder, 'from_local', lambda *a: deepcopy(encoder))
@@ -503,11 +510,14 @@ def test_ema_decay_change_on_resume_preserves_history(v2_training_setup, capsys)
     assert 'ema_settings_changed_on_resume' in capsys.readouterr().out
 
 
-def test_real_evaluation_raw_ema_grids_and_roundtrip(v2_training_setup):
+def test_real_evaluation_raw_ema_grids_and_roundtrip(v2_training_setup, capsys):
     import yaml
     from diffusion_ot.evaluation.stage1a_eval import run_stage1a_weight_comparison
     run, _, _, root = v2_training_setup
     checkpoint, _, _ = run('v2_eval', steps=1)
+    # Reproduce losing only the manifest when copying an already trained run.
+    manifest_path = root / 'artifacts/siglip' / MANIFEST_NAME
+    manifest_path.unlink()
     train_path = root / 'v2_eval.yaml'
     updated_config = yaml.safe_load(train_path.read_text())
     updated_config['ema']['decay'] = .123  # The report must use the saved schedule.
@@ -522,6 +532,8 @@ def test_real_evaluation_raw_ema_grids_and_roundtrip(v2_training_setup):
     path = root / 'eval.yaml'
     path.write_text(yaml.safe_dump(config))
     comparison = run_stage1a_weight_comparison(root / 'v2_eval.yaml', path, device='cpu')
+    assert json.loads(manifest_path.read_text()) == checkpoint['model']['frozen_encoder']
+    assert capsys.readouterr().out.count('siglip_manifest_restored_from_checkpoint') == 1
     report = SimpleNamespace(**comparison['reports']['ema'])
     raw = comparison['reports']['raw']
     assert raw['sample_ids'] == report.sample_ids and raw['seed'] == report.seed

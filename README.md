@@ -247,6 +247,25 @@ equivalent). Raw/EMA grids and reports are saved under each run's
 `pdae_v2_l_eval/step_NNNNNN/raw_ema_comparison.json`. Add `--roundtrip` to enable inversion,
 or `--solver heun --num-steps 50` for the existing Heun sampler.
 
+If evaluation reports missing `pdae_v2_snapshot.json`, this is the repository's
+SigLIP identity manifest, not a missing SiT-L/VAE download. Successful v2
+training already required SigLIP. Evaluation now restores a missing manifest
+from the trained checkpoint **only when every local encoder/processor file
+matches the saved hashes**, without network access. If files are missing too,
+or the wrong SigLIP version was copied, recover the exact trained revision:
+
+```bash
+python scripts/download_siglip2.py --checkpoint outputs/pdae_v2_l_cat/checkpoints/latest.pt
+```
+
+This first reuses matching local files; otherwise it uses the official HF Hub
+downloader for the checkpoint's saved revision and verifies hashes before
+creating the manifest. It does not select the latest Hub `main` revision.
+If the existing encoder is in another project directory, set `encoder.local_dir`
+in the training YAML accordingly (or pass that directory as `--output-dir`
+when repairing). An existing manifest for a different encoder version is
+reported as a mismatch rather than replaced. The same recovery works for v2-B.
+
 The bundled VAE is `sd-vae-ft-mse`: center-cropped 256px RGB in `[-1,1]` becomes
 a posterior-mean `[4,32,32]` latent multiplied by **0.18215 once**. The new
 cache uses float32 encoding/storage to match augmented online targets and saves

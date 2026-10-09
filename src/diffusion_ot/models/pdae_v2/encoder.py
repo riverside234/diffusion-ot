@@ -25,10 +25,21 @@ def snapshot_identity(directory: Path) -> dict:
     """Verify the locally pinned encoder/processor; never contact the Hub."""
     path = directory / MANIFEST_NAME
     if not path.is_file():
-        raise FileNotFoundError(f"Missing {path}. Run scripts/download_siglip2.py first.")
+        raise FileNotFoundError(
+            f"Missing {path}. This is repository metadata, not the SigLIP weights. "
+            "Run scripts/download_siglip2.py; for an existing trained model, add "
+            "--checkpoint <Stage-1A-checkpoint.pt> to preserve its exact encoder version."
+        )
     identity = json.loads(path.read_text(encoding="utf-8"))
+    return _validate_snapshot_files(directory, identity)
+
+
+def _validate_snapshot_files(directory: Path, identity: dict) -> dict:
+    if not isinstance(identity, dict):
+        raise ValueError("Checkpoint has no valid frozen_encoder snapshot identity.")
     files = identity.get("files", {})
     if (identity.get("model_id") != MODEL_ID or not identity.get("revision")
+            or not isinstance(files, dict)
             or not {"config.json", "preprocessor_config.json"}.issubset(files)
             or not any(name.endswith(".safetensors") for name in files)):
         raise ValueError("Invalid PDAE v2 SigLIP snapshot manifest.")
@@ -38,6 +49,21 @@ def snapshot_identity(directory: Path) -> dict:
             raise ValueError("Snapshot manifest contains a path outside its directory.")
         if not candidate.is_file() or file_sha256(candidate) != expected:
             raise ValueError(f"SigLIP snapshot file changed or is missing: {name}")
+    return identity
+
+
+def restore_snapshot_manifest(directory: Path, identity: dict) -> dict:
+    """Restore metadata from a trained checkpoint only after verifying local bytes."""
+    directory = Path(directory)
+    target = directory / MANIFEST_NAME
+    if target.is_file():
+        if snapshot_identity(directory) != identity:
+            raise ValueError("Local SigLIP manifest differs from the checkpoint's frozen_encoder.")
+        return identity
+    _validate_snapshot_files(directory, identity)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
     return identity
 
 

@@ -11,7 +11,32 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from diffusion_ot.integrations.hf_snapshot import resolve_project_local_path
-from diffusion_ot.models.pdae_v2.encoder import MANIFEST_NAME, MODEL_ID, file_sha256, snapshot_identity
+from diffusion_ot.models.pdae_v2.encoder import (
+    MANIFEST_NAME, MODEL_ID, file_sha256, snapshot_identity, restore_snapshot_manifest,
+)
+
+
+def recover_from_checkpoint(output_dir: Path, checkpoint_path: Path) -> dict:
+    """Reuse matching local files, or ask HF Hub for the exact saved revision."""
+    from diffusion_ot.evaluation.stage1a_eval import _load_checkpoint
+
+    identity = _load_checkpoint(checkpoint_path)["model"].get("frozen_encoder")
+    if not isinstance(identity, dict) or identity.get("model_id") != MODEL_ID or not identity.get("revision"):
+        raise ValueError("The checkpoint does not contain a PDAE v2 SigLIP frozen_encoder identity.")
+    # Do not silently switch an already registered encoder to another version.
+    target = output_dir / MANIFEST_NAME
+    if target.is_file() and json.loads(target.read_text(encoding="utf-8")) != identity:
+        raise ValueError("Local SigLIP manifest differs from the checkpoint's frozen_encoder.")
+    try:
+        return restore_snapshot_manifest(output_dir, identity)
+    except (ValueError, FileNotFoundError):
+        # HF Hub reuses its cache. Never resolve a moving 'main' for evaluation.
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(repo_id=MODEL_ID, revision=identity["revision"],
+                          token=os.environ.get("HF_TOKEN") or None, local_dir=str(output_dir),
+                          allow_patterns=list(identity.get("files", {})))
+        return restore_snapshot_manifest(output_dir, identity)
 
 
 def download(output_dir: Path, revision: str = "main") -> dict:
@@ -40,14 +65,21 @@ def download(output_dir: Path, revision: str = "main") -> dict:
     return snapshot_identity(output_dir)
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="artifacts/siglip2_base_patch16_224")
-    parser.add_argument("--revision", default="main", help="Hub revision to resolve and pin; use a commit SHA to reproduce a run.")
-    args = parser.parse_args()
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--revision", default=None, help="Hub revision to resolve and pin; defaults to main for a new download.")
+    source.add_argument("--checkpoint", help="Recover missing metadata/files using this trained checkpoint's exact SigLIP identity.")
+    args = parser.parse_args(argv)
     directory = resolve_project_local_path(args.output_dir, ROOT, field_name="output_dir")
-    manifest = download(directory, args.revision)
-    print(f"Saved {manifest['model_id']} @ {manifest['revision']} to {directory}")
+    if args.checkpoint:
+        checkpoint = Path(args.checkpoint).expanduser()
+        checkpoint = checkpoint if checkpoint.is_absolute() else ROOT / checkpoint
+        manifest = recover_from_checkpoint(directory, checkpoint)
+    else:
+        manifest = download(directory, args.revision or "main")
+    print(f"Verified {manifest['model_id']} @ {manifest['revision']} at {directory}")
     print("Training and evaluation will load this snapshot locally without a network connection.")
     return 0
 

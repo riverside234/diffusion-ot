@@ -386,6 +386,26 @@ def load_stage1a_evaluator(
             f"Checkpoint domain is {checkpoint_domain}, but training config domain is {domain}."
         )
 
+    encoder_config = _nested(train_config, "encoder")
+    if encoder_config.get("kind") == "siglip2_vit_b16":
+        from diffusion_ot.models.pdae_v2.encoder import MANIFEST_NAME, restore_snapshot_manifest
+
+        directory = resolve_project_local_path(encoder_config["local_dir"], root, field_name="encoder.local_dir")
+        if not (directory / MANIFEST_NAME).is_file():
+            try:
+                restore_snapshot_manifest(directory, checkpoint["model"].get("frozen_encoder"))
+            except (ValueError, FileNotFoundError) as exc:
+                raise ValueError(
+                    f"Cannot restore SigLIP metadata at {directory}: {exc}\n"
+                    "If SigLIP is stored elsewhere, correct encoder.local_dir in the training YAML. "
+                    "Otherwise recover the checkpoint's exact encoder with:\n"
+                    f'python scripts/download_siglip2.py --checkpoint "{resolved_checkpoint}" '
+                    f'--output-dir "{directory}"'
+                ) from exc
+            print(json.dumps({"event": "siglip_manifest_restored_from_checkpoint",
+                              "manifest": str(directory / MANIFEST_NAME),
+                              "checkpoint": str(resolved_checkpoint)}))
+
     components = load_sit_components(
         pretrained_config_path,
         project_root=root,
