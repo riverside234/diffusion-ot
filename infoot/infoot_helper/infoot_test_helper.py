@@ -36,13 +36,11 @@ def generate_and_save_grid(
     )
     dog_images = decode_vae_latents(dog.vae, latents)
 
-    grid = torch.stack(
-        [cat_images.cpu(), dog_images.cpu()], dim=1
-    ).flatten(0, 1)
+    grid = torch.cat([cat_images.cpu(), dog_images.cpu()], dim=0)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_image(grid.clamp(0, 1), str(output_path), nrow=4, padding=8)
+    save_image(grid.clamp(0, 1), str(output_path), nrow=len(cat_images), padding=8)
 
 #functions for co-training test (load co-training checkpoints)
 @torch.no_grad()

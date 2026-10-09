@@ -28,7 +28,8 @@ The canonical configurations are:
 - Stage 1A default evaluation: `configs/stage1a_eval/residual_sit_b2_256.yaml`
 - Separate PDAE v2 Stage 1A: `configs/stage1a_pdae_v2/{cat,dog}.yaml`
 - PDAE v2 evaluation: `configs/stage1a_eval/pdae_v2.yaml`
-- Separate PDAE v2-L Stage 1A: `configs/stage1a_pdae_v2_l/{cat,dog}.yaml` (same v2 evaluator)
+- Separate PDAE v2-L Stage 1A: `configs/stage1a_pdae_v2_l/{cat,dog}.yaml`
+- PDAE v2-L evaluation: `configs/stage1a_eval/pdae_v2_l.yaml`
 - Stage 1B default: `configs/stage1b_infoot/self_supervised_infonce_v7_residual_cosmap_sit_b2.yaml`
 - Stage 1B default evaluation: `configs/stage1b_eval/self_supervised_infonce_v7_residual_cosmap_sit_b2.yaml`
 - Stage 1A historical plain latent recipe: `configs/stage1a_pdae/{cat,dog}_sit_b2_lora.yaml`
@@ -231,11 +232,20 @@ python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2_l/dog.yaml
 # Continue this L experiment later:
 python scripts/train_pdae_domain.py --config configs/stage1a_pdae_v2_l/cat.yaml --resume latest
 
-# Reuse the v2 evaluator: 16 images, original/VAE + correct/shuffled CFG 1/1.5/2,
+# Dedicated L config, existing evaluator: 16 images, original/VAE + correct/shuffled CFG 1/1.5/2,
 # paired raw/EMA, no null_z or CFG-0 rows, round trips disabled by default.
-python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2_l/cat.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --weights both
-python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2_l/dog.yaml --eval-config configs/stage1a_eval/pdae_v2.yaml --weights both
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2_l/cat.yaml --eval-config configs/stage1a_eval/pdae_v2_l.yaml --weights both
+python scripts/evaluate_pdae_domain.py --train-config configs/stage1a_pdae_v2_l/dog.yaml --eval-config configs/stage1a_eval/pdae_v2_l.yaml --weights both
 ```
+
+The evaluator selects `checkpoints/latest.pt` inside the supplied L training
+run by default. For a fixed checkpoint, add
+`--checkpoint outputs/pdae_v2_l_cat/checkpoints/step_005000.pt` (or the dog
+equivalent). Raw/EMA grids and reports are saved under each run's
+`pdae_v2_l_eval/step_NNNNNN/raw/smoke` and
+`pdae_v2_l_eval/step_NNNNNN/ema/smoke`; the comparison report is in
+`pdae_v2_l_eval/step_NNNNNN/raw_ema_comparison.json`. Add `--roundtrip` to enable inversion,
+or `--solver heun --num-steps 50` for the existing Heun sampler.
 
 The bundled VAE is `sd-vae-ft-mse`: center-cropped 256px RGB in `[-1,1]` becomes
 a posterior-mean `[4,32,32]` latent multiplied by **0.18215 once**. The new

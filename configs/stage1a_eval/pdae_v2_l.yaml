@@ -1,0 +1,49 @@
+# PDAE v2-L Stage 1A evaluation; pair with stage1a_pdae_v2_l/{cat,dog}.yaml.
+# The training config selects the SiT-L snapshot, VAE cache, and checkpoint directory.
+stage: stage1a_eval
+project_root: /data/not_backed_up/yxu209/diffusion-ot/
+device: cuda:0
+weights: raw  # Use --weights both for matched raw/EMA grids.
+split: val
+seed: 20260902
+
+architecture:
+  require_encoder_kind: siglip2_vit_b16
+  require_encoder_input_space: rgb
+  require_semantic_cfg: true
+  require_attention_lora: true
+  require_attention_lora_rank: 64
+  require_attention_lora_alpha: 64
+
+dataset:
+  smoke_samples: 16
+  batch_size: 8
+  num_workers: 4
+
+sampling:
+  solver: euler
+  direction: noise_to_data
+  time_evaluation: midpoint
+  smoke_num_steps: 50
+  guidance_scales: [1.0, 1.5, 2.0]
+  variants: [correct_z, shuffled_z]
+  fixed_starting_noise: true
+  noise_batch_size: 8  # Match the v2-B noise blocks for comparisons.
+  inferred_noise:
+    enabled: false  # Opt in with --roundtrip.
+    num_steps: 100
+    guidance_scale: 1.0
+    variants: [correct_z, shuffled_z]
+
+metrics:
+  image_reference: original_rgb
+  smoke: [latent_mse, pixel_mse, pixel_psnr]
+
+output:
+  subdir: pdae_v2_l_eval
+  save_individual_images: false
+  save_sample_records: true
+
+# The vector-only ridge probe does not support SigLIP patch-token conditions.
+input_statistics:
+  enabled: false
