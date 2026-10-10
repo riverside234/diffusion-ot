@@ -1,0 +1,27 @@
+{
+  "command": [
+    "infoot_vit/infoot_fit.py",
+    "--config",
+    "infoot_vit/configs/grouped_partial.yaml",
+    "--source-bank",
+    "data/infoot_vit/cat_train_4000",
+    "--target-bank",
+    "data/infoot_vit/dog_train_4000"
+  ],
+  "elapsed_seconds": 2389.3755811890005,
+  "error": "",
+  "error_type": "KeyboardInterrupt",
+  "finished_at": "2026-10-10T19:37:15.926102+00:00",
+  "metadata": {
+    "resume": null,
+    "root": "/data/not_backed_up/yxu209/diffusion-ot"
+  },
+  "operation": "fit",
+  "platform": "Linux-6.8.0-146-generic-x86_64-with-glibc2.39",
+  "python": "3.10.22",
+  "run_id": "20261010T185726Z_630e8360",
+  "schema": "infoot_run_log_v1",
+  "started_at": "2026-10-10T18:57:26.550578+00:00",
+  "status": "interrupted",
+  "working_directory": "/data/not_backed_up/yxu209/diffusion-ot"
+}
