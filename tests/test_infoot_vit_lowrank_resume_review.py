@@ -69,3 +69,40 @@ def test_completed_resume_error_preserves_completed_manifest(tmp_path, banks, mo
 
     assert artifact_hashes(directory) == before
     assert FeatureMapper.load(directory).manifest["status"] == "complete"
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_image_router_budget_failure_diagnostics_and_restart(tmp_path, banks, partial):
+    config = partial_config() if partial else tiny_config()
+    config["image_solver"].update(lam=.075, reg=.2, max_outer_steps=1)
+    with pytest.raises(RuntimeError, match="Image router max_outer_steps.*Patch fitting has not started"):
+        experiment.fit(config, root=tmp_path)
+    directory = next((tmp_path / "outputs/infoot_vit").iterdir())
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert manifest["status"] == "failed" and manifest["files"] == {}
+    assert not (directory / "kernels.pt").exists()
+    report = json.loads((directory / "image_report.json").read_text())
+    assert report["status"] == "max_outer_steps"
+    assert report["history"][-1]["plan_delta_l1"] > report["config"]["outer_tolerance"]
+    attempt_report = next(directory.glob("logs/*/image_report.json"))
+    assert json.loads(attempt_report.read_text()) == report
+    latest = directory / "plans/image/latest.pt"
+    saved = torch.load(latest, weights_only=True)
+    assert saved["plan"].dtype == torch.float32 and saved["report"] == report["history"][-1]
+
+    # Budgets may grow, but mathematical changes must not reuse these files.
+    before = artifact_hashes(directory)
+    changed = deepcopy(config)
+    changed["image_solver"]["lam"] *= 2
+    with pytest.raises(ValueError, match="resume fingerprint changed"):
+        experiment.fit(changed, root=tmp_path, resume=directory)
+    assert artifact_hashes(directory) == before
+    config["image_solver"]["max_outer_steps"] = 500
+    experiment.fit(config, root=tmp_path, resume=directory)
+    assert FeatureMapper.load(directory).manifest["status"] == "complete"
+    assert not latest.exists()
+    final = torch.load(directory / "plans/image.pt", weights_only=True)
+    assert final["status"] == "converged"
+    assert final["history"][0]["iteration"] == 1  # Diagnostic latest is not a warm start.
+    assert final["history"][-1]["plan_delta_l1"] <= final["config"]["outer_tolerance"]
+    assert attempt_report.exists()  # The failed attempt remains available.

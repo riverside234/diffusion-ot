@@ -10,12 +10,13 @@ kernel_rank: 256
 device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
-  h: 0.4
-  lam: 0.1
-  reg: 0.05
+  h: 0.4  # Keep locality; the supplied log does not justify broader kernels.
+  lam: 0.075  # Reduce router MI/entropy ratio from 2.0 to 1.0.
+  reg: 0.075
   cost_scale: mean
-  max_outer_steps: 300
+  max_outer_steps: 1200
   max_inner_steps: 10000
+  outer_tolerance: 1.0e-7  # Keep the original stationarity requirement.
 kernel:
   h: 0.4
   seed: 4201

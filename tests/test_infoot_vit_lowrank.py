@@ -176,6 +176,10 @@ def test_config_sampling_and_cli_dry_run_are_deterministic(tmp_path,banks,capsys
     cfg = tmp_path/"lowrank.yaml"; cfg.write_text(yaml.safe_dump(c))
     assert main(["--config",str(cfg),"--project-root",str(tmp_path),"--dry-run"]) == 0
     assert json.loads(capsys.readouterr().out)["config"]["transport_rank"] == 2
+    assert main(["--config",str(cfg),"--project-root",str(tmp_path),"--image-max-steps","1500","--dry-run"]) == 0
+    overridden = json.loads(capsys.readouterr().out)["config"]
+    assert overridden["image_solver"]["max_outer_steps"] == 1500
+    assert overridden["optimizer"]["max_steps"] == c["optimizer"]["max_steps"]
     assert not (tmp_path/"outputs").exists()
     bad = deepcopy(c); bad["sampling"]["images_per_domain"] = 4
     with pytest.raises(ValueError): inspect_fit(bad,tmp_path)

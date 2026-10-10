@@ -57,8 +57,9 @@ def compact_inspection(report):
 
 
 def fingerprint(report):
-    # Extending only the outer step budget is supported on explicit resume.
-    c = dict(report["config"],optimizer={k:v for k,v in report["config"]["optimizer"].items() if k != "max_steps"})
+    # Iteration budgets can change on explicit resume; objectives cannot.
+    c = dict(report["config"],optimizer={k:v for k,v in report["config"]["optimizer"].items() if k != "max_steps"},
+             image_solver={k:v for k,v in report["config"]["image_solver"].items() if k != "max_outer_steps"})
     return digest(dict(report,config=c,resources=None))
 
 
@@ -145,8 +146,21 @@ def fit(raw,*,root,output_root=None,resume=None):
                 def image_step(plan,record):
                     save_tensor(directory/"plans/image/latest.pt",store_plan_state(dict(plan=plan.cpu(),report=record)))
                     log.append_jsonl("image_iterations.jsonl",record)
+                    if record["iteration"] == 1 or record["iteration"] % 25 == 0 or record["status"] != "running":
+                        print(f"Image router {record['iteration']}/{c['image_solver']['max_outer_steps']}: "
+                              f"objective={record['objective']:.8g}, delta={record['plan_delta_l1']:.3g}, "
+                              f"effective_targets={record['mean_row_effective_targets']:.1f}, status={record['status']}",flush=True)
                 image = BalancedModel.fit(x.reshape(len(x),-1),y.reshape(len(y),-1),c["image_solver"],on_step=image_step)
-                if image.state["status"] != "converged": raise RuntimeError("Image router did not converge; diagnostics retained.")
+                image_report = {key:value for key,value in image.state.items() if key != "plan"}
+                write_json(directory/"image_report.json",image_report)
+                log.write_json("image_report.json",image_report)
+                if image.state["status"] != "converged":
+                    last = image.state["history"][-1]
+                    raise RuntimeError(f"Image router {image.state['status']} after {last['iteration']} outer iterations: "
+                        f"plan_delta_l1={last['plan_delta_l1']:.3g}, tolerance={c['image_solver']['outer_tolerance']:.3g}, "
+                        f"inner_error={last['inner']['error']:.3g}. Patch fitting has not started. "
+                        "See image_report.json and logs/*/image_iterations.jsonl. For an outer-budget failure, "
+                        "increase --image-max-steps (the unregistered router restarts); changing h/lam/reg needs a fresh fit.")
                 entry,_ = _verified_save(directory,directory/"plans/image.pt",store_plan_state(image.state),
                     lambda s:BalancedModel(x.reshape(len(x),-1),y.reshape(len(y),-1),s))
                 register(directory,manifest,"image",entry); _cleanup_latest(directory,entry,log)

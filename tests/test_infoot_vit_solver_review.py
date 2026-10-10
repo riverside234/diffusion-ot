@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from infoot_vit.infoot_helper import infoot as legacy
 from infoot_vit.infoot_helper import partial
+from infoot_vit.infoot_helper import conditional
 from infoot_vit.infoot_helper.conditional import BalancedModel, _balanced_mi_gradient
 
 
@@ -57,6 +58,63 @@ def test_balanced_narrow_kernel_low_entropy_fit_remains_finite():
     assert observed[-1]["gradient_log_floor_entries"] == 2
     torch.testing.assert_close(model.plan, torch.eye(2, dtype=torch.float64) * .5)
     torch.testing.assert_close(model.project(x), x)
+
+
+def test_balanced_backtracking_checks_full_objective_and_keeps_marginals(monkeypatch):
+    x = torch.tensor([[0.], [1.]], dtype=torch.float64)
+    candidate = torch.eye(2, dtype=torch.float64) * .5
+    monkeypatch.setattr(conditional, "entropy_subproblem", lambda *a: (candidate, {"error": 0.}))
+    observed = []
+    options = dict(h=.7, lam=.01, reg=2., max_outer_steps=1)
+    model = BalancedModel.fit(x, x, options, on_step=lambda p, r: observed.append((p.clone(), r)))
+    # The full step is uphill, while a half step decreases the actual InfoOT
+    # objective. This exercises damping independently of the inner solver.
+    row = model.state["history"][-1]
+    assert row["status"] == "max_outer_steps" and row["step_size"] == .5
+    assert row["backtracks"] == 1 and row["objective_delta"] < 0
+    assert row["accepted_plan_delta_l1"] == pytest.approx(.5 * row["plan_delta_l1"])
+    expected = .5 * (torch.full_like(candidate, .25) + candidate)
+    torch.testing.assert_close(model.plan, expected, atol=0, rtol=0)
+    torch.testing.assert_close(observed[0][0], expected, atol=0, rtol=0)
+    torch.testing.assert_close(model.plan.sum(0), x.new_full((2,), .5))
+    torch.testing.assert_close(model.plan.sum(1), x.new_full((2,), .5))
+    solver = legacy.FusedInfoOT(x, x, h=.7)
+    loss = legacy.fitting_loss(expected, solver.Ks, solver.Kt, reg=2.,
+                               C=solver.C / solver.C.mean(), mi_weight=.01, eps=1e-300)
+    assert row["objective"] == pytest.approx(float(loss), abs=1e-12)
+
+
+@pytest.mark.parametrize("options", [dict(max_backtracks=1), dict(outer_tolerance=.6)])
+def test_balanced_stalled_update_is_not_reported_as_convergence(monkeypatch, options):
+    x = torch.tensor([[0.], [1.]], dtype=torch.float64)
+    candidate = torch.eye(2, dtype=torch.float64) * .5
+    monkeypatch.setattr(conditional, "entropy_subproblem", lambda *a: (candidate, {"error": 0.}))
+    observed = []
+    model = BalancedModel.fit(x, x, dict(h=.7, lam=.01, reg=2., **options),
+        on_step=lambda p, r: observed.append((p.clone(), r)))
+    row = model.state["history"][-1]
+    assert model.state["status"] == row["status"] == "line_search_stalled"
+    assert row["plan_delta_l1"] > model.state["config"]["outer_tolerance"]
+    assert row["accepted_plan_delta_l1"] == row["objective_delta"] == row["step_size"] == 0.
+    torch.testing.assert_close(model.plan, torch.full_like(candidate, .25), atol=0, rtol=0)
+    torch.testing.assert_close(observed[-1][0], model.plan, atol=0, rtol=0)
+
+
+def test_balanced_converged_plan_is_a_checked_fixed_point():
+    x = torch.tensor([[0.], [.4], [2.]], dtype=torch.float64)
+    y = torch.tensor([[.1], [.6], [1.8], [2.5]], dtype=torch.float64)
+    model = BalancedModel.fit(x, y, dict(h=.7, lam=.075, reg=.075, max_outer_steps=1200))
+    cfg = model.state["config"]
+    assert model.state["status"] == "converged"
+    assert model.state["history"][-1]["plan_delta_l1"] <= cfg["outer_tolerance"]
+    reference = legacy.FusedInfoOT(x, y, h=cfg["h"])
+    grad, _ = _balanced_mi_gradient(model.plan, reference.Ks, reference.Kt, cfg["log_floor"])
+    candidate, _ = partial.entropy_subproblem(x.new_full((len(x),), 1 / len(x)),
+        y.new_full((len(y),), 1 / len(y)), reference.C / reference.C.mean() + cfg["lam"] * grad, 1., cfg)
+    assert float((candidate - model.plan).abs().sum()) <= cfg["outer_tolerance"]
+    assert all(row["objective_delta"] <= cfg["objective_tolerance"] for row in model.state["history"])
+    for direction in ("source", "target"):
+        assert model.state["kernel_diagnostics"][direction]["mean_effective_neighbors"] >= 1.
 
 
 def test_partial_stall_is_emitted_with_last_accepted_plan(monkeypatch):

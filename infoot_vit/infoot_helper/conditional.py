@@ -5,7 +5,7 @@ import math
 import torch
 
 from . import infoot as legacy
-from .partial import distance, kernel_state, solver_config, entropy_subproblem
+from .partial import distance, solver_config, entropy_subproblem
 from .storage import validate_plan
 
 
@@ -68,16 +68,22 @@ class BalancedModel:
     def fit(cls, source, target, options=None, on_step=None):
         c = solver_config(options)
         source, target = source.detach().double(), target.detach().double()
-        _, sx = kernel_state(source, c["h"])
-        _, sy = kernel_state(target, c["h"])
         # Reuse local FusedInfoOT geometry/kernels and its fixed-marginal MI.
         solver = legacy.FusedInfoOT(source, target, h=c["h"], lam=c["lam"], reg=c["reg"])
+        sx = float((solver.Cs.square().mean() / 2).sqrt())
+        sy = float((solver.Ct.square().mean() / 2).sqrt())
+        if not all(math.isfinite(s) and s > 0 for s in (sx, sy)):
+            raise ValueError("Degenerate fit support or zero bandwidth; provide distinct training features.")
         scale = float(solver.C.mean()) if c["cost_scale"] == "mean" else float(c["cost_scale"])
         if not math.isfinite(scale) or scale <= 0:
             raise ValueError("Invalid balanced cost scale.")
         cost = solver.C / scale
         a, b = source.new_full((len(source),), 1 / len(source)), target.new_full((len(target),), 1 / len(target))
         plan, history, status = torch.outer(a, b), [], "max_outer_steps"
+        def evaluate(p):
+            return legacy.fitting_loss(p, solver.Ks, solver.Kt, c["reg"], C=cost,
+                mi_weight=c["lam"], eps=c["log_floor"], return_terms=True)
+        loss, terms = evaluate(plan)
         for iteration in range(1, c["max_outer_steps"] + 1):
             floored = 0
             effective = cost
@@ -86,20 +92,55 @@ class BalancedModel:
                 effective = cost + c["lam"] * gradient
             candidate, inner = entropy_subproblem(a, b, effective, 1., c)
             delta = float((candidate - plan).abs().sum())
-            plan = candidate
-            loss, terms = legacy.fitting_loss(plan, solver.Ks, solver.Kt, c["reg"], C=cost,
-                                               mi_weight=c["lam"], eps=c["log_floor"], return_terms=True)
-            record = dict(iteration=iteration, objective=float(loss), cost=float(terms[0]), mi_term=float(terms[1]),
+            previous_loss = float(loss)
+            step, backtracks = 0., 0
+            if c["lam"] and delta <= c["outer_tolerance"]:
+                status = "converged"
+            else:
+                # Generalized conditional-gradient direction: the entropy
+                # subproblem stays exact, and convex mixing keeps its marginals.
+                # Check the FULL InfoOT objective before accepting an update.
+                step = 1.
+                for backtracks in range(c["max_backtracks"]):
+                    trial = candidate if step == 1. else plan + step * (candidate - plan)
+                    trial_loss, trial_terms = evaluate(trial)
+                    if torch.isfinite(trial_loss) and float(trial_loss) <= previous_loss + c["objective_tolerance"]:
+                        break
+                    step *= .5
+                else:
+                    status, step, backtracks = "line_search_stalled", 0., c["max_backtracks"]
+                if step and c["lam"] and step * delta <= c["outer_tolerance"]:
+                    # A tiny damped update is not a stationary fixed point.
+                    status, step = "line_search_stalled", 0.
+                if step:
+                    plan, loss, terms = trial.detach(), trial_loss, trial_terms
+                    if c["lam"] == 0:
+                        status = "converged"
+            rows = plan / a[:, None]
+            row_entropy = -(rows * rows.clamp_min(c["log_floor"]).log()).sum(1)
+            record = dict(iteration=iteration, status=(status if status != "max_outer_steps" or iteration == c["max_outer_steps"] else "running"),
+                          objective=float(loss), cost=float(terms[0]), mi_term=float(terms[1]),
                           entropy_term=float(terms[2]), plan_delta_l1=delta, inner=inner,
+                          accepted_plan_delta_l1=step * delta, objective_delta=float(loss) - previous_loss,
+                          step_size=step, backtracks=backtracks, outer_tolerance=c["outer_tolerance"],
+                          row_residual=float((plan.sum(1) - a).abs().max()),
+                          column_residual=float((plan.sum(0) - b).abs().max()),
+                          mean_row_effective_targets=float(row_entropy.exp().mean()),
+                          mean_row_max_probability=float(rows.max(1).values.mean()),
+                          normalized_row_entropy=float(row_entropy.mean()) / math.log(len(b)) if len(b) > 1 else 0.,
                           gradient_log_floor_entries=floored)
             history.append(record)
             if on_step:
                 on_step(plan, record)
-            if c["lam"] == 0 or delta <= c["outer_tolerance"]:
-                status = "converged"
+            if status in {"converged", "line_search_stalled"}:
                 break
+        def kernel_diagnostics(k):
+            weights = k / k.sum(1, keepdim=True)
+            return dict(mean_self_probability=float(weights.diagonal().mean()),
+                mean_effective_neighbors=float((-(weights * weights.clamp_min(c["log_floor"]).log()).sum(1)).exp().mean()))
         state = dict(plan=plan.cpu(), config=c, source_scale=sx, target_scale=sy, cost_scale=scale,
-                     status=status, history=history, solver="local_FusedInfoOT_checked_fixed_point_v1",
+                     status=status, history=history, solver="local_FusedInfoOT_linesearch_v2",
+                     kernel_diagnostics=dict(source=kernel_diagnostics(solver.Ks), target=kernel_diagnostics(solver.Kt)),
                      distance="euclidean", source_count=len(source), target_count=len(target),
                      row_residual=float((plan.sum(1) - a).abs().max()), column_residual=float((plan.sum(0) - b).abs().max()))
         return cls(source, target, state)

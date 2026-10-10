@@ -62,6 +62,43 @@ provide precedent for positive kernel features. Our row-normalized Gaussian
 feature map below is a documented finite-rank approximation; it does not inherit
 an unbiased-kernel claim from the paper.
 
+## Image-router convergence
+
+The router runs **before** patch-kernel/factor fitting. Its settings are
+`image_solver.h`, `image_solver.lam`, `image_solver.reg` and
+`image_solver.max_outer_steps`. The patch `kernel.h` and `optimizer.*` fields
+control a separate problem; `--max-steps` only changes the patch optimizer.
+
+Following the [300-step router log review](../../docs/analysis/vit_infoot_router_300/README.md),
+the balanced YAML uses **h = 0.40, lam = 0.075, reg = 0.075, 1,200 outer steps**.
+The old router used lam = 0.10, reg = 0.05, 300 steps. Its inner Sinkhorn solves
+passed but its outer residual remained above tolerance. The revised weights
+reduce MI pressure relative to entropy; they are a lab experiment, not a claim
+of optimal translation quality. Kernel locality stays at 0.40. Patch settings
+and the partial experiment's YAML are unchanged by this tuning.
+
+The shared balanced solver now checks the **full cost - lam*MI + reg*entropy**
+objective before accepting a Sinkhorn update. If needed, it halves the step
+along the segment between feasible plans, preserving balanced marginals. This
+follows the generalized conditional-gradient direction/line-search pattern in
+[POT](https://pythonot.github.io/_modules/ot/optim.html#gcg), while retaining the
+existing log-domain Sinkhorn and tensor computations. It uses a monotone
+backtracking check, not POT's NumPy/SciPy Armijo implementation. It does not
+change the InfoOT objective or introduce an approximation.
+
+Convergence still requires the **undamped** fixed-point L1 residual <= `1e-7`
+(or the exact entropy subproblem when `lam: 0`). A tiny accepted step alone is
+a stall, not convergence. Inner tolerance remains `1e-10`, and float64
+feasibility remains `1e-8`. Older completed artifacts remain loadable;
+changed solver source or mathematical settings require a fresh fit directory.
+
+`image_report.json` in the fit root and attempt log records the final status,
+kernel self-mass/effective neighbors and iteration history, including on an
+outer-budget failure. Iteration logs include objective components, raw and
+accepted plan changes, backtracks, balanced residuals and routing concentration.
+Numerical exceptions inside an inner solve retain the last successful iteration
+and the attempt's traceback. Console summaries appear every 25 router steps.
+
 ## Balanced factor constraints and objective
 
 For `n` source and `m` target patches, save
@@ -341,7 +378,8 @@ and cleanup is recoverable. A converged checkpoint interrupted before final
 registration gets a fresh numerical convergence check, including one extra
 iteration if it was at the budget boundary.
 
-Only `optimizer.max_steps` may be increased on resume. Different ranks,
+`optimizer.max_steps` and `image_solver.max_outer_steps` may be increased on
+resume. Different ranks,
 bandwidths, seeds, sampling, code or runtime versions require a new directory.
 Rejected resumes leave the existing manifest, factors and checkpoints unchanged;
 only the new attempt's logs record the error. Verification or cleanup failures
@@ -373,6 +411,14 @@ For reverse translation, swap `--source-bank data/infoot_vit/dog_train` and
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --resume outputs/infoot_vit/FIT_DIRECTORY --max-steps 600
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_partial_lowrank.yaml --resume outputs/infoot_vit/PARTIAL_FIT_DIRECTORY --max-steps 400
 ```
+
+For an image-router budget failure under the **same code and mathematical
+settings**, use `--image-max-steps 2400` instead of `--max-steps`. This restarts
+an unregistered image router from its initial plan and preserves the failed
+attempt's logs. It reuses an already registered router. Keep the original
+`--source-bank`/`--target-bank` overrides when resuming. The older failed run
+cannot be resumed across this code/recipe change; rerun its original fit
+command without `--resume` to create a fresh directory.
 
 Map the same 16 held-out cats and decode with the **existing frozen dog PDAE**:
 
