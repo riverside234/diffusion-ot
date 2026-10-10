@@ -4,16 +4,16 @@ device: cuda
 source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
 solver:
-  h: 0.4
-  lam: 0.1
-  reg: 0.05
+  h: 0.35
+  lam: 0.075
+  reg: 0.06
   # Explicit training-mean EUCLIDEAN cost normalization; raw feature values stay unchanged.
   # These are starting values, not validated quality optima.
   cost_scale: mean
   max_outer_steps: 300
   max_inner_steps: 10000
 projection:
-  bandwidth_multiplier: 0.5  # Fit h=0.4 -> projection h=0.2.
+  bandwidth_multiplier: 0.6  # Fit h=0.4 -> projection h=0.2.
   selection: mean
   top_k_images: null
   seed: 0
