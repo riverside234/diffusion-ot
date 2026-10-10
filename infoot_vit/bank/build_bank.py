@@ -15,6 +15,7 @@ from diffusion_ot.data.manifests import read_jsonl
 from diffusion_ot.integrations.hf_snapshot import load_yaml_config, resolve_project_local_path
 from diffusion_ot.models.pdae_v2.encoder import FrozenSiglipPatchEncoder
 from infoot_vit.infoot_helper.feature_bank import BankWriter, file_hash
+from infoot_vit.infoot_helper.sampling import sample_ids, sampling_record
 
 
 def main(domain, argv=None):
@@ -25,6 +26,9 @@ def main(domain, argv=None):
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-images", type=int, help="Explicit first-N stable-ID subset; recorded in provenance.")
+    parser.add_argument("--sample-images", type=int, help="Seeded train sample without replacement; use 2000 for grouped_partial.")
+    parser.add_argument("--sample-seed", type=int, default=42)
+    parser.add_argument("--all-images", action="store_true", help="Explicitly use all images of the chosen split.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)
     root = args.project_root.resolve()
@@ -40,7 +44,22 @@ def main(domain, argv=None):
     data = load_yaml_config(data_path)
     manifest_path = resolve(data["manifest_dir"]) / f"{domain}_{args.split}.jsonl"
     records = sorted(read_jsonl(manifest_path), key=lambda r: r["sample_id"])
-    records = records if args.max_images is None else records[:args.max_images]
+    if sum((args.max_images is not None, args.sample_images is not None, args.all_images)) > 1:
+        raise ValueError("Choose only one of --sample-images, --max-images, --all-images.")
+    if args.sample_images is not None and args.split != "train":
+        raise ValueError("Seeded training sampling may only use the train split.")
+    population = [r["sample_id"] for r in records]
+    # Detect accidental split leakage before encoding, wherever split files exist.
+    for other in {"train", "val", "test"} - {args.split}:
+        other_path = manifest_path.with_name(f"{domain}_{other}.jsonl")
+        if other_path.exists() and set(population) & {r["sample_id"] for r in read_jsonl(other_path)}:
+            raise ValueError(f"Overlapping IDs in {args.split}/{other} manifests.")
+    count = args.sample_images
+    selected = sample_ids(population, count, args.sample_seed)
+    if args.max_images is not None:
+        selected = selected[:args.max_images]
+    lookup = {r["sample_id"]: r for r in records}
+    records = [lookup[sid] for sid in selected]
     if not records:
         raise ValueError(f"No images in {manifest_path}")
     loader = OriginalImageLoader(data_path, records)
@@ -53,7 +72,9 @@ def main(domain, argv=None):
     writer = BankWriter(resolve(output), domain=domain, split=args.split, representation=representation,
         provenance=dict(manifest=str(manifest_path), manifest_sha256=file_hash(manifest_path),
                         data_config=str(data_path), train_config=str(train_path), max_images=args.max_images,
-                        extraction_dtype="float32", saved_dtype="float32", selection="sorted_stable_ids"))
+                        extraction_dtype="float32", saved_dtype="float32",
+                        sampling=sampling_record(population, selected, args.sample_seed) if count is not None else None,
+                        selection="seeded_without_replacement" if count is not None else "sorted_stable_ids"))
     with torch.inference_mode():
         for offset in range(0, len(records), args.batch_size):
             batch = records[offset:offset + args.batch_size]

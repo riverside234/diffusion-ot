@@ -53,20 +53,21 @@ def kernel_state(x, h):
 
 
 def information(plan, kx, ky, log_floor=1e-300):
-    """Mass-weighted KDE information including derivatives of both marginals."""
-    mass = plan.sum()
+    """Mass-weighted KDE MI; optional leading pair axis stays independent."""
+    mass = plan.sum((-2, -1), keepdim=True)
     normalized = plan / mass
-    joint = kx @ normalized @ ky.T
-    fx, fy = kx @ normalized.sum(1), ky @ normalized.sum(0)
-    log_ratio = (joint.clamp_min(log_floor).log() - fx.clamp_min(log_floor).log()[:, None]
-                 - fy.clamp_min(log_floor).log()[None, :])
-    return mass * (normalized * log_ratio).sum()
+    joint = kx @ normalized @ ky.transpose(-2, -1)
+    fx = (kx @ normalized.sum(-1).unsqueeze(-1)).squeeze(-1)
+    fy = (ky @ normalized.sum(-2).unsqueeze(-1)).squeeze(-1)
+    log_ratio = (joint.clamp_min(log_floor).log() - fx.clamp_min(log_floor).log().unsqueeze(-1)
+                 - fy.clamp_min(log_floor).log().unsqueeze(-2))
+    return mass[..., 0, 0] * (normalized * log_ratio).sum((-2, -1))
 
 
 def information_gradient(plan, kx, ky, log_floor=1e-300):
     with torch.enable_grad():
         variable = plan.detach().clone().requires_grad_(True)
-        return torch.autograd.grad(information(variable, kx, ky, log_floor), variable)[0].detach()
+        return torch.autograd.grad(information(variable, kx, ky, log_floor).sum(), variable)[0].detach()
 
 
 def objective(plan, cost, kx, ky, config):

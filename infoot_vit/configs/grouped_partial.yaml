@@ -1,7 +1,14 @@
-# Requested target: balanced image routing + complete offline partial patch-pair bank.
+# Storage-efficient experiment: 2000 seeded images/domain; 8 saved pairs/source.
 mode: grouped_partial
+device: cuda
+pair_batch_size: 256  # Independent exact [B,196,196] partial InfoOT solves; null = serial POT.
+pair_checkpoint_every: 10  # Outer iterations; first and every terminal state are always saved.
 source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
+sampling:
+  images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
+  seed: 42
+fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
 solver:
   h: 0.4
   lam: 0.1
@@ -35,5 +42,5 @@ projection:
     mass_floor: 1.0e-12
     all_invalid_policy: error
 resources:
-  max_working_gib: 16
+  max_working_gib: 24  # Includes cached kernels and batched float64 solver/autograd workspace.
   max_plan_gib: 64

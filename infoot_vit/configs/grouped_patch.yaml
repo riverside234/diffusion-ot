@@ -1,4 +1,5 @@
 mode: grouped_patch
+device: cuda
 source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
 solver:

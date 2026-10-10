@@ -21,6 +21,7 @@ def main(argv=None):
     p.add_argument("--output-dir", type=Path)
     p.add_argument("--count", type=int, default=16)
     p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--device",help="Override every mapper's saved device (cuda, cuda:<index>, cpu).")
     a = p.parse_args(argv)
     if min(a.count, a.threads) < 1:
         p.error("count and threads must be positive")
@@ -36,16 +37,19 @@ def _compare(a, output, log):
     reports, population = [], None
     for i, path in enumerate(a.mappings):
         log.event("comparison_mapping_started", index=i, mapping=path)
-        mapper = FeatureMapper.load(path)
-        fitted_population = (mapper.source.artifact_id, mapper.target.artifact_id)
+        mapper = FeatureMapper.load(path,device=a.device)
+        fitted_population = (mapper.source.artifact_id, mapper.target.artifact_id, tuple(mapper.source.ids), tuple(mapper.target.ids))
         if population is not None and population != fitted_population:
             raise ValueError("Comparison requires exactly the same source/target fit banks and representations.")
         population = fitted_population
         result, _ = mapper.project_bank(bank, output / f"{i:02d}_{mapper.mode}", count=a.count)
-        reports.append(dict(mapping=str(path.resolve()), artifact_id=mapper.manifest["artifact_id"],
-            mode=mapper.mode, partial=mapper.config["partial"], solver=mapper.config["solver"],
+        report = dict(mapping=str(path.resolve()), artifact_id=mapper.manifest["artifact_id"],
+            mode=mapper.mode, partial=mapper.config.get("partial"), solver=mapper.config.get("solver",mapper.config.get("image_solver")),
             projection=mapper.config["projection"], resources=mapper.manifest["resources"],
-            fit_seconds=mapper.manifest["fit_seconds"], diagnostics=result.diagnostics))
+            fit_seconds=mapper.manifest.get("fit_seconds"), diagnostics=result.diagnostics)
+        if mapper.mode in {"grouped_patch_lowrank","grouped_partial_lowrank"}:
+            report["lowrank"] = {key:mapper.config[key] for key in ("transport_rank","kernel_rank","kernel","estimator","optimizer")}
+        reports.append(report)
         log.event("comparison_mapping_completed", index=i, mapper_id=mapper.manifest["artifact_id"])
     write_json(output / "comparison.json", dict(query_bank_id=bank.artifact_id, query_ids=bank.ids[:a.count],
         fit_banks=population, comparisons=reports,

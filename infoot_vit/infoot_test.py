@@ -34,7 +34,7 @@ def main(argv=None):
     p.add_argument("--guidance", type=float, default=1.5)
     p.add_argument("--solver", choices=["euler", "heun"], default="euler")
     p.add_argument("--seed", type=int, default=20260903)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device",help="Mapping AND generation device; defaults to the saved experiment device.")
     a = p.parse_args(argv)
     if min(a.count, a.chunk_size, a.threads, a.steps) < 1:
         p.error("Counts, chunk size, threads and steps must be positive")
@@ -43,8 +43,16 @@ def main(argv=None):
         # Validate small metadata before allocating supports/kernels or the DiT.
         m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
         q = json.loads((a.query_bank / "manifest.json").read_text(encoding="utf-8"))
+        training_ids = set(m["source_ids"]) | set(m["target_ids"])
+        if m.get("schema") in {"siglip_infoot_mapping_v3", "siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
+            for name in ("source_bank", "target_bank"):
+                fit_bank = json.loads((a.mapping / m[name]["path"] / "manifest.json").read_text(encoding="utf-8"))
+                if (fit_bank["artifact_id"] != m[name]["artifact_id"]
+                        or digest({k: v for k, v in fit_bank.items() if k != "artifact_id"}) != fit_bank["artifact_id"]):
+                    raise ValueError("Fit bank identity changed.")
+                training_ids.update(fit_bank["ids"])
         if (m["status"] != "complete" or m["representation"] != q["representation"] or q["split"] == "train"
-                or m["source_domain"] != q["domain"] or set(q["ids"]) & (set(m["source_ids"]) | set(m["target_ids"]))
+                or m["source_domain"] != q["domain"] or set(q["ids"]) & training_ids
                 or digest({k:v for k,v in m.items() if k != "artifact_id"}) != m["artifact_id"]
                 or digest({k:v for k,v in q.items() if k != "artifact_id"}) != q["artifact_id"]):
             raise ValueError("Need completed mapper and compatible held-out query bank")
@@ -55,7 +63,7 @@ def main(argv=None):
     output = a.output_dir or ROOT / "results/infoot_vit" / f"{a.mapping.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:6]}"
     output.mkdir(parents=True, exist_ok=False)
     with RunLog(output, "mapping_test", vars(a)) as log:
-        mapper, bank = FeatureMapper.load(a.mapping), FeatureBank.load(a.query_bank)
+        mapper, bank = FeatureMapper.load(a.mapping,device=a.device), FeatureBank.load(a.query_bank)
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)
         result, manifest = mapper.project_bank(bank, output, count=a.count, chunk_size=a.chunk_size, run_log=log)
         if a.generate:
@@ -63,7 +71,7 @@ def main(argv=None):
             log.event("generation_started")
             generate(mapper, bank, result, output, root=ROOT, train_config=a.train_config, eval_config=a.eval_config,
                      checkpoint=a.checkpoint, weights=a.weights, steps=a.steps, guidance=a.guidance, solver=a.solver,
-                     seed=a.seed, batch_size=a.chunk_size, device=a.device)
+                     seed=a.seed, batch_size=a.chunk_size, device=str(mapper.device))
             log.event("generation_completed", report="generation_report.json")
         print(f"Saved {len(manifest['ids'])} projections to {output}; mode={mapper.mode}")
     return 0

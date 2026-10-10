@@ -83,7 +83,8 @@ def test_fit_save_reload_unseen_batch_independence_no_refit(tmp_path, banks, mon
     monkeypatch.setattr(BalancedModel, "fit", classmethod(spy))
     directory = fit_mapping(config(mode), root=tmp_path)
     assert directory.parent == tmp_path / "outputs/infoot_vit"
-    assert list((directory / "plans").rglob("latest.pt"))
+    assert bool(list((directory / "plans").rglob("latest.pt"))) == (mode != "grouped_partial")
+    assert list((directory / "plans").rglob("iterations.jsonl"))
     assert observed == ([(8, 12)] if mode == "patch_global" else [(2, 3), (8, 12)] if mode == "grouped_patch" else [(2, 3)])
     monkeypatch.setattr(BalancedModel, "fit", lambda *a, **k: pytest.fail("inference refit"))
     monkeypatch.setattr(legacy.FusedInfoOT, "solve", lambda *a, **k: pytest.fail("legacy inference refit"))
@@ -295,7 +296,7 @@ def test_invalid_banks_and_resource_dry_run(tmp_path,banks):
         kernel_state(torch.ones(2,3,dtype=torch.float64),.4)
     report=inspect_fit(config("grouped_partial"),tmp_path)
     assert report["resources"]["pairs"] == 6
-    assert report["resources"]["plan_storage_bytes"] == 6*16*8
+    assert report["resources"]["plan_storage_bytes"] == 6*16*4
 
 
 def test_selection_ties_stable_sampling_topk_and_averaging():
@@ -321,10 +322,12 @@ def test_partial_balanced_pair_limit(tmp_path,banks):
     torch.testing.assert_close(result.match_confidence,torch.ones_like(result.match_confidence),atol=1e-8,rtol=1e-8)
     pair=mapper._pair(mapper.source.ids[0],mapper.target.ids[0])
     local=BalancedModel.fit(mapper.x[0],mapper.y[0],mapper.config["partial"]["solver"])
-    torch.testing.assert_close(pair["plan"],local.plan,atol=1e-9,rtol=1e-9)
+    torch.testing.assert_close(pair["plan"],local.plan.float().double(),atol=0,rtol=0)
     candidate,_,_=partial_projection(banks[2].features[0],mapper.x[0],mapper.y[0],pair["plan"],pair["a"],pair["b"],
         mapper.shared["sx"][0],mapper.shared["sy"][0],mapper.shared["h_projection"],dict(threshold=None))
-    torch.testing.assert_close(candidate,local.project(banks[2].features[0]),atol=1e-10,rtol=1e-10)
+    # Stored pair is rounded once; the balanced reference here remains float64.
+    bound = 8 * torch.finfo(torch.float32).eps * max(1., float(local.target.abs().max()))
+    torch.testing.assert_close(candidate,local.project(banks[2].features[0]),atol=bound,rtol=0)
 
 
 def test_mask_all_invalid_policy():
@@ -347,7 +350,8 @@ def test_partial_streamed_aggregation_equals_dense_accounting(tmp_path,banks):
             for j,tid in enumerate(mapper.target.ids):
                 pair=mapper._pair(sid,tid)
                 candidate,g,d=partial_projection(patches,mapper.x[i],mapper.y[j],pair["plan"],pair["a"],pair["b"],
-                    mapper.shared["sx"][i],mapper.shared["sy"][j],mapper.shared["h_projection"],mapper.shared["support"][i])
+                    mapper.shared["sx"][i],mapper.shared["sy"][j],mapper.shared["h_projection"],mapper.shared["support"][i],
+                    target_kernel=mapper.projection_ky[j])
                 matched=theta[i,j]*g[:,None]*d["weights"]
                 rejected=theta[i,j]*(1-g)
                 grouped_budget[:,j]+=matched.sum(1)+rejected
@@ -461,7 +465,8 @@ def test_explicit_reuse_image_router_without_second_solve(tmp_path,banks,monkeyp
     assert FeatureMapper.load(directory).manifest["reused_models"]["image"]==FeatureMapper.load(whole).manifest["artifact_id"]
 
 
-def test_rgb_siglip_bank_extraction_reuses_unpooled_encoder(tmp_path,monkeypatch):
+@pytest.mark.parametrize("sample_count", [None, 2])
+def test_rgb_siglip_bank_extraction_reuses_unpooled_encoder(tmp_path,monkeypatch,sample_count):
     import yaml
     from infoot_vit.bank import build_bank
     train=dict(domain="cat",data_config="data.yaml",encoder=dict(kind="siglip2_vit_b16",frozen=True,local_dir="siglip"))
@@ -482,11 +487,23 @@ def test_rgb_siglip_bank_extraction_reuses_unpooled_encoder(tmp_path,monkeypatch
             return rgb[:,0,0,0,None,None].expand(-1,196,768)+torch.arange(196)[None,:,None]*.01
     monkeypatch.setattr(build_bank,"OriginalImageLoader",Loader)
     monkeypatch.setattr(build_bank.FrozenSiglipPatchEncoder,"from_local",lambda *a:Encoder())
-    build_bank.main("cat",["--project-root",str(tmp_path),"--train-config","train.yaml","--batch-size","2","--device","cpu"])
+    args=["--project-root",str(tmp_path),"--train-config","train.yaml","--batch-size","2","--device","cpu"]
+    if sample_count is not None:
+        args.extend(["--sample-images",str(sample_count),"--sample-seed","42"])
+    build_bank.main("cat",args)
     saved=FeatureBank.load(tmp_path/"data/infoot_vit/cat_train")
-    assert saved.features.shape==(3,196,768)
+    assert saved.features.shape==(sample_count or 3,196,768)
     assert saved.manifest["representation"]["normalization"]=="none"
-    assert saved.ids==[r["sample_id"] for r in records]
+    from infoot_vit.infoot_helper.sampling import sample_ids
+    assert saved.ids==sample_ids([r["sample_id"] for r in records],sample_count,42)
+    if sample_count is not None:
+        assert saved.manifest["provenance"]["sampling"]["ordered_ids"]==saved.ids
+        assert saved.manifest["provenance"]["sampling"]["seed"]==42
+    # Split checks run before encoder loading or creating another bank.
+    (tmp_path/"manifests/cat_val.jsonl").write_text(json.dumps(records[0]))
+    with pytest.raises(ValueError,match="Overlapping IDs"):
+        build_bank.main("cat",args+["--output-dir","bad_split"])
+    assert not (tmp_path/"bad_split").exists()
 
 
 def test_fit_project_and_compare_cli(tmp_path,banks):

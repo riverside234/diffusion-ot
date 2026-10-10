@@ -6,6 +6,7 @@ import torch
 
 from . import infoot as legacy
 from .partial import distance, kernel_state, solver_config, entropy_subproblem
+from .storage import validate_plan
 
 
 def normalize_rows(scores):
@@ -46,11 +47,15 @@ class BalancedModel:
         self.state = state
         self.plan = state["plan"].to(self.source)
         n, m = len(source), len(target)
-        tol = state["config"]["feasibility_tolerance"]
-        if (self.plan.shape != (n, m) or not torch.isfinite(self.plan).all() or (self.plan < 0).any()
-                or (self.plan.sum(1) - 1 / n).abs().max() > tol
-                or (self.plan.sum(0) - 1 / m).abs().max() > tol):
-            raise ValueError("Invalid balanced plan/marginals. Refit; no post-hoc row/column repair.")
+        if state.get("storage"):
+            self.storage_validation = validate_plan(state, state["plan"].new_full((n,), 1/n,dtype=torch.float64), state["plan"].new_full((m,), 1/m,dtype=torch.float64),
+                                                    1., state["config"], balanced=True)
+        else:
+            tol = state["config"]["feasibility_tolerance"]
+            if (self.plan.shape != (n, m) or not torch.isfinite(self.plan).all() or (self.plan < 0).any()
+                    or (self.plan.sum(1) - 1 / n).abs().max() > tol
+                    or (self.plan.sum(0) - 1 / m).abs().max() > tol):
+                raise ValueError("Invalid balanced plan/marginals. Refit; no post-hoc row/column repair.")
         self.h = state["config"]["h"] * bandwidth_multiplier
         if not math.isfinite(self.h) or self.h <= 0:
             raise ValueError("Invalid projection bandwidth.")

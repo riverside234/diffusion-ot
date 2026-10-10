@@ -1,5 +1,6 @@
 # Fixed-training-bandwidth patch baseline, using the same explicit cost policy.
 mode: patch_global
+device: cuda
 source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
 solver:

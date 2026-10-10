@@ -1,5 +1,6 @@
 # First baseline: complete feature maps are the OT samples. No co-training.
 mode: whole_map
+device: cuda
 source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
 solver:

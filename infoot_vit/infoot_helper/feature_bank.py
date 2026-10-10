@@ -80,6 +80,20 @@ class FeatureBank:
     def artifact_id(self):
         return self.manifest["artifact_id"]
 
+    def subset(self, ordered_ids):
+        """An in-memory view; artifact_id still identifies the ORIGINAL bank.
+
+        Fits separately fingerprint ordered selected IDs. The original manifest
+        retains all bank IDs for split-leakage checks, including unsampled rows.
+        """
+        index = {sid: i for i, sid in enumerate(self.ids)}
+        if not ordered_ids or len(set(ordered_ids)) != len(ordered_ids) or not set(ordered_ids) <= index.keys():
+            raise ValueError("Invalid ordered bank subset.")
+        if ordered_ids == self.ids:
+            return self
+        rows = [index[sid] for sid in ordered_ids]
+        return FeatureBank(self.features[rows], list(ordered_ids), [self.records[i] for i in rows], self.manifest, self.path)
+
     @classmethod
     def load(cls, directory):
         directory = Path(directory).resolve()

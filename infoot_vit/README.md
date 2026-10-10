@@ -6,18 +6,39 @@ held-out images without refitting. It does not launch co-training or change the
 DiT projector, cross-attention layers, positional embeddings, losses, or learned
 checkpoint keys.
 
+**Separate low-rank experiments:** see [`lowrank/README.md`](lowrank/README.md).
+`configs/grouped_patch_lowrank.yaml` uses balanced global patch factors at
+rank 256/256. `configs/grouped_partial_lowrank.yaml` uses capacity-constrained
+pair factors at rank 64/64, transported mass 0.8, and eight saved target pairs
+per training source. Both use sampled InfoOT, 2,000 train images/domain
+(seed 42), float64 fitting and float32 factors, with a checked final budget
+below 4 GB. Use `infoot_fit_lowrank.py`; dense modes remain available.
+
+All current `infoot_vit/configs/*.yaml` select **`device: cuda`**. The device
+applies to routers, kernels, transport solvers and mapping. Use `--device cpu`
+explicitly on CPU systems, or `--device cuda:1` for another GPU. Unavailable
+requested CUDA raises an error. `infoot_test.py`/`infoot_compare.py` default to
+the artifact's saved device and accept the same override; older artifacts
+without device metadata retain CPU behavior. Storage verification and I/O use
+CPU tensors; the numerical pipeline uses the selected device.
+
 ## What changed
 
 | File | Responsibility |
 |---|---|
 | `bank/bank_cat.py`, `bank/bank_dog.py`, `bank/build_bank.py` | Original RGB → the existing frozen SigLIP2 encoder → unpooled `[N,196,768]` banks. No CNN, VAE-encoded input, pooling, or additional feature normalization. |
-| `infoot_fit.py` | Validate resources; fit/resume; save every accepted outer iteration's latest raw plan in a **new fit directory**. |
+| `infoot_fit.py` | Validate resources; fit/resume; save solver iteration diagnostics and the active checkpoint in a **new fit directory**. |
+| `infoot_fit_lowrank.py`, `lowrank/` | Balanced global and partial pair InfoOT factors; shared objective, kernels, checkpointing and projection. |
+| `infoot_helper/device.py` | Explicit CPU/CUDA selection and artifact-to-device transfers. |
 | `infoot_test.py` | Project a disjoint validation/test bank; optionally run fixed-checkpoint diffusion inference. |
 | `infoot_compare.py` | Compare saved mappers on the same queries and fit populations. |
 | `infoot_helper/feature_bank.py` | Sharded tensor banks, stable IDs, representation identity, fingerprints. |
 | `infoot_helper/conditional.py` | Fixed-training-bandwidth balanced scoring and partial confidence projection. |
 | `infoot_helper/partial.py` | Transported-marginal MI autodiff, POT partial subproblems, feasibility and full-objective line search. |
+| `infoot_helper/partial_batch.py`, `pair_batch_fit.py` | Exact dense pair batches, independent stopping/failures, per-pair registration and checkpoint I/O. |
+| `benchmark_partial_batch.py` | Matched serial/batched solver timing and CUDA peak-memory measurement on deterministic synthetic pairs. |
 | `infoot_helper/fit_mapping.py`, `mapping.py` | Mapping artifacts, pair inventory, resume, streamed projection and mandatory masks. |
+| `infoot_helper/sampling.py`, `pair_selection.py`, `storage.py` | Deterministic training subset, persisted router pair selection and checked float32 disk storage for `grouped_partial`. |
 | `infoot_helper/evaluate_mapping.py` | Existing PDAE sampling/decoding and original-image loading. |
 | `infoot_helper/run_logging.py` | Per-attempt console capture, structured events, timing, failure tracebacks and run status. |
 | `../src/diffusion_ot/evaluation/stage1a_eval.py` | Backward-compatible optional `condition_padding_mask` passthrough, including sampler chunking. |
@@ -59,23 +80,130 @@ Every bank records train/val/test split, original sample records, image IDs,
 preprocessing, encoder file hashes and float32 storage. Existing output banks
 are never silently overwritten. Choose another `--output-dir` for a new bank.
 
-### Size matters: exact full support
+### Storage-efficient `grouped_partial`
 
-Run `--dry-run` before fitting. A whole-map plan has `N_cat*N_dog` entries. A
-complete partial pair bank has `N_cat*N_dog*196*196` float64 plan entries, plus
-iteration checkpoints, kernels and reports. For example, **32×32 images already
-need about 0.293 GiB just for the final pair plans**; 4,000×4,000 need about
-4,580 GiB. Global patch baselines also require patch-count-squared dense kernels.
-The mandatory `latest.pt` checkpoints add a second copy of the plans. The disk
-guard now uses `required_plan_storage_gib`, including those copies and shared
-pair kernels; `plan_storage_gib` still describes only the primary final plans.
-For 32×32 image pairs, the two plan copies alone need about **0.586 GiB**.
-Keep extra free space for metadata/logs and atomic writes. Estimates are not
-measured peak process memory or a disk-space reservation.
+Only `grouped_partial` uses the sampling, sparse pair inventory, float32 disk
+plans/kernels and completed-checkpoint cleanup described here. `whole_map`,
+`patch_global` and `grouped_patch` retain their full-support, float64 behavior.
 
-No command silently drops images/patches, pools tokens, applies PCA, or replaces
-exact routing with nearest neighbors. Resource limits in YAML fail explicitly;
-raise them deliberately if the machine and disk can support the exact fit.
+The supplied `configs/grouped_partial.yaml` selects **2,000 training images per
+domain without replacement, seed 42**, fits the 2,000×2,000 image router, and
+sets **`fit_pair_top_k: 8`**. Sampling runs on sorted stable IDs with Python's
+seeded `random.sample`; selected IDs are sorted for storage. The manifest saves
+the algorithm, seed, population count and ordered sample IDs. Fewer than 2,000
+available images is an error; there is no replacement or silent size reduction.
+All 196 patches of each selected image are retained.
+
+Existing full training banks work directly: fitting selects an in-memory subset
+and preserves the original bank identity. Held-out checks include **all original
+bank IDs**, including training rows omitted from the fit. To reduce feature-bank
+extraction/storage too, explicitly build separate sampled train banks:
+
+```bash
+python infoot_vit/bank/bank_cat.py --split train --sample-images 2000 --sample-seed 42 --output-dir data/infoot_vit/cat_train_2000_s42
+python infoot_vit/bank/bank_dog.py --split train --sample-images 2000 --sample-seed 42 --output-dir data/infoot_vit/dog_train_2000_s42
+
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_2000_s42 --target-bank data/infoot_vit/dog_train_2000_s42 --dry-run
+```
+
+Bank sampling is opt-in and train-only; the extractor's default remains all
+images. Train/validation/test manifests are never mixed. Replace `--dry-run`
+with an actual fit only after reviewing its resource estimate.
+
+For each fitted source image, the saved router's conditional probabilities at
+the fit bandwidth rank target images, with stable target-ID tie breaking. The
+eight selected pairs and probabilities are saved in `pair_selection.json`.
+Selection uses the serialized router promoted to float64, so new and resumed
+fits use the same router. Only these pairs are solved. Set `fit_pair_top_k: null`
+or pass `--full-pairs` to retain every pair; K at least the target count is also
+equivalent to full-pair mode.
+
+At 2,000 images/domain, K=8 gives **16,000 pairs**. Float32 partial-plan arrays
+need about **2.29 GiB**, versus **572.44 GiB** for all 4,000,000 pairs. Shared
+patch kernels add about **0.57 GiB** and the image plan about **0.015 GiB**.
+`required_plan_storage_gib` also allows for active latest/atomic-write copies
+and a temporary shared-kernel copy. It excludes container metadata, IDs and
+logs and retained failed checkpoints: reserve extra disk space. Float64 fitting is still substantial work;
+these estimates are neither measured peak memory nor a disk reservation.
+
+### Exact GPU batches for the top-8 experiment
+
+`grouped_partial.yaml` now sets **`device: cuda`**, **`pair_batch_size: 256`**,
+and `pair_checkpoint_every: 10`. Selected pairs are fitted as `[B,196,196]`
+costs, cached per-image kernels, plans and solver updates. The last batch uses
+its actual size. Patch features, sampling, router selection, per-pair mean cost
+scaling, bandwidths, MI, entropy and transported mass are unchanged. This is
+the **dense** experiment; the separate low-rank experiments are unchanged.
+
+POT 0.9.7's log-domain partial routine accepts one cost matrix. The batched
+implementation reuses PyTorch's batched matmul, reductions and the shared MI
+autodiff, and lifts POT's three log-domain Dykstra projections to a leading pair
+axis: row capacities, column capacities, fixed mass. It does not approximate
+plans/kernels or substitute balanced marginals for partial constraints. Only the
+existing `keep_mass: 1` control uses balanced log-Sinkhorn, as in the serial
+reference. Inner stopping is checked at POT's original iterations 1, 11, 21,
+etc.; a single host check per ten updates replaces per-pair synchronization.
+Converged/failed inner states are frozen on device. Outer iterations compact
+the remaining active pairs and retain independent full-objective line searches.
+
+Each pair records its inner error/count, mass/cap residuals, outer count,
+objective terms, accepted step and status. A failed member does not cancel its
+neighbors or later batches. A converged member is atomically saved, reloaded,
+validated and durably journaled immediately, then its redundant `latest.pt` is
+removed. Nonconvergence is never registered as a successful fit. The overall
+run fails after processing all batches if any pair failed; details remain in
+`pair_failures.jsonl` and `pair_batch_report.json`. Save/validation failures also
+retain the checkpoint and allow other members to finish.
+
+Per-pair iteration metrics are logged every outer iteration. Float32 checkpoints
+are written at the first step, every ten steps, and every terminal state;
+change `pair_checkpoint_every` to adjust I/O frequency. Numerical computation
+stays float64 on the selected device; host transfers occur for packed diagnostics
+and checkpoint/artifact I/O. Cached kernels are rebuilt in float64 and checked
+against their float32 snapshots on resume. Unfinished/failed pairs restart from
+their original feasible initialization, preserving the existing recovery policy;
+quantized checkpoints are diagnostics, not silently repaired warm starts.
+Registered successful pairs are validated and reused without refitting.
+
+The resource estimate for 2,000 images/domain, 196 patches and B=256 is about
+**17.70 GiB working memory** (conservative workspace allowance), with a
+**24 GiB configured limit**. Active checkpoints/temporary plans add about
+75 MiB; required plan/kernel storage is about 3.52 GiB before logs, file/container
+overhead and failed checkpoints. These are estimates, not measured GPU peaks.
+
+```bash
+# Default: CUDA, 256 pairs, a fresh fit directory.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --dry-run
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml
+
+# A smaller explicit CUDA batch, or the original POT serial CUDA reference.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --pair-batch-size 64
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --serial-pairs
+
+# Explicit CPU batched execution (batch size 1 still uses the batched solver).
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --device cpu --pair-batch-size 1
+
+# Resume with exactly the original configuration and overrides.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --resume outputs/infoot_vit/<fit-directory>
+
+# Lab CUDA benchmark: identical seeded synthetic pairs, including MI.
+python infoot_vit/benchmark_partial_batch.py --pairs 256 --pair-batch-size 256 --repeats 3 --output outputs/infoot_vit/partial_batch_benchmark.json
+```
+
+Missing/null `pair_batch_size` or `--serial-pairs` keeps the serial reference.
+Other dense modes do not accept this setting. Completed older mappings remain
+loadable; changed numerical source/config fingerprints require a fresh fit.
+Benchmark JSON reports synchronized wall time, pairs/second, allocated/reserved
+peak GPU memory, objective/plan agreement and convergence status. It excludes
+cost/kernel setup and file I/O; production batch logs separately include those
+costs. Solver failures or mismatched results set `valid_speed_comparison: false`
+and are reported explicitly. This workspace has PyTorch `2.14.0+cpu`: **CUDA runtime, throughput and
+peak memory remain unverified**. The benchmark records `unverified` when CUDA
+is unavailable, without silently timing CPU instead.
+
+Run `--dry-run` before fitting. Other modes' dense patch kernels/plans can be
+much larger. Resource limits fail explicitly; raise them only when the machine
+can support the estimate. No method pools tokens or applies PCA.
 
 For a **separate, explicitly smaller pilot**, build named banks, then point all
 comparison configurations to those same banks:
@@ -86,8 +214,10 @@ python infoot_vit/bank/bank_dog.py --split train --max-images 16 --output-dir da
 ```
 
 `--max-images` selects the first N sorted stable image IDs and records that
-selection. It does not claim to be a representative random subset. All 196
-patches of each selected image remain in the fit.
+selection. It does not claim to be a representative random subset. For a
+16-image `grouped_partial` pilot, also pass `--sample-images 16` to fitting to
+override the YAML's 2,000-image requirement. Use the same population for every
+controlled comparison.
 
 ## Fit modes and saved plans
 
@@ -96,7 +226,7 @@ patches of each selected image remain in the fit.
 | `patch_global` | Balanced FusedInfoOT on individual unpooled patches, with saved fixed bandwidth state. |
 | `whole_map` | A balanced FusedInfoOT router on `[N,196*768]`; one image-weight vector mixes all patch positions. First baseline. |
 | `grouped_patch` | The image router plus a global patch model; image weights are shared, patch scores normalize **within** each target image using the global KDE. |
-| `grouped_partial` | Balanced image router plus a full bank of independently fitted fixed-mass partial patch plans, one per training image pair. Requested target experiment. |
+| `grouped_partial` | Balanced image router plus independent fixed-mass partial patch plans for saved selected training-image pairs. Defaults: 2,000 images/domain, top 8 pairs/source; full-pair mode remains available. |
 
 ```bash
 python infoot_vit/infoot_fit.py --config infoot_vit/configs/whole_map.yaml --dry-run
@@ -120,15 +250,18 @@ saved over the old `data/infoot_test/cat_to_dog_plan.pt`.
 manifest.json                    # Configuration, supports, IDs, versions, hashes, status
 fit_report.json                  # Convergence, residuals, scales, resource estimates
 plans/image.pt                   # Balanced image plan + fitted scale state + trace
-plans/image/latest.pt            # Updated while the image fit runs
+plans/image/latest.pt            # Active/failed fit only for grouped_partial
 plans/image/iterations.jsonl
 plans/patch.pt                   # Global patch plan, when applicable
 plans/pair_kernels.pt            # Shared fit kernels/scales and fit-only support thresholds
 plans/pairs/<indices_short-ID-hash>.pt  # Gamma, a,b,r,c,s/report, full IDs and order
-plans/pairs/<indices_short-ID-hash>/latest.pt
+plans/pairs/<indices_short-ID-hash>/latest.pt  # Active/failed pair only
 plans/pairs/<indices_short-ID-hash>/iterations.jsonl
-pairs.jsonl                     # Complete accepted pair inventory and file hashes
+pair_selection.json             # Expected pair set, router hash, ranks/probabilities
+pairs.jsonl                     # Accepted selected pair inventory and file hashes
 pair_diagnostics.jsonl          # Per-pair objective, caps, mass and raw retention summaries
+pair_failures.jsonl             # Batched failure journal; preserved across retry attempts
+pair_batch_report.json          # Latest batched attempt counts, timing, failure summary
 ```
 
 Interrupted partial fits resume **completed accepted pairs**; an interrupted
@@ -144,6 +277,14 @@ Use the same overrides as the initial fit. Resume checks data, support order,
 configuration, numerical source hashes and runtime fingerprints. Different
 settings require a new fit; failures/stalled solves remain explicitly failed.
 No marginal renormalization hides a failed solve.
+
+For `grouped_partial`, each final plan is atomically written, flushed, reloaded
+and validated before registration in the manifest or flushed pair journal.
+Only then is that plan's redundant `latest.pt` removed. Iteration logs and
+unfinished/failed checkpoints remain. Resume verifies completed registered
+plans and finishes interrupted cleanup; it never treats an unregistered final
+file as proof of success. An interrupted individual solve restarts from its
+initialization, while accepted pairs and the saved selection are reused.
 
 Optional YAML `image_model: outputs/infoot_vit/<completed-whole-map-fit>` and
 `patch_model: outputs/infoot_vit/<completed-patch-global-fit>` reuse saved models
@@ -166,9 +307,33 @@ An explicit multiplier is part of the fit configuration/artifact identity; it
 rebuilds projection kernels and calibrates partial support thresholds on fit
 data. There is no query-time threshold calibration or hidden bandwidth sweep.
 
-All current offline numerical work uses CPU float64; saved RGB banks stay
-float32 and mapped features return to the query dtype/device. GPU solver and
-lower-precision paths have not been validated or enabled.
+All fitting and projection arithmetic uses float64 on the configured CUDA/CPU
+device. Saved feature banks stay float32 and mapped features return to the query
+dtype/device. Lower-precision fitting is not enabled.
+
+### Float32 storage contract (`grouped_partial` only)
+
+New artifacts use schema `siglip_infoot_mapping_v3`: plans and shared kernels
+are float32 on disk, with dtype/version metadata and content hashes. Original
+solver convergence and feasibility checks remain float64 and unchanged.
+Stored row/column marginals are recomputed in float64 **from the quantized
+plan**, never copied from the original plan. Reports record maximum/L1 error,
+row/column/mass error and positive entries that underflowed to zero.
+
+Storage validation separately allows the round-to-nearest bound
+`|float32(x)-x| <= 2^-24*x + 2^-150` for nonnegative entries. For example, a
+row with cap `a`, original feasibility tolerance `tau` and M entries receives
+`tau + 2^-24*(a+tau) + M*2^-150`, plus float64 reduction roundoff. Mass and
+columns use analogous bounds. This does **not** relax the solver's stopping
+rules or renormalize stored plans. Confidence clipping is limited to the
+validated solver/storage roundoff budget and its size is logged.
+
+Mapping promotes stored plans/kernels to float64. Resumed fitting reconstructs
+the original float64 kernels from immutable feature banks and verifies their
+float32 copies match the saved kernels; it does not fit with rounded kernels.
+Storage policy and selected ordered IDs participate in fit fingerprints.
+Completed legacy v2 artifacts remain loadable; earlier incomplete fits need a
+new directory because their numerical-source fingerprints differ.
 
 ## Saved logs for tuning and debugging
 
@@ -193,7 +358,8 @@ logs/<attempt>/
 ```
 
 Files specific to fitting or mapping appear only for that operation. Per-plan
-`plans/.../iterations.jsonl` and `latest.pt` remain available. Iteration JSONL
+`plans/.../iterations.jsonl` remains available. `latest.pt` remains for active or
+failed `grouped_partial` solves and for the other modes. Iteration JSONL
 records include the attempt ID and elapsed time, so an interrupted/refitted pair
 can be distinguished from earlier attempts. `events.jsonl` also records which
 model/pair was active if failure occurs before an accepted first step. Inner
@@ -214,6 +380,8 @@ Use these signals together:
 | Narrow-kernel numerics | Balanced `gradient_log_floor_entries` counts ratio entries protected by the existing log floor. Nonzero counts signal a numerically sharp kernel/plan; they are not evidence of semantic quality. |
 | Overly smooth/query-independent mapping | Per-query image weights, normalized entropy/effective targets, within-image effective patches; compare mapped corresponding-patch variance across images with source/target/query statistics. |
 | Excessive rejection | Confidence quantiles, valid-token fraction, all-invalid IDs, separate OT-rejected and support-invalid retained mass. |
+| Pair pruning | Per-query `fit_pair_retained_routing_mass`, `fit_pair_discarded_routing_mass` and renormalization; separate from `top_k_images` omission and partial-OT rejection. Summary min/mean/max and before/after image weights. |
+| Storage precision | Plan/kernel quantization errors and underflow counts, original solver residuals, stored marginal/mass residuals and explicit storage bounds. |
 | Norm/spread contraction | `mapping_report.json` includes valid-token norms/variance, corresponding-patch variance across images and image-mean variance for queries, mapped outputs and fixed supports. |
 | Reproducibility | Fit/mapping manifests contain ordered IDs, frozen encoder identity, numerical source hashes and saved settings; generation reports pin checkpoint hash, seeds, sampler and guidance. |
 
@@ -242,7 +410,8 @@ error. Each interrupted individual pair still restarts from its initialization.
   mapped conditioning validates finite values and confidence shapes/ranges.
 - Generation checks query/result ID order before loading PDAE and uses stable-ID
   tie breaking for its reference row.
-- Required plan storage includes mandatory latest checkpoints; failed report
+- Required plan storage includes active latest/temporary writes for the compact
+  partial experiment and retained latest copies for other modes; failed report
   writing no longer double-counts elapsed fit time.
 
 These numerical-source changes intentionally invalidate **resume** fingerprints
@@ -303,6 +472,14 @@ weights `alpha[j]`. Each query patch uses the **same** pair routing budget.
 Within a pair, conditional weights use the **original** target proposal
 `b/(K_Y@b)`, whereas the fitting MI uses transported marginals.
 
+For saved pair set S, after any optional image-selection operation, compute
+`rho = sum_{(i,j) in S} Theta[i,j]` and use
+`Theta_saved = 1_S * Theta / rho`. Log `1-rho` as
+`fit_pair_discarded_routing_mass`; it is **not** partial-OT rejection. A query
+with no usable saved routing mass fails explicitly. Intentional exclusions
+require no file; every selected pair must exist and pass its checksum and
+state validation. Mapping never selects new pairs or runs a fitting solver.
+
 Confidence estimates retained source mass:
 `g_raw=(K_Q @ Gamma.sum(1))/(K_Q @ a)`. Fit-only leave-one-out log-density gating
 handles out-of-support queries; this is a heuristic, not a probability of
@@ -310,16 +487,19 @@ anatomical correctness. `support_calibration: fixed` with a finite
 `support_log_threshold` is also supported. `disabled` is an explicit diagnostic
 ablation, used for the pure `s=1` confidence-one regression.
 
-The output is `sum(Theta*g*candidate)/sum(Theta*g)`, with unnormalized confidence
-`sum(Theta*g)`. True zero retained mass gives a zero placeholder and invalid
+The output is `sum(Theta_saved*g*candidate)/sum(Theta_saved*g)`, with confidence
+`sum(Theta_saved*g)` conditional on the retained routing. True zero retained
+mass gives a zero placeholder and invalid
 mask. Numerical underflow is separately diagnosed; tiny conditional scores
 retry in log space. A support-valid confidence underflow is an error, not a
 fabricated match. Matching plus rejection recovers each target-image routing
 budget. Matched-only image proportions may vary by patch.
 
-**Raw fitted retention**, **smoothed query confidence**, **top-k omitted routing
-mass**, **support-invalid mass**, and **thresholded mask coverage** are separate
-diagnostics. The average confidence of unseen queries need not equal `s`.
+**Raw fitted retention**, **smoothed query confidence**, **top-k image omission**,
+**fit-pair discarded routing**, **support-invalid mass**, and **thresholded mask
+coverage** are separate diagnostics. On normalized saved routes, matched mass
++ partial-OT rejection + support-invalid retained mass sums to one per patch.
+The average confidence of unseen queries need not equal `s`.
 
 `MappingResult.conditioning()` translates mapper `True=valid` to the existing
 PDAE `True=padding` convention. Confidence is not multiplied into features and
@@ -342,7 +522,8 @@ python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml
 python infoot_vit/infoot_compare.py --mappings outputs/infoot_vit/<whole-map-fit> outputs/infoot_vit/<s1-pair-fit> outputs/infoot_vit/<s08-pair-fit> --query-bank data/infoot_vit/cat_val
 ```
 
-The comparison verifies identical fit-bank fingerprints and query IDs. Include
+The comparison verifies identical fit-bank fingerprints, selected ordered
+training IDs and query IDs. Include
 the `patch_global.yaml` and `grouped_patch.yaml` fits when resources permit.
 Keep diffusion checkpoint, sampler, guidance and seed identical for image
 comparisons. Check source color/pattern, target realism, pose, and whether
@@ -352,8 +533,10 @@ independent evidence of better images.
 Optional `selection: argmax|sample` and `top_k_images` act once per entire image.
 Tie breaks use stable target IDs; sampling uses a hash of seed and query ID.
 Full support (`mean`, `top_k_images: null`) is the reference. These controls do
-not avoid fitting the complete pair bank. Sparse banks, variable grids, learned
-rejection, and joint hierarchical optimization are not implemented.
+not select which patch plans are fitted: that is controlled separately by
+`fit_pair_top_k` in `grouped_partial`. Use `--full-pairs` for the full-pair
+baseline. Variable grids, learned rejection and joint hierarchical
+optimization are not implemented.
 
 ## Verification and provenance
 
@@ -373,7 +556,11 @@ marginals, `s=1`, `lam=0`, negative costs, entropy convention, monotonic accepte
 partial objectives, mass/cap feasibility, dense-versus-streamed aggregation,
 confidence rescaling, compact-kernel zero retention, support rejection,
 serialization/tampering, interrupted resume, CLI commands, and the existing
-PDAE mask path without changing parameter counts or checkpoint keys.
+PDAE mask path without changing parameter counts or checkpoint keys. Compact
+partial regressions additionally cover seed-42 sampling, stable probability
+ties, split separation, float32 round trips/underflow, strict solver versus
+storage bounds, selected-pair corruption, sparse routing accounting, full-pair
+equivalence and interruptions before/after plan registration and cleanup.
 
 The existing `tests/test_local_infoot_pipeline.py` covers legacy fixed-bandwidth
 scoring; `tests/test_pdae_v2.py` covers pretrained equivalence and attention masks.
@@ -381,17 +568,17 @@ One pre-existing legacy test expects `numIter=50` although the unchanged
 `infoot/infoot_fit.py` uses 100. It is separately reported, not fixed by changing
 the old experiment.
 
-Latest local review regression: **130 passed, 1 deselected**, using PyTorch
+Earlier dense/storage review regression: **145 passed, 1 deselected**, using PyTorch
 `2.14.0+cpu` and POT `0.9.7.post1`. The single warning is from the existing
 legacy encoder-alignment test's Sinkhorn iteration budget. Command (using the
 local test environment's Python):
 
 ```bash
-python -m pytest tests/test_infoot_vit_mapping.py tests/test_infoot_vit_logging.py tests/test_infoot_vit_mapping_review.py tests/test_infoot_vit_solver_review.py tests/test_pdae_v2.py tests/test_stage1a_rgb_eval.py tests/test_local_infoot_pipeline.py -k "not test_bank_fit_script_passes_raw_features_and_cli_lam" --basetemp tmp/vrfinal -p no:cacheprovider -q
+python -m pytest tests/test_infoot_vit_mapping.py tests/test_infoot_vit_logging.py tests/test_infoot_vit_mapping_review.py tests/test_infoot_vit_solver_review.py tests/test_infoot_vit_sparse_storage.py tests/test_pdae_v2.py tests/test_stage1a_rgb_eval.py tests/test_local_infoot_pipeline.py -k "not test_bank_fit_script_passes_raw_features_and_cli_lam" --basetemp tmp/vsfinal2 -p no:cacheprovider -q
 ```
 
-The original mapping test module contributes 33 cases; review/logging tests add
-25 cases. The one deselection is the pre-existing legacy iteration-default
+The mapping test module contributes 34 cases; review/logging tests add 25 cases,
+and sparse-storage tests add 14. The one deselection is the pre-existing legacy iteration-default
 mismatch described above. Syntax compilation and
 `git diff --check` also pass. Pair filenames use indices plus a short ID hash
 to avoid unnecessarily long Windows paths; full IDs and fingerprints remain
@@ -402,6 +589,18 @@ generation on lab checkpoints has been run during this implementation. The
 generation test uses mocked checkpoint/data loading; the sampler mask test uses
 the existing tiny real PDAE branch. Numerical correctness is not a claim of
 translation quality or of global optimality.
+
+**Batched partial revision (2026-10-10): 145 passed, 3 CUDA-only skipped.**
+The focused dense/low-rank regression below includes 28 new passing batch
+cases: batch-size-1/multi-pair POT agreement, nonuniform capacities, masses
+0.3/0.8/1, full 196-patch shapes, finite MI gradients, mixed convergence and
+failures, line-search/iteration budgets, incomplete batches, float32 save/load,
+interruption/verification failure recovery, CLI settings and benchmark reports.
+CUDA placement/agreement tests are present but skipped on this CPU-only host.
+
+```bash
+python -m pytest tests/test_infoot_vit_partial_batch.py tests/test_infoot_vit_lowrank_partial.py tests/test_infoot_vit_lowrank.py tests/test_infoot_vit_mapping.py tests/test_infoot_vit_logging.py tests/test_infoot_vit_mapping_review.py tests/test_infoot_vit_solver_review.py tests/test_infoot_vit_sparse_storage.py -q
+```
 
 ### References and attribution
 

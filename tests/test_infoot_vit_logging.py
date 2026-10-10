@@ -97,7 +97,7 @@ def test_bad_resource_limits_rejected():
         validate_config(c)
 
 
-def test_disk_limit_includes_mandatory_latest_plans(tmp_path, banks):
+def test_disk_limit_includes_active_latest_and_kernels(tmp_path, banks):
     r = resource_estimate((2, 4, 3), (3, 4, 3), "grouped_partial")
     assert r["required_plan_storage_bytes"] > 2 * r["plan_storage_bytes"]
     c = config("grouped_partial")

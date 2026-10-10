@@ -34,7 +34,7 @@ def test_partial_effective_patch_count_uses_matched_probability_weights(tmp_path
                 pair = mapper._pair(sid, tid)
                 _, confidence, detail = partial_projection(patches, mapper.x[i], mapper.y[j],
                     pair["plan"], pair["a"], pair["b"], mapper.shared["sx"][i], mapper.shared["sy"][j],
-                    mapper.shared["h_projection"], mapper.shared["support"][i])
+                    mapper.shared["h_projection"], mapper.shared["support"][i], target_kernel=mapper.projection_ky[j])
                 entropy = -(detail["weights"] * detail["weights"].clamp_min(1e-300).log()).sum(1)
                 weighted += (theta[i, j] * confidence * entropy.exp()).sum()
                 mass += (theta[i, j] * confidence).sum()
