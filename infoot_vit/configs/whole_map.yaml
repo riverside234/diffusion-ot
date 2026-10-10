@@ -5,7 +5,7 @@ source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
 solver:
   h: 0.35
-  lam: 0.065  # Lower-MI ablation; assess source correspondence and decoded quality.
+  lam: 0.075  # Restore the baseline MI weight.
   reg: 0.06
   # Explicit training-mean EUCLIDEAN cost normalization; raw feature values stay unchanged.
   # Keep h/reg fixed for the MI-weight comparison.
