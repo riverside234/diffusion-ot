@@ -59,13 +59,18 @@ repository's existing implementation of
 
 [Linear Time Sinkhorn Divergences using Positive Features (NeurIPS 2020)](https://papers.neurips.cc/paper_files/paper/2020/hash/9bde76f262285bb1eaeb7b40c758b53e-Abstract.html)
 and the authors' [LinearSinkhorn code](https://github.com/meyerscetbon/LinearSinkhorn)
-provide precedent for positive kernel features. Our row-normalized Gaussian
-feature map below is a documented finite-rank approximation; it does not inherit
-an unbiased-kernel claim from the paper.
+provide precedent for positive kernel features with explicit scale compensation.
+The balanced recipe now uses a training-moment **OPRF** candidate based on
+[Chefs' Random Tables (NeurIPS 2022), Eqs. 4–8](https://proceedings.neurips.cc/paper_files/paper/2022/file/df2d62b96a4003203450cf89cd338bb7-Paper-Conference.pdf).
+It uses PyTorch QR/linear algebra, without replacing the InfoOT optimizer or
+adding a transformer/attention dependency. The moment heuristic and orthogonal
+directions can reduce estimator variance; this is not a guarantee for SigLIP
+features at `h=0.4`. Accuracy is measured before fitting.
 
 ## Image-router convergence
 
-The router runs **before** patch-kernel/factor fitting. Its settings are
+In the active balanced recipe, **kernel acceptance runs before either transport
+fit**. The image router then runs before patch-factor optimization. Its settings are
 `image_solver.h`, `image_solver.lam`, `image_solver.reg` and
 `image_solver.max_outer_steps`. The patch `kernel.h` and `optimizer.*` fields
 control a separate problem; `--max-steps` only changes the patch optimizer.
@@ -214,14 +219,40 @@ s^2=\sum_d\operatorname{Var}_{train}(x_d)
 \]
 
 This equals the dense training RMS-distance rule without allocating its distance
-matrix. Save each domain's mean, scale, sigma and Gaussian random matrix W.
-With `z=(x-mean)/sigma`, the unnormalized positive feature
-`exp(w.T z - ||z||²)/sqrt(k)` has the Gaussian kernel in expectation.
-We normalize each feature row to unit L2 norm using stable shifted exponents.
-The common norm term cancels in this normalization. The resulting kernel is
-nonnegative, positive semidefinite and has diagonal 1, **but is biased at finite
-rank**. It may substantially smooth a narrow kernel. Rank 256 is an experiment,
-not an accuracy guarantee.
+matrix. Save each domain's mean, scale, sigma and random matrix W. The **raw
+SigLIP vectors and Euclidean cost stay unchanged**. Only auxiliary kernel
+features use `z=(x-mean)/sigma`.
+
+Balanced fits support three explicitly versioned methods:
+
+| `kernel.method` | Kernel feature construction |
+|---|---|
+| `oprf_gaussian_v1` (active YAML) | Full-scale positive features with a training-moment variance parameter A |
+| `positive_gaussian_v1` | Full-scale standard positive features, A=0 |
+| `normalized_positive_gaussian_v1` | Legacy shifted-exponential row normalization; retained for old artifacts and the partial experiment |
+
+For the first two methods, with k features and d input dimensions:
+
+\[
+\phi_j(z)=\frac{(1-4A)^{d/4}}{\sqrt{k}}
+ \exp\!\left(A\|w_j\|^2+\sqrt{1-4A}\,w_j^Tz-\|z\|^2\right).
+\]
+
+Gaussian-marginal directions give
+`E[phi(x) @ phi(y)] = exp(-||x-y||²/(2 sigma²))`.
+OPRF chooses A from the paper's moment heuristic using
+`E||z+z'||² = 2/h²` for independent centered training samples. With
+`kernel.orthogonal: true`, each block uses orthogonal directions and independent
+chi-d radii, preserving Gaussian marginals; the last incomplete block is supported.
+The coefficient and exact random matrix are saved. Queries reuse them.
+This is a candidate estimator, not a full FAVOR++ transformer implementation.
+
+**No row normalization, clipping, or per-row maximum subtraction is applied to
+the new methods.** Those operations would alter the Gaussian scale. Overflow,
+nonfinite features and all-zero rows fail explicitly. Finite-rank diagonals
+need not equal one. Unbiased expectation does not ensure a particular saved
+kernel is accurate. The legacy normalized method is nonnegative and has unit
+diagonal, but is biased at finite rank; it may smooth narrow kernels substantially.
 
 Default seeds: sampling 42, source kernel 4201, target kernel 4202, objective
 pairs 4202, independent audit pairs 4203, transport initialization 4203. Each
@@ -249,16 +280,41 @@ Checks written to disk:
   means and diagonal error. Defaults: 4,096 pairs.
 - Exact-Gaussian marginal-density checks against **all** train patches for 32
   seeded query patches, streamed in chunks.
+- Both checks above are repeated after a float32 factor round trip on the same
+  samples. They test kernel approximation plus storage, not just quantization.
+- A bounded exact-Gaussian comparison: four training images × 32 patches per
+  domain, 16 distinct training query patches, seed `kernel.seed + 1000`.
+  Compare MI, objective components, full and feasible-gradient directions,
+  within-target-image weight total variation, mapped-feature error and spread.
+  Full-training bandwidths are reused. The two arms share a fixed nonuniform
+  feasible plan and subset-mean cost scale; both use exact sums on the subset.
+  This isolates kernel effects, not optimizer or transport-rank effects.
+  The plan is a randomly permuted interval-overlap coupling mixed with 20%
+  uniform mass. Flat indices refer to the manifest's ordered training IDs and
+  original patch order. Equal image-router weights isolate patch projection.
+  These are training diagnostics, not held-out image-quality measurements.
 - Independent 32,768-pair objective audit, component standard errors, and its
   gap from the training estimator. Standard errors are reported only for IID
   audit sampling, not for the training strata. Repeated use for model selection
   makes this an optimization diagnostic, not an untouched generalization test.
 - Float32-versus-float64 objective audit on identical pairs after serialization.
 
-Kernel relative RMSE above `0.5` emits a warning. Inspect this and density errors
-before interpreting translated images. A poor approximation is not fixed by
-more optimizer steps. Try a separate kernel-rank experiment and recheck the
-budget; increasing rank or changing bandwidth also changes the approximation.
+The active balanced YAML requires `kernel.error_policy: error`: both domains,
+in float64 and after storage, must have relative RMSE ≤ **0.50**, mean density
+relative error ≤ **0.25**, and maximum probed density relative error ≤ **1.0**.
+These configurable engineering thresholds screen gross errors; they do not
+certify image quality. Failure saves diagnostics and stops **before** the router
+or patch optimizer. No inaccurate final kernel is registered in this case.
+An explicit `warn` policy is available for diagnostic comparisons; it does not
+make a failing kernel acceptable. Older/partial recipes retain their previous
+warning behavior. Reference MI/gradient/mapping errors remain visible diagnostics,
+not automatically accepted merely because the pair/density gate passes.
+
+A poor approximation is not fixed by more optimizer steps. Compare methods or
+ranks using `--kernel-check-only`; changing `h` also changes the intended
+kernel and locality, so it is not an isolated approximation fix. Recheck the
+resource budget after rank changes. The bounded reference is capped at 512
+support patches per domain and 128 queries; no full-bank dense kernel is built.
 Audit standard errors measure pair sampling error only, not kernel bias or
 rank-constraint error. No universal accuracy threshold is claimed here.
 
@@ -308,8 +364,9 @@ kernel. Prefix/suffix sums exclude self terms without subtractive cancellation.
 Only validated storage roundoff is clipped from confidence; saved factors are
 never repaired during projection. Zero/underflow failures remain explicit.
 
-No new mode constructs a full patch plan or KDE matrix during fitting or
-mapping. Mapping also streams conditional score blocks via
+Production fitting and mapping never construct a full-bank patch plan or KDE
+matrix. Only the explicitly bounded reference audit constructs small dense
+matrices. Mapping also streams conditional score blocks via
 `projection.patch_chunk_size: 64`. Dense modes intentionally keep their old
 dense algebra. Low-rank partial mapping keeps a bounded 32-pair device cache;
 many saved pairs still mean substantial I/O and computation.
@@ -397,6 +454,7 @@ work unchanged. Use the pinned optional dependencies:
 ```bash
 python -m pip install -r infoot_vit/requirements.txt
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --dry-run
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --kernel-check-only
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_partial_lowrank.yaml --dry-run
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_partial_lowrank.yaml
@@ -406,6 +464,30 @@ Each fit creates a fresh `outputs/infoot_vit/grouped_patch_lowrank_<UTC>_<id>`
 directory. Supply `--output-root outputs/infoot_vit_lr` to choose another parent.
 The partial mode instead uses `grouped_partial_lowrank_<UTC>_<id>`.
 Add `--device cuda:1` to select a GPU, or `--device cpu` for CPU execution.
+`--kernel-check-only` saves its manifest with status `kernel_checked` and does
+not fit either transport. After acceptance passes, continue with the same config:
+
+```bash
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --resume outputs/infoot_vit/KERNEL_CHECK_DIRECTORY
+```
+
+This reuses verified kernels, then fits the router and patch coupling. A
+`kernel_checked` directory cannot yet be used for mapping. Compare alternative
+methods in **fresh** directories, keeping seeds, ranks and bandwidth fixed:
+
+```bash
+# Standard full-scale PRF with the same orthogonal-direction option as OPRF.
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --kernel-check-only --kernel-method positive_gaussian_v1
+# Historical normalized IID construction (also changes the direction sampler).
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --kernel-check-only --kernel-method normalized_positive_gaussian_v1
+```
+
+`--kernel-rank` supports separate rank comparisons and still enforces the 5 GB
+budget. Preserve any CLI overrides when resuming. Existing completed artifacts
+retain their saved kernel method and remain loadable; this code change requires
+a fresh fit for old unfinished runs. Changing acceptance settings also requires
+a fresh directory, so rejected runs retain their original diagnostics.
+
 For reverse translation, swap `--source-bank data/infoot_vit/dog_train` and
 `--target-bank data/infoot_vit/cat_train`; fit a separate mapper. Resume with:
 
@@ -459,6 +541,10 @@ Fit outputs:
 - `manifest.json`: reproducible identity, resources and registered file hashes.
 - `fit_report.json`: last solver segment, image-router concentration, kernel
   errors, estimator definition, storage errors and same-pair quantization audit.
+- `kernel_approximation.json`, `kernel_quality.json`, `kernel_reference.json`:
+  sampled Gaussian/density errors, acceptance decisions, and the bounded
+  Gaussian-vs-approximation comparison. Saved in the artifact root and attempt
+  logs, including rejected runs. The reference file is absent when disabled.
 - `logs/<attempt>/iterations.jsonl`: objective components, gradient magnitude,
   mirror residual, step size/backtracking, feasibility, estimated patch routing
   entropy, component entropy, and periodic independent audit/standard errors.
@@ -500,6 +586,7 @@ full patch-pair allocations during kernel construction and optimization. Run:
 
 ```bash
 python -m pytest tests/test_infoot_vit_lowrank.py -q
+python -m pytest tests/test_infoot_vit_kernel_accuracy.py -q
 python -m pytest tests/test_infoot_vit_lowrank_partial.py -q
 python -m pytest tests/test_infoot_vit_lowrank_resume_review.py tests/test_infoot_vit_lowrank_routing.py -q
 ```
@@ -511,3 +598,28 @@ Review kernel errors, audit gap, native/mapped feature spread and matched grids
 before deciding whether rank 256 is adequate. Do not compare optimizer losses
 from different sample sizes, entropy conventions or kernel settings as if they
 were the same objective.
+
+The kernel-accuracy tests additionally integrate PRF/OPRF against a Gaussian
+using deterministic quadrature, compare exact-Gaussian MI/gradients/grouped
+projection, and check error gates, preflight/resume, float32 round trips,
+raw-feature preservation and legacy artifact loading. CUDA tests skip when
+unavailable. Neither OPRF nor rank 1024 has been validated on the lab banks here.
+For this kernel revision, the kernel-accuracy, balanced/partial low-rank,
+resume, routing and dense mapping suites passed **120 tests**, with **4
+CUDA-only skips**, on the local CPU environment (2026-10-10).
+
+A local narrow-kernel stress test also illustrates why acceptance is mandatory:
+256 IID Gaussian vectors in 768 dimensions (data seed 42), `h=0.4`, rank 1024,
+kernel seed 4201, 4,096 pair probes and 16 density queries (audit seed 4211).
+
+| Construction | Relative kernel RMSE | Mean density relative error |
+|---|---:|---:|
+| Legacy normalized IID | 0.740 | 3.797 |
+| Full-scale PRF + orthogonal directions | 1.791 | 0.831 |
+| OPRF + orthogonal directions | 2.943 | 0.763 |
+
+All three fail the active limits on this synthetic draw. OPRF's density error
+is lower here, but its kernel RMSE is worse; there is no across-the-board
+improvement claim. These vectors are not SigLIP data. Run the saved-bank
+preflight before spending time on InfoOT, and compare methods using every
+diagnostic rather than choosing the smallest single error.

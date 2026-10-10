@@ -430,12 +430,15 @@ def _fit_mapping(config, *, root, directory, resume, log):
                 _cleanup_latest(directory, manifest["models"][name], log)
             log.event("model_completed", unit=name, status=state["status"], last_iteration=state["history"][-1])
         if mode == "grouped_partial":
-            router = BalancedModel(x.reshape(len(x), -1), y.reshape(len(y), -1), state)
+            multiplier = config["projection"]["bandwidth_multiplier"]
+            router = BalancedModel(x.reshape(len(x), -1), y.reshape(len(y), -1), state, multiplier)
             if "pair_selection" in manifest:
                 selection = json.loads(checked_file(directory, manifest["pair_selection"]).read_text(encoding="utf-8"))
             else:
                 selection = select_pairs(router, source.ids, target.ids, config["fit_pair_top_k"])
                 selection["router_sha256"] = manifest["models"]["image"]["sha256"]
+                selection["projection_bandwidth_multiplier"] = multiplier
+                selection["projection_h"] = router.h
                 selection_path = directory / "pair_selection.json"
                 write_json(selection_path, selection)
                 manifest["pair_selection"] = _file_entry(directory, selection_path)
@@ -445,6 +448,19 @@ def _fit_mapping(config, *, root, directory, resume, log):
             selected_pairs = selection_edges(selection, source.ids, target.ids, config["fit_pair_top_k"])
             log.event("pair_selection_loaded", selected_pairs=len(selected_pairs), full_pairs=len(x)*len(y),
                       fit_pair_top_k=config["fit_pair_top_k"])
+            retained = torch.tensor([r["retained_probability"] for r in selection["rows"]], dtype=torch.float64)
+            routing = dict(projection_h=router.h, projection_bandwidth_multiplier=multiplier,
+                effective_k=selection["effective_k"], mean_retained_probability=float(retained.mean()),
+                median_retained_probability=float(retained.median()), min_retained_probability=float(retained.min()),
+                max_retained_probability=float(retained.max()), mean_discarded_probability=float(1-retained.mean()),
+                interpretation="Training-source conditional routing before retained-edge renormalization; not partial OT rejection.")
+            write_json(directory / "pair_selection_report.json", routing)
+            log.write_json("pair_selection_report.json", routing)
+            print(f"Top-{selection['effective_k']} router selection: mean retained mass={retained.mean():.2%}, "
+                  f"discarded={1-retained.mean():.2%}, projection h={router.h:g}.", flush=True)
+            if float(retained.mean()) < .05:
+                print("Router diagnostic: selected pairs retain less than 5% of probability. "
+                      "Inspect router h/reg/lam and mapping images; fit convergence alone does not establish useful routing.", flush=True)
             pc = config["partial"]["solver"]
             h_projection = pc["h"] * config["projection"]["bandwidth_multiplier"]
             if "pair_kernels" in manifest:

@@ -24,11 +24,11 @@ def tiny_config():
         optimizer=dict(max_steps=3,stationarity_tolerance=10.,chunk_size=7,checkpoint_every=1,audit_every=1))
 
 
-def problem(n=6,m=7):
+def problem(n=6,m=7,*,method=kernels.LEGACY):
     rng = torch.Generator().manual_seed(300)
     x,y = torch.randn(n,3,generator=rng,dtype=torch.float64),torch.randn(m,3,generator=rng,dtype=torch.float64)
-    fx,sx = kernels.fit_features(x,5,.8,1,chunk_size=2)
-    fy,sy = kernels.fit_features(y,5,.8,2,chunk_size=3)
+    fx,sx = kernels.fit_features(x,5,.8,1,chunk_size=2,method=method)
+    fy,sy = kernels.fit_features(y,5,.8,2,chunk_size=3,method=method)
     cfg = canonical(tiny_config())["optimizer"]
     factors = solver.initialize(n,m,2,cfg,"cpu")
     pairs = objective.with_cost(objective.sample_pairs(n,m,seed=3,exact=True),x,y,scale=1.,chunk_size=3)
@@ -36,8 +36,9 @@ def problem(n=6,m=7):
 
 
 @pytest.mark.parametrize("lam,reg",[(0.,.05),(.3,.05),(.3,0.)])
-def test_exact_sampled_objective_and_all_factor_gradients_match_dense(lam,reg):
-    x,y,fx,fy,_,_,cfg,factors,pairs = problem()
+@pytest.mark.parametrize("method",kernels.METHODS)
+def test_exact_sampled_objective_and_all_factor_gradients_match_dense(lam,reg,method):
+    x,y,fx,fy,_,_,cfg,factors,pairs = problem(method=method)
     result,gradients = objective.evaluate(*factors,fx,fy,pairs,lam=lam,reg=reg,gradient=True,chunk_size=5)
     q,r,g = [v.clone().requires_grad_(True) for v in factors]
     plan = (q/g)@r.T
@@ -337,7 +338,8 @@ def test_kernel_approximation_warning_is_explicit_and_persistent(tmp_path,banks)
     assert list(directory.glob("logs/*/kernel_approximation.json"))
 
 
-def test_patch_fit_never_allocates_full_pairwise_tensors():
+@pytest.mark.parametrize("method",kernels.METHODS)
+def test_patch_fit_never_allocates_full_pairwise_tensors(method):
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_leaves
     n,m = 127,131
@@ -351,8 +353,8 @@ def test_patch_fit_never_allocates_full_pairwise_tensors():
     with NoDensePatchMatrices():
         rng = torch.Generator().manual_seed(44)
         x,y = (torch.randn(count,9,dtype=torch.float64,generator=rng) for count in (n,m))
-        fx,sx = kernels.fit_features(x,8,.7,1,chunk_size=17)
-        fy,_ = kernels.fit_features(y,8,.7,2,chunk_size=17)
+        fx,sx = kernels.fit_features(x,8,.7,1,chunk_size=17,method=method)
+        fy,_ = kernels.fit_features(y,8,.7,2,chunk_size=17,method=method)
         kernels.error_report(x,fx,sx,seed=3,count=33,density_queries=3,chunk_size=17)
         pairs = objective.with_cost(objective.sample_pairs(n,m,seed=4,per_row=2),x,y,chunk_size=17)
         audit = objective.with_cost(objective.sample_pairs(n,m,seed=5,count=71),x,y,scale=pairs["cost_scale"],chunk_size=17)

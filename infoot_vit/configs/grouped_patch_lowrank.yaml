@@ -18,11 +18,20 @@ image_solver:
   max_inner_steps: 10000
   outer_tolerance: 1.0e-7  # Keep the original stationarity requirement.
 kernel:
+  method: oprf_gaussian_v1  # Full Gaussian scale terms; training-moment OPRF, no row normalization.
+  orthogonal: true  # Block-orthogonal directions with Gaussian marginal radii.
   h: 0.4
   seed: 4201
   check_pairs: 4096
   density_queries: 32
   error_warn_relative_rmse: 0.5
+  error_policy: error  # Reject inaccurate kernels before image-router/patch fitting.
+  max_relative_rmse: 0.5
+  max_density_relative_error_mean: 0.25
+  max_density_relative_error_max: 1.0
+  reference_images: 4
+  reference_patches_per_image: 32  # <=128 support patches/domain, exact Gaussian audit only.
+  reference_queries: 16
 estimator:
   seed: 4202
   samples_per_row: 2  # Both source- and target-stratified pairs; 1,568,000 samples.

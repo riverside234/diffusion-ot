@@ -37,13 +37,15 @@ def test_inner_matches_pot_with_nonuniform_caps_and_independent_counts(mass):
     costs, _, _ = problem()
     a = torch.tensor([.1, .2, .3, .4], dtype=torch.float64).expand(3, -1)
     b = torch.tensor([.1, .2, .15, .25, .3], dtype=torch.float64).expand(3, -1)
-    c = solver_config(dict(reg=.4))
+    c = solver_config(dict(reg=.4, inner_tolerance=1e-12))
     actual, diagnostics = entropy_subproblem_batch(a, b, costs, mass, c)
     assert diagnostics["ok"].all()
     for i in range(3):
         expected, log = entropy_subproblem(a[i], b[i], costs[i], mass, c)
         torch.testing.assert_close(actual[i], expected, atol=1e-12, rtol=1e-11)
-        assert float(diagnostics["error"][i]) == pytest.approx(log["error"], abs=1e-12)
+        assert float(diagnostics["error"][i]) <= c["inner_tolerance"]
+        assert log["error"] <= c["inner_tolerance"]
+        assert float(diagnostics["relative_duality_gap"][i]) <= c["inner_tolerance"]
         feasibility(actual[i], a[i], b[i], mass, c)
 
 
@@ -111,7 +113,7 @@ def test_mixed_inner_convergence_counts_stop_at_their_own_iteration():
 
 def test_outer_budget_keeps_last_accepted_iterate_and_matches_serial():
     cost, kx, ky = problem()
-    c = solver_config(dict(reg=.4, max_outer_steps=1, cost_scale=2.))
+    c = solver_config(dict(reg=.4, max_outer_steps=1, cost_scale=2., inner_tolerance=1e-12))
     plans, reports = solve_partial_batch(cost, kx, ky, config=c)
     for i, report in enumerate(reports):
         expected, reference = solve_partial(cost[i], kx[i], ky[i], config=c)
@@ -128,7 +130,8 @@ def test_line_search_stall_is_local_and_never_accepts_uphill_plan(monkeypatch):
         candidate = torch.tensor([[[0., .4], [.4, 0.]], [[.2, .2], [.2, .2]]], dtype=torch.float64)
         return candidate, dict(ok=torch.ones(2, dtype=torch.bool), error=torch.zeros(2),
             iterations=torch.ones(2, dtype=torch.long), failure=torch.zeros(2, dtype=torch.long),
-            cost_shift=torch.zeros(2), residuals=module.residual_values(candidate, a, b, mass), method="test")
+            cost_shift=torch.zeros(2), residuals=module.residual_values(candidate, a, b, mass),
+            duality_gap=torch.zeros(2), relative_duality_gap=torch.zeros(2), method="test")
     monkeypatch.setattr(module, "entropy_subproblem_batch", uphill)
     plans, reports = module.solve_partial_batch(costs, kernels, kernels, config=dict(cost_scale=1., max_backtracks=1))
     assert [r["status"] for r in reports] == ["line_search_stalled", "converged"]
@@ -147,8 +150,8 @@ def test_cli_batch_overrides_and_config_defaults(tmp_path, monkeypatch):
         assert infoot_fit.main(["--config", str(path), "--device", "cpu", *option]) == 0
         assert seen[-1]["pair_batch_size"] == expected and seen[-1]["device"] == "cpu"
     actual = yaml.safe_load((infoot_fit.ROOT / "infoot_vit/configs/grouped_partial.yaml").read_text())
-    assert actual["device"] == "cuda" and actual["pair_batch_size"] == 256
-    assert actual["fit_pair_top_k"] == 8 and actual["partial"]["keep_mass"] == .75
+    assert actual["device"] == "cuda" and actual["pair_batch_size"] == 1024
+    assert actual["fit_pair_top_k"] == 8 and actual["partial"]["keep_mass"] == .80
 
 
 def test_converged_outer_members_are_never_updated_again():

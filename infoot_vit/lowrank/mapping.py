@@ -78,7 +78,7 @@ class LowRankMapper(FeatureMapper):
             raise ValueError("Invalid factor fit identity or convergence status.")
         q,r,g = (state[key].to(device=self.device,dtype=torch.float64) for key in ("q","r","g"))
         kernel = torch.load(files["kernels"],weights_only=True)
-        validate_kernels(kernel,(n,m,self.config["kernel_rank"]),self.x.shape[-1])
+        validate_kernels(kernel,(n,m,self.config["kernel_rank"]),self.x.shape[-1],self.config["kernel"])
         self.kernel_source = move(kernel["source"],self.device)
         fx,fy = kernel["fx"].to(self.x),kernel["fy"].to(self.y)
         self.cross = ((fx.T@q)/g) @ (fy.T@r).T  # Only [kernel_rank,kernel_rank].

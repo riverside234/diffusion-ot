@@ -1,8 +1,10 @@
 """Exact dense partial InfoOT for independent GPU/CPU pair batches.
 
-POT 0.9.7's partial API accepts one 2-D cost. The inner loop below lifts its
-log-domain Dykstra updates and ten-step stopping checks to [B,P,Q], using
-PyTorch reductions/matmul. No change to the objective or feasible set. The
+POT 0.9.7's partial API accepts one 2-D cost. We solve the same entropic
+subproblem by exact dual block ascent: jointly optimize row potentials and
+the mass multiplier, then column potentials and the mass multiplier. Grouping
+each capacity constraint with mass avoids slow three-set Dykstra iterations
+near saturated supports. No change to the objective or feasible set. The
 mass-one control uses POT's balanced log updates, just like partial.py.
 See https://pythonot.github.io/_modules/ot/partial/partial_solvers.html.
 """
@@ -13,7 +15,7 @@ import torch
 
 from .partial import OBJECTIVE, capabilities, information, information_gradient, solver_config
 
-VERSION = "dense_partial_infoot_batch_v1"
+VERSION = "dense_partial_infoot_batch_v2_capped_mass"
 RUNNING, CONVERGED, BUDGET, STALLED, INVALID, INNER_FAILED, NONFINITE = range(7)
 STATUS = ("running", "converged", "max_outer_steps", "line_search_stalled",
           "invalid_input", "inner_failed", "nonfinite_objective_or_gradient")
@@ -40,9 +42,39 @@ def feasible(residuals, config):
             & (residuals[:, 2:].amax(-1) <= config["feasibility_tolerance"]))
 
 
+def _capped_mass_potentials(log_weights, capacities, mass):
+    """Exact log water filling: sum min(cap_i, exp(log_weight_i + w)) = mass.
+
+    Sorting log(cap_i)-log_weight_i identifies the saturated prefix. Reverse
+    logcumsumexp keeps the unsaturated tail accurate even for tiny weights.
+    Returned inequality potentials are <= 0; the mass potential is free.
+    Requires 0 < mass < sum(capacities), with all capacities positive.
+    """
+    log_caps = capacities.log()
+    breaks, order = (log_caps - log_weights).sort(-1)
+    caps = capacities.gather(-1, order)
+    remaining = mass - (caps.cumsum(-1) - caps)
+    tail = log_weights.gather(-1, order).flip(-1).logcumsumexp(-1).flip(-1)
+    candidates = remaining.clamp_min(torch.finfo(log_weights.dtype).tiny).log() - tail
+    admissible = (remaining > 0) & (candidates <= breaks)
+    index = admissible.to(torch.int64).argmax(-1, keepdim=True)
+    w = candidates.gather(-1, index).squeeze(-1)
+    # No silent fallback if extreme inputs exhaust floating-point resolution.
+    w = w.masked_fill(~admissible.any(-1), float("nan"))
+    return (log_caps - log_weights - w[:, None]).clamp_max(0), w
+
+
+def _duality_gap(plan, log_plan, base, a, b, mass, u, v, w, reg):
+    """Primal minus dual for shifted cost -reg*base; no entropy approximation."""
+    primal = reg * (plan * (log_plan - base - 1)).sum((-2, -1))
+    dual = reg * ((u * a).sum(-1) + (v * b).sum(-1) + w * mass - plan.sum((-2, -1)))
+    gap = primal - dual
+    return gap, gap.abs() / torch.maximum(torch.ones_like(gap), torch.maximum(primal.abs(), dual.abs()))
+
+
 @torch.no_grad()
 def entropy_subproblem_batch(a, b, cost, mass, config):
-    """POT-equivalent subproblems, with pair-local stopping/failure tensors.
+    """Exact entropic subproblems, with pair-local stopping/failure tensors.
 
     Only one batch-wide host check per ten iterations. Converged/failed state
     is frozen by GPU masks. Counts include every update, including the first
@@ -57,12 +89,13 @@ def entropy_subproblem_batch(a, b, cost, mass, config):
     error = cost.new_full((batch,), float("inf"))
     counts = torch.zeros(batch, dtype=torch.int64, device=cost.device)
     loga, logb = a.log(), b.log()
+    u, v = torch.zeros_like(a), torch.zeros_like(b)
+    w = cost.new_zeros(batch)
     if mass == 1.:
-        u, v = torch.zeros_like(a), torch.zeros_like(b)
         lk = base.clone()
     else:
-        lk = base + math.log(mass) - base.logsumexp((-2, -1), keepdim=True)
-        q1, q2, q3 = (torch.zeros_like(cost) for _ in range(3))
+        w = math.log(mass) - base.logsumexp((-2, -1))
+        lk = base + w[:, None, None]
     for iteration in range(config["max_inner_steps"]):
         previous = lk
         if mass == 1.:
@@ -70,45 +103,41 @@ def entropy_subproblem_batch(a, b, cost, mass, config):
             next_u = loga - (base + next_v[:, None, :]).logsumexp(-1)
             update = base + next_u[:, :, None] + next_v[:, None, :]
         else:
-            row_input = previous + q1
-            row = row_input + (loga - row_input.logsumexp(-1)).clamp_max(0)[:, :, None]
-            next_q1 = q1 + previous - row
-            column_input = row + q2
-            column = column_input + (logb - column_input.logsumexp(-2)).clamp_max(0)[:, None, :]
-            next_q2 = q2 + row - column
-            mass_input = column + q3
-            update = mass_input + math.log(mass) - mass_input.logsumexp((-2, -1), keepdim=True)
-            next_q3 = q3 + column - update
+            next_u, _ = _capped_mass_potentials((base + v[:, None, :]).logsumexp(-1), a, mass)
+            next_v, next_w = _capped_mass_potentials((base + next_u[:, :, None]).logsumexp(-2), b, mass)
+            update = base + next_u[:, :, None] + next_v[:, None, :] + next_w[:, None, None]
         finite = torch.isfinite(update).all((-2, -1))
         counts += active
         numerical |= active & ~finite
         active &= finite
         mask = active[:, None, None]
         lk = torch.where(mask, update, previous)
-        if mass == 1.:
-            u = torch.where(active[:, None], next_u, u)
-            v = torch.where(active[:, None], next_v, v)
-        else:
-            q1 = torch.where(mask, next_q1, q1)
-            q2 = torch.where(mask, next_q2, q2)
-            q3 = torch.where(mask, next_q3, q3)
+        u = torch.where(active[:, None], next_u, u)
+        v = torch.where(active[:, None], next_v, v)
+        if mass != 1.:
+            w = torch.where(active, next_w, w)
         if iteration % 10 == 0:
             err = (torch.linalg.vector_norm(lk.exp().sum(-2) - b, dim=-1) if mass == 1.
                    else torch.linalg.vector_norm((previous - lk).flatten(1), dim=-1))
             error = torch.where(active, err, error)
-            # Match POT: balanced uses <; partial while loop stops at <=.
+            # Keep the strict log-plan residual; feasibility alone is insufficient.
             stopped = error < config["inner_tolerance"] if mass == 1. else error <= config["inner_tolerance"]
+            if mass != 1.:
+                plan = lk.exp()
+                _, gap_error = _duality_gap(plan, lk, base, a, b, mass, u, v, w, config["reg"])
+                stopped &= feasible(residual_values(plan, a, b, mass), config) & (gap_error <= config["inner_tolerance"])
             active &= ~stopped
             if not bool(active.any()):
                 break
     plan = lk.exp()
     residuals = residual_values(plan, a, b, mass)
+    gap, gap_error = _duality_gap(plan, lk, base, a, b, mass, u, v, w, config["reg"])
     ok = valid & ~numerical & ~active & feasible(residuals, config)
     # 0 success, 1 input/numerical failure, 2 iteration budget, 3 feasibility.
     failure = torch.where(numerical, 1, torch.where(active, 2, torch.where(ok, 0, 3)))
     return plan, dict(ok=ok, error=error, iterations=counts, failure=failure,
-        cost_shift=shift, residuals=residuals,
-        method="balanced_sinkhorn_log_s_equals_1" if mass == 1. else "partial_sinkhorn_log")
+        cost_shift=shift, residuals=residuals, duality_gap=gap, relative_duality_gap=gap_error,
+        method="balanced_sinkhorn_log_s_equals_1" if mass == 1. else "partial_capped_mass_log")
 
 
 def _number(value):
@@ -212,12 +241,15 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
             scales[indices, None], steps[:, None], backtracks[:, None], delta[:, None],
             (steps * delta)[:, None], (terms[:, 3]-old[:, 3])[:, None], terms, residuals,
             inner["error"][:, None], inner["iterations"][:, None], inner["failure"][:, None],
-            inner["cost_shift"][:, None], inner["residuals"]), -1).cpu().tolist()
+            inner["cost_shift"][:, None], inner["residuals"],
+            inner["duality_gap"][:, None], inner["relative_duality_gap"][:, None]), -1).cpu().tolist()
         emitted = [None] * batch
         for row in packed:
             idx, status, count = map(int, row[:3])
             inner_report = dict(method=inner["method"], error=_number(row[17]), iterations=int(row[18]),
                 failure_code=int(row[19]), cost_shift=_number(row[20]), warnings=[],
+                duality_gap=_number(row[25]), relative_duality_gap=_number(row[26]),
+                error_metric="column_marginal_l2" if keep_mass == 1. else "log_plan_delta_l2",
                 **dict(zip(("mass", "mass_error", "row_cap_error", "column_cap_error"), map(_number, row[21:25]))))
             record = dict(iteration=count, status=STATUS[status], step_size=row[4], backtracks=int(row[5]),
                 plan_delta_l1=_number(row[6]), accepted_plan_delta_l1=_number(row[7]), objective_delta=_number(row[8]),

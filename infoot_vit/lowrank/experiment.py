@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import uuid
@@ -19,7 +20,7 @@ from ..infoot_helper.run_logging import RunLog
 from .config import canonical, resources, MODE, SCHEMA,PARTIAL_MODE,PARTIAL_SCHEMA
 from ..infoot_helper.device import resolve_device,move
 from .units import fit_unit
-from . import kernels, objective, solver
+from . import kernels, kernel_audit, objective, solver
 from .storage import VERSION
 
 
@@ -70,28 +71,98 @@ def register(directory,manifest,key,entry):
     _sync_directory(directory)
 
 
-def validate_kernels(state,shape,dimension=None):
+def validate_kernels(state,shape,dimension=None,kernel_config=None):
     if state.get("storage_version") != VERSION:
         raise ValueError("Kernel storage version mismatch.")
     for key,n in (("fx",shape[0]),("fy",shape[1])):
         f = state[key]
+        method = state["source" if key == "fx" else "target"]["method"]
         if (f.shape != (n,shape[2]) or f.dtype != torch.float32 or not torch.isfinite(f).all()
-                or (f < 0).any() or (f.double().square().sum(1)-1).abs().max() > 2e-6):
+                or (f < 0).any() or (f.double().sum(1) <= 0).any()
+                or (method == kernels.LEGACY and (f.double().square().sum(1)-1).abs().max() > 2e-6)):
             raise ValueError("Invalid float32 kernel factors.")
     for key in ("source", "target"):
         s = state[key]
         dim = len(s["mean"]) if dimension is None else dimension
-        if (s["method"] != "normalized_positive_gaussian_v1" or s["rank"] != shape[2]
+        if (s["method"] not in kernels.METHODS or s["rank"] != shape[2]
                 or s["mean"].shape != (dim,) or s["omega"].shape != (dim, shape[2])
                 or any(t.dtype != torch.float64 or not torch.isfinite(t).all() for t in (s["mean"], s["omega"]))
                 or not all(isinstance(s[k], (int, float)) and 0 < s[k] < float("inf") for k in ("scale", "h", "sigma"))
                 or s["sigma"] != s["h"]*s["scale"]):
             raise ValueError("Invalid saved kernel parameters/bandwidth.")
+        if s["method"] != kernels.LEGACY:
+            expected_a = kernels.oprf_coefficient(dim,s["h"]) if s["method"] == kernels.OPRF else 0.
+            if (type(s.get("orthogonal")) is not bool or not isinstance(s.get("a"),(int,float))
+                    or not math.isclose(s["a"],expected_a,rel_tol=1e-12,abs_tol=1e-14)):
+                raise ValueError("Invalid saved positive-kernel scale compensation.")
+        if kernel_config is not None and (s["method"] != kernel_config.get("method",kernels.LEGACY)
+                or s.get("orthogonal",False) != kernel_config.get("orthogonal",False)):
+            raise ValueError("Saved kernel method differs from the fitted configuration.")
+    if kernel_config is not None and kernel_config.get("error_policy") == "error":
+        checks = state.get("approximation",{})
+        if set(checks) != {"source","target"} or not all("float32_roundtrip" in v for v in checks.values()):
+            raise ValueError("Strict kernel artifact lacks its raw/storage acceptance audits.")
+        if not kernel_audit.acceptance(checks,kernel_config)["accepted"]:
+            raise ValueError("Saved kernel artifact failed the configured accuracy limits.")
 
 
-def fit(raw,*,root,output_root=None,resume=None):
+def _balanced_kernels(directory,manifest,x,y,log):
+    c = manifest["config"]; kc = c["kernel"]; chunk = c["optimizer"]["chunk_size"]
+    flatx,flaty = x.flatten(0,1),y.flatten(0,1)
+    shape = (len(flatx),len(flaty),c["kernel_rank"])
+    print(f"Kernel audit: method={kc['method']}, rank={c['kernel_rank']}, policy={kc['error_policy']}",flush=True)
+    if "kernels" in manifest["files"]:
+        state = torch.load(checked_file(directory,manifest["files"]["kernels"]),weights_only=True)
+        validate_kernels(state,shape,flatx.shape[1],kc)
+        fx = kernels.features(flatx,state["source"],chunk)
+        fy = kernels.features(flaty,state["target"],chunk)
+        if not torch.equal(fx.float(),state["fx"].to(x.device)) or not torch.equal(fy.float(),state["fy"].to(y.device)):
+            raise ValueError("Recomputed float64 kernel factors differ from the saved snapshot.")
+        checks,reference = state["approximation"],state.get("reference")
+    else:
+        fx,sx = kernels.fit_features(flatx,c["kernel_rank"],kc["h"],kc["seed"],chunk,
+                                    method=kc["method"],orthogonal=kc["orthogonal"])
+        fy,sy = kernels.fit_features(flaty,c["kernel_rank"],kc["h"],kc["seed"]+1,chunk,
+                                    method=kc["method"],orthogonal=kc["orthogonal"])
+        checks = {}
+        for i,(name,z,f,s) in enumerate((("source",flatx,fx,sx),("target",flaty,fy,sy))):
+            args = dict(seed=kc["seed"]+10+i,count=kc["check_pairs"],density_queries=kc["density_queries"],chunk_size=chunk)
+            checks[name] = kernels.error_report(z,f,s,**args)
+            checks[name]["float32_roundtrip"] = kernels.error_report(z,f,s,storage_roundtrip=True,**args)
+            print(f"{name}: kernel relative RMSE={checks[name]['relative_rmse']:.4g}, "
+                  f"mean density relative error={checks[name]['density_relative_error_mean']:.4g}",flush=True)
+        reference = None
+    quality = kernel_audit.acceptance(checks,kc)
+    # Persist acceptance before the optional reference, including if that audit fails.
+    for filename,report in (("kernel_approximation.json",checks),("kernel_quality.json",quality)):
+        write_json(directory/filename,report); log.write_json(filename,report)
+    if "kernels" not in manifest["files"] and kc["reference_images"]:
+        reference = kernel_audit.reference_report(x,y,fx,fy,sx,sy,kc,c["optimizer"])
+    if reference is not None:
+        write_json(directory/"kernel_reference.json",reference); log.write_json("kernel_reference.json",reference)
+    log.event("kernel_accuracy_checked",accepted=quality["accepted"],policy=quality["policy"],failures=quality["failures"])
+    if not quality["accepted"] and kc["error_policy"] == "error":
+        raise RuntimeError("Kernel accuracy acceptance failed; transport fitting has not started. "
+                           "See kernel_quality.json, kernel_approximation.json and kernel_reference.json. "
+                           "Compare methods/ranks in a fresh --kernel-check-only run.")
+    for name,check in checks.items():
+        if check["relative_rmse"] > kc["error_warn_relative_rmse"]:
+            warnings.warn(f"{name} positive-kernel relative RMSE={check['relative_rmse']:.3g}; inspect approximation before claiming quality.")
+    if "kernels" not in manifest["files"]:
+        qfx,ex = quantize(fx); qfy,ey = quantize(fy)
+        state = dict(fx=qfx,fy=qfy,source=move(sx,"cpu"),target=move(sy,"cpu"),storage_version=VERSION,
+                     quantization=dict(fx=ex,fy=ey),approximation=checks,quality=quality,reference=reference)
+        entry,_ = _verified_save(directory,directory/"kernels.pt",state,
+                                  lambda s:validate_kernels(s,shape,flatx.shape[1],kc))
+        register(directory,manifest,"kernels",entry)
+    return fx,fy,checks,reference,quality
+
+
+def fit(raw,*,root,output_root=None,resume=None,kernel_check_only=False):
     root = Path(root).resolve()
     mode = canonical(raw)["mode"]
+    if kernel_check_only and mode != MODE:
+        raise ValueError("--kernel-check-only currently supports grouped_patch_lowrank only.")
     schema = PARTIAL_SCHEMA if mode == PARTIAL_MODE else SCHEMA
     directory = Path(resume).resolve() if resume else (Path(output_root) if output_root else root/"outputs/infoot_vit")/f"{mode}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}"
     directory.mkdir(parents=True,exist_ok=bool(resume))
@@ -141,6 +212,14 @@ def fit(raw,*,root,output_root=None,resume=None):
             n,m = len(x)*x.shape[1],len(y)*y.shape[1]
             flatx,flaty = x.reshape(n,-1),y.reshape(m,-1)
             shape = (n,m,c["transport_rank"])
+            kernel_result = None
+            if mode == MODE and (kernel_check_only or c["kernel"]["error_policy"] == "error" or c["kernel"]["reference_images"]):
+                kernel_result = _balanced_kernels(directory,manifest,x,y,log)
+                if kernel_check_only:
+                    manifest["status"] = "kernel_checked"
+                    write_json(directory/"manifest.json",manifest)
+                    print("Kernel-only diagnostics saved; resume this directory with identical settings for the full fit.",flush=True)
+                    return directory
             # Existing balanced image router: unchanged whole-image geometry/MI.
             if "image" not in manifest["files"]:
                 def image_step(plan,record):
@@ -183,30 +262,7 @@ def fit(raw,*,root,output_root=None,resume=None):
                 manifest["artifact_id"] = digest({k:v for k,v in manifest.items() if k != "artifact_id"})
                 write_json(directory/"manifest.json",manifest)
                 return directory
-            kc = c["kernel"]
-            if "kernels" not in manifest["files"]:
-                fx,sx = kernels.fit_features(flatx,c["kernel_rank"],kc["h"],kc["seed"],c["optimizer"]["chunk_size"])
-                fy,sy = kernels.fit_features(flaty,c["kernel_rank"],kc["h"],kc["seed"]+1,c["optimizer"]["chunk_size"])
-                checks = {name:kernels.error_report(z,f,s,seed=kc["seed"]+10+i,count=kc["check_pairs"],density_queries=kc["density_queries"])
-                          for i,(name,z,f,s) in enumerate((("source",flatx,fx,sx),("target",flaty,fy,sy)))}
-                qfx,ex = quantize(fx); qfy,ey = quantize(fy)
-                state = dict(fx=qfx,fy=qfy,source=move(sx,"cpu"),target=move(sy,"cpu"),storage_version=VERSION,
-                             quantization=dict(fx=ex,fy=ey),approximation=checks)
-                entry,_ = _verified_save(directory,directory/"kernels.pt",state,
-                    lambda s:validate_kernels(s,(n,m,c["kernel_rank"]),flatx.shape[1]))
-                register(directory,manifest,"kernels",entry)
-            else:
-                state = torch.load(checked_file(directory,manifest["files"]["kernels"]),weights_only=True)
-                validate_kernels(state,(n,m,c["kernel_rank"]),flatx.shape[1])
-                fx = kernels.features(flatx,state["source"],c["optimizer"]["chunk_size"])
-                fy = kernels.features(flaty,state["target"],c["optimizer"]["chunk_size"])
-                if not torch.equal(fx.float(),state["fx"].to(device)) or not torch.equal(fy.float(),state["fy"].to(device)):
-                    raise ValueError("Recomputed float64 kernel factors differ from the saved snapshot.")
-                checks = state["approximation"]
-            log.write_json("kernel_approximation.json",checks)
-            for name,check in checks.items():
-                if check["relative_rmse"] > kc["error_warn_relative_rmse"]:
-                    warnings.warn(f"{name} positive-kernel relative RMSE={check['relative_rmse']:.3g}; inspect approximation before claiming quality.")
+            fx,fy,checks,reference,quality = kernel_result or _balanced_kernels(directory,manifest,x,y,log)
             if "samples" not in manifest["files"]:
                 ec = c["estimator"]
                 pairs = objective.with_cost(objective.sample_pairs(n,m,seed=ec["seed"],per_row=ec["samples_per_row"],exact=ec["exact"],device=device),flatx,flaty)
@@ -248,6 +304,7 @@ def fit(raw,*,root,output_root=None,resume=None):
             manifest.update(status="complete",artifact_bytes_before_report=total_bytes)
             manifest["artifact_id"] = digest({k:v for k,v in manifest.items() if k != "artifact_id"})
             fit_report = dict(resources=report["resources"],kernel_approximation=checks,solver=final_report,device=str(device),
+                kernel_quality=quality,kernel_reference=reference,
                 image_router=image_diagnostics,
                 factor_quantization=state["quantization"],storage_constraints=state["storage_constraints"],
                 float32_audit=stored_audit,float32_minus_float64_audit=quantized_delta,

@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 import yaml
 from infoot_vit.lowrank.experiment import fit,inspect_fit,compact_inspection
+from infoot_vit.lowrank.kernels import METHODS
 
 
 def main(argv=None):
@@ -22,14 +23,23 @@ def main(argv=None):
     p.add_argument("--max-steps",type=int,help="May be increased on resume; all mathematical settings remain fixed.")
     p.add_argument("--image-max-steps",type=int,help="Image-router outer budget, separate from --max-steps. Unregistered routers restart on resume.")
     p.add_argument("--dry-run",action="store_true")
+    p.add_argument("--kernel-check-only",action="store_true",help="Audit grouped_patch_lowrank kernels before fitting either transport plan; saves diagnostics.")
+    p.add_argument("--kernel-method",choices=METHODS,help="New fit only; override the kernel estimator for a controlled comparison.")
+    p.add_argument("--kernel-rank",type=int,help="New fit only; override kernel rank, retaining resource checks.")
     a = p.parse_args(argv)
     c = yaml.safe_load(a.config.read_text(encoding="utf-8"))
     for name in ("source_bank","target_bank","device"):
         if getattr(a,name) is not None:c[name] = getattr(a,name)
     if a.max_steps is not None:c.setdefault("optimizer",{})["max_steps"] = a.max_steps
     if a.image_max_steps is not None:c.setdefault("image_solver",{})["max_outer_steps"] = a.image_max_steps
+    if a.kernel_method is not None:
+        c.setdefault("kernel",{})["method"] = a.kernel_method
+        if a.kernel_method == METHODS[0]: c["kernel"]["orthogonal"] = False
+    if a.kernel_rank is not None:c["kernel_rank"] = a.kernel_rank
     if a.dry_run:print(json.dumps(compact_inspection(inspect_fit(c,a.project_root)),indent=2))
-    else:print(f"Saved low-rank mapping: {fit(c,root=a.project_root,output_root=a.output_root,resume=a.resume)}")
+    else:
+        directory = fit(c,root=a.project_root,output_root=a.output_root,resume=a.resume,kernel_check_only=a.kernel_check_only)
+        print(f"Saved {'kernel diagnostics' if a.kernel_check_only else 'low-rank mapping'}: {directory}")
     return 0
 
 

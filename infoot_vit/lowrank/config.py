@@ -5,6 +5,7 @@ from copy import deepcopy
 from ..infoot_helper.fit_mapping import validate_config, CONFIDENCE
 from ..infoot_helper.partial import solver_config
 from ..infoot_helper.device import resolve_device
+from .kernels import LEGACY, METHODS
 
 MODE = "grouped_patch_lowrank"
 SCHEMA = "siglip_lowrank_grouped_patch_v1"
@@ -12,7 +13,10 @@ PARTIAL_MODE = "grouped_partial_lowrank"
 PARTIAL_SCHEMA = "siglip_lowrank_grouped_partial_v1"
 DEFAULT = dict(mode=MODE,source_bank="data/infoot_vit/cat_train",target_bank="data/infoot_vit/dog_train",
     sampling=dict(images_per_domain=2000,seed=42),transport_rank=256,kernel_rank=256,
-    kernel=dict(h=.4,seed=4201,check_pairs=4096,density_queries=32,error_warn_relative_rmse=.5),
+    kernel=dict(h=.4,seed=4201,check_pairs=4096,density_queries=32,error_warn_relative_rmse=.5,
+                method=LEGACY,orthogonal=False,error_policy="warn",max_relative_rmse=.5,
+                max_density_relative_error_mean=.25,max_density_relative_error_max=1.,
+                reference_images=0,reference_patches_per_image=32,reference_queries=16),
     estimator=dict(seed=4202,samples_per_row=2,audit_samples=32768,exact=False),
     optimizer=dict(seed=4203,lam=.1,reg=.05,step_size=1.,max_steps=300,max_backtracks=12,
         projection_iterations=10000,projection_tolerance=1e-12,constraint_tolerance=1e-8,min_g=1e-10,
@@ -44,6 +48,18 @@ def canonical(raw):
     if c["mode"] not in {MODE,PARTIAL_MODE}:
         raise ValueError(f"This entry point requires {MODE} or {PARTIAL_MODE}.")
     resolve_device(c["device"],check=False)
+    kc = c["kernel"]
+    if kc["method"] not in METHODS or type(kc["orthogonal"]) is not bool or kc["error_policy"] not in {"warn","error"}:
+        raise ValueError("Invalid kernel method, orthogonal option or error policy.")
+    if kc["method"] == LEGACY and kc["orthogonal"]:
+        raise ValueError("Legacy kernel method requires IID projections.")
+    if c["mode"] == PARTIAL_MODE and (kc["method"] != LEGACY or kc["error_policy"] != "warn" or kc["reference_images"] != 0):
+        raise ValueError("New kernel methods/audits currently apply only to grouped_patch_lowrank.")
+    if (type(kc["reference_images"]) is not int or kc["reference_images"] < 0
+            or type(kc["reference_patches_per_image"]) is not int or kc["reference_patches_per_image"] < 1
+            or kc["reference_images"]*kc["reference_patches_per_image"] > 512
+            or type(kc["reference_queries"]) is not int or not 1 <= kc["reference_queries"] <= 128):
+        raise ValueError("Exact kernel audit requires <=512 reference patches per domain and 1..128 queries.")
     if not 0 < c["partial"]["keep_mass"] <= 1:
         raise ValueError("partial.keep_mass must be in (0,1].")
     if c["fit_pair_top_k"] is not None and (type(c["fit_pair_top_k"]) is not int or c["fit_pair_top_k"] < 1):
@@ -66,7 +82,8 @@ def canonical(raw):
     mass = c["partial"]["keep_mass"] if c["mode"] == PARTIAL_MODE else 1.
     if c["optimizer"]["min_g"] >= mass/c["transport_rank"] or c["optimizer"]["log_floor"] >= 1:
         raise ValueError("min_g must be below mass/rank and log_floor below 1.")
-    for value in (c["kernel"]["h"],c["kernel"]["error_warn_relative_rmse"],*c["resources"].values()):
+    for value in (kc["h"],kc["error_warn_relative_rmse"],kc["max_relative_rmse"],
+                  kc["max_density_relative_error_mean"],kc["max_density_relative_error_max"],*c["resources"].values()):
         if not math.isfinite(value) or value <= 0: raise ValueError("Invalid bandwidth/resource/error threshold.")
     if c["projection"]["bandwidth_multiplier"] != 1:
         raise ValueError("This experiment fixes KDE bandwidths at fit time; multiplier must be 1.")

@@ -29,6 +29,19 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
     index_path = directory / "pairs.jsonl"
     started = time.perf_counter()
     initial_done = len(done)
+    attempted = 0
+
+    def save_report(status):
+        report = dict(status=status, device=str(x.device), pair_batch_size=size, attempted_pairs=attempted,
+            successful_pairs=len(done)-initial_done, previously_completed_pairs=initial_done,
+            failed_pairs=len(failures), elapsed_seconds=time.perf_counter()-started,
+            failures=[{k: v for k, v in row.items() if k != "report"} for row in failures],
+            resume_policy="Reuse registered successful pairs; restart unfinished/failed pairs from exact float64 feasible initialization.")
+        write_json(directory / "pair_batch_report.json", report)
+        log.write_json("pair_batch_report.json", report)
+        manifest.update(pair_count=len(done), failed_pair_count=len(failures))
+        if index_path.exists():
+            manifest["pair_inventory"] = _file_entry(directory, index_path)
 
     def journal(path, value):
         with path.open("a", encoding="utf-8") as handle:
@@ -39,6 +52,7 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
 
     for offset in range(0, len(pending), size):
         batch = pending[offset:offset + size]
+        attempted += len(batch)
         batch_start = time.perf_counter()
         batch_done = len(done)
         log.event("pair_batch_started", batch=offset // size, pairs=len(batch), configured_batch_size=size,
@@ -63,6 +77,21 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
             failures.append(entry)
             journal(directory / "pair_failures.jsonl", entry)
             log.event("pair_failed", **entry)
+            if len(failures) == 1:
+                # A bounded, exact reproducer when only logs can be copied from the lab.
+                example = log.directory / "first_failed_pair.pt"
+                try:
+                    save_tensor(example, dict(cost=costs[member].detach().cpu(), kx=kx[member].detach().cpu(),
+                        ky=ky[member].detach().cpu(), a=a_cpu, b=b_cpu, config=pc, keep_mass=mass,
+                        source_id=sid, target_id=tid, report=report, fit_fingerprint=fingerprint))
+                    reproduction = f"Exact reproduction inputs: {example}"
+                except Exception as error:
+                    # Optional evidence must not prevent successful neighbors from saving.
+                    reproduction = f"Could not save reproduction inputs: {error}"
+                    log.event("failure_reproducer_save_failed", error=str(error), source_id=sid, target_id=tid)
+                last = report.get("history", [{}])[-1] if report.get("history") else {}
+                print(f"First failed pair: {sid}/{tid}, {status}; inner={last.get('inner', {})}. "
+                      f"{reproduction}", flush=True)
 
         def progress(plans, reports):
             # One bulk transfer only at checkpoint/terminal boundaries. Metrics
@@ -123,24 +152,19 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
                     total_pairs=len(selected_pairs), status=report["status"], last_iteration=record,
                     storage=saved["storage"])
 
-        solve_partial_batch(costs, kx, ky, keep_mass=mass, config=pc, on_step=progress)
+        try:
+            solve_partial_batch(costs, kx, ky, keep_mass=mass, config=pc, on_step=progress)
+        except BaseException:
+            save_report("interrupted_or_failed")
+            raise
         elapsed = time.perf_counter() - batch_start
         log.event("pair_batch_finished", batch=offset // size, pairs=len(batch),
             successful_pairs=len(done)-batch_done, failed_pairs=len(failed_members),
             batch_seconds=elapsed, pairs_per_second=len(batch)/elapsed,
             timing_includes="cost construction, solver, validation, checkpoint and artifact I/O")
         print(f"Pairs {len(done)}/{len(selected_pairs)} accepted; {len(failures)} failed this attempt", flush=True)
-    elapsed = time.perf_counter() - started
-    report = dict(device=str(x.device), pair_batch_size=size, attempted_pairs=len(pending),
-        successful_pairs=len(done)-initial_done, previously_completed_pairs=initial_done,
-        failed_pairs=len(failures), elapsed_seconds=elapsed,
-        failures=[{k: v for k, v in row.items() if k != "report"} for row in failures],
-        resume_policy="Reuse registered successful pairs; restart unfinished/failed pairs from exact float64 feasible initialization.")
-    write_json(directory / "pair_batch_report.json", report)
-    log.write_json("pair_batch_report.json", report)
-    manifest.update(pair_count=len(done), failed_pair_count=len(failures))
-    if index_path.exists():
-        manifest["pair_inventory"] = _file_entry(directory, index_path)
+        save_report("running")
+    save_report("failed" if failures else "completed")
     if failures:
         raise RuntimeError(f"{len(failures)} partial pairs failed; {len(done)} successful pairs saved. "
                            f"See {directory / 'pair_failures.jsonl'} and pair_batch_report.json.")

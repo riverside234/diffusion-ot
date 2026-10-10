@@ -13,7 +13,7 @@ solver:
   max_outer_steps: 300
   max_inner_steps: 10000
 projection:
-  bandwidth_multiplier: 1.0
+  bandwidth_multiplier: 0.5  # Fit h=0.4 -> projection h=0.2.
   selection: mean
   top_k_images: null
   seed: 0

@@ -1,7 +1,7 @@
 # Storage-efficient experiment: 2000 seeded images/domain; 8 saved pairs/source.
 mode: grouped_partial
 device: cuda
-pair_batch_size: 256  # Independent exact [B,196,196] partial InfoOT solves; null = serial POT.
+pair_batch_size: 1024  # Independent exact [B,196,196] partial InfoOT solves; null = serial POT.
 pair_checkpoint_every: 10  # Outer iterations; first and every terminal state are always saved.
 source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
@@ -10,9 +10,9 @@ sampling:
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
 solver:  # Balanced IMAGE router; separate from partial.solver below.
-  h: 0.4
+  h: 0.35  # Less image-KDE smoothing after test2's near-uniform router.
   lam: 0.075
-  reg: 0.075
+  reg: 0.06  # Between the previous .05 and over-diffuse .075 recipes.
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000
@@ -20,11 +20,11 @@ solver:  # Balanced IMAGE router; separate from partial.solver below.
   feasibility_tolerance: 1.0e-8
   outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
-  keep_mass: 0.75  # Provisional: retain 75% of pair mass, NOT exactly 75% of patches.
-  solver:  # Exact PARTIAL patch-pair InfoOT; conservative starting point pending lab validation.
+  keep_mass: 0.80  # Preserve more condition coverage; transported mass, NOT a patch count.
+  solver:  # Exact PARTIAL patch-pair InfoOT; visual quality still needs lab validation.
     h: 0.45
-    lam: 0.05
-    reg: 0.075
+    lam: 0.025  # Reduce MI amplification of cost contrast after the first update.
+    reg: 0.10
     cost_scale: mean
     max_outer_steps: 600
     max_inner_steps: 10000
@@ -33,7 +33,7 @@ partial:
     mass_tolerance: 1.0e-8
     outer_tolerance: 1.0e-7
 projection:
-  bandwidth_multiplier: 0.5  # Projection h: image 0.20, partial patches 0.225; fit bandwidths stay unchanged.
+  bandwidth_multiplier: 0.5  # Projection AND pair-selection h: image .175; patches .225.
   selection: mean
   top_k_images: null
   seed: 0
@@ -41,9 +41,9 @@ projection:
   confidence:
     support_calibration: fit_leave_one_out_log_density
     support_quantile: 0.01  # Fit-only heuristic, not semantic correctness.
-    threshold: 0.10  # Provisional weak-condition filter; inspect mapping_report threshold coverage.
+    threshold: 0.05  # Coverage-first baseline; compare .10 on the same validation images.
     mass_floor: 1.0e-12
     all_invalid_policy: error
 resources:
-  max_working_gib: 24  # Includes cached kernels and batched float64 solver/autograd workspace.
+  max_working_gib: 48  # B=1024 estimate ~35.2 GiB; allow workspace on the 80-GB lab GPU.
   max_plan_gib: 64

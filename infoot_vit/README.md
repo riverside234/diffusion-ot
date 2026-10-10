@@ -15,6 +15,12 @@ per training source. Both use sampled InfoOT, 2,000 train images/domain
 storage budgets. The balanced 256/1024 recipe estimates 4.35 GB under a 5 GB
 guard; the partial experiment retains its 4 GB guard. Use
 `infoot_fit_lowrank.py`; dense modes remain available.
+The balanced recipe uses full-scale OPRF kernel features and rejects excessive
+Gaussian/density approximation errors before transport fitting. Run
+`infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --kernel-check-only`
+to save diagnostics and a bounded exact-Gaussian comparison first. This does
+not change the partial experiment's kernel method; see the low-rank README
+for thresholds, comparison methods and continuation commands.
 
 All current `infoot_vit/configs/*.yaml` select **`device: cuda`**. The device
 applies to routers, kernels, transport solvers and mapping. Use `--device cpu`
@@ -130,27 +136,35 @@ these estimates are neither measured peak memory nor a disk reservation.
 
 ### Exact GPU batches for the top-8 experiment
 
-The 2026-10-10 top-8 log stopped in the **balanced image router**, before any
-partial patch pairs were fitted. All inner solves passed; the outer residual was
-`1.12e-5` against `1e-7` at the 300-step budget. The revised starting recipe is:
+The latest `results/vit_infoot_top8/test2` run passed the image router in 141
+iterations, but all 9,797 recorded pairs exhausted the inner 10,000-step budget.
+Passing mass/capacity checks alone did not establish an optimal partial plan.
+The batched solver now groups each capacity projection with fixed mass, using
+exact log-domain dual block updates. The revised experimental recipe is:
 
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
-| Image router: `solver` | 0.40 | 0.075 | 0.075 | 1,200 |
-| Partial patch pairs: `partial.solver` | 0.45 | 0.075 | 0.05 | 600 |
+| Image router: `solver` | 0.35 | 0.06 | 0.075 | 1,200 |
+| Partial patch pairs: `partial.solver` | 0.45 | 0.10 | 0.025 | 600 |
 
-Strict convergence, capacity and mass tolerances remain unchanged. The partial
-settings, `partial.keep_mass: 0.75` and confidence `threshold: 0.10` are **provisional**:
-the failed lab run has no patch-fit or mapping evidence. A small CPU numerical
-probe supports the gentler partial MI/entropy balance; it does not establish
-image quality. `keep_mass` specifies transported mass, not a fixed number of
-valid patches. The threshold filters smoothed query confidence after support
-checks, separately from top-8 discarded routing mass. Neither affects router
-convergence. See [the run analysis](../docs/analysis/vit_infoot_top8_300/README.md).
+Strict log-plan, outer, capacity and mass tolerances remain unchanged; the
+partial inner solver additionally checks a relative primal-dual gap of `1e-10`.
+The router was overly diffuse: mean effective targets 1,943/2,000 and mean top-8
+retained probability only 0.445%. Narrower image kernels and less image entropy
+are proposed to improve selectivity. Patch MI pressure is reduced separately.
+`partial.keep_mass: 0.80` and confidence `threshold: 0.05` are **coverage-first
+starting values, not visually validated optima**. No successful patch mapping
+was produced by test2. Mass is not a patch count; threshold filters smoothed
+query confidence and does not fix solver convergence or top-8 discarded mass.
+See [the test2 analysis](../docs/analysis/vit_infoot_top8_test2/README.md), and
+[the earlier router failure](../docs/analysis/vit_infoot_top8_300/README.md).
 
 The top-8 dense partial recipe uses `projection.bandwidth_multiplier: 0.5`:
-projection `h` is 0.20 for the image router and 0.225 for patch pairs, while fit
-`h` remains 0.40/0.45. This setting is stored in new mapping artifacts; editing
+projection `h` is 0.175 for the image router and 0.225 for patch pairs, while fit
+`h` is 0.35/0.45. **New pair selection uses the same image projection bandwidth
+as mapping** (previously it incorrectly used the broader fitting bandwidth).
+Selection records its bandwidth and retained/discarded routing mass in
+`pair_selection.json` and `pair_selection_report.json`. This setting is stored in new mapping artifacts; editing
 the YAML does not change existing fits or their resume fingerprints. With
 `--generate`, `infoot_test.py` defaults to 40 Euler steps and guidance 2.0 for
 `grouped_partial`. Explicit `--steps`/`--guidance` overrides remain supported;
@@ -183,32 +197,38 @@ value. That sweep does not generate extra images or choose a threshold. Use
 validation to select it, then keep it fixed for test; keep the explicit
 all-invalid error policy.
 
-`grouped_partial.yaml` now sets **`device: cuda`**, **`pair_batch_size: 256`**,
+`grouped_partial.yaml` now sets **`device: cuda`**, **`pair_batch_size: 1024`**,
 and `pair_checkpoint_every: 10`. Selected pairs are fitted as `[B,196,196]`
 costs, cached per-image kernels, plans and solver updates. The last batch uses
 its actual size. Batching preserves patch features, sampling, router selection,
 per-pair mean cost scaling and the configured bandwidths, MI, entropy and transported mass. This is
 the **dense** experiment; the separate low-rank experiments are unchanged.
 
-POT 0.9.7's log-domain partial routine accepts one cost matrix. The batched
-implementation reuses PyTorch's batched matmul, reductions and the shared MI
-autodiff, and lifts POT's three log-domain Dykstra projections to a leading pair
-axis: row capacities, column capacities, fixed mass. It does not approximate
+POT 0.9.7's log-domain partial routine accepts one cost matrix and remains the
+serial reference. Its three-set Dykstra loop can be very slow near saturated
+supports. The batched implementation reuses PyTorch's matmul, reductions, sorting
+and shared MI autodiff. Each row/mass and column/mass block uses exact capped
+log water filling, with vector inequality potentials and one mass multiplier.
+It solves the same entropic partial subproblem, with no change to the InfoOT
+MI, cost scaling, entropy or feasible set. It does not approximate
 plans/kernels or substitute balanced marginals for partial constraints. Only the
 existing `keep_mass: 1` control uses balanced log-Sinkhorn, as in the serial
-reference. Inner stopping is checked at POT's original iterations 1, 11, 21,
+reference. Inner stopping is checked at iterations 1, 11, 21,
 etc.; a single host check per ten updates replaces per-pair synchronization.
 Converged/failed inner states are frozen on device. Outer iterations compact
 the remaining active pairs and retain independent full-objective line searches.
 
-Each pair records its inner error/count, mass/cap residuals, outer count,
+Each pair records its inner error/count, primal-dual gap, mass/cap residuals, outer count,
 objective terms, accepted step and status. A failed member does not cancel its
 neighbors or later batches. A converged member is atomically saved, reloaded,
 validated and durably journaled immediately, then its redundant `latest.pt` is
 removed. Nonconvergence is never registered as a successful fit. The overall
 run fails after processing all batches if any pair failed; details remain in
 `pair_failures.jsonl` and `pair_batch_report.json`. Save/validation failures also
-retain the checkpoint and allow other members to finish.
+retain the checkpoint and allow other members to finish. The first failed pair
+also saves exact float64 cost/kernel inputs in the attempt's
+`first_failed_pair.pt` for reproduction without copying full banks. Batch
+summaries are refreshed after every batch and on solver/callback interruption.
 
 Per-pair iteration metrics are logged every outer iteration. Float32 checkpoints
 are written at the first step, every ten steps, and every terminal state;
@@ -220,14 +240,14 @@ their original feasible initialization, preserving the existing recovery policy;
 quantized checkpoints are diagnostics, not silently repaired warm starts.
 Registered successful pairs are validated and reused without refitting.
 
-The resource estimate for 2,000 images/domain, 196 patches and B=256 is about
-**17.70 GiB working memory** (conservative workspace allowance), with a
-**24 GiB configured limit**. Active checkpoints/temporary plans add about
-75 MiB; required plan/kernel storage is about 3.52 GiB before logs, file/container
+The resource estimate for 2,000 images/domain, 196 patches and B=1024 is about
+**35.21 GiB working memory** (conservative workspace allowance), with a
+**48 GiB configured limit** for the 80-GB lab GPU. Active checkpoints/temporary plans add about
+300 MiB; required plan/kernel storage is about 3.74 GiB before logs, file/container
 overhead and failed checkpoints. These are estimates, not measured GPU peaks.
 
 ```bash
-# Default: CUDA, 256 pairs, a fresh fit directory.
+# Default: CUDA, 1,024 pairs, a fresh fit directory.
 python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --dry-run
 python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml
 
@@ -242,7 +262,7 @@ python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml
 python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --resume outputs/infoot_vit/<fit-directory>
 
 # Lab CUDA benchmark: identical seeded synthetic pairs, including MI.
-python infoot_vit/benchmark_partial_batch.py --pairs 256 --pair-batch-size 256 --repeats 3 --output outputs/infoot_vit/partial_batch_benchmark.json
+python infoot_vit/benchmark_partial_batch.py --pairs 1024 --pair-batch-size 1024 --repeats 3 --output outputs/infoot_vit/partial_batch_benchmark.json
 ```
 
 Missing/null `pair_batch_size` or `--serial-pairs` keeps the serial reference.

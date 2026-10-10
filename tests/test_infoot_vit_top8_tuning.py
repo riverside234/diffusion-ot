@@ -72,7 +72,7 @@ def test_revised_partial_recipe_matches_serial_and_preserves_constraints():
         assert report["history"][-1]["objective"] == pytest.approx(reference["history"][-1]["objective"], abs=1e-9)
         assert report["mass_error"] <= pc["mass_tolerance"]
         assert max(report["row_cap_error"], report["column_cap_error"]) <= pc["feasibility_tolerance"]
-        assert float(plans[i].sum()) == pytest.approx(.75, abs=pc["mass_tolerance"])
+        assert float(plans[i].sum()) == pytest.approx(mass, abs=pc["mass_tolerance"])
 
 
 def test_counterfactual_threshold_coverage_does_not_change_mapping():
