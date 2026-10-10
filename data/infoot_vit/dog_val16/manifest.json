@@ -1,0 +1,71 @@
+{
+  "artifact_id": "795b83b2e9996ac48c1dffd26c4fa155fd3558138d52dde526ea8cf356823f75",
+  "domain": "dog",
+  "ids": [
+    "afhq_dog_000001",
+    "afhq_dog_000007",
+    "afhq_dog_000008",
+    "afhq_dog_000026",
+    "afhq_dog_000029",
+    "afhq_dog_000044",
+    "afhq_dog_000060",
+    "afhq_dog_000074",
+    "afhq_dog_000078",
+    "afhq_dog_000079",
+    "afhq_dog_000087",
+    "afhq_dog_000088",
+    "afhq_dog_000109",
+    "afhq_dog_000114",
+    "afhq_dog_000119",
+    "afhq_dog_000121"
+  ],
+  "provenance": {
+    "data_config": "/data/not_backed_up/yxu209/diffusion-ot/configs/data/afhq_pdae_v2_l.yaml",
+    "extraction_dtype": "float32",
+    "manifest": "/data/not_backed_up/yxu209/diffusion-ot/data/manifests/dog_val.jsonl",
+    "manifest_sha256": "b65f03b9e50b70bade2b0b3112332c844ffed2b8e44e4e8590b7143ff2a2d716",
+    "max_images": 16,
+    "sampling": null,
+    "saved_dtype": "float32",
+    "selection": "sorted_stable_ids",
+    "train_config": "/data/not_backed_up/yxu209/diffusion-ot/configs/stage1a_pdae_v2_l/dog.yaml"
+  },
+  "representation": {
+    "dim": 768,
+    "encoder": {
+      "files": {
+        "config.json": "fe8b5fe6d5734360678fd71c11c21e1ea3364bd8598d34295d9206335973ffd7",
+        "model.safetensors": "612923381c76ec5a9bed335d1c48827e3f2e506ac31b044b63b2031fadee6a0b",
+        "preprocessor_config.json": "9b36b57ebaf20f09bf4c22100ccc21877ea6bfe5aead0c00c59f8af8ccefacfc"
+      },
+      "model_id": "google/siglip2-base-patch16-224",
+      "revision": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
+    },
+    "grid": [
+      14,
+      14
+    ],
+    "layer": "last_hidden_state_post_layernorm",
+    "normalization": "none",
+    "patch_order": "row_major_no_special_tokens",
+    "preprocessing": {
+      "augmentation": "none",
+      "center_crop": true,
+      "rgb_image_size": 256,
+      "rgb_range": [
+        -1,
+        1
+      ],
+      "siglip_processor": "snapshot_pil_do_rescale_false"
+    }
+  },
+  "schema": "siglip_patch_bank_v1",
+  "shards": [
+    {
+      "count": 16,
+      "file": "features_00000.pt",
+      "sha256": "77df3a5d376e8e90233487bf752a5274545dce848352730e5a1f2f878329c0d5"
+    }
+  ],
+  "split": "val"
+}

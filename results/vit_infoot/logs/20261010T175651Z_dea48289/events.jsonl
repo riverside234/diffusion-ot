@@ -1,0 +1,2 @@
+{"event": "run_started", "timestamp": "2026-10-10T17:56:51.400522+00:00", "elapsed_seconds": 0.0024129119992721826, "operation": "lowrank_grouped_fit"}
+{"event": "run_finished", "timestamp": "2026-10-10T17:59:50.680553+00:00", "elapsed_seconds": 179.2824438950047, "status": "failed"}

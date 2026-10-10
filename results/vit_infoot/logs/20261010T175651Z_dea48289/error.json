@@ -1,0 +1,4 @@
+{
+  "error_type": "RuntimeError",
+  "message": "Image router did not converge; diagnostics retained."
+}

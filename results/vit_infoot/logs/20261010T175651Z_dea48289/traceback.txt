@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/lowrank/experiment.py", line 149, in fit
+    if image.state["status"] != "converged": raise RuntimeError("Image router did not converge; diagnostics retained.")
+RuntimeError: Image router did not converge; diagnostics retained.

@@ -1,0 +1,92 @@
+{
+  "command": [
+    "infoot_vit/infoot_fit_lowrank.py",
+    "--config",
+    "infoot_vit/configs/grouped_patch_lowrank.yaml",
+    "--source-bank",
+    "data/infoot_vit/cat_train_4000",
+    "--target-bank",
+    "data/infoot_vit/dog_train_4000"
+  ],
+  "elapsed_seconds": 179.28205113401054,
+  "error": "Image router did not converge; diagnostics retained.",
+  "error_type": "RuntimeError",
+  "finished_at": "2026-10-10T17:59:50.680177+00:00",
+  "metadata": {
+    "requested": {
+      "device": "cuda",
+      "estimator": {
+        "audit_samples": 32768,
+        "exact": false,
+        "samples_per_row": 2,
+        "seed": 4202
+      },
+      "image_solver": {
+        "cost_scale": "mean",
+        "h": 0.4,
+        "lam": 0.1,
+        "max_inner_steps": 10000,
+        "max_outer_steps": 300,
+        "reg": 0.05
+      },
+      "kernel": {
+        "check_pairs": 4096,
+        "density_queries": 32,
+        "error_warn_relative_rmse": 0.5,
+        "h": 0.4,
+        "seed": 4201
+      },
+      "kernel_rank": 256,
+      "mode": "grouped_patch_lowrank",
+      "optimizer": {
+        "audit_every": 10,
+        "checkpoint_every": 10,
+        "chunk_size": 4096,
+        "constraint_tolerance": 1e-08,
+        "lam": 0.1,
+        "log_every": 1,
+        "log_floor": 1e-300,
+        "max_backtracks": 12,
+        "max_steps": 300,
+        "min_g": 1e-10,
+        "objective_tolerance": 1e-12,
+        "projection_iterations": 10000,
+        "projection_tolerance": 1e-12,
+        "reg": 0.05,
+        "seed": 4203,
+        "stationarity_tolerance": 1e-06,
+        "step_size": 1.0
+      },
+      "projection": {
+        "bandwidth_multiplier": 1.0,
+        "patch_chunk_size": 64,
+        "query_chunk_size": 1,
+        "seed": 42,
+        "selection": "mean",
+        "target_chunk_size": 8,
+        "top_k_images": null
+      },
+      "resources": {
+        "max_artifact_bytes": 4000000000,
+        "max_working_gib": 64
+      },
+      "sampling": {
+        "images_per_domain": 2000,
+        "seed": 42
+      },
+      "source_bank": "data/infoot_vit/cat_train_4000",
+      "target_bank": "data/infoot_vit/dog_train_4000",
+      "threads": 4,
+      "transport_rank": 256
+    },
+    "resume": "None"
+  },
+  "operation": "lowrank_grouped_fit",
+  "platform": "Linux-6.8.0-146-generic-x86_64-with-glibc2.39",
+  "python": "3.10.22",
+  "run_id": "20261010T175651Z_dea48289",
+  "schema": "infoot_run_log_v1",
+  "started_at": "2026-10-10T17:56:51.398175+00:00",
+  "status": "failed",
+  "working_directory": "/data/not_backed_up/yxu209/diffusion-ot"
+}
