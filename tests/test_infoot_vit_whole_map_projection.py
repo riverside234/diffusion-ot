@@ -96,9 +96,9 @@ def test_new_override_cannot_change_saved_pairs_or_approximate_kernels(mode):
     assert c == before
 
 
-def test_whole_map_config_lowers_mi_weight_and_requests_projection_point_one():
+def test_whole_map_config_restores_mi_weight_and_requests_projection_point_one():
     c = validate_config(yaml.safe_load((infoot_test.ROOT / "infoot_vit/configs/whole_map.yaml").read_text()))
-    assert (c["solver"]["h"], c["solver"]["reg"], c["solver"]["lam"]) == (.35, .06, .065)
+    assert (c["solver"]["h"], c["solver"]["reg"], c["solver"]["lam"]) == (.35, .06, .075)
     assert c["solver"]["max_outer_steps"] >= 638
     assert c["solver"]["h"] * c["projection"]["bandwidth_multiplier"] == pytest.approx(.1)
     assert c["projection"]["top_k_images"] is None and c["projection"]["selection"] == "mean"
