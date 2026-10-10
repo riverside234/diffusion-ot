@@ -19,6 +19,7 @@ from .storage import validate_plan, load_kernels, VERSION as STORAGE_VERSION
 from .pair_selection import selection_edges
 from .sampling import sample_ids, sampling_record
 from .device import resolve_device, move
+from .mapping_manifest import load_mapping_manifest
 
 
 @dataclass
@@ -132,12 +133,19 @@ class FeatureMapper:
                     raise ValueError("Pair inventory indices do not match its stable IDs.")
                 checked_file(directory, entry)  # Verify every referenced shard before using the mapper.
                 self.pairs[key] = entry
-            if set(self.pairs) != expected or manifest["pair_count"] != len(expected):
+            failed = {(row["source_id"], row["target_id"])
+                      for row in manifest.get("incomplete_fit", {}).get("failures", [])}
+            successful = set(self.pairs)
+            if (successful | failed != expected or successful & failed
+                    or manifest["pair_count"] != len(successful)):
                 raise ValueError("Incomplete or unexpected selected pair bank; intentionally excluded pairs need no file, selected pairs do. Projection never fits missing pairs.")
-            self.neighbors = {sid: [tid for tid in target.ids if (sid, tid) in expected] for sid in source.ids}
+            self.neighbors = {sid: [tid for tid in target.ids if (sid, tid) in successful] for sid in source.ids}
             self.pair_mask = torch.zeros(len(source.ids), len(target.ids), dtype=torch.bool,device=self.device)
-            for sid, tid in expected:
+            for sid, tid in successful:
                 self.pair_mask[self.source_index[sid], self.target_index[tid]] = True
+            self.failed_pair_mask = torch.zeros_like(self.pair_mask)
+            for sid, tid in failed:
+                self.failed_pair_mask[self.source_index[sid], self.target_index[tid]] = True
             kernel_state = torch.load(checked_file(directory, manifest["pair_kernels"]), weights_only=True)
             if manifest["schema"] == "siglip_infoot_mapping_v3" and kernel_state.get("storage", {}).get("version") != STORAGE_VERSION:
                 raise ValueError("Compact mappings require float32 kernel storage metadata.")
@@ -156,17 +164,19 @@ class FeatureMapper:
                 self.projection_ky = torch.stack([
                     torch.exp(-.5 * (distance(y, y) / (self.shared["sy"][j] * self.shared["h_projection"])).square())
                     for j, y in enumerate(self.y)])
+            if failed:
+                # Verify ALL registered successes before permitting an incomplete
+                # fit, even if top-k routing will not use some of them.
+                for sid, tid in self.pairs:
+                    self._pair(sid, tid)
 
     @classmethod
-    def load(cls, directory, *, device=None, projection=None, run_log=None):
+    def load(cls, directory, *, device=None, projection=None, run_log=None, allow_failed_pairs=False):
         directory = Path(directory).resolve()
-        m = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        m = load_mapping_manifest(directory, allow_failed_pairs=allow_failed_pairs)
         if m.get("schema") in {"siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
             from infoot_vit.lowrank.mapping import LowRankMapper
             return LowRankMapper.load(directory,device=device,projection=projection,run_log=run_log)
-        if (m.get("schema") not in {"siglip_infoot_mapping_v2", "siglip_infoot_mapping_v3"} or m.get("status") != "complete"
-                or digest({k: v for k, v in m.items() if k != "artifact_id"}) != m.get("artifact_id")):
-            raise ValueError("Mapping artifact is incomplete, legacy, or its manifest fingerprint changed.")
         resolve_device(device if device is not None else m["config"].get("device","cpu"))
         banks = [FeatureBank.load(directory / m[key]["path"]) for key in ("source_bank", "target_bank")]
         for i, (key, bank) in enumerate(zip(("source_bank", "target_bank"), banks)):
@@ -185,7 +195,17 @@ class FeatureMapper:
             elif ids != bank.ids:
                 raise ValueError("Referenced bank ordered IDs changed.")
         compatible_banks(*banks)
-        return cls(directory, m, *banks,device=device,projection=projection)
+        mapper = cls(directory, m, *banks,device=device,projection=projection)
+        if "incomplete_fit" in m:
+            if file_hash(directory / "manifest.json") != m["incomplete_fit"]["original_manifest_sha256"]:
+                raise ValueError("Fit changed while validating successful pairs; stop fitting before testing failed pairs.")
+            if run_log is not None:
+                run_log.write_json("incomplete_fit_snapshot.json", m)
+                run_log.event("incomplete_fit_loaded", **m["incomplete_fit"])
+            print(f"Testing successful pair subset: {m['incomplete_fit']['successful_pair_count']}/"
+                  f"{m['incomplete_fit']['selected_pair_count']}; skipped {m['incomplete_fit']['failed_pair_count']} failed pairs. "
+                  "Original fit remains failed.", flush=True)
+        return mapper
 
     def _pair(self, sid, tid):
         if (sid, tid) not in self.pairs:
@@ -287,18 +307,25 @@ class FeatureMapper:
                         if not torch.allclose(theta.sum(0), alpha, atol=1e-10, rtol=1e-10):
                             raise ValueError("Pair routing does not reproduce image weights.")
                         retained_pairs = float(theta[self.pair_mask].sum())
+                        failed_mask = getattr(self, "failed_pair_mask", None)
+                        failed_mass = float(theta[failed_mask].sum()) if failed_mask is not None else 0.
                         if not math.isfinite(retained_pairs) or retained_pairs <= settings["confidence"]["mass_floor"]:
-                            raise ValueError(f"No usable saved-pair routing mass for {query_id}; excluded pairs are never fitted during mapping.")
+                            raise ValueError(f"No usable saved-pair routing mass for {query_id}; failed_pair_discarded_routing_mass={failed_mass:.6g}. "
+                                             "Excluded/failed pairs are never fitted during mapping.")
                         # Pair pruning is routing truncation, not partial-OT rejection.
                         theta = theta.masked_fill(~self.pair_mask, 0.) / retained_pairs
                         alpha = theta.sum(0)
                         entropy = float(-(alpha * alpha.clamp_min(1e-300).log()).sum())
-                        detail.update(fit_pair_retained_routing_mass=retained_pairs,
-                            fit_pair_discarded_routing_mass=max(0., 1. - retained_pairs),
+                        detail.update(fit_pair_retained_routing_mass=retained_pairs + failed_mass,
+                            fit_pair_discarded_routing_mass=max(0., 1. - retained_pairs - failed_mass),
                             routing_renormalization=1. / retained_pairs,
                             image_weights_before_pair_pruning=detail["image_weights"], image_weights=alpha.tolist(),
                             image_entropy=entropy, image_effective_targets=math.exp(entropy), image_max_weight=float(alpha.max()),
                             image_normalized_entropy=entropy / math.log(len(alpha)) if len(alpha) > 1 else 0.)
+                        if "incomplete_fit" in self.manifest:
+                            detail.update(failed_pair_discarded_routing_mass=failed_mass,
+                                successful_pair_retained_routing_mass=retained_pairs,
+                                total_pair_discarded_routing_mass=max(0., 1. - retained_pairs))
                         feature_sum, confidence = torch.zeros_like(patches), patches.new_zeros(p)
                         rejected_ot, support_invalid = torch.zeros_like(confidence), torch.zeros_like(confidence)
                         invalid_routes = torch.zeros_like(confidence)
@@ -357,6 +384,8 @@ class FeatureMapper:
                                dict(queries=records, seconds=time.perf_counter() - start, mode=self.mode,device=str(self.device),
                                     mapped_variance=float(torch.stack(outputs).flatten(0, 1).var(0, unbiased=False).mean()),
                                     note="Feature diagnostics are not independent image-quality validation."))
+        if "incomplete_fit" in self.manifest:
+            result.diagnostics["incomplete_fit"] = self.manifest["incomplete_fit"]
         # Enforce the chosen all-invalid policy at the public boundary.
         result.conditioning(query_ids, all_invalid_policy=cf["all_invalid_policy"])
         return result if return_metadata else result.mapped_features
@@ -372,6 +401,8 @@ class FeatureMapper:
         context = RunLog(output, "mapping", metadata=dict(mapper_id=self.manifest["artifact_id"],
             query_bank_id=bank.artifact_id, mode=self.mode)) if run_log is None else nullcontext(run_log)
         with context as log:
+            if "incomplete_fit" in self.manifest:
+                log.write_json("incomplete_fit_snapshot.json", self.manifest)
             if getattr(self, "projection_kernel_report", None) is not None:
                 log.write_json("projection_kernel_quality.json", self.projection_kernel_report)
             compatible_banks(self.source, bank, fitting=False)
@@ -404,10 +435,12 @@ class FeatureMapper:
         manifest = dict(schema="infoot_mapped_features_v2", mapper_id=self.manifest["artifact_id"],
             projection_implementation_sha256=file_hash(Path(__file__)),
             projection_dependency_sha256={name: file_hash(Path(__file__).with_name(name))
-                for name in ("conditional.py", "partial.py", "feature_bank.py", "storage.py", "pair_selection.py", "device.py")},
+                for name in ("conditional.py", "partial.py", "feature_bank.py", "storage.py", "pair_selection.py", "device.py", "mapping_manifest.py")},
             mode=self.mode, query_bank_id=bank.artifact_id, ids=ids, query_domain=bank.manifest["domain"],
             representation=bank.representation, projection=self.config["projection"],
             output=dict(file="mapped.pt", sha256=file_hash(path)), diagnostics=result.diagnostics)
+        if "incomplete_fit" in self.manifest:
+            manifest["incomplete_fit"] = self.manifest["incomplete_fit"]
         manifest["artifact_id"] = digest(manifest)
         write_json(output / "manifest.json", manifest)
         return manifest
@@ -451,6 +484,13 @@ def mapping_summary(result, query, source, target, *, confidence_settings=None):
     if discarded:
         report["fit_pair_discarded_routing_mass"] = dict(min=min(discarded), mean=sum(discarded)/len(discarded), max=max(discarded))
         report["routing_note"] = "Confidence/rejection are conditional on renormalized saved routes. Discarded routing mass is reported separately."
+    if "incomplete_fit" in result.diagnostics:
+        report["incomplete_fit"] = result.diagnostics["incomplete_fit"]
+        for key in ("failed_pair_discarded_routing_mass", "successful_pair_retained_routing_mass", "total_pair_discarded_routing_mass"):
+            values = [row[key] for row in result.diagnostics["queries"]]
+            report[key] = dict(min=min(values), mean=sum(values)/len(values), max=max(values))
+        report["routing_note"] = ("After image top-k/selection: intentionally excluded + failed + successful pair mass = 1. "
+            "Only successful routes are renormalized; partial-OT rejection/support confidence apply afterward.")
     if result.diagnostics["mode"] == "whole_map":
         rows = result.diagnostics["queries"]
         routing = {}

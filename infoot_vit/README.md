@@ -452,6 +452,46 @@ There is no calibration from held-out query data or hidden bandwidth sweep.
 The partial low-rank fit config still requires multiplier 1; its test-time
 override supports other positive multipliers using the saved basis.
 
+### Preview a dense partial fit with a few failed pairs
+
+Testing normally requires a complete fit. For a **stopped, failed batched
+`grouped_partial` fit**, `--allow-failed-pairs` explicitly permits inference
+using its registered successful pairs (for example, 1,587 successes out of
+1,600 selected pairs). No transport is fitted during testing:
+
+```bash
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<failed-fit-directory> --query-bank data/infoot_vit/cat_val --allow-failed-pairs --generate --steps 40 --guidance 2.0 --count 16
+```
+
+This also works with `--projection-bandwidth`, `--top-k-images` and
+`--confidence-threshold`. It does not change the original manifest's `failed`
+status or any fitted files, so the fit can still be resumed. All registered
+successes must pass file hashes, identities, convergence and plan-constraint
+validation. Missing selected pairs must **exactly** match the final
+`pair_batch_report.json` and its `pair_failures.jsonl` journal. Unknown missing
+files, corrupted successes, active/interrupted fits and failed low-rank fits
+are not accepted by this option. A metadata-only `--dry-run` checks coverage
+and identities, but full numerical/file validation occurs on actual loading.
+
+After image top-k/selection, routing mass is partitioned into:
+
+- `fit_pair_discarded_routing_mass`: pairs intentionally excluded at fitting.
+- `failed_pair_discarded_routing_mass`: selected pairs with recorded failures.
+- `successful_pair_retained_routing_mass`: usable, validated saved pairs.
+
+These sum to one. Only successful routes are renormalized; partial-OT rejection
+and support-confidence masking are evaluated afterward. A query with no usable
+successful routing mass errors, even with the all-invalid-mask bypass enabled.
+The failed-pair count fraction alone does not measure its effect on a query;
+inspect the per-query discarded routing mass and matched validation images.
+
+`logs/<run>/incomplete_fit_snapshot.json` preserves the read-only snapshot and
+its separate mapper identity. The mapped manifest, `mapping_report.json` and
+`generation_report.json` label the result with `incomplete_fit` provenance;
+the latter also lists failed-pair discarded mass by query ID. A later complete
+fit has a different mapper identity. Its historical failure journal does not
+cause recovered pairs to be skipped.
+
 All fitting and projection arithmetic uses float64 on the configured CUDA/CPU
 device. Saved feature banks stay float32 and mapped features return to the query
 dtype/device. Lower-precision fitting is not enabled.

@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import torch
 from infoot_vit.infoot_helper.feature_bank import FeatureBank, digest
 from infoot_vit.infoot_helper.mapping import FeatureMapper
+from infoot_vit.infoot_helper.mapping_manifest import load_mapping_manifest
 from infoot_vit.infoot_helper.run_logging import RunLog
 
 
@@ -43,6 +44,8 @@ def main(argv=None):
                    help="Absolute image-router projection h (patch h for patch_global). The same multiplier scales patch kernels; saved plans stay fixed.")
     p.add_argument("--top-k-images", type=int,
                    help="Retain and renormalize K target-image weights; 0 keeps all. Partial modes still use saved pairs only.")
+    p.add_argument("--allow-failed-pairs", action="store_true",
+                   help="Test successful pairs from a failed batched grouped_partial fit; record skipped routing mass without modifying the fit.")
     a = p.parse_args(argv)
     if min(a.count, a.chunk_size, a.threads) < 1 or (a.steps is not None and a.steps < 1):
         p.error("Counts, chunk size, threads and steps must be positive")
@@ -55,7 +58,7 @@ def main(argv=None):
     torch.set_num_threads(a.threads)
     if a.dry_run:
         # Validate small metadata before allocating supports/kernels or the DiT.
-        m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
+        m = load_mapping_manifest(a.mapping, allow_failed_pairs=a.allow_failed_pairs)
         a.steps, a.guidance = generation_settings(m["config"]["mode"], a.steps, a.guidance)
         projection = projection_settings(m["config"], a.confidence_threshold,
             bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images)
@@ -68,14 +71,14 @@ def main(argv=None):
                         or digest({k: v for k, v in fit_bank.items() if k != "artifact_id"}) != fit_bank["artifact_id"]):
                     raise ValueError("Fit bank identity changed.")
                 training_ids.update(fit_bank["ids"])
-        if (m["status"] != "complete" or m["representation"] != q["representation"] or q["split"] == "train"
+        if (m["representation"] != q["representation"] or q["split"] not in {"val", "test"}
                 or m["source_domain"] != q["domain"] or set(q["ids"]) & training_ids
                 or digest({k:v for k,v in m.items() if k != "artifact_id"}) != m["artifact_id"]
                 or digest({k:v for k,v in q.items() if k != "artifact_id"}) != q["artifact_id"]):
             raise ValueError("Need completed mapper and compatible held-out query bank")
         print(json.dumps(dict(mapper_id=m["artifact_id"], mode=m["config"]["mode"], fit_resources=m["resources"],
             query_count=min(a.count, len(q["ids"])), mask="existing condition_padding_mask; True is padding",
-            generate=a.generate, projection=projection,
+            generate=a.generate, projection=projection, incomplete_fit=m.get("incomplete_fit"),
             sampling=dict(num_steps=a.steps, guidance_scale=a.guidance)), indent=2))
         return 0
     output = a.output_dir or ROOT / "results/infoot_vit" / f"{a.mapping.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:6]}"
@@ -85,7 +88,8 @@ def main(argv=None):
         projection = projection_settings(m["config"], a.confidence_threshold,
             bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images)
         # Set overrides BEFORE loading cached KDEs, factors and support thresholds.
-        mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log)
+        mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log,
+                                    allow_failed_pairs=a.allow_failed_pairs)
         bank = FeatureBank.load(a.query_bank)
         a.steps, a.guidance = generation_settings(mapper.mode, a.steps, a.guidance)
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)

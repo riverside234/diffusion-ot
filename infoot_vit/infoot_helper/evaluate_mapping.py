@@ -78,5 +78,9 @@ def generate(mapper, query_bank, result, output, *, root, train_config, eval_con
         projection=mapper.config["projection"],
         confidence_policy=mapper.config["projection"]["confidence"], target_domain=config["domain"],
         interpretation="No paired target ground truth. Feature metrics are not independent semantic validation.")
+    if "incomplete_fit" in mapper.manifest:
+        report["incomplete_fit"] = mapper.manifest["incomplete_fit"]
+        report["failed_pair_discarded_routing_mass"] = {
+            row["query_id"]: row["failed_pair_discarded_routing_mass"] for row in result.diagnostics["queries"]}
     write_json(output / "generation_report.json", report)
     return report
