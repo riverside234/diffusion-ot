@@ -5,10 +5,10 @@ source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
 solver:
   h: 0.35
-  lam: 0.075
+  lam: 0.065  # Source-correspondence ablation: reduce MI weight from 0.075.
   reg: 0.06
   # Explicit training-mean EUCLIDEAN cost normalization; raw feature values stay unchanged.
-  # Keep the converged 4,000-image fit; tune projection separately first.
+  # Keep h/reg fixed while testing lower MI weight; requires a fresh fit.
   cost_scale: mean
   max_outer_steps: 1200  # Reviewed run converged at 638; 300 stopped too early.
   max_inner_steps: 10000
