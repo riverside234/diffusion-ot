@@ -1,0 +1,29 @@
+{
+  "command": [
+    "infoot_vit/infoot_fit.py",
+    "--config",
+    "infoot_vit/configs/whole_map.yaml",
+    "--source-bank",
+    "data/infoot_vit/cat_train_4000",
+    "--target-bank",
+    "data/infoot_vit/dog_train_4000",
+    "--max-outer-steps",
+    "1200",
+    "--device",
+    "cuda"
+  ],
+  "elapsed_seconds": 767.9067699029983,
+  "finished_at": "2026-10-10T20:20:58.934309+00:00",
+  "metadata": {
+    "resume": null,
+    "root": "/data/not_backed_up/yxu209/diffusion-ot"
+  },
+  "operation": "fit",
+  "platform": "Linux-6.8.0-146-generic-x86_64-with-glibc2.39",
+  "python": "3.10.22",
+  "run_id": "20261010T200811Z_48bb45ae",
+  "schema": "infoot_run_log_v1",
+  "started_at": "2026-10-10T20:08:11.027599+00:00",
+  "status": "completed",
+  "working_directory": "/data/not_backed_up/yxu209/diffusion-ot"
+}
