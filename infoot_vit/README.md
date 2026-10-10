@@ -91,6 +91,35 @@ Every bank records train/val/test split, original sample records, image IDs,
 preprocessing, encoder file hashes and float32 storage. Existing output banks
 are never silently overwritten. Choose another `--output-dir` for a new bank.
 
+### Whole-map projection tuning without refitting
+
+The reviewed 4,000-image `whole_map` fit converged at iteration 638 with mean
+fitted-row top-1 weight 74.8%. Its held-out projection at h=0.21 was much more
+diffuse: median effective targets 1,895 and median top-1 weight 1.72%, with
+repetitive, blurred generation. See the [review and matched comparison commands](../docs/analysis/infoot_vit_whole_map_20261010/README.md).
+
+`configs/whole_map.yaml` keeps fit h=0.35, reg=0.06, lam=0.075, sets the outer
+budget to 1,200, and requests projection h=0.10 through multiplier `0.10/0.35`.
+This projection setting still needs visual validation. Reuse an existing fit
+with `infoot_test.py --projection-bandwidth 0.10`; editing the YAML alone does
+not change a saved mapping. The override is an absolute h, uses the saved
+training distance scales and target-density correction, and never fits a plan.
+It is recorded in each fresh mapping output and generation report.
+
+Compare 0.21/0.15/0.10 with the same validation bank, checkpoint and noise seed.
+Whole-map `--top-k-images 0` keeps all targets; `--top-k-images 4` keeps and
+renormalizes four weights, logging discarded mass. `--top-k-images 1` supplies
+one real target's complete feature map: a useful decoder/retrieval control,
+not evidence of source-preserving translation. The grid's top-1 reference row
+alone does not describe the all-target averaged condition used by default.
+The new overrides are restricted to `whole_map`; partial saved-pair selection
+and low-rank kernel acceptance remain unchanged.
+
+Whole-map logs now include actual projection h, source-neighborhood concentration,
+raw and selected target concentration, raw top-k mass, and mapped-to-target
+feature-spread ratios. Read these alongside generated images; balanced masks
+are all valid by construction and do not measure semantic correctness.
+
 ### Storage-efficient `grouped_partial`
 
 Only `grouped_partial` uses the sampling, sparse pair inventory, float32 disk

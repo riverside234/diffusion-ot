@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import argparse
 import json
+import math
 import sys
 import uuid
 
@@ -38,17 +39,26 @@ def main(argv=None):
     p.add_argument("--device",help="Mapping AND generation device; defaults to the saved experiment device.")
     p.add_argument("--confidence-threshold", type=float,
                    help="Partial mapping only: override token validity threshold without refitting. Recorded in mapped metadata.")
+    p.add_argument("--projection-bandwidth", type=float,
+                   help="Whole-map only: absolute projection h (e.g. 0.10); reuse the saved plan and training distance scales.")
+    p.add_argument("--top-k-images", type=int,
+                   help="Whole-map only: retain and renormalize K target weights; 0 keeps all, 1 is a target-code retrieval control.")
     a = p.parse_args(argv)
     if min(a.count, a.chunk_size, a.threads) < 1 or (a.steps is not None and a.steps < 1):
         p.error("Counts, chunk size, threads and steps must be positive")
     if a.confidence_threshold is not None and not 0 <= a.confidence_threshold <= 1:
         p.error("--confidence-threshold must be finite and in [0,1]")
+    if a.projection_bandwidth is not None and (not math.isfinite(a.projection_bandwidth) or a.projection_bandwidth <= 0):
+        p.error("--projection-bandwidth must be finite and positive")
+    if a.top_k_images is not None and a.top_k_images < 0:
+        p.error("--top-k-images must be nonnegative (0 keeps all)")
     torch.set_num_threads(a.threads)
     if a.dry_run:
         # Validate small metadata before allocating supports/kernels or the DiT.
         m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
         a.steps, a.guidance = generation_settings(m["config"]["mode"], a.steps, a.guidance)
-        projection = projection_settings(m["config"], a.confidence_threshold)
+        projection = projection_settings(m["config"], a.confidence_threshold,
+            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images)
         q = json.loads((a.query_bank / "manifest.json").read_text(encoding="utf-8"))
         training_ids = set(m["source_ids"]) | set(m["target_ids"])
         if m.get("schema") in {"siglip_infoot_mapping_v3", "siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
@@ -71,10 +81,15 @@ def main(argv=None):
     output = a.output_dir or ROOT / "results/infoot_vit" / f"{a.mapping.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:6]}"
     output.mkdir(parents=True, exist_ok=False)
     with RunLog(output, "mapping_test", vars(a)) as log:
-        mapper, bank = FeatureMapper.load(a.mapping,device=a.device), FeatureBank.load(a.query_bank)
+        m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
+        projection = projection_settings(m["config"], a.confidence_threshold,
+            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images)
+        # Set whole-map bandwidth before loading: its target KDE/smoothing are cached.
+        overrides = dict(projection=projection) if m["config"]["mode"] == "whole_map" else {}
+        mapper, bank = FeatureMapper.load(a.mapping,device=a.device, **overrides), FeatureBank.load(a.query_bank)
         a.steps, a.guidance = generation_settings(mapper.mode, a.steps, a.guidance)
         mapper.config = deepcopy(mapper.config)
-        mapper.config["projection"] = projection_settings(mapper.config, a.confidence_threshold)
+        mapper.config["projection"] = projection
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)
         result, manifest = mapper.project_bank(bank, output, count=a.count, chunk_size=a.chunk_size, run_log=log)
         if a.generate:
@@ -95,13 +110,24 @@ def generation_settings(mode, steps, guidance):
             (2.0 if partial else 1.5) if guidance is None else guidance)
 
 
-def projection_settings(config, threshold):
-    """Projection-only comparison: preserve immutable fit metadata and bandwidths."""
+def projection_settings(config, threshold, *, bandwidth=None, top_k_images=None):
+    """Projection-only comparison; never mutate fit metadata or refit a plan."""
     projection = deepcopy(config["projection"])
     if threshold is not None:
         if config["mode"] not in {"grouped_partial", "grouped_partial_lowrank"}:
             raise ValueError("--confidence-threshold applies only to partial mappings.")
         projection["confidence"]["threshold"] = threshold
+    if bandwidth is not None or top_k_images is not None:
+        if config["mode"] != "whole_map":
+            raise ValueError("Bandwidth/top-k overrides currently apply only to whole_map; partial pair selection and low-rank kernels stay fixed.")
+        if bandwidth is not None:
+            if not math.isfinite(bandwidth) or bandwidth <= 0:
+                raise ValueError("Projection bandwidth must be finite and positive.")
+            projection["bandwidth_multiplier"] = bandwidth / config["solver"]["h"]
+        if top_k_images is not None:
+            if type(top_k_images) is not int or top_k_images < 0:
+                raise ValueError("top_k_images must be a nonnegative integer (0 keeps all).")
+            projection["top_k_images"] = top_k_images or None
     return projection
 
 

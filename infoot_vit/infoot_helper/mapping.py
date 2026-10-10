@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import nullcontext
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -70,12 +71,17 @@ def select_images(alpha, target_ids, query_id, settings):
 
 
 class FeatureMapper:
-    def __init__(self, directory, manifest, source, target, *, device=None):
+    def __init__(self, directory, manifest, source, target, *, device=None, projection=None):
         self.directory, self.manifest = Path(directory), manifest
         self.source, self.target = source, target
         self.source_index = {sid: i for i, sid in enumerate(source.ids)}
         self.target_index = {tid: j for j, tid in enumerate(target.ids)}
-        self.config, self.mode = manifest["config"], manifest["config"]["mode"]
+        self.config, self.mode = deepcopy(manifest["config"]), manifest["config"]["mode"]
+        if projection is not None:
+            if self.mode != "whole_map":
+                raise ValueError("Projection overrides currently apply only to whole_map.")
+            from .fit_mapping import validate_config
+            self.config["projection"] = validate_config(dict(self.config, projection=projection))["projection"]
         self.device = resolve_device(device if device is not None else self.config.get("device", "cpu"))
         self.x, self.y = source.features.to(device=self.device,dtype=torch.float64), target.features.to(device=self.device,dtype=torch.float64)
         self.is_partial = self.mode in {"grouped_partial", "grouped_partial_lowrank"}
@@ -146,9 +152,11 @@ class FeatureMapper:
                     for j, y in enumerate(self.y)])
 
     @classmethod
-    def load(cls, directory, *, device=None):
+    def load(cls, directory, *, device=None, projection=None):
         directory = Path(directory).resolve()
         m = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        if projection is not None and m.get("config", {}).get("mode") != "whole_map":
+            raise ValueError("Projection overrides currently apply only to whole_map.")
         if m.get("schema") in {"siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
             from infoot_vit.lowrank.mapping import LowRankMapper
             return LowRankMapper.load(directory,device=device)
@@ -173,7 +181,7 @@ class FeatureMapper:
             elif ids != bank.ids:
                 raise ValueError("Referenced bank ordered IDs changed.")
         compatible_banks(*banks)
-        return cls(directory, m, *banks,device=device)
+        return cls(directory, m, *banks,device=device,projection=projection)
 
     def _pair(self, sid, tid):
         if (sid, tid) not in self.pairs:
@@ -241,6 +249,15 @@ class FeatureMapper:
                         query_min_fit_distance=float(torch.cdist(vector, self.image.source).min()))
                     if self.mode == "whole_map":
                         mapped = (alpha @ self.y.reshape(len(self.y), -1)).reshape_as(patches)
+                        source_weights = self.image.query_kernel(vector).softmax(1)[0]
+                        raw_entropy = -(original_alpha * original_alpha.clamp_min(1e-300).log()).sum()
+                        top_weights = original_alpha.topk(min(32, len(original_alpha))).values
+                        detail.update(projection_h=self.image.h,
+                            query_source_effective_neighbors=float((-(source_weights * source_weights.clamp_min(1e-300).log()).sum()).exp()),
+                            query_source_max_weight=float(source_weights.max()),
+                            raw_image_effective_targets=float(raw_entropy.exp()),
+                            raw_image_max_weight=float(original_alpha.max()),
+                            raw_image_topk_mass={str(k): float(top_weights[:k].sum()) for k in (1, 4, 8, 32)})
                     elif self.mode == "grouped_patch":
                         mapped = torch.zeros_like(patches)
                         effective, error = 0., 0.
@@ -422,6 +439,22 @@ def mapping_summary(result, query, source, target, *, confidence_settings=None):
     if discarded:
         report["fit_pair_discarded_routing_mass"] = dict(min=min(discarded), mean=sum(discarded)/len(discarded), max=max(discarded))
         report["routing_note"] = "Confidence/rejection are conditional on renormalized saved routes. Discarded routing mass is reported separately."
+    if result.diagnostics["mode"] == "whole_map":
+        rows = result.diagnostics["queries"]
+        routing = {}
+        for key in ("projection_h", "query_source_effective_neighbors", "query_source_max_weight",
+                    "raw_image_effective_targets", "raw_image_max_weight", "image_effective_targets",
+                    "image_max_weight", "top_k_retained_mass", "top_k_discarded_mass"):
+            values = [row[key] for row in rows if key in row]
+            if values:
+                routing[key] = dict(min=min(values), mean=sum(values)/len(values), max=max(values))
+        report["whole_map_routing"] = routing
+        report["mapped_to_target_spread_ratio"] = {key: report["mapped"][key] / report["target_support"][key]
+            if report["mapped"][key] is not None and report["target_support"][key] else None
+            for key in ("norm_mean", "token_variance", "image_mean_variance", "corresponding_patch_variance_across_images")}
+        report["routing_note"] = "Raw routing precedes top-k/selection; retained routes are explicitly normalized. " \
+            "Feature spread compares this query set with the full target bank; it is descriptive, not a quality score. " \
+            "Top-1 whole-map conditioning is target-code retrieval, not evidence of source-preserving translation."
     if confidence_settings is not None and result.diagnostics["mode"] in {"grouped_partial", "grouped_partial_lowrank"}:
         active_threshold = confidence_settings["threshold"]
         mass_floor = confidence_settings["mass_floor"]

@@ -75,6 +75,7 @@ def generate(mapper, query_bank, result, output, *, root, train_config, eval_con
         checkpoint=str(used_checkpoint), checkpoint_sha256=file_hash(used_checkpoint), weights=weights,
         query_ids=ids, target_reference_ids=[r["sample_id"] for r in targets], row_order=row_names,
         solver=solver, num_steps=steps, guidance_scale=guidance, seed=seed, per_image_noise_seeds=seeds,
+        projection=mapper.config["projection"],
         confidence_policy=mapper.config["projection"]["confidence"], target_domain=config["domain"],
         interpretation="No paired target ground truth. Feature metrics are not independent semantic validation.")
     write_json(output / "generation_report.json", report)

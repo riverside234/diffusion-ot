@@ -8,12 +8,12 @@ solver:
   lam: 0.075
   reg: 0.06
   # Explicit training-mean EUCLIDEAN cost normalization; raw feature values stay unchanged.
-  # These are starting values, not validated quality optima.
+  # Keep the converged 4,000-image fit; tune projection separately first.
   cost_scale: mean
-  max_outer_steps: 300
+  max_outer_steps: 1200  # Reviewed run converged at 638; 300 stopped too early.
   max_inner_steps: 10000
 projection:
-  bandwidth_multiplier: 0.6  # Fit h=0.4 -> projection h=0.2.
+  bandwidth_multiplier: 0.2857142857142857  # Fit h=0.35 -> projection h=0.10 (was 0.21).
   selection: mean
   top_k_images: null
   seed: 0
