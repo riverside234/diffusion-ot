@@ -60,12 +60,15 @@ repository's existing implementation of
 [Linear Time Sinkhorn Divergences using Positive Features (NeurIPS 2020)](https://papers.neurips.cc/paper_files/paper/2020/hash/9bde76f262285bb1eaeb7b40c758b53e-Abstract.html)
 and the authors' [LinearSinkhorn code](https://github.com/meyerscetbon/LinearSinkhorn)
 provide precedent for positive kernel features with explicit scale compensation.
-The balanced recipe now uses a training-moment **OPRF** candidate based on
+An optional training-moment **OPRF** candidate is based on
 [Chefs' Random Tables (NeurIPS 2022), Eqs. 4–8](https://proceedings.neurips.cc/paper_files/paper/2022/file/df2d62b96a4003203450cf89cd338bb7-Paper-Conference.pdf).
 It uses PyTorch QR/linear algebra, without replacing the InfoOT optimizer or
 adding a transformer/attention dependency. The moment heuristic and orthogonal
 directions can reduce estimator variance; this is not a guarantee for SigLIP
-features at `h=0.4`. Accuracy is measured before fitting.
+features at `h=0.4`. Accuracy is measured before fitting. Repeated synthetic
+checks favored the legacy normalized IID method at patch `h=0.75`.
+The active recipe retains that method but now requests fit `h=0.7` and projection
+`h=0.2`; the earlier acceptance evidence does not validate these new bandwidths.
 
 ## Image-router convergence
 
@@ -76,12 +79,15 @@ fit**. The image router then runs before patch-factor optimization. Its settings
 control a separate problem; `--max-steps` only changes the patch optimizer.
 
 Following the [300-step router log review](../../docs/analysis/vit_infoot_router_300/README.md),
-the balanced YAML uses **h = 0.40, lam = 0.075, reg = 0.075, 1,200 outer steps**.
+the router recipe used **h = 0.40, lam = 0.075, reg = 0.075, 1,200 outer steps**.
 The old router used lam = 0.10, reg = 0.05, 300 steps. Its inner Sinkhorn solves
 passed but its outer residual remained above tolerance. The revised weights
 reduce MI pressure relative to entropy; they are a lab experiment, not a claim
-of optimal translation quality. Kernel locality stays at 0.40. Patch settings
-and the partial experiment's YAML are unchanged by this tuning.
+of optimal translation quality. The latest requested experiment sets both
+`image_solver.h` and `kernel.h` to **0.7**, keeping lam/reg unchanged.
+`projection.bandwidth_multiplier: 0.2857142857142857` sets both projection h
+values to **0.2**. Actual Gaussian sigma is still h times each domain's saved
+training RMS scale, rather than an absolute feature-space distance of 0.2.
 
 The shared balanced solver now checks the **full cost - lam*MI + reg*entropy**
 objective before accepting a Sinkhorn update. If needed, it halves the step
@@ -227,9 +233,9 @@ Balanced fits support three explicitly versioned methods:
 
 | `kernel.method` | Kernel feature construction |
 |---|---|
-| `oprf_gaussian_v1` (active YAML) | Full-scale positive features with a training-moment variance parameter A |
+| `oprf_gaussian_v1` | Full-scale positive features with a training-moment variance parameter A |
 | `positive_gaussian_v1` | Full-scale standard positive features, A=0 |
-| `normalized_positive_gaussian_v1` | Legacy shifted-exponential row normalization; retained for old artifacts and the partial experiment |
+| `normalized_positive_gaussian_v1` (active YAML) | Legacy shifted-exponential row normalization; fit h=0.7, projection h=0.2 in the balanced recipe |
 
 For the first two methods, with k features and d input dimensions:
 
@@ -341,8 +347,19 @@ Selected targets still require valid nonzero conditional scores.
 
 This is balanced transport: confidence is one and the condition padding mask
 is all false. It does not perform partial-OT rejection. Invalid/nonfinite scores
-fail explicitly rather than falling back to uniform scores. Projection bandwidth
-multiplier must stay 1 because the saved low-rank kernel is fixed at fitting.
+fail explicitly rather than falling back to uniform scores. Balanced projection
+supports a positive bandwidth multiplier. For a value other than 1, fit preflight
+evaluates the saved random bases at the requested bandwidth on both training
+supports, including target-density correction. It saves an independent mandatory
+accuracy gate in `projection_kernel_quality.json` (root and attempt logs), using
+the same error limits and float64/float32 probes. Failure stops before transport.
+The artifact retains the original basis, mean, training scale and audit; mapping
+re-evaluates these fixed bases without refitting OT, sampling new directions or
+using query statistics. It never combines a narrow query kernel with broad
+support kernels. Extra projection factor arrays are temporary float64 memory,
+not another disk copy; the resource estimate includes their memory allowance.
+Multiplier 1 preserves the previous saved-float32 projection path. The separate
+`grouped_partial_lowrank` mode still requires multiplier 1.
 
 ### Partial routing, confidence and masks
 
@@ -476,11 +493,16 @@ This reuses verified kernels, then fits the router and patch coupling. A
 methods in **fresh** directories, keeping seeds, ranks and bandwidth fixed:
 
 ```bash
-# Standard full-scale PRF with the same orthogonal-direction option as OPRF.
+# Standard full-scale PRF, inheriting orthogonal:false from the active YAML.
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --kernel-check-only --kernel-method positive_gaussian_v1
-# Historical normalized IID construction (also changes the direction sampler).
-python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --kernel-check-only --kernel-method normalized_positive_gaussian_v1
+# OPRF with the same IID direction sampler.
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --kernel-check-only --kernel-method oprf_gaussian_v1
 ```
+
+To reproduce the orthogonal PRF/OPRF candidates in the comparison below, use
+a separate YAML with that method and `kernel.orthogonal: true`. The selected
+legacy method requires `false`. Different bandwidths, methods and direction
+samplers are different experiments; retain each full configuration.
 
 `--kernel-rank` supports separate rank comparisons and still enforces the 5 GB
 budget. Preserve any CLI overrides when resuming. Existing completed artifacts
@@ -623,3 +645,48 @@ is lower here, but its kernel RMSE is worse; there is no across-the-board
 improvement claim. These vectors are not SigLIP data. Run the saved-bank
 preflight before spending time on InfoOT, and compare methods using every
 diagnostic rather than choosing the smallest single error.
+
+### Selected candidate after repeated checks
+
+[Full comparison records](../../docs/analysis/grouped_patch_lowrank_kernel_selection/selection.json)
+retain the initial sweep and two follow-up protocols. They use 256 and 1,568
+Gaussian vectors/domain, 768 dimensions, multiple data/kernel seeds, 4,096
+pair probes and 32 density queries. Both domains and float64/float32 round trips
+must pass the original 0.50/0.25/1.0 limits. At `h=0.75`, rank 1024:
+
+| Method | Passed paired runs | Worst kernel RMSE | Worst mean density error | Worst max density error |
+|---|---:|---:|---:|---:|
+| Legacy normalized IID | 12/12 | 0.3003 | 0.2056 | 0.5596 |
+| Full-scale PRF + orthogonal directions | 11/12 | 0.9850 | 0.0641 | 0.3349 |
+| OPRF + orthogonal directions | 11/12 | 1.0658 | 0.0632 | 0.3072 |
+
+The comparison selected **legacy normalized IID, patch h=0.75, ranks 256/1024**.
+It was more stable across these draws; lower density errors alone did not
+protect the other candidates against kernel outliers. The original method
+can therefore pass these synthetic checks at a broader bandwidth. At `h=0.4`,
+none passed the initial sweep, including rank 1152 (4.75 GB); this is not proof
+that every possible estimator/rank must fail. The selected storage estimate
+remains 4.35 GB, with the 5 GB guard and all error limits unchanged.
+
+**This selection broadens the target Gaussian kernel, rather than solving the
+fixed-h=0.4 approximation problem.** That comparison used projection multiplier
+1 and image-router h=0.4. The current requested YAML uses fit h=0.7 for both
+router and patch kernels and projection h=0.2; it is a new, unvalidated setting.
+Narrowing the projection kernel can fail its independent acceptance gate even
+if the fit kernel passes. Do not relax the limits merely to run it. These are CPU synthetic
+results, not a real-SigLIP acceptance or image-quality result; the real banks
+must pass `--kernel-check-only` before fitting. Start a fresh directory for
+this changed configuration. Original completed artifacts retain their own h.
+
+For the newly requested 0.7/0.2 setting, an additional CPU check used 256
+synthetic Gaussian vectors, dimension 768, data seed 42, kernel seed 4201,
+rank 1024, audit seed 4211, 4,096 pairs and 32 density queries:
+
+| h | Kernel relative RMSE | Mean density relative error | Max density relative error | Accepted |
+|---|---:|---:|---:|---|
+| 0.7 | 0.3598 | 0.2575 | 0.5885 | No |
+| 0.2 | 0.6447 | 0.9697 | 2.4476 | No |
+
+These are synthetic diagnostics, not a real-bank result. The requested YAML is
+retained with the existing acceptance limits. Start with `--kernel-check-only`;
+do not assume either the fit or projection kernel will pass on lab features.

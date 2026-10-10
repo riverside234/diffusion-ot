@@ -85,8 +85,8 @@ def canonical(raw):
     for value in (kc["h"],kc["error_warn_relative_rmse"],kc["max_relative_rmse"],
                   kc["max_density_relative_error_mean"],kc["max_density_relative_error_max"],*c["resources"].values()):
         if not math.isfinite(value) or value <= 0: raise ValueError("Invalid bandwidth/resource/error threshold.")
-    if c["projection"]["bandwidth_multiplier"] != 1:
-        raise ValueError("This experiment fixes KDE bandwidths at fit time; multiplier must be 1.")
+    if c["mode"] == PARTIAL_MODE and c["projection"]["bandwidth_multiplier"] != 1:
+        raise ValueError("grouped_partial_lowrank fixes KDE bandwidths at fit time; multiplier must be 1.")
     extra_chunk = c["projection"].pop("target_chunk_size")
     patch_chunk = c["projection"].pop("patch_chunk_size")
     base = validate_config(dict(mode="grouped_patch",source_bank=c["source_bank"],target_bank=c["target_bank"],
@@ -128,6 +128,8 @@ def resources(ns,nt,p,d,c):
     # Include conservative metadata/log reserve in the final-artifact guard.
     final = factors+parameters+estimator+router+256*2**20
     working = 8*((n+m)*d + (n+m)*k + 10*(n+m)*r + 12*ns*nt + 8*c["optimizer"]["chunk_size"]*(d+k+r))
+    if c["projection"]["bandwidth_multiplier"] != 1:
+        working += 8*(n+m)*k  # Separate projection-bandwidth feature evaluation/audit.
     return dict(source_patches=n,target_patches=m,transport_rank=r,kernel_rank=k,
         saved_factor_bytes=factors,estimator_bytes=estimator,router_bytes=router,
         estimated_final_artifact_bytes=final,estimated_final_artifact_GB=final/1e9,

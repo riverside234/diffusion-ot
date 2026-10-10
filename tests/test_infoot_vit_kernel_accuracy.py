@@ -125,8 +125,12 @@ def test_failed_acceptance_persists_diagnostics_before_any_transport(tmp_path, b
     assert len(list((directory / "logs").glob("*/kernel_quality.json"))) == 2
 
 
-def test_kernel_only_resume_storage_and_grouped_projection(tmp_path, banks, monkeypatch):
+@pytest.mark.parametrize("multiplier", [1., .5])
+def test_kernel_only_resume_storage_and_grouped_projection(tmp_path, banks, monkeypatch, multiplier):
     c = audit_config()
+    c["projection"] = dict(bandwidth_multiplier=multiplier)
+    if multiplier != 1:
+        c["kernel"]["h"] = 4.
     with monkeypatch.context() as patch:
         patch.setattr(experiment.BalancedModel, "fit", lambda *a, **kw: pytest.fail("Kernel-only command started a router"))
         directory = experiment.fit(c, root=tmp_path, kernel_check_only=True)
@@ -143,6 +147,12 @@ def test_kernel_only_resume_storage_and_grouped_projection(tmp_path, banks, monk
     assert (directory / "kernels.pt").read_bytes() == original_bytes
     assert not list(directory.rglob("latest.pt"))
     state = torch.load(directory / "kernels.pt", weights_only=True)
+    if multiplier != 1:
+        assert state["projection"]["quality"]["accepted"]
+        assert state["projection"]["source_h"] == 2.
+        bad = deepcopy(state); bad["projection"]["approximation"]["source"]["relative_rmse"] = 99.
+        with pytest.raises(ValueError, match="projection-bandwidth"):
+            experiment.validate_kernels(bad, (8, 8, 256), 3, canonical(c)["kernel"], multiplier)
     assert state["fx"].dtype == state["fy"].dtype == torch.float32
     assert state["source"]["omega"].dtype == torch.float64
     bad = deepcopy(state); bad["source"]["a"] += .1
@@ -154,6 +164,7 @@ def test_kernel_only_resume_storage_and_grouped_projection(tmp_path, banks, monk
     monkeypatch.setattr(kernels, "fit_features", lambda *a, **kw: pytest.fail("Inference kernel refit"))
     monkeypatch.setattr(solver, "solve", lambda *a, **kw: pytest.fail("Inference OT refit"))
     mapper = LowRankMapper.load(directory)
+    assert mapper.image.h == pytest.approx(c["image_solver"]["h"]*multiplier)
     result = mapped(mapper, banks[2], chunk_size=1)
     mapper.config["projection"].update(target_chunk_size=1, patch_chunk_size=1)
     torch.testing.assert_close(result, mapped(mapper, banks[2], chunk_size=2), atol=2e-12, rtol=0)
@@ -162,12 +173,53 @@ def test_kernel_only_resume_storage_and_grouped_projection(tmp_path, banks, monk
     factors = torch.load(directory / "factors.pt", weights_only=True)
     q, r, g = [factors[k].double() for k in ("q", "r", "g")]
     fx, fy = state["fx"].double(), state["fy"].double()
+    source_state = state["source"]
+    if multiplier != 1:
+        source_state = kernels.projection_state(source_state, multiplier)
+        target_state = kernels.projection_state(state["target"], multiplier)
+        fx = kernels.features(mapper.x.flatten(0,1), source_state)
+        fy = kernels.features(mapper.y.flatten(0,1), target_state)
     smoothing = (q / g) @ r.T @ (fy @ fy.T) / (fy @ fy.T).mean(0)
     for i, image in enumerate(banks[2].features):
-        scores = kernels.features(image, state["source"]) @ fx.T @ smoothing
+        scores = kernels.features(image, source_state) @ fx.T @ smoothing
         alpha = mapper.image.conditional_weights(image.reshape(1, -1))[0]
         expected = sum(alpha[j] * (scores[:, j*4:(j+1)*4] / scores[:, j*4:(j+1)*4].sum(1, keepdim=True)) @ mapper.y[j] for j in range(len(mapper.y)))
         torch.testing.assert_close(result[i], expected, atol=2e-12, rtol=0)
+
+
+@pytest.mark.parametrize("method", kernels.METHODS)
+def test_projection_state_reuses_saved_basis_and_training_scale(method):
+    x = torch.randn(19, 3, dtype=torch.float64, generator=torch.Generator().manual_seed(127))
+    _, state = kernels.fit_features(x, 64, .7, 11, method=method)
+    changed = kernels.projection_state(state, .2/.7)
+    assert changed["omega"] is state["omega"] and changed["mean"] is state["mean"]
+    assert state["h"] == .7 and changed["h"] == pytest.approx(.2)
+    assert changed["sigma"] == pytest.approx(state["scale"]*.2)
+    fresh, _ = kernels.fit_features(x, 64, .2, 11, method=method)
+    torch.testing.assert_close(kernels.features(x, changed), fresh, atol=1e-12, rtol=1e-12)
+
+
+def test_projection_audit_rejects_before_transport_and_keeps_diagnostics(tmp_path, banks, monkeypatch):
+    c = audit_config()
+    c["projection"] = dict(bandwidth_multiplier=.01)
+    original = kernels.error_report
+    def faulty_projection(x, factor, state, **kwargs):
+        report = original(x, factor, state, **kwargs)
+        if state["h"] < .1:
+            report["relative_rmse"] = 1e9
+        return report
+    # Use the legacy construction here to avoid full-scale exponential underflow
+    # before the acceptance gate being tested.
+    c["kernel"].update(method=kernels.LEGACY, orthogonal=False, h=4.)
+    monkeypatch.setattr(kernels, "error_report", faulty_projection)
+    monkeypatch.setattr(experiment.BalancedModel, "fit", lambda *a, **kw: pytest.fail("Router started"))
+    with pytest.raises(RuntimeError, match="Projection kernel accuracy acceptance failed"):
+        experiment.fit(c, root=tmp_path, kernel_check_only=True)
+    directory = next((tmp_path / "outputs/infoot_vit").iterdir())
+    report = json.loads((directory / "projection_kernel_quality.json").read_text())
+    assert not report["quality"]["accepted"]
+    assert list((directory / "logs").glob("*/projection_kernel_quality.json"))
+    assert json.loads((directory / "manifest.json").read_text())["status"] == "failed"
 
 
 def test_legacy_artifact_without_new_kernel_config_still_loads(tmp_path, banks):

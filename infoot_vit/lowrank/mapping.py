@@ -14,7 +14,7 @@ from ..infoot_helper.device import resolve_device,move
 from .projection import project_scores
 from .storage import validate_factors
 from .experiment import validate_kernels
-from .kernels import features
+from .kernels import features, projection_state
 
 
 class LowRankMapper(FeatureMapper):
@@ -65,7 +65,8 @@ class LowRankMapper(FeatureMapper):
         files = {key:checked_file(directory,entry) for key,entry in manifest["files"].items()}
         image = torch.load(files["image"],weights_only=True)
         if image["status"] != "converged": raise ValueError("Nonconverged image router.")
-        self.image = BalancedModel(self.x.reshape(len(self.x),-1),self.y.reshape(len(self.y),-1),image)
+        self.image = BalancedModel(self.x.reshape(len(self.x),-1),self.y.reshape(len(self.y),-1),image,
+                                   self.config["projection"]["bandwidth_multiplier"])
         self.patch = None
         return files
 
@@ -78,9 +79,19 @@ class LowRankMapper(FeatureMapper):
             raise ValueError("Invalid factor fit identity or convergence status.")
         q,r,g = (state[key].to(device=self.device,dtype=torch.float64) for key in ("q","r","g"))
         kernel = torch.load(files["kernels"],weights_only=True)
-        validate_kernels(kernel,(n,m,self.config["kernel_rank"]),self.x.shape[-1],self.config["kernel"])
+        multiplier = self.config["projection"]["bandwidth_multiplier"]
+        validate_kernels(kernel,(n,m,self.config["kernel_rank"]),self.x.shape[-1],self.config["kernel"],multiplier)
         self.kernel_source = move(kernel["source"],self.device)
-        fx,fy = kernel["fx"].to(self.x),kernel["fy"].to(self.y)
+        if multiplier == 1:
+            fx,fy = kernel["fx"].to(self.x),kernel["fy"].to(self.y)
+        else:
+            # Re-evaluate saved bases, means and training scales. No kernel/OT fit
+            # or query-derived bandwidth; BOTH supports and target density change.
+            chunk = self.config["optimizer"]["chunk_size"]
+            self.kernel_source = projection_state(self.kernel_source,multiplier)
+            target_state = projection_state(move(kernel["target"],self.device),multiplier)
+            fx = features(self.x.flatten(0,1),self.kernel_source,chunk)
+            fy = features(self.y.flatten(0,1),target_state,chunk)
         self.cross = ((fx.T@q)/g) @ (fy.T@r).T  # Only [kernel_rank,kernel_rank].
         self.density_y = (fy@fy.mean(0)).reshape(len(self.y),self.y.shape[1])
         self.target_kernel_features = fy.reshape(len(self.y),self.y.shape[1],-1)
@@ -121,7 +132,9 @@ class LowRankMapper(FeatureMapper):
                     image_normalized_entropy=entropy/math.log(len(alpha)) if len(alpha)>1 else 0.,
                     top_k_retained_mass=retained,top_k_discarded_mass=1-retained,
                     within_image_effective_patches=effective,group_mass_residual=residual,
-                    transport_rank=self.config["transport_rank"],kernel_rank=self.config["kernel_rank"])
+                    transport_rank=self.config["transport_rank"],kernel_rank=self.config["kernel_rank"],
+                    patch_fit_h=self.config["kernel"]["h"],patch_projection_h=self.kernel_source["h"],
+                    image_projection_h=self.image.h)
                 outputs.append(mapped); records.append(record)
                 if on_query: on_query(record)
         result = torch.stack(outputs).to(values)

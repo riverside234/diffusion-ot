@@ -15,6 +15,17 @@ OPRF = "oprf_gaussian_v1"
 METHODS = (LEGACY, PRF, OPRF)
 
 
+def projection_state(state, multiplier):
+    """Evaluate a saved random basis at a new bandwidth; never refit it."""
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise ValueError("Projection bandwidth multiplier must be finite and positive.")
+    result = dict(state, h=state["h"] * multiplier)
+    result["sigma"] = result["scale"] * result["h"]
+    if result["method"] == OPRF:
+        result["a"] = oprf_coefficient(len(result["mean"]), result["h"])
+    return result
+
+
 def oprf_coefficient(dimension, h):
     # E||z+z'||^2 = 2/h^2 after centering and the training RMS bandwidth.
     # Rationalized Eq. 7 avoids subtracting two nearly equal numbers.

@@ -15,8 +15,11 @@ per training source. Both use sampled InfoOT, 2,000 train images/domain
 storage budgets. The balanced 256/1024 recipe estimates 4.35 GB under a 5 GB
 guard; the partial experiment retains its 4 GB guard. Use
 `infoot_fit_lowrank.py`; dense modes remain available.
-The balanced recipe uses full-scale OPRF kernel features and rejects excessive
-Gaussian/density approximation errors before transport fitting. Run
+The balanced recipe retains normalized positive kernel features. Both fit
+bandwidths are now `h=0.7`; `projection.bandwidth_multiplier=0.2/0.7` requests
+router and patch projection `h=0.2`, with a separate mandatory projection-kernel
+accuracy gate. This requested setting has not passed real-bank acceptance.
+It rejects excessive Gaussian/density approximation errors before transport fitting. Run
 `infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --kernel-check-only`
 to save diagnostics and a bounded exact-Gaussian comparison first. This does
 not change the partial experiment's kernel method; see the low-rank README
@@ -377,7 +380,8 @@ override the balanced solver; patch-pair settings are under `partial.solver`.
 
 Kernel widths follow the local convention:
 `h * sqrt(mean(training_pairwise_distances**2)/2)`. Projection uses the saved
-multiplier (0.5 in the top-8 dense partial recipe; 1.0 in low-rank configs) and
+multiplier (0.5 in the top-8 dense partial recipe; 0.2/0.7 in balanced low-rank,
+1.0 in partial low-rank) and
 never estimates a query-batch scale.
 An explicit multiplier is part of the fit configuration/artifact identity; it
 rebuilds projection kernels and calibrates partial support thresholds on fit
