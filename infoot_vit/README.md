@@ -8,11 +8,13 @@ checkpoint keys.
 
 **Separate low-rank experiments:** see [`lowrank/README.md`](lowrank/README.md).
 `configs/grouped_patch_lowrank.yaml` uses balanced global patch factors at
-rank 256/256. `configs/grouped_partial_lowrank.yaml` uses capacity-constrained
+transport/kernel ranks 256/1024. `configs/grouped_partial_lowrank.yaml` uses capacity-constrained
 pair factors at rank 64/64, transported mass 0.8, and eight saved target pairs
 per training source. Both use sampled InfoOT, 2,000 train images/domain
-(seed 42), float64 fitting and float32 factors, with a checked final budget
-below 4 GB. Use `infoot_fit_lowrank.py`; dense modes remain available.
+(seed 42), float64 fitting and float32 factors, with checked per-experiment
+storage budgets. The balanced 256/1024 recipe estimates 4.35 GB under a 5 GB
+guard; the partial experiment retains its 4 GB guard. Use
+`infoot_fit_lowrank.py`; dense modes remain available.
 
 All current `infoot_vit/configs/*.yaml` select **`device: cuda`**. The device
 applies to routers, kernels, transport solvers and mapping. Use `--device cpu`
@@ -145,6 +147,15 @@ image quality. `keep_mass` specifies transported mass, not a fixed number of
 valid patches. The threshold filters smoothed query confidence after support
 checks, separately from top-8 discarded routing mass. Neither affects router
 convergence. See [the run analysis](../docs/analysis/vit_infoot_top8_300/README.md).
+
+The top-8 dense partial recipe uses `projection.bandwidth_multiplier: 0.5`:
+projection `h` is 0.20 for the image router and 0.225 for patch pairs, while fit
+`h` remains 0.40/0.45. This setting is stored in new mapping artifacts; editing
+the YAML does not change existing fits or their resume fingerprints. With
+`--generate`, `infoot_test.py` defaults to 40 Euler steps and guidance 2.0 for
+`grouped_partial`. Explicit `--steps`/`--guidance` overrides remain supported;
+other modes keep defaults of 50 steps and guidance 1.5. Resolved sampling settings
+are printed by `--dry-run` and recorded in generation logs/reports.
 
 Start a **new** fit with the revised recipe; changing settings/source invalidates
 resume fingerprints. Existing complete artifacts remain loadable.
@@ -345,8 +356,9 @@ recipe; it never changes projected target feature values. `--h/--reg/--lam`
 override the balanced solver; patch-pair settings are under `partial.solver`.
 
 Kernel widths follow the local convention:
-`h * sqrt(mean(training_pairwise_distances**2)/2)`. Projection starts with the
-same width (`bandwidth_multiplier: 1.0`) and never estimates a query-batch scale.
+`h * sqrt(mean(training_pairwise_distances**2)/2)`. Projection uses the saved
+multiplier (0.5 in the top-8 dense partial recipe; 1.0 in low-rank configs) and
+never estimates a query-batch scale.
 An explicit multiplier is part of the fit configuration/artifact identity; it
 rebuilds projection kernels and calibrates partial support thresholds on fit
 data. There is no query-time threshold calibration or hidden bandwidth sweep.
@@ -477,6 +489,9 @@ python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<fit-directory> --
 
 # Fixed dog PDAE checkpoint: original cat / routed top-1 dog reference / translated dog.
 python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<fit-directory> --query-bank data/infoot_vit/cat_val --generate --train-config configs/stage1a_pdae_v2_l/dog.yaml --eval-config configs/stage1a_eval/pdae_v2_l.yaml --checkpoint outputs/pdae_v2_l_dog/checkpoints/latest.pt --weights ema --steps 50 --solver euler --guidance 1.5
+
+# Top-8 grouped_partial recipe; pin sampling explicitly for reproducible comparisons.
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<grouped-partial-fit> --query-bank data/infoot_vit/cat_val --count 16 --generate --weights ema --steps 40 --solver euler --guidance 2.0
 ```
 
 Use numbered checkpoints for reproducible comparisons. Noise is seeded per

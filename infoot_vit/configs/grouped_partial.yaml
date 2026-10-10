@@ -33,7 +33,7 @@ partial:
     mass_tolerance: 1.0e-8
     outer_tolerance: 1.0e-7
 projection:
-  bandwidth_multiplier: 1.0
+  bandwidth_multiplier: 0.5  # Projection h: image 0.20, partial patches 0.225; fit bandwidths stay unchanged.
   selection: mean
   top_k_images: null
   seed: 0

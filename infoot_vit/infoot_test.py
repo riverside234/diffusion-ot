@@ -31,15 +31,15 @@ def main(argv=None):
     p.add_argument("--eval-config", default="configs/stage1a_eval/pdae_v2_l.yaml")
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--weights", choices=["raw", "ema"], default="ema")
-    p.add_argument("--steps", type=int, default=50)
-    p.add_argument("--guidance", type=float, default=1.5)
+    p.add_argument("--steps", type=int, help="Generation steps; defaults to 40 for grouped_partial, 50 for other modes.")
+    p.add_argument("--guidance", type=float, help="Generation guidance; defaults to 2.0 for grouped_partial, 1.5 for other modes.")
     p.add_argument("--solver", choices=["euler", "heun"], default="euler")
     p.add_argument("--seed", type=int, default=20260903)
     p.add_argument("--device",help="Mapping AND generation device; defaults to the saved experiment device.")
     p.add_argument("--confidence-threshold", type=float,
                    help="Partial mapping only: override token validity threshold without refitting. Recorded in mapped metadata.")
     a = p.parse_args(argv)
-    if min(a.count, a.chunk_size, a.threads, a.steps) < 1:
+    if min(a.count, a.chunk_size, a.threads) < 1 or (a.steps is not None and a.steps < 1):
         p.error("Counts, chunk size, threads and steps must be positive")
     if a.confidence_threshold is not None and not 0 <= a.confidence_threshold <= 1:
         p.error("--confidence-threshold must be finite and in [0,1]")
@@ -47,6 +47,7 @@ def main(argv=None):
     if a.dry_run:
         # Validate small metadata before allocating supports/kernels or the DiT.
         m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
+        a.steps, a.guidance = generation_settings(m["config"]["mode"], a.steps, a.guidance)
         projection = projection_settings(m["config"], a.confidence_threshold)
         q = json.loads((a.query_bank / "manifest.json").read_text(encoding="utf-8"))
         training_ids = set(m["source_ids"]) | set(m["target_ids"])
@@ -64,25 +65,34 @@ def main(argv=None):
             raise ValueError("Need completed mapper and compatible held-out query bank")
         print(json.dumps(dict(mapper_id=m["artifact_id"], mode=m["config"]["mode"], fit_resources=m["resources"],
             query_count=min(a.count, len(q["ids"])), mask="existing condition_padding_mask; True is padding",
-            generate=a.generate, projection=projection), indent=2))
+            generate=a.generate, projection=projection,
+            sampling=dict(num_steps=a.steps, guidance_scale=a.guidance)), indent=2))
         return 0
     output = a.output_dir or ROOT / "results/infoot_vit" / f"{a.mapping.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:6]}"
     output.mkdir(parents=True, exist_ok=False)
     with RunLog(output, "mapping_test", vars(a)) as log:
         mapper, bank = FeatureMapper.load(a.mapping,device=a.device), FeatureBank.load(a.query_bank)
+        a.steps, a.guidance = generation_settings(mapper.mode, a.steps, a.guidance)
         mapper.config = deepcopy(mapper.config)
         mapper.config["projection"] = projection_settings(mapper.config, a.confidence_threshold)
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)
         result, manifest = mapper.project_bank(bank, output, count=a.count, chunk_size=a.chunk_size, run_log=log)
         if a.generate:
             from infoot_vit.infoot_helper.evaluate_mapping import generate
-            log.event("generation_started")
+            log.event("generation_started", num_steps=a.steps, guidance_scale=a.guidance, weights=a.weights)
             generate(mapper, bank, result, output, root=ROOT, train_config=a.train_config, eval_config=a.eval_config,
                      checkpoint=a.checkpoint, weights=a.weights, steps=a.steps, guidance=a.guidance, solver=a.solver,
                      seed=a.seed, batch_size=a.chunk_size, device=str(mapper.device))
             log.event("generation_completed", report="generation_report.json")
         print(f"Saved {len(manifest['ids'])} projections to {output}; mode={mapper.mode}")
     return 0
+
+
+def generation_settings(mode, steps, guidance):
+    """Use the dense partial recipe unless explicit sampling overrides are supplied."""
+    partial = mode == "grouped_partial"
+    return ((40 if partial else 50) if steps is None else steps,
+            (2.0 if partial else 1.5) if guidance is None else guidance)
 
 
 def projection_settings(config, threshold):

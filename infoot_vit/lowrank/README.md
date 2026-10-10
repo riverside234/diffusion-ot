@@ -10,7 +10,7 @@ select `device: cuda`; CPU remains an explicit supported option.
 
 | Method | Patch support and constraints | Default ranks: transport / kernel |
 |---|---|---:|
-| `grouped_patch_lowrank` | One global balanced patch coupling; original uniform marginals | 256 / 256 |
+| `grouped_patch_lowrank` | One global balanced patch coupling; original uniform marginals | 256 / 1024 |
 | `grouped_partial_lowrank` | One capacity-constrained coupling per saved image pair; mass `0.8` | 64 / 64 |
 
 The partial default uses 64 because 256 factors for each 196-patch pair would
@@ -32,7 +32,8 @@ configurable starting rank, not an accuracy claim. No rank is silently reduced.
   **2,000 × 2,000** image maps. Its dense image-level plan is affordable.
 - Replace the global **392,000 × 392,000 patch plan** with a nonnegative,
   balanced factorization of rank at most **256**. It is not SVD compression.
-- Approximate each Gaussian KDE kernel with **256 positive features**. Evaluate
+- Approximate each Gaussian KDE kernel with **1,024 positive features** in the
+  balanced experiment. Evaluate
   the outer sums for cost, KDE mutual information, and plan entropy using fixed
   sampled patch pairs. These are explicit changes to the dense objective.
 - Fit in float64; store transport and kernel factor arrays in float32. Small
@@ -315,25 +316,26 @@ many saved pairs still mean substantial I/O and computation.
 
 ## Storage, memory, resume
 
-At 2,000 images/domain, 196 patches/image and both ranks 256:
+At 2,000 images/domain, 196 patches/image, transport rank 256 and kernel rank 1024:
 
 | Component | Decimal size |
 |---|---:|
 | Q and R, float32 | 0.803 GB |
-| Fx and Fy, float32 | 0.803 GB |
+| Fx and Fy, float32 | 3.211 GB |
 | Image router, float32 | 0.016 GB |
 | Training/audit indices and costs | 0.038 GB |
-| Estimated completed directory, including parameters and 256 MiB log reserve | **1.932 GB** |
+| Estimated completed directory, including parameters and 256 MiB log reserve | **4.350 GB** |
 | One hypothetical dense float64 patch matrix | **1,229.312 GB** |
 
-The configured final directory limit is **4,000,000,000 bytes**, excluding
-existing banks. The fitter checks both the estimate and actual completed
-directory size, including logs. Checkpoint/atomic-write copies temporarily need
+The configured balanced final directory limit is **5,000,000,000 bytes**,
+excluding existing banks; the partial experiment retains its 4 GB limit.
+The fitter checks both the estimate and actual completed directory size,
+including logs. Checkpoint/atomic-write copies temporarily need
 about **1.606 GB** extra for transport alone; interrupted artifacts can exceed
 the final budget. Keep additional disk headroom for diagnostics and filesystem
 overhead.
 
-The selected-support working-memory estimate is about **21.61 GiB**, not a
+The selected-support working-memory estimate is about **26.28 GiB**, not a
 measured peak. Loading existing full feature banks before selecting 2,000
 images can temporarily cost more. Float64 matrix products and repeated
 constraint projections remain substantial computation; low disk usage does

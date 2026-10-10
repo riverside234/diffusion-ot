@@ -6,7 +6,7 @@ sampling:
   images_per_domain: 2000
   seed: 42
 transport_rank: 256
-kernel_rank: 256
+kernel_rank: 1024
 device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
@@ -55,5 +55,5 @@ projection:
   target_chunk_size: 8
   patch_chunk_size: 64
 resources:
-  max_artifact_bytes: 4000000000  # Decimal GB; completed directory including logs.
+  max_artifact_bytes: 5000000000  # 5 decimal GB; rank-256/1024 estimate is 4.35 GB, including logs.
   max_working_gib: 64
