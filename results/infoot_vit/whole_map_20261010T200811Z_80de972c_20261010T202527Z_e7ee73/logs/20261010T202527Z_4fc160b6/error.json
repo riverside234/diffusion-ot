@@ -1,0 +1,4 @@
+{
+  "error_type": "FileNotFoundError",
+  "message": "[Errno 2] No such file or directory: '/data/not_backed_up/yxu209/diffusion-ot/data/infoot_vit/cat_val/manifest.json'"
+}

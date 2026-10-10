@@ -1,0 +1,51 @@
+{
+  "all_invalid_images": 0,
+  "confidence_quantiles": {
+    "max": 1.0,
+    "min": 1.0,
+    "p05": 1.0,
+    "p50": 1.0,
+    "p95": 1.0
+  },
+  "device": "cuda",
+  "mapped": {
+    "corresponding_patch_variance_across_images": 0.03604272641436207,
+    "image_mean_variance": 0.007206800755649495,
+    "images": 16,
+    "norm_mean": 35.977059934890356,
+    "token_variance": 0.371357635758348,
+    "valid_images": 16,
+    "valid_tokens": 3136
+  },
+  "mode": "whole_map",
+  "note": "Descriptive feature diagnostics only; image means do not replace patch features for fitting or conditioning. Compare fixed generated images independently.",
+  "query": {
+    "corresponding_patch_variance_across_images": 1.1068052383730733,
+    "image_mean_variance": 0.10945818577484656,
+    "images": 16,
+    "norm_mean": 47.3440262231483,
+    "token_variance": 1.5825309325723316,
+    "valid_images": 16,
+    "valid_tokens": 3136
+  },
+  "seconds": 0.41021755398833193,
+  "source_support": {
+    "corresponding_patch_variance_across_images": 1.1953669825653737,
+    "image_mean_variance": 0.12066349211735895,
+    "images": 4000,
+    "norm_mean": 47.275457553093965,
+    "token_variance": 1.5965998989430141,
+    "valid_images": 4000,
+    "valid_tokens": 784000
+  },
+  "target_support": {
+    "corresponding_patch_variance_across_images": 1.3987359364254905,
+    "image_mean_variance": 0.2122850191574257,
+    "images": 4000,
+    "norm_mean": 47.74065831922476,
+    "token_variance": 1.7155045356481273,
+    "valid_images": 4000,
+    "valid_tokens": 784000
+  },
+  "valid_fraction": 0.9999999999999999
+}
