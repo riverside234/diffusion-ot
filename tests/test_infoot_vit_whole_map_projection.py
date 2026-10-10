@@ -85,14 +85,17 @@ def test_invalid_overrides_rejected_before_loading(tmp_path, flag, value):
         infoot_test.main(["--mapping", str(tmp_path / "missing"), flag, value])
 
 
-@pytest.mark.parametrize("mode", ["patch_global", "grouped_patch", "grouped_partial", "grouped_patch_lowrank", "grouped_partial_lowrank"])
-def test_new_override_cannot_change_saved_pairs_or_approximate_kernels(mode):
+@pytest.mark.parametrize("mode", ["patch_global", "grouped_patch", "grouped_partial"])
+def test_override_settings_preserve_fit_config(mode):
     c = config(mode)
     before = deepcopy(c)
-    with pytest.raises(ValueError, match="only to whole_map"):
-        infoot_test.projection_settings(c, None, bandwidth=.1)
-    with pytest.raises(ValueError, match="only to whole_map"):
-        infoot_test.projection_settings(c, None, top_k_images=4)
+    settings = infoot_test.projection_settings(c, None, bandwidth=.1)
+    assert settings["bandwidth_multiplier"] == pytest.approx(.1/.7)
+    if mode == "patch_global":
+        with pytest.raises(ValueError, match="no image router"):
+            infoot_test.projection_settings(c, None, top_k_images=4)
+    else:
+        assert infoot_test.projection_settings(c, None, top_k_images=4)["top_k_images"] == 4
     assert c == before
 
 

@@ -112,8 +112,41 @@ renormalizes four weights, logging discarded mass. `--top-k-images 1` supplies
 one real target's complete feature map: a useful decoder/retrieval control,
 not evidence of source-preserving translation. The grid's top-1 reference row
 alone does not describe the all-target averaged condition used by default.
-The new overrides are restricted to `whole_map`; partial saved-pair selection
-and low-rank kernel acceptance remain unchanged.
+The overrides also work for `grouped_patch`, `grouped_partial`,
+`grouped_patch_lowrank` and `grouped_partial_lowrank`. `patch_global` accepts
+bandwidth changes but has no image router for `--top-k-images`.
+
+For grouped modes, **`--projection-bandwidth` is the absolute image-router h**:
+the multiplier is `requested_h / saved_router_fit_h`, and that same multiplier
+scales the patch fit bandwidth. Example: router fit h=0.35 and patch fit h=0.45,
+with `--projection-bandwidth 0.20`, gives router projection h=0.20 and patch
+projection h≈0.25714. This is not two independent bandwidth settings. Each
+query log records `image_projection_h` and `patch_projection_h`.
+
+```bash
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<partial-fit> --query-bank data/infoot_vit/cat_val --projection-bandwidth 0.20 --top-k-images 4 --generate --steps 40 --guidance 2.0
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<lowrank-fit> --query-bank data/infoot_vit/cat_val --projection-bandwidth 0.20 --top-k-images 4 --generate
+```
+
+Partial mapping truncates image routing, then intersects routes with the
+**unchanged saved pair inventory** and renormalizes retained mass. This override
+does not change `fit_pair_top_k`: a top-8 fit cannot recover unfitted pairs by
+requesting more targets. Excluded-pair mass, top-k discarded mass, and partial-OT
+rejection remain separate diagnostics. No usable saved route is an explicit
+error. Missing/corrupt selected files remain errors too.
+
+Dense partial mapping rebuilds exact projection kernels and recalibrates support
+thresholds using training patches only. Low-rank mapping re-evaluates the saved
+random bases, means and scales at the requested bandwidth, updates both support
+factors and target-density correction, and recalibrates partial support thresholds.
+It never fits a new kernel basis or transport plan. A changed bandwidth triggers
+a sampled exact-Gaussian comparison saved as `logs/<run>/projection_kernel_quality.json`
+in the **test output**, including failed acceptance. Balanced low-rank non-fit
+bandwidths still require acceptance; partial low-rank retains its configured
+kernel error policy (currently `warn`). Top-k-only overrides reuse the original
+kernel path. The fitted directory and its fingerprints remain unchanged; new
+mapped artifacts record actual projection settings. Passing `--dry-run` checks
+metadata only and does not certify numerical kernel accuracy.
 
 Whole-map logs now include actual projection h, source-neighborhood concentration,
 raw and selected target concentration, raw top-k mass, and mapped-to-target
@@ -412,9 +445,12 @@ Kernel widths follow the local convention:
 multiplier (0.5 in the top-8 dense partial recipe; 0.2/0.7 in balanced low-rank,
 1.0 in partial low-rank) and
 never estimates a query-batch scale.
-An explicit multiplier is part of the fit configuration/artifact identity; it
-rebuilds projection kernels and calibrates partial support thresholds on fit
-data. There is no query-time threshold calibration or hidden bandwidth sweep.
+An explicit multiplier is part of the fit configuration/artifact identity.
+Test-time overrides are recorded in the separate mapped artifact; they rebuild
+projection kernels and calibrate partial support thresholds on training data.
+There is no calibration from held-out query data or hidden bandwidth sweep.
+The partial low-rank fit config still requires multiplier 1; its test-time
+override supports other positive multipliers using the saved basis.
 
 All fitting and projection arithmetic uses float64 on the configured CUDA/CPU
 device. Saved feature banks stay float32 and mapped features return to the query

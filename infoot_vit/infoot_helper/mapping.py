@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from .conditional import BalancedModel, normalize_rows, partial_projection, log_query_kernel
+from .conditional import BalancedModel, normalize_rows, partial_projection, log_query_kernel, calibrate_support
 from .feature_bank import FeatureBank, compatible_banks, checked_file, digest, file_hash, save_tensor, write_json, validate_maps
 from .partial import feasibility, distance, OBJECTIVE
 from .storage import validate_plan, load_kernels, VERSION as STORAGE_VERSION
@@ -78,8 +78,6 @@ class FeatureMapper:
         self.target_index = {tid: j for j, tid in enumerate(target.ids)}
         self.config, self.mode = deepcopy(manifest["config"]), manifest["config"]["mode"]
         if projection is not None:
-            if self.mode != "whole_map":
-                raise ValueError("Projection overrides currently apply only to whole_map.")
             from .fit_mapping import validate_config
             self.config["projection"] = validate_config(dict(self.config, projection=projection))["projection"]
         self.device = resolve_device(device if device is not None else self.config.get("device", "cpu"))
@@ -144,6 +142,14 @@ class FeatureMapper:
             if manifest["schema"] == "siglip_infoot_mapping_v3" and kernel_state.get("storage", {}).get("version") != STORAGE_VERSION:
                 raise ValueError("Compact mappings require float32 kernel storage metadata.")
             self.shared = move(load_kernels(kernel_state),self.device)
+            projection_h = self.config["partial"]["solver"]["h"] * multiplier
+            if (projection_h != self.shared["h_projection"] or
+                    self.config["projection"]["confidence"] != manifest["config"]["projection"]["confidence"]):
+                # Calibrate on TRAINING support at the actual projection h, never on queries.
+                self.shared["support"] = [calibrate_support(x, self.shared["sx"][i], projection_h,
+                    self.config["projection"]["confidence"]) for i, x in enumerate(self.x)]
+            self.shared["h_projection"] = projection_h
+            self.patch_projection_h = projection_h
             if multiplier == 1:
                 self.projection_ky = self.shared["ky"]
             else:
@@ -152,14 +158,12 @@ class FeatureMapper:
                     for j, y in enumerate(self.y)])
 
     @classmethod
-    def load(cls, directory, *, device=None, projection=None):
+    def load(cls, directory, *, device=None, projection=None, run_log=None):
         directory = Path(directory).resolve()
         m = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-        if projection is not None and m.get("config", {}).get("mode") != "whole_map":
-            raise ValueError("Projection overrides currently apply only to whole_map.")
         if m.get("schema") in {"siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
             from infoot_vit.lowrank.mapping import LowRankMapper
-            return LowRankMapper.load(directory,device=device)
+            return LowRankMapper.load(directory,device=device,projection=projection,run_log=run_log)
         if (m.get("schema") not in {"siglip_infoot_mapping_v2", "siglip_infoot_mapping_v3"} or m.get("status") != "complete"
                 or digest({k: v for k, v in m.items() if k != "artifact_id"}) != m.get("artifact_id")):
             raise ValueError("Mapping artifact is incomplete, legacy, or its manifest fingerprint changed.")
@@ -231,6 +235,12 @@ class FeatureMapper:
         for offset in range(0, len(q), size):
             for patches, query_id in zip(q[offset:offset + size], query_ids[offset:offset + size]):
                 detail = dict(query_id=query_id)
+                if self.image is not None:
+                    detail["image_projection_h"] = self.image.h
+                if self.patch is not None:
+                    detail["patch_projection_h"] = self.patch.h
+                elif self.is_partial:
+                    detail["patch_projection_h"] = self.patch_projection_h
                 confidence = patches.new_ones(p)
                 if self.mode == "patch_global":
                     weights = self.patch.conditional_weights(patches)
@@ -362,6 +372,8 @@ class FeatureMapper:
         context = RunLog(output, "mapping", metadata=dict(mapper_id=self.manifest["artifact_id"],
             query_bank_id=bank.artifact_id, mode=self.mode)) if run_log is None else nullcontext(run_log)
         with context as log:
+            if getattr(self, "projection_kernel_report", None) is not None:
+                log.write_json("projection_kernel_quality.json", self.projection_kernel_report)
             compatible_banks(self.source, bank, fitting=False)
             if bank.manifest["domain"] != self.source.manifest["domain"]:
                 raise ValueError("Query domain must match the fitted source domain.")

@@ -1,20 +1,23 @@
 """Saved-factor grouped projection; no OT/kernel fitting during inference."""
 import json
 import math
+from copy import deepcopy
 from pathlib import Path
 import time
+import warnings
 import torch
 
 from ..infoot_helper.feature_bank import FeatureBank, compatible_banks, digest, checked_file, validate_maps, file_hash, write_json
 from ..infoot_helper.sampling import sample_ids, sampling_record
 from ..infoot_helper.conditional import BalancedModel, normalize_rows
 from ..infoot_helper.mapping import FeatureMapper, MappingResult, select_images
-from .config import SCHEMA, MODE,PARTIAL_SCHEMA,PARTIAL_MODE
+from .config import SCHEMA, MODE,PARTIAL_SCHEMA,PARTIAL_MODE, DEFAULT, projection_config
 from ..infoot_helper.device import resolve_device,move
 from .projection import project_scores
 from .storage import validate_factors
 from .experiment import validate_kernels
-from .kernels import features, projection_state
+from .kernels import features, projection_state, error_report
+from .kernel_audit import acceptance
 
 
 class LowRankMapper(FeatureMapper):
@@ -28,7 +31,7 @@ class LowRankMapper(FeatureMapper):
         return manifest
 
     @classmethod
-    def load(cls,directory,*,device=None):
+    def load(cls,directory,*,device=None,projection=None,run_log=None):
         directory = Path(directory).resolve()
         manifest = json.loads((directory/"manifest.json").read_text(encoding="utf-8"))
         if (manifest.get("schema") not in {SCHEMA,PARTIAL_SCHEMA} or manifest.get("status") != "complete"
@@ -51,12 +54,14 @@ class LowRankMapper(FeatureMapper):
         compatible_banks(*banks)
         if partial:
             from .partial_mapping import LowRankPartialMapper
-            return LowRankPartialMapper(directory,manifest,*banks,device=device)
-        return cls(directory,manifest,*banks,device=device)
+            return LowRankPartialMapper(directory,manifest,*banks,device=device,projection=projection,run_log=run_log)
+        return cls(directory,manifest,*banks,device=device,projection=projection,run_log=run_log)
 
-    def _initialize(self,directory,manifest,source,target,device):
+    def _initialize(self,directory,manifest,source,target,device,projection=None):
         self.directory,self.manifest,self.source,self.target = directory,manifest,source,target
-        self.config,self.mode = manifest["config"],manifest["config"]["mode"]
+        self.config,self.mode = deepcopy(manifest["config"]),manifest["config"]["mode"]
+        if projection is not None:
+            self.config["projection"] = projection_config(self.config, projection)
         self.device = resolve_device(device if device is not None else self.config.get("device","cpu"))
         self.x,self.y = source.features.to(device=self.device,dtype=torch.float64),target.features.to(device=self.device,dtype=torch.float64)
         self.is_partial = self.mode == PARTIAL_MODE
@@ -70,8 +75,27 @@ class LowRankMapper(FeatureMapper):
         self.patch = None
         return files
 
-    def __init__(self,directory,manifest,source,target,*,device=None):
-        files = self._initialize(directory,manifest,source,target,device)
+    def _check_projection_kernels(self, checks, run_log=None):
+        """Audit runtime factors without modifying the fitted artifact or its policy."""
+        quality = acceptance(checks, dict(DEFAULT["kernel"], **self.config["kernel"]))
+        self.projection_kernel_report = dict(quality, approximation=checks,
+            bandwidth_multiplier=self.config["projection"]["bandwidth_multiplier"],
+            image_projection_h=self.image.h, patch_projection_h=self.patch_projection_h,
+            support="training only; saved random bases/scales; runtime float64 factors")
+        if run_log is not None:
+            run_log.write_json("projection_kernel_quality.json", self.projection_kernel_report)
+            run_log.event("projection_kernel_checked", accepted=quality["accepted"], policy=quality["policy"])
+        if not quality["accepted"]:
+            message = (f"Projection kernel approximation failed {len(quality['failures'])} accuracy checks; "
+                       f"first failures: {quality['failures'][:5]}")
+            # Balanced non-fit bandwidths already require an accepted audit, even
+            # for older artifacts whose FIT-kernel policy was warn.
+            if quality["policy"] == "error" or (not self.is_partial and self.config["projection"]["bandwidth_multiplier"] != 1):
+                raise ValueError(message)
+            warnings.warn(message)
+
+    def __init__(self,directory,manifest,source,target,*,device=None,projection=None,run_log=None):
+        files = self._initialize(directory,manifest,source,target,device,projection)
         n,m = len(self.x)*self.x.shape[1],len(self.y)*self.y.shape[1]
         state = torch.load(files["factors"],weights_only=True)
         self.factor_validation = validate_factors(state,self.config["optimizer"],(n,m,self.config["transport_rank"]))
@@ -80,8 +104,12 @@ class LowRankMapper(FeatureMapper):
         q,r,g = (state[key].to(device=self.device,dtype=torch.float64) for key in ("q","r","g"))
         kernel = torch.load(files["kernels"],weights_only=True)
         multiplier = self.config["projection"]["bandwidth_multiplier"]
-        validate_kernels(kernel,(n,m,self.config["kernel_rank"]),self.x.shape[-1],self.config["kernel"],multiplier)
+        saved_multiplier = manifest["config"]["projection"]["bandwidth_multiplier"]
+        # Validate the immutable snapshot with its SAVED settings. A new bandwidth
+        # receives a separate runtime audit below, not a forged saved audit.
+        validate_kernels(kernel,(n,m,self.config["kernel_rank"]),self.x.shape[-1],self.config["kernel"],saved_multiplier)
         self.kernel_source = move(kernel["source"],self.device)
+        target_state = move(kernel["target"],self.device)
         if multiplier == 1:
             fx,fy = kernel["fx"].to(self.x),kernel["fy"].to(self.y)
         else:
@@ -89,9 +117,17 @@ class LowRankMapper(FeatureMapper):
             # or query-derived bandwidth; BOTH supports and target density change.
             chunk = self.config["optimizer"]["chunk_size"]
             self.kernel_source = projection_state(self.kernel_source,multiplier)
-            target_state = projection_state(move(kernel["target"],self.device),multiplier)
+            target_state = projection_state(target_state,multiplier)
             fx = features(self.x.flatten(0,1),self.kernel_source,chunk)
             fy = features(self.y.flatten(0,1),target_state,chunk)
+        self.patch_projection_h = self.kernel_source["h"]
+        if multiplier != saved_multiplier:
+            kc = self.config["kernel"]
+            checks = {}
+            for i, (name, x, f, s) in enumerate((("source", self.x, fx, self.kernel_source), ("target", self.y, fy, target_state))):
+                checks[name] = error_report(x.flatten(0,1), f, s, seed=kc["seed"]+10+i,
+                    count=kc["check_pairs"], density_queries=kc["density_queries"], chunk_size=self.config["optimizer"]["chunk_size"])
+            self._check_projection_kernels(checks, run_log)
         self.cross = ((fx.T@q)/g) @ (fy.T@r).T  # Only [kernel_rank,kernel_rank].
         self.density_y = (fy@fy.mean(0)).reshape(len(self.y),self.y.shape[1])
         self.target_kernel_features = fy.reshape(len(self.y),self.y.shape[1],-1)

@@ -40,9 +40,9 @@ def main(argv=None):
     p.add_argument("--confidence-threshold", type=float,
                    help="Partial mapping only: override token validity threshold without refitting. Recorded in mapped metadata.")
     p.add_argument("--projection-bandwidth", type=float,
-                   help="Whole-map only: absolute projection h (e.g. 0.10); reuse the saved plan and training distance scales.")
+                   help="Absolute image-router projection h (patch h for patch_global). The same multiplier scales patch kernels; saved plans stay fixed.")
     p.add_argument("--top-k-images", type=int,
-                   help="Whole-map only: retain and renormalize K target weights; 0 keeps all, 1 is a target-code retrieval control.")
+                   help="Retain and renormalize K target-image weights; 0 keeps all. Partial modes still use saved pairs only.")
     a = p.parse_args(argv)
     if min(a.count, a.chunk_size, a.threads) < 1 or (a.steps is not None and a.steps < 1):
         p.error("Counts, chunk size, threads and steps must be positive")
@@ -84,12 +84,10 @@ def main(argv=None):
         m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
         projection = projection_settings(m["config"], a.confidence_threshold,
             bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images)
-        # Set whole-map bandwidth before loading: its target KDE/smoothing are cached.
-        overrides = dict(projection=projection) if m["config"]["mode"] == "whole_map" else {}
-        mapper, bank = FeatureMapper.load(a.mapping,device=a.device, **overrides), FeatureBank.load(a.query_bank)
+        # Set overrides BEFORE loading cached KDEs, factors and support thresholds.
+        mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log)
+        bank = FeatureBank.load(a.query_bank)
         a.steps, a.guidance = generation_settings(mapper.mode, a.steps, a.guidance)
-        mapper.config = deepcopy(mapper.config)
-        mapper.config["projection"] = projection
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)
         result, manifest = mapper.project_bank(bank, output, count=a.count, chunk_size=a.chunk_size, run_log=log)
         if a.generate:
@@ -118,13 +116,14 @@ def projection_settings(config, threshold, *, bandwidth=None, top_k_images=None)
             raise ValueError("--confidence-threshold applies only to partial mappings.")
         projection["confidence"]["threshold"] = threshold
     if bandwidth is not None or top_k_images is not None:
-        if config["mode"] != "whole_map":
-            raise ValueError("Bandwidth/top-k overrides currently apply only to whole_map; partial pair selection and low-rank kernels stay fixed.")
         if bandwidth is not None:
             if not math.isfinite(bandwidth) or bandwidth <= 0:
                 raise ValueError("Projection bandwidth must be finite and positive.")
-            projection["bandwidth_multiplier"] = bandwidth / config["solver"]["h"]
+            solver = "image_solver" if config["mode"].endswith("_lowrank") else "solver"
+            projection["bandwidth_multiplier"] = bandwidth / config[solver]["h"]
         if top_k_images is not None:
+            if config["mode"] == "patch_global":
+                raise ValueError("patch_global has no image router; --top-k-images is not applicable.")
             if type(top_k_images) is not int or top_k_images < 0:
                 raise ValueError("top_k_images must be a nonnegative integer (0 keeps all).")
             projection["top_k_images"] = top_k_images or None

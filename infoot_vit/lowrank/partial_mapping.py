@@ -17,8 +17,8 @@ from ..infoot_helper.device import move
 class LowRankPartialMapper(LowRankMapper):
     map_features = FeatureMapper.map_features
 
-    def __init__(self,directory,manifest,source,target,*,device=None):
-        files = self._initialize(directory,manifest,source,target,device)
+    def __init__(self,directory,manifest,source,target,*,device=None,projection=None,run_log=None):
+        files = self._initialize(directory,manifest,source,target,device,projection)
         self.options = optimizer_config(self.config)
         selection = json.loads(files["pair_selection"].read_text(encoding="utf-8"))
         if selection["router_sha256"] != manifest["files"]["image"]["sha256"]:
@@ -43,6 +43,30 @@ class LowRankPartialMapper(LowRankMapper):
             pair_kernels.validate_collection(kernel[name],images.shape,self.config["kernel_rank"])
         self.kernel = move(kernel,self.device)
         self.fx,self.fy = self.kernel["source"]["factors"].double(),self.kernel["target"]["factors"].double()
+        multiplier = self.config["projection"]["bandwidth_multiplier"]
+        self.patch_projection_h = self.config["kernel"]["h"] * multiplier
+        checks = {}
+        if multiplier != 1:
+            # Retain each saved mean, distance scale and random basis. Re-evaluate
+            # both domains (including target-density correction), never fit OT.
+            kc = self.config["kernel"]
+            for name, images in (("source", self.x), ("target", self.y)):
+                state = self.kernel[name]
+                params = [kernels.projection_state(pair_kernels.parameters(state, i), multiplier)
+                          for i in range(len(images))]
+                factors = []
+                for i, (x, s) in enumerate(zip(images, params)):
+                    f = kernels.features(x, s, self.config["optimizer"]["chunk_size"])
+                    factors.append(f)
+                    checks[f"{name}:{i}"] = kernels.error_report(x, f, s,
+                        seed=state["seed"]+100+i, count=kc["check_pairs"],
+                        density_queries=min(kc["density_queries"], max(1,len(x)-1)), chunk_size=max(1,min(64,len(x)-1)))
+                state["h"], state["sigmas"] = params[0]["h"], [s["sigma"] for s in params]
+                setattr(self, "fx" if name == "source" else "fy", torch.stack(factors))
+            self._check_projection_kernels(checks, run_log)
+        confidence = self.config["projection"]["confidence"]
+        if multiplier != 1 or confidence != manifest["config"]["projection"]["confidence"]:
+            self.kernel["source"]["support"] = [pair_kernels.support_threshold(f, confidence) for f in self.fx]
         self._factor_cache = OrderedDict()  # Bounded GPU cache, never all pair factors.
 
     def _partial_query(self,patches,i):

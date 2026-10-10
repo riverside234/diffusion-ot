@@ -103,6 +103,18 @@ def optimizer_config(config):
                 transported_mass=config["partial"]["keep_mass"] if partial else 1.)
 
 
+def projection_config(config, projection):
+    """Validate runtime settings separately from fit-only pair/kernel choices."""
+    settings = deepcopy(projection)
+    chunks = {key: settings.pop(key, DEFAULT["projection"][key])
+              for key in ("target_chunk_size", "patch_chunk_size")}
+    if any(type(value) is not int or value < 1 for value in chunks.values()):
+        raise ValueError("Projection chunk sizes must be positive integers.")
+    base = validate_config(dict(mode="grouped_patch", source_bank=config["source_bank"],
+        target_bank=config["target_bank"], solver=config["image_solver"], projection=settings))
+    return dict(base["projection"], **chunks)
+
+
 def resources(ns,nt,p,d,c):
     n,m,r,k = ns*p,nt*p,c["transport_rank"],c["kernel_rank"]
     samples = n*m if c["estimator"]["exact"] else c["estimator"]["samples_per_row"]*(n+m)
