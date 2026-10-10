@@ -103,13 +103,17 @@ class LowRankMapper(FeatureMapper):
                 effective,residual = 0.,0.
                 for j in range(0,len(self.y),settings["target_chunk_size"]):
                     stop = j+settings["target_chunk_size"]
-                    if (alpha[j:stop] == 0).all(): continue
-                    candidate,diag = project_scores(left,self.target_kernel_features[j:stop],self.y[j:stop],self.density_y[j:stop],settings.get("patch_chunk_size",64))
+                    active = alpha[j:stop] > 0
+                    if not active.any(): continue
+                    # Sparse routing excludes these groups entirely, including
+                    # conditional validity checks and projection diagnostics.
+                    weights = alpha[j:stop][active]
+                    candidate,diag = project_scores(left,self.target_kernel_features[j:stop][active],self.y[j:stop][active],self.density_y[j:stop][active],settings.get("patch_chunk_size",64))
                     if (diag["weight_row_sums"] == 0).any():
                         raise ValueError("Zero-mass balanced conditional row; inspect kernel approximation.")
-                    mapped += (alpha[j:stop,None,None]*candidate).sum(0)
+                    mapped += (weights[:,None,None]*candidate).sum(0)
                     residual = max(residual,float((diag["weight_row_sums"]-1).abs().max()))
-                    effective += float((alpha[j:stop]*diag["patch_entropy"].exp().mean(-1)).sum())
+                    effective += float((weights*diag["patch_entropy"].exp().mean(-1)).sum())
                 if not torch.isfinite(mapped).all(): raise ValueError("Nonfinite low-rank mapped features.")
                 entropy = float(-(alpha*alpha.clamp_min(1e-300).log()).sum())
                 record = dict(query_id=qid,image_weights=alpha.tolist(),target_ids=self.target.ids,

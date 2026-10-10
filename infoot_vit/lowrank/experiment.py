@@ -105,19 +105,23 @@ def fit(raw,*,root,output_root=None,resume=None):
             device = resolve_device(c["device"])
             torch.set_num_threads(c["threads"])
             if resume:
-                manifest = json.loads((directory/"manifest.json").read_text(encoding="utf-8"))
-                if manifest["schema"] != schema or manifest["fit_fingerprint"] != identity:
+                # Preflight and completed-fit verification are read-only. Only
+                # adopt an unfinished manifest after accepting this resume, so
+                # a rejected request cannot mark an existing artifact failed.
+                saved_manifest = json.loads((directory/"manifest.json").read_text(encoding="utf-8"))
+                if saved_manifest["schema"] != schema or saved_manifest["fit_fingerprint"] != identity:
                     raise ValueError("Low-rank resume fingerprint changed; use a new fit directory.")
-                if manifest["status"] == "complete":
+                if saved_manifest["status"] == "complete":
                     from .mapping import LowRankMapper
                     completed = LowRankMapper.load(directory)
                     if mode == PARTIAL_MODE:
                         for entry in completed.pairs.values():
                             _cleanup_latest(directory,entry,log)
                     else:
-                        _cleanup_latest(directory,manifest["files"]["factors"],log)
-                    _cleanup_latest(directory,manifest["files"]["image"],log)
+                        _cleanup_latest(directory,saved_manifest["files"]["factors"],log)
+                    _cleanup_latest(directory,saved_manifest["files"]["image"],log)
                     return directory
+                manifest = saved_manifest
                 manifest.update(config=c,status="fitting"); manifest.pop("error",None)
             source,target = [FeatureBank.load(root/c[key]) for key in ("source_bank","target_bank")]
             compatible_banks(source,target)

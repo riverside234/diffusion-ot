@@ -240,6 +240,10 @@ The target-density correction is retained. A global patch softmax is not used.
 Projection streams target-image chunks and smaller target-patch blocks and returns the query's original
 `[B,196,768]` shape and dtype. The query patch order is preserved. It never
 infers target-grid positions or refits a plan, bandwidth or random feature map.
+Targets with zero routing weight are skipped before projection and validity
+checks. With argmax, sampling or top-K routing, unselected zero-score targets
+cannot change success or diagnostics when the target chunk size changes.
+Selected targets still require valid nonzero conditional scores.
 
 This is balanced transport: confidence is one and the condition padding mask
 is all false. It does not perform partial-OT rejection. Invalid/nonfinite scores
@@ -339,6 +343,9 @@ iteration if it was at the budget boundary.
 
 Only `optimizer.max_steps` may be increased on resume. Different ranks,
 bandwidths, seeds, sampling, code or runtime versions require a new directory.
+Rejected resumes leave the existing manifest, factors and checkpoints unchanged;
+only the new attempt's logs record the error. Verification or cleanup failures
+while reopening a completed fit also leave its completed manifest intact.
 The image router's unfinished diagnostic checkpoint is retained, but its
 unregistered solve restarts on resume; registered routers are never refitted.
 
@@ -446,6 +453,7 @@ full patch-pair allocations during kernel construction and optimization. Run:
 ```bash
 python -m pytest tests/test_infoot_vit_lowrank.py -q
 python -m pytest tests/test_infoot_vit_lowrank_partial.py -q
+python -m pytest tests/test_infoot_vit_lowrank_resume_review.py tests/test_infoot_vit_lowrank_routing.py -q
 ```
 
 **Actual 2,000-image fitting and translated-image quality have not been measured
