@@ -19,5 +19,5 @@ projection:
   seed: 0
   query_chunk_size: 4
 resources:
-  max_working_gib: 16
+  max_working_gib: 90
   max_plan_gib: 64
