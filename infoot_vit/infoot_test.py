@@ -1,132 +1,73 @@
-from infoot_helper import infoot
-import torch
-import sys
+"""Project held-out SigLIP banks, optionally generate with a fixed PDAE checkpoint."""
 from pathlib import Path
-from torchvision.utils import save_image
+from datetime import datetime, timezone
+import argparse
+import json
+import sys
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
-from diffusion_ot.data.manifests import read_jsonl
-from diffusion_ot.data.ground_truth import load_ground_truth_images
-from diffusion_ot.evaluation.stage1a_eval import (
-    load_stage1a_evaluator,
-    integrate_pdae_flow,
-    decode_vae_latents,
-)
-from infoot_helper.infoot_test_helper import generate_and_save_grid
-from diffusion_ot.data.latent_dataset import load_latent_tensor
-
-import argparse
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--h", type=float)
-parser.add_argument("--reg", type=float)
-parser.add_argument("--save", type=str, default="1")
-args = parser.parse_args()
-
-@torch.inference_mode()
-def generate_and_save_grid(
-    dog, v_dog, cat_image, output_path, steps=20, seed=0
-):
-    v_dog = v_dog.to(device=dog.device, dtype=dog.model_dtype)
-    generator = torch.Generator(device=dog.device).manual_seed(seed)
-
-    noise = torch.randn(
-        (1, 4, 32, 32),
-        device=dog.device,
-        dtype=dog.model_dtype,
-        generator=generator,
-    )
-
-    dog_latent = integrate_pdae_flow(
-        dog.branch,
-        dog.transformer,
-        noise,
-        v_dog,
-        num_steps=steps,
-        guidance_scale=1.0,
-        null_label=dog.training_config["class_conditioning"]["null_label"],
-    )
-    dog_image = decode_vae_latents(dog.vae, dog_latent)
-
-    grid = torch.cat(
-        [cat_image.cpu(), dog_image.cpu()], dim=0
-    ).clamp(0, 1)
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_image(grid, str(output_path), nrow=len(cat_image), padding=8)
+import torch
+from infoot_vit.infoot_helper.feature_bank import FeatureBank, digest
+from infoot_vit.infoot_helper.mapping import FeatureMapper
+from infoot_vit.infoot_helper.run_logging import RunLog
 
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-bank_dir = ROOT / "data/infoot_test"
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mapping", required=True, type=Path)
+    p.add_argument("--query-bank", type=Path, default=ROOT / "data/infoot_vit/cat_val")
+    p.add_argument("--output-dir", type=Path, help="New directory for mapped tensors, metadata and optional images.")
+    p.add_argument("--count", type=int, default=16)
+    p.add_argument("--chunk-size", type=int, default=4)
+    p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--generate", action="store_true", help="Also run fixed-checkpoint diffusion inference; never train.")
+    p.add_argument("--train-config", default="configs/stage1a_pdae_v2_l/dog.yaml")
+    p.add_argument("--eval-config", default="configs/stage1a_eval/pdae_v2_l.yaml")
+    p.add_argument("--checkpoint", type=Path)
+    p.add_argument("--weights", choices=["raw", "ema"], default="ema")
+    p.add_argument("--steps", type=int, default=50)
+    p.add_argument("--guidance", type=float, default=1.5)
+    p.add_argument("--solver", choices=["euler", "heun"], default="euler")
+    p.add_argument("--seed", type=int, default=20260903)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    a = p.parse_args(argv)
+    if min(a.count, a.chunk_size, a.threads, a.steps) < 1:
+        p.error("Counts, chunk size, threads and steps must be positive")
+    torch.set_num_threads(a.threads)
+    if a.dry_run:
+        # Validate small metadata before allocating supports/kernels or the DiT.
+        m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
+        q = json.loads((a.query_bank / "manifest.json").read_text(encoding="utf-8"))
+        if (m["status"] != "complete" or m["representation"] != q["representation"] or q["split"] == "train"
+                or m["source_domain"] != q["domain"] or set(q["ids"]) & (set(m["source_ids"]) | set(m["target_ids"]))
+                or digest({k:v for k,v in m.items() if k != "artifact_id"}) != m["artifact_id"]
+                or digest({k:v for k,v in q.items() if k != "artifact_id"}) != q["artifact_id"]):
+            raise ValueError("Need completed mapper and compatible held-out query bank")
+        print(json.dumps(dict(mapper_id=m["artifact_id"], mode=m["config"]["mode"], fit_resources=m["resources"],
+            query_count=min(a.count, len(q["ids"])), mask="existing condition_padding_mask; True is padding",
+            generate=a.generate, projection=m["config"]["projection"]), indent=2))
+        return 0
+    output = a.output_dir or ROOT / "results/infoot_vit" / f"{a.mapping.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:6]}"
+    output.mkdir(parents=True, exist_ok=False)
+    with RunLog(output, "mapping_test", vars(a)) as log:
+        mapper, bank = FeatureMapper.load(a.mapping), FeatureBank.load(a.query_bank)
+        log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)
+        result, manifest = mapper.project_bank(bank, output, count=a.count, chunk_size=a.chunk_size, run_log=log)
+        if a.generate:
+            from infoot_vit.infoot_helper.evaluate_mapping import generate
+            log.event("generation_started")
+            generate(mapper, bank, result, output, root=ROOT, train_config=a.train_config, eval_config=a.eval_config,
+                     checkpoint=a.checkpoint, weights=a.weights, steps=a.steps, guidance=a.guidance, solver=a.solver,
+                     seed=a.seed, batch_size=a.chunk_size, device=a.device)
+            log.event("generation_completed", report="generation_report.json")
+        print(f"Saved {len(manifest['ids'])} projections to {output}; mode={mapper.mode}")
+    return 0
 
-cat_bank = torch.load(
-    bank_dir / "cat_bank.pt", map_location="cpu", weights_only=True
-)
-dog_bank = torch.load(
-    bank_dir / "dog_bank.pt", map_location="cpu", weights_only=True
-)
-transport = torch.load(
-    bank_dir / "cat_to_dog_plan.pt",
-    map_location=device,
-    weights_only=True,
-)
-if not isinstance(transport, dict) or transport.get("feature_space") != "raw":
-    raise ValueError("Rerun infoot_fit.py to save a plan fitted on raw features.")
 
-Xs = cat_bank["v_bank"].to(device=device, dtype=torch.float32)
-Xt = dog_bank["v_bank"].to(device=device, dtype=torch.float32)
-
-solver = infoot.FusedInfoOT(
-    Xs, Xt, h=transport["h"] if args.h is None else args.h,
-    reg=transport["reg"], lam=transport["lam"],
-)
-solver.P = transport["P"].to(dtype=Xs.dtype)
-assert solver.P.shape == (len(Xs), len(Xt))
-
-count = 16
-latent_dir = ROOT / "data/latents/afhq_sit_b2_256/cat_val"
-paths = sorted(latent_dir.glob("*.pt"))[:count]
-if len(paths) < count:
-    raise ValueError(f"Need {count} validation latents in {latent_dir}")
-
-cat = load_stage1a_evaluator(
-    ROOT / "configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml",
-    ROOT / "configs/stage1a_eval/residual_sit_b2_256.yaml",
-    device=device,
-    weights="raw",
-    checkpoint_path=cat_bank["checkpoint_path"],
-)
-
-with torch.no_grad():
-    x0 = torch.stack([load_latent_tensor(path) for path in paths])
-    x0 = x0.to(device=cat.device, dtype=cat.model_dtype)
-    v_cat = cat.branch.encode(x0).to(Xs)
-
-    scores = solver.conditional_score(v_cat)
-    v_dog = infoot.projection(scores, Xt)
-
-del cat
-
-records = {
-    record["sample_id"]: record
-    for record in read_jsonl(ROOT / "data/manifests/cat_val.jsonl")
-}
-cat_images = load_ground_truth_images(
-    ROOT / "configs/data/afhq_huggan.yaml",
-    [records[path.stem] for path in paths],
-)
-
-dog = load_stage1a_evaluator(
-    ROOT / "configs/stage1a_pdae/dog_sit_b2_lora_residual_cosmap.yaml",
-    ROOT / "configs/stage1a_eval/residual_sit_b2_256.yaml",
-    device=device,
-    weights="raw",
-    checkpoint_path=dog_bank["checkpoint_path"],
-)
-
-output_path = ROOT / f"results/infoot_test/cat_to_dog_test_{args.save}.png"
-generate_and_save_grid(dog, v_dog, cat_images, output_path)
-print("Saved:", output_path)
+if __name__ == "__main__":
+    raise SystemExit(main())

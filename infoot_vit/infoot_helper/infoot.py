@@ -187,38 +187,6 @@ class FusedInfoOT():
         return P
   
 
-    """
-    def project(self, X, method='barycentric', h=None):
-        if method not in ['conditional', 'barycentric']:
-            raise Exception('only suppot conditional or barycebtric projection')
-        if self.P is None:
-            raise Exception('please run FusedInfoOT.solve() to obtain transportation plan')
-
-        if h is None:
-            h = self.h
-
-        if torch.equal(X, self.Xs):
-            if method == 'conditional':
-                if h == self.h:
-                    P = ratio(self.P, self.Ks, self.Kt)
-                else:
-                    _Ks, _Kt = compute_kernel(self.Cs, self.Ct, h)
-                    P = ratio(self.P, _Ks, _Kt)
-            else:
-                P = self.P
-            return projection(P, self.Xt)
-        else:
-            if method == 'conditional':
-                _Cs = torch.cdist(X, Xs, compute_mode='donot_use_mm_for_euclid_dist')
-                _Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
-                _Ks, _Kt = compute_kernel(_Cs, _Ct, h)
-
-                P = ratio(P, _Ks, _Kt)
-                return projection(P, self.Xt)
-            else:
-                raise Exception('barycentric cannot generalize to new samples')
-    """
-
     def conditional_score(self, X, h=None):
         if h is None:
             h = self.h
@@ -273,37 +241,6 @@ class InfoOT():
                                        method='sinkhorn_log', numItermax=5000, stopThr=1e-4)
         self.P = P
         return P
-    """
-    def project(self, X, method='barycentric', h=None):
-        if method not in ['conditional', 'barycentric']:
-            raise Exception('only suppot conditional or barycebtric projection')
-        if self.P is None:
-            raise Exception('please run InfoOT.solve() to obtain transportation plan')
-
-        if h is None:
-            h = self.h
-
-        if torch.equal(X, self.Xs):
-            if method == 'conditional':
-                if h == self.h:
-                    P = ratio(self.P, self.Ks, self.Kt)
-                else:
-                    _Ks, _Kt = compute_kernel(self.Cs, self.Ct, h)
-                    P = ratio(self.P, _Ks, _Kt)
-            else:
-                P = self.P
-            return projection(P, self.Xt)
-        else:
-            if method == 'conditional':
-                _Cs = torch.cdist(X, Xs, compute_mode='donot_use_mm_for_euclid_dist')
-                _Ct = torch.cdist(Xt, Xt, compute_mode='donot_use_mm_for_euclid_dist')
-                _Ks, _Kt = compute_kernel(_Cs, _Ct, h)
-
-                P = ratio(P, _Ks, _Kt)
-                return projection(P, self.Xt)
-            else:
-                raise Exception('barycentric cannot generalize to new samples')
-"""
 
     def conditional_score(self, X, h=None):
         if h is None:

@@ -1,0 +1,16 @@
+# Fixed-training-bandwidth patch baseline, using the same explicit cost policy.
+mode: patch_global
+source_bank: data/infoot_vit/cat_train
+target_bank: data/infoot_vit/dog_train
+solver:
+  h: 0.4
+  lam: 0.1
+  reg: 0.05
+  cost_scale: mean
+  max_outer_steps: 300
+projection:
+  bandwidth_multiplier: 1.0
+  query_chunk_size: 4
+resources:
+  max_working_gib: 16
+  max_plan_gib: 64

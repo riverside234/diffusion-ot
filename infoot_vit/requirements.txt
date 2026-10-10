@@ -1,0 +1,3 @@
+# Opt-in standalone experiment dependencies. Does not change the lab environment.
+# Log-domain fixed-mass partial OT was verified locally with POT 0.9.7.post1.
+POT==0.9.7.post1

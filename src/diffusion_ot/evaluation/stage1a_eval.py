@@ -496,6 +496,7 @@ def integrate_pdae_flow(
     time_eps: float = 1.0e-5,
     batch_size: int | None = None,
     sampling_stats: dict | None = None,
+    condition_padding_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Integrate velocity: legacy Euler at midpoint times, or endpoint Heun.
 
@@ -516,6 +517,9 @@ def integrate_pdae_flow(
         raise ValueError("Integration times must be finite and in [0,1].")
     if z.shape[0] != initial_state.shape[0]:
         raise ValueError("Conditions and states must have matching batch dimensions.")
+    if condition_padding_mask is not None:
+        from diffusion_ot.models.pdae_v2.cross_attention import validate_padding_mask
+        validate_padding_mask(z, condition_padding_mask)
     if batch_size is not None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
@@ -524,7 +528,9 @@ def integrate_pdae_flow(
                 branch, transformer, initial_state[i:i + batch_size], z[i:i + batch_size],
                 num_steps=num_steps, start_time=start_time, end_time=end_time,
                 guidance_scale=guidance_scale, null_label=null_label, solver=solver,
-                time_eps=time_eps, sampling_stats=sampling_stats)
+                time_eps=time_eps, sampling_stats=sampling_stats,
+                condition_padding_mask=(condition_padding_mask[i:i + batch_size]
+                                        if condition_padding_mask is not None else None))
                 for i in range(0, len(initial_state), batch_size)])
 
     state = initial_state.clone()
@@ -536,6 +542,8 @@ def integrate_pdae_flow(
         null_label=null_label,
     )
     def velocity_at(value, time_value):
+        mask_kwargs = ({"condition_padding_mask": condition_padding_mask}
+                       if condition_padding_mask is not None else {})
         if solver == "heun":
             time_value = min(1 - time_eps, max(time_eps, time_value))
         timestep = torch.full(
@@ -546,6 +554,7 @@ def integrate_pdae_flow(
         )
         if bool(getattr(branch, "semantic_cfg_enabled", False)):
             output = branch.predict_cfg_with_z(
+                **mask_kwargs,
                 x_t=value,
                 timestep=timestep,
                 z=z,
@@ -556,6 +565,7 @@ def integrate_pdae_flow(
         else:
             # Compatibility path for Stage 1A checkpoints trained before learned-null CFG.
             output = branch.predict_with_z(
+                **mask_kwargs,
                 x_t=value,
                 timestep=timestep,
                 z=z,

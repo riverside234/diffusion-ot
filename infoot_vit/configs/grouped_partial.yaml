@@ -1,0 +1,39 @@
+# Requested target: balanced image routing + complete offline partial patch-pair bank.
+mode: grouped_partial
+source_bank: data/infoot_vit/cat_train
+target_bank: data/infoot_vit/dog_train
+solver:
+  h: 0.4
+  lam: 0.1
+  reg: 0.05
+  cost_scale: mean
+  max_outer_steps: 300
+  max_inner_steps: 10000
+partial:
+  keep_mass: 0.8  # Retained mass per pair, NOT a fixed fraction of rejected patches.
+  solver:
+    h: 0.4
+    lam: 0.1
+    reg: 0.05
+    cost_scale: mean
+    max_outer_steps: 300
+    max_inner_steps: 10000
+    inner_tolerance: 1.0e-10
+    feasibility_tolerance: 1.0e-8
+    mass_tolerance: 1.0e-8
+    outer_tolerance: 1.0e-7
+projection:
+  bandwidth_multiplier: 1.0
+  selection: mean
+  top_k_images: null
+  seed: 0
+  query_chunk_size: 4
+  confidence:
+    support_calibration: fit_leave_one_out_log_density
+    support_quantile: 0.01  # Fit-only heuristic, not semantic correctness.
+    threshold: 0.05
+    mass_floor: 1.0e-12
+    all_invalid_policy: error
+resources:
+  max_working_gib: 16
+  max_plan_gib: 64
