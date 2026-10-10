@@ -19,9 +19,14 @@ def main(argv=None):
     p.add_argument("--source-bank", default=None)
     p.add_argument("--target-bank", default=None)
     p.add_argument("--mode", choices=["patch_global", "whole_map", "grouped_patch", "grouped_partial"])
-    p.add_argument("--h", type=float)
-    p.add_argument("--reg", type=float)
-    p.add_argument("--lam", type=float)
+    p.add_argument("--h", type=float, help="solver.h: balanced router/global-patch bandwidth (not partial.solver).")
+    p.add_argument("--reg", type=float, help="solver.reg: balanced entropy regularization (not partial.solver).")
+    p.add_argument("--lam", type=float, help="solver.lam: balanced MI weight (not partial.solver).")
+    p.add_argument("--max-outer-steps", type=int, help="solver.max_outer_steps; changed settings require a new fit.")
+    p.add_argument("--partial-h", type=float, help="grouped_partial: patch-pair KDE bandwidth.")
+    p.add_argument("--partial-reg", type=float, help="grouped_partial: patch-pair entropy regularization.")
+    p.add_argument("--partial-lam", type=float, help="grouped_partial: patch-pair MI weight.")
+    p.add_argument("--partial-max-steps", type=int, help="grouped_partial: patch-pair outer iteration budget.")
     p.add_argument("--keep-mass", type=float, help="Partial patch mass; use 1.0 for the matched balanced-pair baseline.")
     p.add_argument("--sample-images", type=int, help="grouped_partial only: training images per domain, sampled without replacement.")
     p.add_argument("--sample-seed", type=int, help="grouped_partial only: sampling seed (default 42).")
@@ -47,9 +52,13 @@ def main(argv=None):
     for key in ("source_bank", "target_bank", "mode", "device"):
         if getattr(args, key) is not None:
             config[key] = getattr(args, key)
-    for key in ("h", "reg", "lam"):
+    for key in ("h", "reg", "lam", "max_outer_steps"):
         if getattr(args, key) is not None:
             config.setdefault("solver", {})[key] = getattr(args, key)
+    for argument, field in ((args.partial_h, "h"), (args.partial_reg, "reg"),
+                            (args.partial_lam, "lam"), (args.partial_max_steps, "max_outer_steps")):
+        if argument is not None:
+            config.setdefault("partial", {}).setdefault("solver", {})[field] = argument
     if args.keep_mass is not None:
         config.setdefault("partial", {})["keep_mass"] = args.keep_mass
     for argument, field in ((args.sample_images, "images_per_domain"), (args.sample_seed, "seed")):

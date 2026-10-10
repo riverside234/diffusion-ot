@@ -9,21 +9,24 @@ sampling:
   images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
-solver:
+solver:  # Balanced IMAGE router; separate from partial.solver below.
   h: 0.4
-  lam: 0.1
-  reg: 0.05
+  lam: 0.075
+  reg: 0.075
   cost_scale: mean
-  max_outer_steps: 300
+  max_outer_steps: 1200
   max_inner_steps: 10000
+  inner_tolerance: 1.0e-10
+  feasibility_tolerance: 1.0e-8
+  outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
-  keep_mass: 0.8  # Retained mass per pair, NOT a fixed fraction of rejected patches.
-  solver:
-    h: 0.4
-    lam: 0.1
-    reg: 0.05
+  keep_mass: 0.75  # Provisional: retain 75% of pair mass, NOT exactly 75% of patches.
+  solver:  # Exact PARTIAL patch-pair InfoOT; conservative starting point pending lab validation.
+    h: 0.45
+    lam: 0.05
+    reg: 0.075
     cost_scale: mean
-    max_outer_steps: 300
+    max_outer_steps: 600
     max_inner_steps: 10000
     inner_tolerance: 1.0e-10
     feasibility_tolerance: 1.0e-8
@@ -38,7 +41,7 @@ projection:
   confidence:
     support_calibration: fit_leave_one_out_log_density
     support_quantile: 0.01  # Fit-only heuristic, not semantic correctness.
-    threshold: 0.05
+    threshold: 0.10  # Provisional weak-condition filter; inspect mapping_report threshold coverage.
     mass_floor: 1.0e-12
     all_invalid_policy: error
 resources:

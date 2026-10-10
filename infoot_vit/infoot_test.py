@@ -1,5 +1,6 @@
 """Project held-out SigLIP banks, optionally generate with a fixed PDAE checkpoint."""
 from pathlib import Path
+from copy import deepcopy
 from datetime import datetime, timezone
 import argparse
 import json
@@ -35,13 +36,18 @@ def main(argv=None):
     p.add_argument("--solver", choices=["euler", "heun"], default="euler")
     p.add_argument("--seed", type=int, default=20260903)
     p.add_argument("--device",help="Mapping AND generation device; defaults to the saved experiment device.")
+    p.add_argument("--confidence-threshold", type=float,
+                   help="Partial mapping only: override token validity threshold without refitting. Recorded in mapped metadata.")
     a = p.parse_args(argv)
     if min(a.count, a.chunk_size, a.threads, a.steps) < 1:
         p.error("Counts, chunk size, threads and steps must be positive")
+    if a.confidence_threshold is not None and not 0 <= a.confidence_threshold <= 1:
+        p.error("--confidence-threshold must be finite and in [0,1]")
     torch.set_num_threads(a.threads)
     if a.dry_run:
         # Validate small metadata before allocating supports/kernels or the DiT.
         m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
+        projection = projection_settings(m["config"], a.confidence_threshold)
         q = json.loads((a.query_bank / "manifest.json").read_text(encoding="utf-8"))
         training_ids = set(m["source_ids"]) | set(m["target_ids"])
         if m.get("schema") in {"siglip_infoot_mapping_v3", "siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
@@ -58,12 +64,14 @@ def main(argv=None):
             raise ValueError("Need completed mapper and compatible held-out query bank")
         print(json.dumps(dict(mapper_id=m["artifact_id"], mode=m["config"]["mode"], fit_resources=m["resources"],
             query_count=min(a.count, len(q["ids"])), mask="existing condition_padding_mask; True is padding",
-            generate=a.generate, projection=m["config"]["projection"]), indent=2))
+            generate=a.generate, projection=projection), indent=2))
         return 0
     output = a.output_dir or ROOT / "results/infoot_vit" / f"{a.mapping.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:6]}"
     output.mkdir(parents=True, exist_ok=False)
     with RunLog(output, "mapping_test", vars(a)) as log:
         mapper, bank = FeatureMapper.load(a.mapping,device=a.device), FeatureBank.load(a.query_bank)
+        mapper.config = deepcopy(mapper.config)
+        mapper.config["projection"] = projection_settings(mapper.config, a.confidence_threshold)
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)
         result, manifest = mapper.project_bank(bank, output, count=a.count, chunk_size=a.chunk_size, run_log=log)
         if a.generate:
@@ -75,6 +83,16 @@ def main(argv=None):
             log.event("generation_completed", report="generation_report.json")
         print(f"Saved {len(manifest['ids'])} projections to {output}; mode={mapper.mode}")
     return 0
+
+
+def projection_settings(config, threshold):
+    """Projection-only comparison: preserve immutable fit metadata and bandwidths."""
+    projection = deepcopy(config["projection"])
+    if threshold is not None:
+        if config["mode"] not in {"grouped_partial", "grouped_partial_lowrank"}:
+            raise ValueError("--confidence-threshold applies only to partial mappings.")
+        projection["confidence"]["threshold"] = threshold
+    return projection
 
 
 if __name__ == "__main__":

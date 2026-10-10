@@ -361,7 +361,7 @@ class FeatureMapper:
                       projection=self.config["projection"])
             result = self.map_features(features, ids, valid_mask=torch.ones(features.shape[:2], dtype=torch.bool,device=self.device),
                                        return_metadata=True, chunk_size=chunk_size, on_query=on_query)
-            report = mapping_summary(result, features, self.x, self.y)
+            report = mapping_summary(result, features, self.x, self.y, confidence_settings=self.config["projection"]["confidence"])
             log.write_json("mapping_report.json", report)
             manifest = self._save_mapping(bank, output, ids, result)
             log.event("mapping_saved", artifact_id=manifest["artifact_id"], query_count=n,
@@ -384,7 +384,7 @@ class FeatureMapper:
         return manifest
 
 
-def mapping_summary(result, query, source, target):
+def mapping_summary(result, query, source, target, *, confidence_settings=None):
     """Separate within-map spread from variation between image means for tuning."""
     def statistics(features, mask=None):
         x = features.detach().double()
@@ -422,6 +422,19 @@ def mapping_summary(result, query, source, target):
     if discarded:
         report["fit_pair_discarded_routing_mass"] = dict(min=min(discarded), mean=sum(discarded)/len(discarded), max=max(discarded))
         report["routing_note"] = "Confidence/rejection are conditional on renormalized saved routes. Discarded routing mass is reported separately."
+    if confidence_settings is not None and result.diagnostics["mode"] in {"grouped_partial", "grouped_partial_lowrank"}:
+        active_threshold = confidence_settings["threshold"]
+        mass_floor = confidence_settings["mass_floor"]
+        coverage = []
+        for threshold in sorted({.05, .10, .20, .30, active_threshold}):
+            mask = (confidence > mass_floor) & (confidence >= threshold)
+            counts = mask.sum(1)
+            coverage.append(dict(threshold=threshold, valid_fraction=float(mask.double().mean()),
+                mean_valid_tokens=float(counts.double().mean()), min_valid_tokens=int(counts.min()),
+                all_invalid_images=int((counts == 0).sum())))
+        report["confidence_threshold_sweep"] = dict(active_threshold=active_threshold, mass_floor=mass_floor,
+            coverage=coverage, note="Counterfactual mask coverage only, from the same saved confidences; no fitting or image generation. "
+                "Use held-out validation images to choose a threshold; confidence is not a semantic correctness probability.")
     return report
 
 

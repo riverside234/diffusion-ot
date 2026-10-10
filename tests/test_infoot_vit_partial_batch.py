@@ -148,7 +148,7 @@ def test_cli_batch_overrides_and_config_defaults(tmp_path, monkeypatch):
         assert seen[-1]["pair_batch_size"] == expected and seen[-1]["device"] == "cpu"
     actual = yaml.safe_load((infoot_fit.ROOT / "infoot_vit/configs/grouped_partial.yaml").read_text())
     assert actual["device"] == "cuda" and actual["pair_batch_size"] == 256
-    assert actual["fit_pair_top_k"] == 8 and actual["partial"]["keep_mass"] == .8
+    assert actual["fit_pair_top_k"] == 8 and actual["partial"]["keep_mass"] == .75
 
 
 def test_converged_outer_members_are_never_updated_again():

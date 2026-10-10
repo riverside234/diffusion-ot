@@ -363,6 +363,11 @@ def _fit_mapping(config, *, root, directory, resume, log):
             with (path / "iterations.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(dict(report, run_id=log.run_id, elapsed_seconds=time.perf_counter() - start), allow_nan=False) + "\n")
             log.event("solver_iteration", unit=name, **report)
+            if name in {"image", "patch"} and (report["iteration"] == 1 or report["iteration"] % 25 == 0
+                                               or report["status"] != "running"):
+                print(f"{name} FusedInfoOT {report['iteration']}/{config['solver']['max_outer_steps']}: "
+                      f"objective={report['objective']:.8g}, delta={report['plan_delta_l1']:.3g}, "
+                      f"effective_targets={report['mean_row_effective_targets']:.1f}, status={report['status']}", flush=True)
         return callback
 
     try:
@@ -395,6 +400,12 @@ def _fit_mapping(config, *, root, directory, resume, log):
                 else:
                     model = BalancedModel.fit(xs, ys, config["solver"], on_step=progress(name))
                     state = model.state | dict(source_ids=source.ids, target_ids=target.ids)
+                report = {key: state[key] for key in ("status", "config", "solver", "cost_scale", "source_scale",
+                    "target_scale", "source_count", "target_count", "kernel_diagnostics", "history",
+                    "row_residual", "column_residual") if key in state}
+                # Keep a readable report even if convergence/quantization validation fails.
+                write_json(directory / f"{name}_report.json", report)
+                log.write_json(f"{name}_report.json", report)
                 path = directory / "plans" / f"{name}.pt"
                 if compact:
                     # Solver has finished in double. Only disk state is quantized.
@@ -404,8 +415,15 @@ def _fit_mapping(config, *, root, directory, resume, log):
                     save_tensor(path, state)
                     entry = _file_entry(directory, path)
                 if state["status"] != "converged":
-                    raise RuntimeError(f"{name} FusedInfoOT {state['status']}; diagnostics/plan saved in {path}. "
-                                       "Reassess scales or start a new configuration with a larger iteration budget.")
+                    last = state["history"][-1]
+                    stage = " Patch-pair fitting has not started." if name == "image" and mode == "grouped_partial" else ""
+                    raise RuntimeError(f"{name} FusedInfoOT {state['status']} after {last['iteration']} outer iterations: "
+                        f"plan_delta_l1={last['plan_delta_l1']:.3g}, tolerance={config['solver']['outer_tolerance']:.3g}, "
+                        f"inner_error={last['inner']['error']:.3g}.{stage} "
+                        f"Diagnostics: {directory / (name + '_report.json')}; plan: {path}. "
+                        "For a budget stop, increase solver.max_outer_steps (--max-outer-steps) or reassess solver.h/reg/lam; "
+                        "partial.solver and confidence.threshold do not control the image router. "
+                        "Changed settings require a new fit, without --resume.")
                 manifest["models"][name] = entry
                 _registered_manifest(directory, manifest)
             if compact:

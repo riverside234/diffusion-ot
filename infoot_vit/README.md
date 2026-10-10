@@ -128,11 +128,55 @@ these estimates are neither measured peak memory nor a disk reservation.
 
 ### Exact GPU batches for the top-8 experiment
 
+The 2026-10-10 top-8 log stopped in the **balanced image router**, before any
+partial patch pairs were fitted. All inner solves passed; the outer residual was
+`1.12e-5` against `1e-7` at the 300-step budget. The revised starting recipe is:
+
+| Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
+|---|---:|---:|---:|---:|
+| Image router: `solver` | 0.40 | 0.075 | 0.075 | 1,200 |
+| Partial patch pairs: `partial.solver` | 0.45 | 0.075 | 0.05 | 600 |
+
+Strict convergence, capacity and mass tolerances remain unchanged. The partial
+settings, `partial.keep_mass: 0.75` and confidence `threshold: 0.10` are **provisional**:
+the failed lab run has no patch-fit or mapping evidence. A small CPU numerical
+probe supports the gentler partial MI/entropy balance; it does not establish
+image quality. `keep_mass` specifies transported mass, not a fixed number of
+valid patches. The threshold filters smoothed query confidence after support
+checks, separately from top-8 discarded routing mass. Neither affects router
+convergence. See [the run analysis](../docs/analysis/vit_infoot_top8_300/README.md).
+
+Start a **new** fit with the revised recipe; changing settings/source invalidates
+resume fingerprints. Existing complete artifacts remain loadable.
+
+```bash
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000
+```
+
+CLI `--h/--reg/--lam/--max-outer-steps` affect only `solver`. The independent
+`--partial-h/--partial-reg/--partial-lam/--partial-max-steps` affect only
+`partial.solver`. Use `--keep-mass` for a fresh matched mass ablation.
+
+After fitting, compare thresholds on the **same validation IDs and noise seeds**
+without refitting or modifying the fit artifact:
+
+```bash
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<new-fit> --query-bank data/infoot_vit/cat_val --count 16 --confidence-threshold 0.10 --generate
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<new-fit> --query-bank data/infoot_vit/cat_val --count 16 --confidence-threshold 0.05 --generate
+```
+
+The override and resulting masks are recorded in each mapping manifest. Each
+partial `mapping_report.json` also reports counterfactual valid-token coverage
+and all-invalid image counts at thresholds 0.05/0.10/0.20/0.30 plus the active
+value. That sweep does not generate extra images or choose a threshold. Use
+validation to select it, then keep it fixed for test; keep the explicit
+all-invalid error policy.
+
 `grouped_partial.yaml` now sets **`device: cuda`**, **`pair_batch_size: 256`**,
 and `pair_checkpoint_every: 10`. Selected pairs are fitted as `[B,196,196]`
 costs, cached per-image kernels, plans and solver updates. The last batch uses
-its actual size. Patch features, sampling, router selection, per-pair mean cost
-scaling, bandwidths, MI, entropy and transported mass are unchanged. This is
+its actual size. Batching preserves patch features, sampling, router selection,
+per-pair mean cost scaling and the configured bandwidths, MI, entropy and transported mass. This is
 the **dense** experiment; the separate low-rank experiments are unchanged.
 
 POT 0.9.7's log-domain partial routine accepts one cost matrix. The batched
@@ -352,6 +396,8 @@ logs/<attempt>/
   error.json                # exception type/message on failure/interruption
   requested_config.txt      # fit input, including before preflight validation
   inspection.json           # validated fit settings, bank identities, versions, resource estimate
+  image_report.json         # router settings/history/residuals, including budget stops; also at fit root
+  patch_report.json         # analogous balanced global-patch report, when applicable
   fit_report.json           # successful fit summary (also at the fit directory root)
   queries.jsonl             # mapping diagnostics, one completed query per line
   mapping_report.json       # successful mapping summary
@@ -364,6 +410,9 @@ records include the attempt ID and elapsed time, so an interrupted/refitted pair
 can be distinguished from earlier attempts. `events.jsonl` also records which
 model/pair was active if failure occurs before an accepted first step. Inner
 solver warnings captured by POT wrappers are in the iteration's `inner.warnings`.
+Balanced model progress prints at iteration 1, every 25 iterations, and terminal
+states. Budget-stop errors include the raw fixed-point residual and inner error;
+partial-pair settings cannot fix an image-router stop.
 
 Mapping saves each query's diagnostics **before** enforcing the all-invalid
 policy. A rejected-query failure therefore retains confidence/rejection evidence
