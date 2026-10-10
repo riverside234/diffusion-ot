@@ -1,0 +1,2 @@
+{"event": "run_started", "timestamp": "2026-10-10T20:53:09.635413+00:00", "elapsed_seconds": 0.0022017849842086434, "operation": "mapping_test"}
+{"event": "run_finished", "timestamp": "2026-10-10T20:53:09.635870+00:00", "elapsed_seconds": 0.0026563360006548464, "status": "failed"}

@@ -1,0 +1,105 @@
+{
+  "all_invalid_images": 0,
+  "confidence_quantiles": {
+    "max": 1.0,
+    "min": 1.0,
+    "p05": 1.0,
+    "p50": 1.0,
+    "p95": 1.0
+  },
+  "device": "cuda",
+  "mapped": {
+    "corresponding_patch_variance_across_images": 0.00958033991325947,
+    "image_mean_variance": 0.0016434191951051162,
+    "images": 16,
+    "norm_mean": 35.479806588274734,
+    "token_variance": 0.339206925223543,
+    "valid_images": 16,
+    "valid_tokens": 3136
+  },
+  "mapped_to_target_spread_ratio": {
+    "corresponding_patch_variance_across_images": 0.006849284174211111,
+    "image_mean_variance": 0.007741569337431174,
+    "norm_mean": 0.7431779920384407,
+    "token_variance": 0.197730124388968
+  },
+  "mode": "whole_map",
+  "note": "Descriptive feature diagnostics only; image means do not replace patch features for fitting or conditioning. Compare fixed generated images independently.",
+  "query": {
+    "corresponding_patch_variance_across_images": 1.1068052383730733,
+    "image_mean_variance": 0.10945818577484656,
+    "images": 16,
+    "norm_mean": 47.3440262231483,
+    "token_variance": 1.5825309325723316,
+    "valid_images": 16,
+    "valid_tokens": 3136
+  },
+  "routing_note": "Raw routing precedes top-k/selection; retained routes are explicitly normalized. Feature spread compares this query set with the full target bank; it is descriptive, not a quality score. Top-1 whole-map conditioning is target-code retrieval, not evidence of source-preserving translation.",
+  "seconds": 0.4409064479987137,
+  "source_support": {
+    "corresponding_patch_variance_across_images": 1.1953669825653737,
+    "image_mean_variance": 0.12066349211735895,
+    "images": 4000,
+    "norm_mean": 47.275457553093965,
+    "token_variance": 1.5965998989430141,
+    "valid_images": 4000,
+    "valid_tokens": 784000
+  },
+  "target_support": {
+    "corresponding_patch_variance_across_images": 1.3987359364254905,
+    "image_mean_variance": 0.2122850191574257,
+    "images": 4000,
+    "norm_mean": 47.74065831922476,
+    "token_variance": 1.7155045356481273,
+    "valid_images": 4000,
+    "valid_tokens": 784000
+  },
+  "valid_fraction": 0.9999999999999999,
+  "whole_map_routing": {
+    "image_effective_targets": {
+      "max": 3422.477938904538,
+      "mean": 2888.3384190911984,
+      "min": 581.831863017905
+    },
+    "image_max_weight": {
+      "max": 0.28867807850431715,
+      "mean": 0.034295462022452365,
+      "min": 0.0007292079829918944
+    },
+    "projection_h": {
+      "max": 0.15,
+      "mean": 0.14999999999999997,
+      "min": 0.15
+    },
+    "query_source_effective_neighbors": {
+      "max": 159.63450140207277,
+      "mean": 66.98260922697104,
+      "min": 1.0003125763806588
+    },
+    "query_source_max_weight": {
+      "max": 0.9999819615584182,
+      "mean": 0.31710588213294766,
+      "min": 0.08934700796543686
+    },
+    "raw_image_effective_targets": {
+      "max": 3422.477938904538,
+      "mean": 2888.3384190911966,
+      "min": 581.831863017904
+    },
+    "raw_image_max_weight": {
+      "max": 0.2886780785043171,
+      "mean": 0.034295462022452365,
+      "min": 0.0007292079829918944
+    },
+    "top_k_discarded_mass": {
+      "max": 2.220446049250313e-16,
+      "mean": 5.551115123125783e-17,
+      "min": 0.0
+    },
+    "top_k_retained_mass": {
+      "max": 1.0,
+      "mean": 1.0,
+      "min": 0.9999999999999998
+    }
+  }
+}

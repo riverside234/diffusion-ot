@@ -1,0 +1,4 @@
+{
+  "error_type": "FileNotFoundError",
+  "message": "[Errno 2] No such file or directory: 'outputs/infoot_vit/whole_map_20261010T200811Z_80de972c/manifest.json'"
+}
