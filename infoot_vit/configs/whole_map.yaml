@@ -5,10 +5,10 @@ source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
 solver:
   h: 0.35
-  lam: 0.075  # Restore MI weight after lower lam produced overly diffuse routing.
+  lam: 0.065  # Lower-MI ablation; assess source correspondence and decoded quality.
   reg: 0.06
   # Explicit training-mean EUCLIDEAN cost normalization; raw feature values stay unchanged.
-  # Keep h/reg fixed while restoring MI weight; requires a fresh fit.
+  # Keep h/reg fixed for the MI-weight comparison.
   cost_scale: mean
   max_outer_steps: 1200  # Reviewed run converged at 638; 300 stopped too early.
   max_inner_steps: 10000
