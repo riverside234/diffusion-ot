@@ -72,6 +72,19 @@ The active recipe retains that method but now requests fit `h=0.7` and projectio
 
 ## Image-router convergence
 
+For console-only router parameter trials, use:
+
+```bash
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.075 --reg 0.075
+```
+
+This fits only the image router on the same sampled training images. No logs,
+error files, checkpoints or plans are saved. `--h/--lam/--reg` override
+`image_solver.*`; patch kernels, patch factors and their accuracy gates are not
+evaluated in this mode. See [tuning mode](../README.md#console-only-image-router-tuning)
+for printing frequency, exit statuses and limits. Remove `--tune` for a full
+saved fit with all kernel acceptance checks enabled.
+
 In the active balanced recipe, **kernel acceptance runs before either transport
 fit**. The image router then runs before patch-factor optimization. Its settings are
 `image_solver.h`, `image_solver.lam`, `image_solver.reg` and

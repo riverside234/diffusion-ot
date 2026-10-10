@@ -42,7 +42,13 @@ def main(argv=None):
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--device",help="Device for image router, kernels and transport solvers; overrides YAML.")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--tune", action="store_true", help="Fit only the image router; terminal output only, no files/plans saved.")
+    p.add_argument("--tune-log-every", type=int, default=25, help="Router tuning progress interval (default 25).")
     args = p.parse_args(argv)
+    if args.tune and (args.resume or args.output_root or args.dry_run):
+        p.error("--tune cannot be combined with --resume, --output-root or --dry-run")
+    if args.tune_log_every < 1:
+        p.error("--tune-log-every must be positive")
     if args.threads < 1:
         p.error("--threads must be positive")
     torch.set_num_threads(args.threads)
@@ -68,6 +74,10 @@ def main(argv=None):
         config["fit_pair_top_k"] = None if args.full_pairs else args.fit_pair_top_k
     if args.serial_pairs or args.pair_batch_size is not None:
         config["pair_batch_size"] = None if args.serial_pairs else args.pair_batch_size
+    if args.tune:
+        from infoot_vit.infoot_helper.tuning import tune_image_router
+        report = tune_image_router(config, root=args.project_root, log_every=args.tune_log_every)
+        return 0 if report["status"] == "converged" else 2
     if args.dry_run:
         print(json.dumps(display_inspection(inspect_fit(config, args.project_root)), indent=2))
     else:

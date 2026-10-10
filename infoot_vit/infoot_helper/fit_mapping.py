@@ -366,7 +366,10 @@ def _fit_mapping(config, *, root, directory, resume, log):
             if name in {"image", "patch"} and (report["iteration"] == 1 or report["iteration"] % 25 == 0
                                                or report["status"] != "running"):
                 print(f"{name} FusedInfoOT {report['iteration']}/{config['solver']['max_outer_steps']}: "
-                      f"objective={report['objective']:.8g}, delta={report['plan_delta_l1']:.3g}, "
+                      f"objective={report['objective']:.8g}, cost={report['cost']:.8g}, "
+                      f"mi_term={report['mi_term']:.8g}, entropy_term={report['entropy_term']:.8g}, "
+                      f"lam={config['solver']['lam']:.6g}, reg={config['solver']['reg']:.6g}, "
+                      f"delta={report['plan_delta_l1']:.3g}, "
                       f"effective_targets={report['mean_row_effective_targets']:.1f}, status={report['status']}", flush=True)
         return callback
 

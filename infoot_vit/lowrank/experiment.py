@@ -263,7 +263,10 @@ def fit(raw,*,root,output_root=None,resume=None,kernel_check_only=False):
                     log.append_jsonl("image_iterations.jsonl",record)
                     if record["iteration"] == 1 or record["iteration"] % 25 == 0 or record["status"] != "running":
                         print(f"Image router {record['iteration']}/{c['image_solver']['max_outer_steps']}: "
-                              f"objective={record['objective']:.8g}, delta={record['plan_delta_l1']:.3g}, "
+                              f"objective={record['objective']:.8g}, cost={record['cost']:.8g}, "
+                              f"mi_term={record['mi_term']:.8g}, entropy_term={record['entropy_term']:.8g}, "
+                              f"lam={c['image_solver']['lam']:.6g}, reg={c['image_solver']['reg']:.6g}, "
+                              f"delta={record['plan_delta_l1']:.3g}, "
                               f"effective_targets={record['mean_row_effective_targets']:.1f}, status={record['status']}",flush=True)
                 image = BalancedModel.fit(x.reshape(len(x),-1),y.reshape(len(y),-1),c["image_solver"],on_step=image_step)
                 image_report = {key:value for key,value in image.state.items() if key != "plan"}

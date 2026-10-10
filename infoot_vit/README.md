@@ -446,6 +446,46 @@ new directory because their numerical-source fingerprints differ.
 
 ## Saved logs for tuning and debugging
 
+### Console-only image-router tuning
+
+Use `--tune` to run the **image router only**, using the same training-bank
+sampling/seed, float64 solver, cost scaling and convergence checks as a full fit.
+It creates no output directory, log/error files, checkpoint or transport-plan
+artifact. Plans exist only in memory; this run cannot be resumed or passed to
+`infoot_test.py`. Patch fitting, partial-pair selection and low-rank patch-kernel
+audits are skipped. Router convergence does not validate those stages or image
+quality. The normal command without `--tune` still saves full fit diagnostics.
+
+```bash
+# Existing top-8 grouped_partial recipe; optional router overrides shown.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --tune --h 0.35 --lam 0.075 --reg 0.06
+
+# Low-rank recipe: these overrides change image_solver.*, not patch kernel.h.
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.075 --reg 0.075
+```
+
+`--tune-log-every 1` prints every outer iteration; the default is 25 plus the
+first and final iterations. The terminal summary includes weighted objective
+terms, residuals, router concentration, settings, bank identities and hashes of
+the ordered sampled IDs. Nonconvergence returns exit code 2; numerical errors
+remain visible in the terminal without creating error files. `--tune` rejects
+`--resume`, `--output-root`, `--dry-run` and, for low-rank, `--kernel-check-only`.
+`patch_global` has no image router and does not support this mode.
+
+### Weighted objective terms
+
+Balanced `image/patch FusedInfoOT` progress and the low-rank experiment's image
+router print the three **signed, weighted objective contributions**:
+`cost = <Gamma, C / cost_scale>`, `mi_term = -lam * MI`, and
+`entropy_term = -reg * H(Gamma)`, where `H = -sum(Gamma * log(Gamma))`.
+Thus `objective = cost + mi_term + entropy_term`. The line also shows `lam`
+and `reg` (the formula's epsilon); `cost` has coefficient 1 after the configured
+cost scaling. These three fields are already persisted in the balanced solver's
+iteration JSONL/checkpoint reports. Printing reuses those values without another
+MI/kernel computation. Partial and low-rank **patch** solver records retain their
+existing `entropy = sum(Gamma * (log(Gamma)-1))` convention and `+reg * entropy`;
+their `entropy` field is unweighted, unlike the `entropy_term` above.
+
 Logging is automatic for actual fits, mapping tests and comparisons; no extra
 flag or shell redirection is required. A successful run, a failed run and each
 resume attempt get a separate `logs/<UTC timestamp>_<unique ID>/` inside their
