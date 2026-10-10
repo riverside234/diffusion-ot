@@ -1,0 +1,4 @@
+{
+  "error_type": "RuntimeError",
+  "message": "image FusedInfoOT max_outer_steps; diagnostics/plan saved in /data/not_backed_up/yxu209/diffusion-ot/outputs/infoot_vit/grouped_partial_20261010T182918Z_d02a31cd/plans/image.pt. Reassess scales or start a new configuration with a larger iteration budget."
+}

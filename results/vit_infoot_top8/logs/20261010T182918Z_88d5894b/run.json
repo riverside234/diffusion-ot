@@ -1,0 +1,27 @@
+{
+  "command": [
+    "infoot_vit/infoot_fit.py",
+    "--config",
+    "infoot_vit/configs/grouped_partial.yaml",
+    "--source-bank",
+    "data/infoot_vit/cat_train_4000",
+    "--target-bank",
+    "data/infoot_vit/dog_train_4000"
+  ],
+  "elapsed_seconds": 176.9941523760208,
+  "error": "image FusedInfoOT max_outer_steps; diagnostics/plan saved in /data/not_backed_up/yxu209/diffusion-ot/outputs/infoot_vit/grouped_partial_20261010T182918Z_d02a31cd/plans/image.pt. Reassess scales or start a new configuration with a larger iteration budget.",
+  "error_type": "RuntimeError",
+  "finished_at": "2026-10-10T18:32:15.835319+00:00",
+  "metadata": {
+    "resume": null,
+    "root": "/data/not_backed_up/yxu209/diffusion-ot"
+  },
+  "operation": "fit",
+  "platform": "Linux-6.8.0-146-generic-x86_64-with-glibc2.39",
+  "python": "3.10.22",
+  "run_id": "20261010T182918Z_88d5894b",
+  "schema": "infoot_run_log_v1",
+  "started_at": "2026-10-10T18:29:18.841224+00:00",
+  "status": "failed",
+  "working_directory": "/data/not_backed_up/yxu209/diffusion-ot"
+}

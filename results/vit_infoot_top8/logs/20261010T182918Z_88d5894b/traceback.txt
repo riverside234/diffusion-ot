@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/fit_mapping.py", line 294, in fit_mapping
+    return _fit_mapping(config, root=root, directory=directory, resume=resume, log=log)
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/fit_mapping.py", line 407, in _fit_mapping
+    raise RuntimeError(f"{name} FusedInfoOT {state['status']}; diagnostics/plan saved in {path}. "
+RuntimeError: image FusedInfoOT max_outer_steps; diagnostics/plan saved in /data/not_backed_up/yxu209/diffusion-ot/outputs/infoot_vit/grouped_partial_20261010T182918Z_d02a31cd/plans/image.pt. Reassess scales or start a new configuration with a larger iteration budget.
