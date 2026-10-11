@@ -239,6 +239,7 @@ class FeatureMapper:
             target_kernel=self.projection_ky[j],query_logs=context)
         diag["weight_row_sums"] = diag["weights"].sum(1)
         diag["patch_entropy"] = -(diag["weights"]*diag["weights"].clamp_min(1e-300).log()).sum(1)
+        diag["projected_patch_top1_probability"] = diag["weights"].max(1).values
         if (sid, tid) not in self._pair_geometry:
             self._pair_geometry[sid, tid] = patch_plan_concentration(pair["plan"])
         diag["plan_geometry"] = self._pair_geometry[sid, tid]
@@ -278,6 +279,16 @@ class FeatureMapper:
                 else:
                     vector = patches.reshape(1, -1)
                     original_alpha = self.image.conditional_weights(vector)[0]
+                    if self.mode == "grouped_partial":
+                        # Query kernel concentration precedes the fitted router,
+                        # saved-pair pruning and confidence weighting.
+                        source_weights = self.image.query_kernel(vector).softmax(1)[0]
+                        raw_entropy = -torch.special.xlogy(original_alpha, original_alpha).sum()
+                        detail.update(image_query_source_effective_neighbors=float(
+                            (-torch.special.xlogy(source_weights, source_weights).sum()).exp()),
+                            image_query_source_max_weight=float(source_weights.max()),
+                            raw_image_effective_targets=float(raw_entropy.exp()),
+                            raw_image_max_weight=float(original_alpha.max()))
                     alpha, retained = select_images(original_alpha, self.target.ids, query_id, settings)
                     entropy = float(-(alpha * alpha.clamp_min(1e-300).log()).sum())
                     detail.update(image_entropy=entropy, image_normalized_entropy=entropy / math.log(len(alpha)) if len(alpha) > 1 else 0.,
@@ -369,6 +380,7 @@ class FeatureMapper:
                                 effective += float((route * g * patch_entropy.exp()).sum())
                                 if "plan_geometry" in diag:  # Exact dense partial diagnostics.
                                     for name, value in dict(diag["plan_geometry"],
+                                            within_image_top1_patch_probability=diag["projected_patch_top1_probability"],
                                             query_source_effective_patches=diag["query_source_effective_patches"]).items():
                                         geometry_totals[name] = geometry_totals.get(name, 0.) + (route * g * value).sum()
                         cf = settings["confidence"]
@@ -530,14 +542,18 @@ def mapping_summary(result, query, source, target, *, confidence_settings=None):
         rows = result.diagnostics["queries"]
         geometry = {}
         for key in ("image_projection_h", "patch_projection_h", "image_effective_targets", "image_max_weight",
+                    "image_query_source_effective_neighbors", "image_query_source_max_weight",
+                    "raw_image_effective_targets", "raw_image_max_weight",
                     "fitted_pair_effective_patches", "fitted_pair_top1_probability", "fitted_pair_normalized_entropy",
-                    "query_source_effective_patches", "within_image_effective_patches"):
+                    "query_source_effective_patches", "within_image_effective_patches", "within_image_top1_patch_probability"):
             values = [r[key] for r in rows if key in r]
             if values:
                 geometry[key] = dict(min=min(values), mean=sum(values)/len(values), max=max(values))
         report["partial_geometry"] = geometry
         report["partial_geometry_note"] = ("Fitted row statistics precede projection; source-neighborhood and projected-patch "
             "statistics include query smoothing. Dense pair metrics are weighted by routing and retained/support-valid mass. "
+            "Projected-patch metrics average individual pair conditionals, not the final mixture across pairs. "
+            "Image query neighborhoods precede the router; raw image weights precede selection/pair pruning. "
             "Their effective counts are descriptive, not additive or semantic correctness scores.")
     if confidence_settings is not None and result.diagnostics["mode"] in {"grouped_partial", "grouped_partial_lowrank"}:
         active_threshold = confidence_settings["threshold"]

@@ -36,14 +36,15 @@ def analytic_block(cost, cheap, mass, reg):
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_mean_scaled_196_patch_optimum_and_mixed_batch(device):
+@pytest.mark.parametrize("reg", [.05, .04])
+def test_mean_scaled_196_patch_optimum_and_mixed_batch(device, reg):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     hard = sharp_blocks().to(device)
     # Include an already-converged neighbor and a quarantined invalid member.
     cost = torch.cat((torch.ones_like(hard[:1]), hard, torch.full_like(hard[:1], float("nan"))))
     a = cost.new_full((4, 196), 1/196)
-    c = solver_config(dict(reg=.05, inner_acceleration="newton", max_inner_steps=1000))
+    c = solver_config(dict(reg=reg, inner_acceleration="newton", max_inner_steps=1000))
     plan, info = entropy_subproblem_batch(a, a, cost, .8, c)
     assert info["ok"].tolist() == [True, True, True, False]
     assert info["iterations"][0].item() == 1 and info["newton_steps"][0].item() == 0
@@ -51,7 +52,7 @@ def test_mean_scaled_196_patch_optimum_and_mixed_batch(device):
     assert (info["iterations"][1:3] < 500).all()
     assert plan.device == cost.device and plan.dtype == torch.float64
     for i, cheap in enumerate((155, 156), 1):
-        torch.testing.assert_close(plan[i], analytic_block(cost[i], cheap, .8, .05), atol=2e-12, rtol=1e-8)
+        torch.testing.assert_close(plan[i], analytic_block(cost[i], cheap, .8, reg), atol=2e-12, rtol=1e-8)
         for key in ("kkt_error", "relative_duality_gap", "relative_plan_delta_l1"):
             assert info[key][i] <= c["inner_tolerance"]
         solo, _ = entropy_subproblem_batch(a[i:i+1], a[i:i+1], cost[i:i+1], .8, c)

@@ -214,7 +214,7 @@ generated-image review below:
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
 | Image router: `solver` | 0.36 | **0.06** | 0.070 | 1,200 |
-| Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
+| Partial patch pairs: `partial.solver` | **0.35** | **0.04** | 0.025 | 600 |
 
 At fixed lam=.070/reg=.06, h=.35 gave 85.42% mean top-8 retained mass but
 98.69% normalized top-1 probability. The h=.375 trial lost too much coverage
@@ -230,12 +230,13 @@ weight on average. The coverage gain did not produce meaningful multi-target
 routing on these training-source probes. This does not prove reference copying
 or establish held-out image quality.
 
-The active recipe therefore **restores reg=.06**, keeping h=.36/lam=.070 as a
+The image-router recipe therefore **retains reg=.06**, keeping h=.36/lam=.070 as a
 working baseline for full fitting and matched held-out image evaluation. It
 still has concentrated routing and is not a validated optimum. Do not continue
 lowering entropy or raising MI solely to improve retained mass. The supplied
 `--tune` runs do not measure patch blur, confidence masks or generated images.
-Patch settings, mass, confidence, top-8 and .20/.20 projection stay fixed.
+The completed-fit review below changes only patch entropy; mass, confidence,
+top-8 and .20/.20 projection stay fixed.
 Run without `--tune` to save a mapping; `--reg .0575` reproduces the sharper
 comparison settings if needed. See [the entropy-trial result and decision](../docs/analysis/infoot_vit_router_reg0575/README.md),
 [the earlier h=.36 review](../docs/analysis/infoot_vit_router_h036/README.md)
@@ -324,17 +325,39 @@ GPU memory without changing the original run. Exit code 2 means unsuccessful;
 only a converged replay supports proceeding to a fresh full fit. The new code
 fingerprint prevents resuming the old v3 run as though its solver were unchanged.
 
-The earlier **fitting** change was patch `h: .45 -> .35`, `reg: .10 -> .05`;
-patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings
-were held fixed for that comparison. The latest candidate now changes only
-image fitting `reg: .06 -> .0575`, holding h=.36 and lam=.070, as described above.
-Projection stays at **.20**,
-with .30 available for comparison;
-top-1 truncation is not enabled. These are hypotheses requiring lab images,
-not a measured optimum. Keep guidance/steps fixed while comparing fits.
+The earlier fitting proposal changed patch `h: .45 -> .35`, `reg: .10 -> .05`.
+The supplied completed run also changed the image router, so its improvement
+cannot be attributed to patch entropy alone. The latest candidate changes only
+**patch `partial.solver.reg: .05 -> .04`**, with patch h=.35/lam=.025,
+image h=.36/lam=.070/reg=.06, mass=.80 and threshold=.05 fixed.
+Both projection bandwidths stay **.20**; top-1 truncation is not enabled.
+This is an untested entropy ablation, not a measured optimum.
+
+#### Completed fit review (2026-10-11)
+
+`grouped_partial_20261011T031042Z_0a162a99` completed all 16,000 pairs with
+strict certificates. Mean fitted patch support is still 34.76/196 (top-1
+21.83%). The uploaded test uses **image projection .15, patch projection .20**,
+raw weights, 40 Euler steps and guidance 1.5. It averages 42.12 effective
+target patches and retains only 36.17% of target-bank within-image variance.
+Several outputs remain smeared even with >96% top-1 image weight. Mean saved
+route loss is 54.74% on held-out queries, distinct from the training-source
+selection's 30.79%; neither is the .20 fitted partial-OT rejection budget.
+
+First re-evaluate the existing fit at **.20/.20** with identical checkpoint,
+raw weights, IDs and per-image noise. Then compare the patch-reg=.04 fit with
+that baseline. Do not infer benefit from sharper plans alone or start another
+router sweep to improve retained mass. See the [complete analysis, image
+excerpts and lab commands](../docs/analysis/infoot_vit_partial_complete_20261011/README.md).
+
+Dense partial test logs now also report image query-neighborhood concentration,
+raw image concentration before pair pruning, and projected within-pair top-1
+patch probability. The latter is weighted by route/confidence, like effective
+patch count; it is not the top-1 of the final mixture across pairs. These are
+diagnostics only; saved plans, feature values and masks are unchanged.
 
 ```bash
-python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<new-fit> --query-bank data/infoot_vit/cat_val16 --count 16 --projection-bandwidth 0.20 --patch-projection-bandwidth 0.20 --generate --steps 40 --guidance 1.5 --solver euler --seed 20260903
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<new-fit> --query-bank data/infoot_vit/cat_val16 --count 16 --projection-bandwidth 0.20 --patch-projection-bandwidth 0.20 --generate --train-config configs/stage1a_pdae_v2_l/dog.yaml --eval-config configs/stage1a_eval/pdae_v2_l.yaml --checkpoint outputs/pdae_v2_l_dog/checkpoints/<pinned-checkpoint>.pt --weights raw --steps 40 --guidance 1.5 --solver euler --seed 20260903 --device cuda
 ```
 
 New batched fitting logs `pair_geometry.jsonl` on each completed pair, and
@@ -652,6 +675,75 @@ the ordered sampled IDs. Nonconvergence returns exit code 2; numerical errors
 remain visible in the terminal without creating error files. `--tune` rejects
 `--resume`, `--output-root`, `--dry-run` and, for low-rank, `--kernel-check-only`.
 `patch_global` has no image router and does not support this mode.
+
+### Partial-solver tuning on a fixed sample of selected pairs
+
+`--tune-partial` tunes **`partial.solver.*` and `partial.keep_mass`** for dense
+`grouped_partial`. It runs the production partial InfoOT solver on a small,
+reproducible sample of the router-selected pairs, without writing any mapping,
+plan or checkpoint. The existing `--tune` remains image-router-only.
+
+```bash
+# Fresh in-memory router, then a 64-pair patch trial using the active recipe.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-pairs 64 --tune-seed 42 --partial-reg 0.04 --tune-report outputs/infoot_vit_tuning/partial_reg004.json
+
+# Preferred matched comparison: reuse the ORIGINAL FIT directory's registered
+# image router and saved top-8 selection, then vary only partial parameters.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-from outputs/infoot_vit/<fit-directory> --tune-pairs 64 --tune-seed 42 --partial-reg 0.05 --tune-report outputs/infoot_vit_tuning/partial_reg005.json
+```
+
+Use the same `--tune-from`, banks, pair limit and seed for both .04/.05 runs.
+`--tune-from` requires the original fitting artifact (including `plans/image.pt`
+and `pair_selection.json`), **not a testing-results folder or logs-only copy**.
+An interrupted fit is usable once those two artifacts have been registered.
+Router settings, support identities/order, image projection and fit top-k must
+match; incompatible or corrupted artifacts are rejected without refitting.
+The existing fit is read only. No patch plans are loaded or reused, so changing
+partial h/lam/reg/mass exercises the actual candidate objective on the same pairs.
+
+- Pair sampling is uniform without replacement over selected `(source_id,
+  target_id)` edges sorted by stable IDs. Defaults: 64 pairs, seed 42. If fewer
+  pairs exist, all are tested and requested/actual counts are both reported.
+  Ordered sampled pairs, their hash, router ranks and probabilities are logged.
+  This is not a router-weighted sample; inspect the logged rank counts.
+- Use `--partial-h`, `--partial-reg`, `--partial-lam`, `--partial-max-steps` and
+  `--keep-mass`. Plain `--h/--reg/--lam` still change the **image router**.
+- `--pair-batch-size` controls the same exact batched solver as fitting, capped
+  by the trial size; the last incomplete batch is included. `--serial-pairs`
+  selects the POT reference. Float64 costs, cached per-image fit kernels, solver
+  arithmetic and projection stay on the configured CUDA/CPU device. CUDA is
+  never silently replaced with CPU.
+- `--tune-log-every` controls outer progress (default 25, plus initial/terminal
+  states). The trial records independent pair failures and continues through the
+  sampled pairs; the full-fit's consecutive-failed-batch abort rule does not
+  truncate this bounded diagnostic sample. Exit code 2 indicates a solver or
+  projection diagnostic failure; 0 indicates successful sampled solves/probes.
+- Console output includes weighted/unweighted cost, MI and entropy; outer
+  deltas and line search; inner errors, KKT/duality diagnostics when the solver
+  exposes them; mass/capacity errors; iterations; failure reasons; runtime; and
+  fitted patch concentration. Summaries exclude failed pairs from success
+  metrics and explicitly count them. Final JSON retains each pair's last solver
+  record, inner-iteration/backtrack summaries, configuration and implementation
+  hashes. No complete 600-step histories or transport tensors are printed.
+- A **training-patch self-query** projection probe logs effective patch mixing,
+  confidence, valid-token coverage, threshold sweeps and mapped-to-target
+  variance/norm ratios. It uses the configured independent patch projection
+  bandwidth (.20 in the active recipe); image projection remains .20 too.
+  Variance/norm measurements exclude invalid tokens. These are per-pair probes
+  before image-router mixing, float32 storage and diffusion generation. They
+  cannot establish held-out image quality or replace matched image evaluation.
+- `--tune-report` optionally saves the final scalar JSON report, including
+  failures. Give each trial a new filename outside the reused fit; existing
+  files are never replaced. To retain progress from an interrupted run, also
+  redirect/tee terminal output. Without this flag no tuning files are created.
+  Neither tuning mode accepts `--resume`, `--output-root` or `--dry-run`, and
+  `--tune`/`--tune-partial` are mutually exclusive.
+
+Start with the matched .05/.04 entropy comparison before changing bandwidth or
+MI weight. A decrease in effective patches is a geometry measurement, not proof
+of sharper or more faithful generated images. Save a full mapping and evaluate
+identical held-out images once the sampled solver and projection diagnostics
+justify a candidate.
 
 ### Weighted objective terms
 

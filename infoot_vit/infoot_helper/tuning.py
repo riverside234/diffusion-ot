@@ -35,16 +35,8 @@ def _pair_selection_preview(model, config, source_ids, target_ids):
             "No partial OT rejection or held-out quality measurement; no pairs saved. Full-fit float32 storage can slightly change values/ties.")
 
 
-def tune_image_router(raw, *, root, lowrank=False, log_every=25):
-    """Run the existing float64 router on the same selected training support.
-
-    Patch solvers/kernel audits, RunLog and checkpoint utilities are deliberately
-    outside this path. Nonconvergence is returned as a status, never accepted as
-    a fitted mapper; numerical errors propagate to the caller's terminal. A
-    converged dense partial router previews its top-K selection at projection h.
-    """
-    if type(log_every) is not int or log_every < 1:
-        raise ValueError("Tuning log interval must be a positive integer.")
+def load_tuning_support(raw, *, root, lowrank=False):
+    """Shared, read-only bank inspection/loading; never apply disk-plan budgets."""
     root = Path(root).resolve()
     if not lowrank and raw.get("mode", "patch_global") == "patch_global":
         raise ValueError("patch_global has no image router; --tune requires a grouped or whole_map config.")
@@ -76,12 +68,21 @@ def tune_image_router(raw, *, root, lowrank=False, log_every=25):
             raise ValueError("Training bank changed after tuning inspection.")
         banks.append(bank.subset(sampling[name]["ordered_ids"]))
     compatible_banks(*banks)
-    print("Image-router tuning: console only; no logs/checkpoints/plans saved; patch fitting skipped.", flush=True)
     context = dict(mode=c["mode"], device=str(device), solver=solver,
         sampling={name: dict(count=counts[i], seed=sampling[name]["seed"],
                             ordered_ids_sha256=digest(sampling[name]["ordered_ids"]))
                   for i, name in enumerate(("source", "target"))},
         estimated_router_working_gib=estimate, source_bank_id=expected[0], target_bank_id=expected[1])
+    return c, banks, device, context
+
+
+def tune_image_router(raw, *, root, lowrank=False, log_every=25):
+    """Run the existing float64 router without writing mapping artifacts."""
+    if type(log_every) is not int or log_every < 1:
+        raise ValueError("Tuning log interval must be a positive integer.")
+    c, banks, device, context = load_tuning_support(raw, root=root, lowrank=lowrank)
+    solver = context["solver"]
+    print("Image-router tuning: console only; no logs/checkpoints/plans saved; patch fitting skipped.", flush=True)
     print(json.dumps(context, indent=2, allow_nan=False), flush=True)
 
     def progress(plan, report):

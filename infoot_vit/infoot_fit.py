@@ -42,11 +42,21 @@ def main(argv=None):
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--device",help="Device for image router, kernels and transport solvers; overrides YAML.")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--tune", action="store_true", help="Fit only the image router; terminal output only, no files/plans saved.")
-    p.add_argument("--tune-log-every", type=int, default=25, help="Router tuning progress interval (default 25).")
+    tuning = p.add_mutually_exclusive_group()
+    tuning.add_argument("--tune", action="store_true", help="Fit only the image router; terminal output only, no files/plans saved.")
+    tuning.add_argument("--tune-partial", action="store_true", help="Tune a seeded sample of selected grouped_partial patch pairs; no mapping/plans saved.")
+    p.add_argument("--tune-from", type=Path, help="Partial tuning: reuse this fit's verified image router and saved pair selection.")
+    p.add_argument("--tune-pairs", type=int, help="Partial tuning pair limit (default 64, or all if fewer are selected).")
+    p.add_argument("--tune-seed", type=int, help="Partial tuning pair-sampling seed (default 42).")
+    p.add_argument("--tune-report", type=Path, help="Partial tuning: optionally save a new JSON report; existing files are never replaced.")
+    p.add_argument("--tune-log-every", type=int, default=25, help="Tuning progress interval in outer iterations (default 25).")
     args = p.parse_args(argv)
-    if args.tune and (args.resume or args.output_root or args.dry_run):
-        p.error("--tune cannot be combined with --resume, --output-root or --dry-run")
+    if (args.tune or args.tune_partial) and (args.resume or args.output_root or args.dry_run):
+        p.error("Tuning cannot be combined with --resume, --output-root or --dry-run")
+    if not args.tune_partial and any(v is not None for v in (args.tune_from, args.tune_pairs, args.tune_seed, args.tune_report)):
+        p.error("--tune-from/--tune-pairs/--tune-seed/--tune-report require --tune-partial")
+    if args.tune_pairs is not None and args.tune_pairs < 1:
+        p.error("--tune-pairs must be positive")
     if args.tune_log_every < 1:
         p.error("--tune-log-every must be positive")
     if args.threads < 1:
@@ -78,6 +88,13 @@ def main(argv=None):
         # The explicit POT reference does not use batched acceleration/guards.
         config["pair_failure_abort_batches"] = None
         config.setdefault("partial", {}).setdefault("solver", {})["inner_acceleration"] = "none"
+    if args.tune_partial:
+        from infoot_vit.infoot_helper.partial_tuning import tune_partial
+        report = tune_partial(config, root=args.project_root, from_fit=args.tune_from,
+            pair_limit=args.tune_pairs if args.tune_pairs is not None else 64,
+            seed=args.tune_seed if args.tune_seed is not None else 42,
+            log_every=args.tune_log_every, report_path=args.tune_report)
+        return 0 if report["status"] == "converged" else 2
     if args.tune:
         from infoot_vit.infoot_helper.tuning import tune_image_router
         report = tune_image_router(config, root=args.project_root, log_every=args.tune_log_every)

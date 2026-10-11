@@ -46,18 +46,30 @@ def test_independent_patch_bandwidth_preserves_router_and_saved_pairs(tmp_path, 
     plan = mapper._pair(sid, tid)["plan"]
     kq = torch.exp(-.5*(distance(q, mapper.x[i])/(mapper.shared["sx"][i]*patch_h)).square())
     ky = mapper.projection_ky[j]
-    expected = normalize_rows((kq @ plan @ ky.T)/ky.mean(0)) @ mapper.y[j]
+    expected_weights = normalize_rows((kq @ plan @ ky.T)/ky.mean(0))
+    expected = expected_weights @ mapper.y[j]
     torch.testing.assert_close(candidate, expected, atol=1e-11, rtol=1e-11)
+    torch.testing.assert_close(diag["projected_patch_top1_probability"], expected_weights.max(1).values,
+                               atol=1e-11, rtol=1e-11)
     assert 1 <= diag["plan_geometry"]["fitted_pair_effective_patches"] <= len(q)
     a = mapped(mapper, banks[2], return_metadata=True, chunk_size=1)
     b = mapped(mapper, banks[2], return_metadata=True, chunk_size=2)
     torch.testing.assert_close(a.mapped_features, b.mapped_features, atol=0, rtol=0)
     torch.testing.assert_close(a.match_confidence, b.match_confidence, atol=0, rtol=0)
     assert torch.equal(a.valid_mask, b.valid_mask)
-    for row in a.diagnostics["queries"]:
+    for features, row in zip(banks[2].features, a.diagnostics["queries"]):
         assert row["patch_projection_h"] == patch_h
         assert row["matched_rejected_group_mass_residual"] < 1e-10
         assert row["fitted_pair_effective_patches"] > 0
+        assert 1/len(q) <= row["within_image_top1_patch_probability"] <= 1
+        neighborhood = mapper.image.query_kernel(features.reshape(1, -1)).softmax(1)[0]
+        assert row["image_query_source_effective_neighbors"] == pytest.approx(
+            float((-torch.special.xlogy(neighborhood, neighborhood).sum()).exp()))
+        assert row["image_query_source_max_weight"] == pytest.approx(float(neighborhood.max()))
+        raw = mapper.image.conditional_weights(features.reshape(1, -1))[0]
+        assert row["raw_image_max_weight"] == pytest.approx(float(raw.max()))
+        assert row["raw_image_effective_targets"] == pytest.approx(
+            float((-torch.special.xlogy(raw, raw).sum()).exp()))
     assert hashes(directory) == before
 
 
@@ -81,6 +93,8 @@ def test_fit_calibration_cli_and_artifact_record_independent_bandwidth(tmp_path,
         assert row["patch_projection_h"] == .2
     report = json.loads(next((tmp_path / "test/logs").glob("*/mapping_report.json")).read_text())
     assert "fitted_pair_effective_patches" in report["partial_geometry"]
+    assert "within_image_top1_patch_probability" in report["partial_geometry"]
+    assert "image_query_source_effective_neighbors" in report["partial_geometry"]
     assert "within_image_token_variance" in report["mapped_to_target_spread_ratio"]
     assert hashes(directory) == before
     capsys.readouterr()
@@ -146,7 +160,7 @@ def test_batched_fit_persists_plan_geometry_before_complete_summary(tmp_path, ba
 def test_revised_config_tunes_fitting_and_keeps_broad_projection():
     c = validate_config(yaml.safe_load((infoot_test.ROOT / "infoot_vit/configs/grouped_partial.yaml").read_text()))
     assert (c["solver"]["h"], c["solver"]["reg"], c["solver"]["lam"]) == (.36, .06, .070)
-    assert (c["partial"]["solver"]["h"], c["partial"]["solver"]["reg"], c["partial"]["solver"]["lam"]) == (.35, .05, .025)
+    assert (c["partial"]["solver"]["h"], c["partial"]["solver"]["reg"], c["partial"]["solver"]["lam"]) == (.35, .04, .025)
     assert c["partial"]["keep_mass"] == .8 and c["projection"]["confidence"]["threshold"] == .05
     assert c["solver"]["h"] * c["projection"]["bandwidth_multiplier"] == pytest.approx(.2)
     assert c["projection"]["patch_bandwidth"] == .2 and c["projection"]["top_k_images"] is None

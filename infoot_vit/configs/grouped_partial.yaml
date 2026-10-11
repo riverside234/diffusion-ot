@@ -22,10 +22,12 @@ solver:  # Working baseline for full mapping; reg=.0575 raised normalized top-1 
   outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
   keep_mass: 0.80  # Preserve more condition coverage; transported mass, NOT a patch count.
-  solver:  # First 1024 pairs now accepted; hold until patch geometry/images are evaluated.
-    h: 0.35  # Was .45: reduce smoothing in the FITTED patch MI geometry.
+  solver:  # 16000/16000 converged; patch entropy is the ONLY new fitting change.
+    h: 0.35  # Hold fitted KDE geometry fixed for the entropy ablation.
     lam: 0.025  # Hold MI pressure fixed; do not amplify it while reducing entropy.
-    reg: 0.05  # Was .10: reduce diffuse patch correspondences at their source.
+    reg: 0.04  # Trial from .05: fitted rows still average 34.76 patches (top-1 21.83%).
+    # First evaluate the saved .05 baseline at .20/.20; its uploaded grid used .15/.20.
+    # Compare this fresh fit with identical raw checkpoint, IDs, noise, steps and guidance.
     cost_scale: mean
     max_outer_steps: 600
     max_inner_steps: 20000  # Hard ceiling; certified members stop independently.
@@ -44,7 +46,7 @@ projection:
   confidence:
     support_calibration: fit_leave_one_out_log_density
     support_quantile: 0.01  # Fit-only heuristic, not semantic correctness.
-    threshold: 0.05  # Coverage-first baseline; compare .10 on the same validation images.
+    threshold: 0.05  # Hold: current valid-token coverage is 95.12%; no all-invalid images.
     mass_floor: 1.0e-12
     all_invalid_policy: error
 resources:
