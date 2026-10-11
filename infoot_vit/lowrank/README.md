@@ -76,7 +76,7 @@ validate this new configuration on the lab banks.
 For console-only router parameter trials, use:
 
 ```bash
-python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.75 --lam 0.10 --reg 0.005
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.75 --lam 0.15 --reg 0.005
 ```
 
 This fits only the image router on the same sampled training images. No logs,
@@ -99,7 +99,7 @@ passed but its outer residual remained above tolerance. The revised weights
 reduce MI pressure relative to entropy; they are a lab experiment, not a claim
 of optimal translation quality. The latest requested experiment sets both
 `image_solver.h` and `kernel.h` to **0.75**. Its next fitting trial uses
-**image reg=0.005, lam=0.10**, and **patch optimizer reg=0.025, lam=0.05**.
+**image reg=0.005, lam=0.15**, and **patch optimizer reg=0.025, lam=0.05**.
 Reducing image entropy targets diffuse routing. Halving both patch weights
 relative to the previous .05/.10 emphasizes geometric cost while retaining
 the patch MI/entropy ratio of 2. These are provisional choices, not values
@@ -184,46 +184,64 @@ both image and patch projection at **0.20**. The separate projection accuracy
 audit remains removed; fitting acceptance and numerical validity checks remain.
 The h=.75 experiment requires a fresh fit, not resuming the h=.7 artifact.
 
-### h=0.75 router result: isolate a further entropy reduction
+### Current h=0.75 router comparison and next MI trial
 
-The supplied 2000-per-domain, seed-42 CUDA tuning run converged in **6 steps /
-6.527 s** with `lam=.10, reg=.01`. Its undamped delta is **1.08435e-08**,
-column residual **2.28348e-12**, transported mass **1.0**, with no inner-solver
-warnings or gradient-floor entries. The final zero accepted update is the
-convergence branch, not evidence of a stalled line search.
+Both supplied CUDA runs use 2000 images per domain, seed 42, identical printed
+bank IDs, ordered sample hashes and cost scale **680.5033570**, with `lam=.10`.
+Only reg changes, so the component metrics below are directly comparable:
 
-| Diagnostic | Observed |
-|---|---:|
-| Mean effective target images | 686.0289 / 2000 |
-| Mean maximum conditional row probability | 0.0410594 (4.11%) |
-| Normalized mean row entropy | 0.8439074 |
-| Mean-scaled transport cost | 0.9773680 (2.2632% below uniform) |
-| Unweighted KDE MI | 0.00389559 |
-| Source/target kernel effective neighbors | 1971.8747 / 1976.5002 |
+| Diagnostic | reg=.01 | reg=.005 |
+|---|---:|---:|
+| Converged iteration | 6 | 9 |
+| Runtime, seconds | 6.527 | 6.959 |
+| Undamped plan L1 delta | 1.08435e-08 | 2.45825e-08 |
+| Maximum marginal residual | 2.28348e-12 | 3.31550e-11 |
+| Mean effective target images | 686.0289 | 98.8913 |
+| Mean maximum conditional row probability | 4.1059% | 20.1376% |
+| Normalized mean row entropy | 0.8439074 | 0.5474866 |
+| Mean-scaled transport cost | 0.9773680 | 0.9619906 |
+| Unweighted KDE MI | 0.00389559 | 0.00776104 |
 
-This is numerically healthy, broad routing. Assuming identical banks/sampling,
-the h=.70 to .75 change raised effective targets only 1.42% (676.4 -> 686.0).
-The fitting kernels' broad neighborhoods motivate caution about interpreting
-the small MI scalar; it does not establish a small or harmful MI gradient.
-For the next trial, change **only image reg .01 -> .005**, keeping h=.75 and
-lam=.10. Lower entropy pressure directly tests whether sharper geometry-based
-routing helps. The exact value is an experimental choice, not a proven optimum.
+The reg=.005 run cuts effective targets **85.6%**, reduces cost **1.57%** from
+the previous run (**3.80% below uniform**) and nearly doubles KDE MI at the
+same h. Both satisfy the convergence/feasibility tolerances, transport mass
+1.0, and report no inner warnings or gradient-floor entries. The last zero
+accepted update is the convergence branch, not a stalled line search. Total
+objectives across different reg values are not directly comparable.
 
-Run the command above with the same lab bank overrides. An intermediate
-`--reg 0.0075` is a useful comparison if `.005` produces overly concentrated
-routing or difficult inner solves. Compare component costs, MI, effective
-targets, top-1 weight, marginal residuals and runtime at fixed h; do not rank
-different reg settings by total objective. Preserve bank IDs and ordered sample
-hashes printed by `--tune`. Final selection needs the same held-out images at
-image/patch projection h=.20, including source correspondence, feature spread,
-blur and similarity to the top-1 reference; fewer effective targets alone is
-not sufficient. No fixed target-count threshold is an image-quality criterion.
+The current `.10/.005` router is a useful baseline for full mapping, with no
+evidence from these averages that further concentration would improve images.
+The next configured trial therefore holds **reg=.005 and h=.75**, and changes
+**only lam .10 -> .15** to test stronger neighborhood coherence. This is a
+moderate experimental perturbation of the [InfoOT MI term](https://proceedings.mlr.press/v202/chuang23a/chuang23a.pdf),
+not a value derived from matching loss magnitudes or a demonstrated improvement.
+Preserve the baseline for comparison with these router-only commands:
 
-`--tune` skips all patch kernels and patch fitting: this result supplies **no
-OPRF approximation-error measurement at h=.75**. Run `--kernel-check-only`
-or the full fit to measure that. Patch optimizer weights, kernel rank/limits,
-both projection bandwidths and the removed projection audit are unchanged.
-Configuration validation is local; the `.005` run still needs the lab banks.
+```bash
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune --h 0.75 --lam 0.10 --reg 0.005
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune --h 0.75 --lam 0.15 --reg 0.005
+```
+
+Compare **unweighted** MI (`-mi_term/lam`), cost, concentration, residuals and
+runtime at fixed h. Multiplying lam by 1.5 increases the weighted MI term even
+if the plan does not change. If the new trial brings little benefit or poorer
+convergence, use the `.10` baseline; do not keep reducing reg solely to minimize
+effective targets. For a full baseline fit, omit `--tune` but retain `--lam .10`.
+Each changed objective needs a fresh fit, not `--resume`.
+
+Kernel effective neighbors stay **1971.8747/1976.5002**, as expected with fixed
+features and h; changing lam/reg does not refit these exact image kernels.
+Their broad neighborhoods and the small MI scalar alone cannot determine the
+useful MI gradient scale. `--tune` skips patch kernels/fitting, so it supplies
+**no OPRF approximation-error measurement at h=.75**. Run `--kernel-check-only`
+or a full fit for that. Patch weights/ranks remain unchanged, with both projection
+bandwidths at .20 and no separate balanced projection audit.
+
+Choose the final recipe using the same held-out images: source correspondence,
+mapped-feature spread, blur and similarity to the top-1 reference. These logs
+describe fitted-plan rows, not held-out conditional routing or decoded quality;
+the mean top-1 weight also cannot rule out individual nearly one-hot rows.
+The `.15` trial is configuration-validated locally and awaits the lab run.
 
 When testing a new `grouped_patch_lowrank` fit from this recipe, make the
 projection setting explicit:

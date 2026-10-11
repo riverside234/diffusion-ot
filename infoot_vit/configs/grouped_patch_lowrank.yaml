@@ -11,8 +11,8 @@ device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
   h: 0.75  # Requested broader fit KDE; projection stays at 0.2.
-  lam: 0.10  # Hold MI fixed for the next entropy-only comparison at h=.75.
-  reg: 0.005  # Was .01: converged, but 686 effective targets and 4.11% mean top-1 weight. Fresh fit.
+  lam: 0.15  # Next MI-only trial; compare with the converged .10 baseline at the same reg/h.
+  reg: 0.005  # Hold entropy fixed: .10 baseline reached 98.9 effective targets, 20.14% mean top-1.
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000
