@@ -11,8 +11,8 @@ device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
   h: 0.75  # Requested broader fit KDE; projection stays at 0.2.
-  lam: 0.10  # Retain the h=.7 follow-up weights: 676.4 effective targets, converged in 7 steps.
-  reg: 0.01  # Isolate the bandwidth change; start a fresh fit.
+  lam: 0.10  # Hold MI fixed for the next entropy-only comparison at h=.75.
+  reg: 0.005  # Was .01: converged, but 686 effective targets and 4.11% mean top-1 weight. Fresh fit.
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000
