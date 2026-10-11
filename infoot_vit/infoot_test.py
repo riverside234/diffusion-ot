@@ -50,6 +50,14 @@ def main(argv=None):
                    help="Test successful pairs from a failed batched grouped_partial fit; record skipped routing mass without modifying the fit.")
     p.add_argument("--preview-checkpoint", action="store_true",
                    help="Preview factors/latest.pt from a stopped failed/interrupted grouped_patch_lowrank fit. Never refit or mark it complete.")
+    p.add_argument("--umap", action="store_true", help="Save an optional training-bank-fitted feature UMAP (umap.png and umap.json).")
+    p.add_argument("--umap-level", choices=["image", "patch"], default="image",
+                   help="Image: valid-token means for display only; patch: individual valid tokens.")
+    p.add_argument("--umap-max-points", type=int, default=1000, help="Maximum sampled points per plotted group.")
+    p.add_argument("--umap-seed", type=int, default=42)
+    p.add_argument("--umap-neighbors", type=int, default=15)
+    p.add_argument("--umap-min-dist", type=float, default=.1)
+    p.add_argument("--umap-metric", choices=["euclidean", "cosine"], default="euclidean")
     a = p.parse_args(argv)
     if a.preview_checkpoint and a.allow_failed_pairs:
         p.error("--preview-checkpoint cannot be combined with --allow-failed-pairs")
@@ -63,6 +71,8 @@ def main(argv=None):
         p.error("--patch-projection-bandwidth must be finite and positive")
     if a.top_k_images is not None and a.top_k_images < 0:
         p.error("--top-k-images must be nonnegative (0 keeps all)")
+    if a.umap_max_points < 2 or a.umap_neighbors < 2 or not 0 <= a.umap_seed < 2**32 or not 0 <= a.umap_min_dist <= 1:
+        p.error("UMAP point limit/neighbors must be at least 2, seed in [0,2**32), and min-dist in [0,1]")
     torch.set_num_threads(a.threads)
     if a.dry_run:
         # Validate small metadata before allocating supports/kernels or the DiT.
@@ -94,6 +104,8 @@ def main(argv=None):
             query_count=min(a.count, len(q["ids"])), mask="existing condition_padding_mask; True is padding",
             generate=a.generate, projection=projection, incomplete_fit=m.get("incomplete_fit"),
             checkpoint_preview=m.get("checkpoint_preview"),
+            umap=dict(enabled=a.umap, level=a.umap_level, max_points=a.umap_max_points,
+                      seed=a.umap_seed, n_neighbors=a.umap_neighbors, min_dist=a.umap_min_dist, metric=a.umap_metric),
             sampling=dict(num_steps=a.steps, guidance_scale=a.guidance)), indent=2))
         return 0
     output = a.output_dir or ROOT / "results/infoot_vit" / f"{a.mapping.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:6]}"
@@ -118,6 +130,14 @@ def main(argv=None):
         a.steps, a.guidance = generation_settings(mapper.mode, a.steps, a.guidance)
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)
         result, manifest = mapper.project_bank(bank, output, count=a.count, chunk_size=a.chunk_size, run_log=log)
+        if a.umap:
+            from infoot_vit.infoot_helper.umap_plot import save_umap
+            log.event("umap_started", level=a.umap_level, max_points=a.umap_max_points, seed=a.umap_seed)
+            report = save_umap(mapper, bank, result, output, level=a.umap_level, max_points=a.umap_max_points,
+                seed=a.umap_seed, n_neighbors=a.umap_neighbors, min_dist=a.umap_min_dist,
+                metric=a.umap_metric, mapped_id=manifest["artifact_id"])
+            log.event("umap_completed", plot="umap.png", report="umap.json", seconds=report["seconds"])
+            print(f"Saved UMAP: {output / 'umap.png'}")
         if a.generate:
             from infoot_vit.infoot_helper.evaluate_mapping import generate
             log.event("generation_started", num_steps=a.steps, guidance_scale=a.guidance, weights=a.weights)

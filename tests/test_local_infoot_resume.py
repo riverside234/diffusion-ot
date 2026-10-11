@@ -125,6 +125,7 @@ def test_resume_supports_existing_checkpoints_without_rng_and_rejects_bn_mismatc
 def test_evaluation_defaults_to_latest_but_allows_explicit_step(local_helpers, tmp_path, monkeypatch,
                                                                arguments, expected_step):
     from infoot_helper import infoot_test_helper as helper
+    from infoot_helper import umap_plot
     from diffusion_ot.data import manifests, ground_truth
 
     _, transport = local_helpers
@@ -151,10 +152,24 @@ def test_evaluation_defaults_to_latest_but_allows_explicit_step(local_helpers, t
         assert dog is domains["dog"] and len(codes) == len(images) == 16
         assert path.name == f"cotraining_step_{expected_step:06d}_1.png"
 
+    def map_features(query, source, target, plan, **kwargs):
+        assert "target_v" not in kwargs
+        torch.testing.assert_close(target, features["dog"])
+        return query
+
+    def save_umap(cat_bank, dog_bank, queries, mapped, path, **kwargs):
+        torch.testing.assert_close(cat_bank, features["cat"])
+        torch.testing.assert_close(dog_bank, features["dog"])
+        torch.testing.assert_close(queries, mapped)
+        assert len(queries) == 16
+        assert path.name == f"cotraining_step_{expected_step:06d}_1_umap.png"
+        return path
+
     monkeypatch.setattr(helper, "prepare_cotraining_test", prepare)
     monkeypatch.setattr(helper, "encode_paths", lambda domain, paths: torch.ones(len(paths), 2))
     monkeypatch.setattr(helper, "generate_and_save_grid", save_grid)
-    monkeypatch.setattr(transport, "conditional_mapping", lambda query, *args, **kwargs: query)
+    monkeypatch.setattr(umap_plot, "save_umap", save_umap)
+    monkeypatch.setattr(transport, "conditional_mapping", map_features)
     monkeypatch.setattr(manifests, "read_jsonl", lambda path: [{"sample_id": f"{i:03d}"} for i in range(16)])
     monkeypatch.setattr(ground_truth, "load_ground_truth_images", lambda *args: torch.ones(16, 3, 2, 2))
     script = tmp_path / "infoot/infoot_test_cotraining.py"

@@ -23,7 +23,7 @@ def training_state(affine=True):
     settings = dict(query_count=2, encode_batch_size=2, flow_batch_size=2,
                     fit_h=.8, projection_h=.8, mi_weight=.1, reg=.5,
                     fit_iterations=2, sampling_steps=2, flow_weight=1.,
-                    infoOT_loss_weight=.1, contrastive_weight=.05, covariance_weight=.3)
+                    infoOT_loss_weight=.1, contrastive_weight=.05)
     for name, context in domains.items():
         context.model_dtype = torch.float32
         context.training_config["class_conditioning"] = {"null_label": None}
@@ -46,13 +46,68 @@ def latent_batch(rank=0, step=0):
 def test_single_process_loss_backward(local_helpers):
     model, optimizer = training_state()
     loss, metrics = model(latent_batch(), report=True)
+    expected = (.5 * (metrics["flow_cat"] + metrics["flow_dog"])
+                + .1 * metrics["infoot"] + .05 * metrics["contrastive"])
+    assert loss.item() == pytest.approx(expected)
+    assert not any(key.startswith("cov_") for key in metrics)
     loss.backward()
     assert torch.isfinite(loss) and metrics["total"] == loss.item()
     for name, context in model.domains.items():
         assert any(p.grad is not None and p.grad.norm() > 0 for p in context.branch.encoder.parameters())
         assert model.batch_norms[name].weight.grad.norm() > 0
+        assert model.batch_norms[name].num_batches_tracked == 1
         assert all(p.grad is None for p in context.vae.parameters())
     optimizer.step()
+
+
+def test_flow_and_translation_condition_on_batchnorm_features(local_helpers, monkeypatch):
+    from infoot_helper.distributed import model as module
+    from infoot_helper.batchnorm_matching import normalize_features
+
+    model, _ = training_state()
+    encoded, calls = {}, []
+    normalize, flow, translation = module.add_matching_features, module.native_flow_loss, module.translation_contrastive_loss
+
+    def capture_features(batch, norms):
+        normalize(batch, norms)
+        encoded.update(batch)
+
+    def check_flow(context, x0, condition):
+        name = next(name for name, domain in model.domains.items() if domain is context)
+        torch.testing.assert_close(condition, encoded[name]["m"][:len(x0)])
+        assert not torch.allclose(condition, encoded[name]["v"][:len(x0)])
+        calls.append(f"flow_{name}")
+        return flow(context, x0, condition)
+
+    def check_translation(context, source, condition, **kwargs):
+        target = next(name for name, domain in model.domains.items() if domain is context)
+        references = encoded[target]["references"]
+        raw_mapped = module.conditional_mapping(
+            source["queries"]["m"], source["references"]["m"], references["m"],
+            plans[target], h=model.settings["projection_h"], target_v=references["v"],
+        )
+        expected = normalize_features(raw_mapped, model.batch_norms[target], references["v"])
+        torch.testing.assert_close(condition, expected)
+        assert not torch.allclose(condition, raw_mapped)
+        assert kwargs["batch_norm"] is model.batch_norms[target]
+        assert kwargs["reference_v"] is references["v"]
+        calls.append(f"translation_{target}")
+        return translation(context, source, condition, **kwargs)
+
+    fit, plans = module.fit_transport, {}
+
+    def capture_plan(*args, **kwargs):
+        plan = fit(*args, **kwargs)
+        plans.update(dog=plan, cat=plan.T)
+        return plan
+
+    monkeypatch.setattr(module, "add_matching_features", capture_features)
+    monkeypatch.setattr(module, "native_flow_loss", check_flow)
+    monkeypatch.setattr(module, "translation_contrastive_loss", check_translation)
+    monkeypatch.setattr(module, "fit_transport", capture_plan)
+    loss, _ = model(latent_batch())
+    loss.backward()
+    assert set(calls) == {"flow_cat", "flow_dog", "translation_cat", "translation_dog"}
 
 
 def distributed_worker(rank, world_size, directory):

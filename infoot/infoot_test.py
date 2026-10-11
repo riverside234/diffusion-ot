@@ -15,6 +15,7 @@ from diffusion_ot.evaluation.stage1a_eval import (
     decode_vae_latents,
 )
 from infoot_helper.infoot_test_helper import generate_and_save_grid
+from infoot_helper.umap_plot import save_umap
 from diffusion_ot.data.latent_dataset import load_latent_tensor
 
 import argparse
@@ -130,3 +131,7 @@ dog = load_stage1a_evaluator(
 output_path = ROOT / f"results/infoot_test/cat_to_dog_test_{args.save}.png"
 generate_and_save_grid(dog, v_dog, cat_images, output_path)
 print("Saved:", output_path)
+print("Saved:", save_umap(
+    Xs, Xt, v_cat, v_dog, output_path.with_name(f"{output_path.stem}_umap.png"),
+    title="InfoOT: raw features",
+))

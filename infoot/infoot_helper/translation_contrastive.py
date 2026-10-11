@@ -8,12 +8,16 @@ from diffusion_ot.training.self_supervised_translation import (
     encode_generated_images,
     source_code_contrastive_loss,
 )
+from .batchnorm_matching import normalize_features
 
 
 def translation_contrastive_loss(
     domain,
     source,
     mapped_v,
+    *,
+    batch_norm,
+    reference_v,
     steps=20,
     temperature=0.2,
     query_projector=None,
@@ -49,11 +53,12 @@ def translation_contrastive_loss(
     recovered_v = domain.branch.encode(
         recovered_latent.to(dtype=domain.model_dtype)
     ).float()
+    recovered_m = normalize_features(recovered_v, batch_norm, reference_v)
 
     return source_code_contrastive_loss(
-        recovered_v,
-        source["queries"]["v"],
-        source["v"],
+        recovered_m,
+        source["queries"]["m"],
+        source["m"],
         temperature=temperature,
         query_projector=query_projector,
         key_projector=key_projector,

@@ -50,7 +50,6 @@ def train(rank, world_size, device):
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
-        "covariance_weight": 0.3,
         "batchnorm": {"affine": False, "momentum": 0.1, "eps": 1e-5},
         "batchnorm_lr": 1e-5,
     }

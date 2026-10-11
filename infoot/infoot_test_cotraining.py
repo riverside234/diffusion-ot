@@ -17,6 +17,7 @@ from infoot_helper.infoot_cotraining_helper import (
     conditional_mapping,
 )
 from infoot_helper.cotraining_checkpoint import latest_checkpoint
+from infoot_helper.umap_plot import save_umap
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--h", type=float, default=0.2)
@@ -44,7 +45,7 @@ dog_bank = torch.load(
     bank_dir / "dog_bank.pt", map_location="cpu", weights_only=True
 )
 
-domains, raw_banks, matching, batch_norms, P = prepare_cotraining_test(
+domains, _, matching, batch_norms, P = prepare_cotraining_test(
     ROOT,
     {"cat": cat_bank, "dog": dog_bank},
     step=args.step,
@@ -63,9 +64,10 @@ if len(paths) < count:
 
 with torch.no_grad():
     v_cat = encode_paths(cat, paths)
-    v_dog = conditional_mapping(
-        batch_norms["cat"](v_cat), matching["cat"], matching["dog"], P,
-        h=args.h, target_v=raw_banks["dog"],
+    m_cat = batch_norms["cat"](v_cat)
+    m_dog = conditional_mapping(
+        m_cat, matching["cat"], matching["dog"], P,
+        h=args.h,
     )
 
 records = {
@@ -81,5 +83,10 @@ output_path = ROOT / (
     f"results/infoot_test/"
     f"cotraining_step_{args.step:06d}_{args.save}.png"
 )
-generate_and_save_grid(dog, v_dog, cat_images, output_path, steps=20)
+generate_and_save_grid(dog, m_dog, cat_images, output_path, steps=20)
 print("Saved:", output_path)
+print("Saved:", save_umap(
+    matching["cat"], matching["dog"], m_cat, m_dog,
+    output_path.with_name(f"{output_path.stem}_umap.png"),
+    title=f"Co-training step {args.step}: BatchNorm features",
+))

@@ -789,6 +789,39 @@ Each test creates a fresh `results/infoot_vit/.../` directory (or the new
 For dog→cat, swap the train banks in fitting, use `dog_val` queries, and choose
 the cat PDAE training config/checkpoint during generation.
 
+### Optional UMAP plot
+
+UMAP is **disabled by default**. Add `--umap` to any offline test command:
+
+```bash
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<fit-directory> --query-bank data/infoot_vit/cat_val --count 16 --umap
+```
+
+The test saves `umap.png` and `umap.json` beside `mapped.pt`. One common reducer
+is fitted on sampled real source/target **training** features; held-out source
+and mapped queries use `transform`. The default image view takes valid-token
+means for display only. Arrows connect each source to its mapped readout, and
+numbers identify query order in the translation grid. Source/mapped query means
+use the same retained patch positions; all-invalid queries are omitted and their
+IDs are recorded. No transport plans or conditioning features are changed.
+
+Use `--umap-level patch` to inspect individual patch features instead of image
+means. Rejected tokens are excluded. Both views sample without replacement by
+stable image ID/patch index, with at most 1,000 points per group. JSON records
+sample IDs, patch indices, coordinates, seed, reducer parameters/versions, mask
+coverage, mapping identity, projection settings and runtime. Start/completion
+events are saved in the normal test logs.
+
+Options: `--umap-max-points 1000`, `--umap-seed 42`, `--umap-neighbors 15`,
+`--umap-min-dist 0.1`, and `--umap-metric euclidean` (or `cosine`). This optional
+CPU visualization uses `umap-learn` and `matplotlib`, already listed in the root
+requirements. If needed: `python -m pip install umap-learn matplotlib`.
+`--dry-run --umap` reports the requested settings without importing UMAP or
+computing an embedding. UMAP is a feature-geometry display; assess image quality
+from the generated grids. Coordinates from separately fitted runs are not
+directly comparable. See the official [UMAP transform documentation](https://umap-learn.readthedocs.io/en/latest/transform.html)
+and [reproducibility guidance](https://umap-learn.readthedocs.io/en/latest/reproducibility.html).
+
 ## Partial objective and rejection contract
 
 For each training image pair, `Gamma>=0`, `Gamma.sum(1)<=a`,

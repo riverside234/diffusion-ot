@@ -39,6 +39,9 @@ def test_training_statistics_use_only_references_and_keep_raw_codes(local_helper
         assert norm.num_batches_tracked == 1
     assert encoded["cat"]["references"]["v"] is references
     assert encoded["cat"]["queries"]["v"] is queries
+    torch.testing.assert_close(encoded["cat"]["m"], torch.cat([
+        encoded["cat"]["queries"]["m"], encoded["cat"]["references"]["m"],
+    ]))
 
     changed_queries = {name: feature_batch(batch["references"]["v"], queries[:1] * 1000)
                        for name, batch in encoded.items()}
@@ -65,6 +68,40 @@ def test_query_normalization_retains_gradients_through_reference_statistics(loca
     normalize(references, queries).square().sum().backward()
     for raw in (references, queries):
         assert torch.isfinite(raw.grad).all() and raw.grad.norm() > 0
+
+
+def test_contrastive_features_reuse_target_reference_statistics(local_helpers, monkeypatch):
+    from infoot_helper import translation_contrastive as helper
+    from infoot_helper.batchnorm_matching import add_matching_features
+
+    reference_v = torch.tensor([[1., 3.], [2., 7.], [4., 9.]], requires_grad=True)
+    norm = torch.nn.BatchNorm1d(2)
+    norm(reference_v)
+    source = {"cat": feature_batch(reference_v * 2 + 10, torch.tensor([[20., 5.], [30., 8.]]))}
+    add_matching_features(source, {"cat": torch.nn.BatchNorm1d(2)})
+    source = source["cat"]
+    source["queries"]["x0"] = torch.zeros(2, 2)
+    mapped = torch.tensor([[3., 5.], [5., 11.]], requires_grad=True)
+    context = SimpleNamespace(device="cpu", model_dtype=torch.float32, vae=None, transformer=None,
+                              branch=SimpleNamespace(encode=lambda x: x),
+                              training_config={"class_conditioning": {"null_label": None}})
+    monkeypatch.setattr(helper, "integrate_training_flow", lambda *args, **kwargs: args[3])
+    monkeypatch.setattr(helper, "decode_training_images", lambda vae, x: x)
+    monkeypatch.setattr(helper, "encode_generated_images", lambda vae, x: x)
+
+    def check_contrastive(recovered, positive, bank, **kwargs):
+        expected = (mapped - reference_v.mean(0)) / (reference_v.var(0, unbiased=False) + norm.eps).sqrt()
+        torch.testing.assert_close(recovered, expected * norm.weight + norm.bias)
+        torch.testing.assert_close(positive, source["queries"]["m"])
+        torch.testing.assert_close(bank, source["m"])
+        return recovered.square().mean(), {}
+
+    monkeypatch.setattr(helper, "source_code_contrastive_loss", check_contrastive)
+    loss, _ = helper.translation_contrastive_loss(context, source, mapped, batch_norm=norm, reference_v=reference_v)
+    loss.backward()
+    assert norm.num_batches_tracked == 1
+    for value in (mapped, reference_v, norm.weight):
+        assert torch.isfinite(value.grad).all() and value.grad.norm() > 0
 
 
 def test_alignment_and_mapping_train_encoders_and_affine_batchnorm(local_helpers):
@@ -97,12 +134,12 @@ def test_alignment_and_mapping_train_encoders_and_affine_batchnorm(local_helpers
 
     query = cat["queries"]["m"]
     raw_target = dog["references"]["v"]
-    mapped = helpers.conditional_mapping(query, source, target, plan, h=.8, target_v=raw_target)
+    mapped = helpers.conditional_mapping(query, source, target, plan, h=.8)
     solver = infoot.InfoOT(source, target, h=.8)
     solver.P = plan.detach()
     scores = solver.conditional_score(query)
-    torch.testing.assert_close(mapped, infoot.projection(scores, raw_target))
-    assert not torch.allclose(mapped, infoot.projection(scores, target))
+    torch.testing.assert_close(mapped, infoot.projection(scores, target))
+    assert not torch.allclose(mapped, infoot.projection(scores, raw_target))
     for features in (query, source, target, raw_target):
         gradient, = torch.autograd.grad(mapped.square().mean(), features, retain_graph=True)
         assert torch.isfinite(gradient).all() and gradient.norm() > 0
@@ -185,7 +222,7 @@ def test_export_roundtrip_and_eval_mapping_are_independent_of_query_batch(local_
         with torch.no_grad():
             return helpers.conditional_mapping(
                 batch_norms["cat"](query), batch_norms["cat"](references["cat"]),
-                batch_norms["dog"](references["dog"]), plan, h=.8, target_v=references["dog"],
+                batch_norms["dog"](references["dog"]), plan, h=.8,
             )
 
     together = map_queries(queries, loaded)
