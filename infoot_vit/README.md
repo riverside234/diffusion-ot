@@ -213,8 +213,20 @@ generated-image review below:
 
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
-| Image router: `solver` | 0.35 | 0.06 | 0.075 | 1,200 |
+| Image router: `solver` | 0.35 | 0.06 | **0.065** | 1,200 |
 | Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
+
+The next router comparison lowers only image `lam: .075 -> .065`. The supplied
+`grouped_partial_20261011T020500Z_2fd39d06` console log shows the .075 router
+converged in 107 iterations with ~2.5 effective targets/2,000 and 92.79% top-8
+retained mass, followed by **1,024 successful pairs and zero failures so far**.
+It contains no completed patch-geometry or generated-image results. The smaller
+MI weight tests less concentrated image routing; it is not a demonstrated blur
+fix. Patch settings, mass, confidence and .20/.20 projection remain fixed.
+See [the supplied-log analysis and objective tradeoff](../docs/analysis/infoot_vit_partial_success_tuning/README.md).
+Use `--lam .075` to reproduce the previous recipe in a fresh directory; a run
+already in progress continues with its saved configuration. Do not resume it
+using the changed YAML.
 
 The active recipe uses `partial.solver.inner_acceleration: newton`: after 100
 log-domain block updates, safeguarded dual Newton steps accelerate unfinished
@@ -296,9 +308,11 @@ GPU memory without changing the original run. Exit code 2 means unsuccessful;
 only a converged replay supports proceeding to a fresh full fit. The new code
 fingerprint prevents resuming the old v3 run as though its solver were unchanged.
 
-The current **fitting** change is patch `h: .45 -> .35`, `reg: .10 -> .05`;
+The earlier **fitting** change was patch `h: .45 -> .35`, `reg: .10 -> .05`;
 patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings
-remain fixed. Projection stays at **.20**, with .30 available for comparison;
+were held fixed for that comparison. The latest candidate now changes only
+image `lam: .075 -> .065`, as described above. Projection stays at **.20**,
+with .30 available for comparison;
 top-1 truncation is not enabled. These are hypotheses requiring lab images,
 not a measured optimum. Keep guidance/steps fixed while comparing fits.
 
@@ -603,7 +617,7 @@ quality. The normal command without `--tune` still saves full fit diagnostics.
 
 ```bash
 # Existing top-8 grouped_partial recipe; optional router overrides shown.
-python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --tune --h 0.35 --lam 0.075 --reg 0.06
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --tune --h 0.35 --lam 0.065 --reg 0.06
 
 # Low-rank recipe: these overrides change image_solver.*, not patch kernel.h.
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.075 --reg 0.075

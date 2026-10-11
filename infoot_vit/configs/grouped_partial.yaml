@@ -10,9 +10,9 @@ sampling:
   images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
-solver:  # Fit logs: converged in 107 steps, 2.49 effective targets. Do not sharpen further.
+solver:  # Next comparison: reduce near-single-target routing; keep h/reg fixed.
   h: 0.35
-  lam: 0.075
+  lam: 0.065  # Was .075: 107 steps converged, ~2.5 effective targets; candidate, not a measured optimum.
   reg: 0.06
   cost_scale: mean
   max_outer_steps: 1200
@@ -22,7 +22,7 @@ solver:  # Fit logs: converged in 107 steps, 2.49 effective targets. Do not shar
   outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
   keep_mass: 0.80  # Preserve more condition coverage; transported mass, NOT a patch count.
-  solver:  # v2 failures: retain sharp objective; accelerate its difficult inner solve.
+  solver:  # First 1024 pairs now accepted; hold until patch geometry/images are evaluated.
     h: 0.35  # Was .45: reduce smoothing in the FITTED patch MI geometry.
     lam: 0.025  # Hold MI pressure fixed; do not amplify it while reducing entropy.
     reg: 0.05  # Was .10: reduce diffuse patch correspondences at their source.
