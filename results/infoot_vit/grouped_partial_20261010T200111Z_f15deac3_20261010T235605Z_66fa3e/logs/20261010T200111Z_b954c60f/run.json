@@ -1,0 +1,27 @@
+{
+  "command": [
+    "infoot_vit/infoot_fit.py",
+    "--config",
+    "infoot_vit/configs/grouped_partial.yaml",
+    "--source-bank",
+    "data/infoot_vit/cat_train_4000",
+    "--target-bank",
+    "data/infoot_vit/dog_train_4000"
+  ],
+  "elapsed_seconds": 10008.877132658003,
+  "error": "13 partial pairs failed; 15987 successful pairs saved. See /data/not_backed_up/yxu209/diffusion-ot/outputs/infoot_vit/grouped_partial_20261010T200111Z_f15deac3/pair_failures.jsonl and pair_batch_report.json.",
+  "error_type": "RuntimeError",
+  "finished_at": "2026-10-10T22:48:00.342433+00:00",
+  "metadata": {
+    "resume": null,
+    "root": "/data/not_backed_up/yxu209/diffusion-ot"
+  },
+  "operation": "fit",
+  "platform": "Linux-6.8.0-146-generic-x86_64-with-glibc2.39",
+  "python": "3.10.22",
+  "run_id": "20261010T200111Z_b954c60f",
+  "schema": "infoot_run_log_v1",
+  "started_at": "2026-10-10T20:01:11.465358+00:00",
+  "status": "failed",
+  "working_directory": "/data/not_backed_up/yxu209/diffusion-ot"
+}

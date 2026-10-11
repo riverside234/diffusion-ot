@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/fit_mapping.py", line 294, in fit_mapping
+    return _fit_mapping(config, root=root, directory=directory, resume=resume, log=log)
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/fit_mapping.py", line 508, in _fit_mapping
+    fit_pairs_batched(directory=directory, manifest=manifest, source=source, target=target,
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/pair_batch_fit.py", line 169, in fit_pairs_batched
+    raise RuntimeError(f"{len(failures)} partial pairs failed; {len(done)} successful pairs saved. "
+RuntimeError: 13 partial pairs failed; 15987 successful pairs saved. See /data/not_backed_up/yxu209/diffusion-ot/outputs/infoot_vit/grouped_partial_20261010T200111Z_f15deac3/pair_failures.jsonl and pair_batch_report.json.

@@ -1,0 +1,4 @@
+{
+  "error_type": "RuntimeError",
+  "message": "13 partial pairs failed; 15987 successful pairs saved. See /data/not_backed_up/yxu209/diffusion-ot/outputs/infoot_vit/grouped_partial_20261010T200111Z_f15deac3/pair_failures.jsonl and pair_batch_report.json."
+}
