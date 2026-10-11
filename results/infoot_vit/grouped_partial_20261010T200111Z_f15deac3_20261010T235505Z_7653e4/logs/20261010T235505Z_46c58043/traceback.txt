@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_test.py", line 91, in main
+    mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log,
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/mapping.py", line 176, in load
+    m = load_mapping_manifest(directory, allow_failed_pairs=allow_failed_pairs)
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/mapping_manifest.py", line 25, in load_mapping_manifest
+    raise ValueError(f"Mapping artifact is incomplete (status={m.get('status')!r}). "
+ValueError: Mapping artifact is incomplete (status='failed'). For a failed batched grouped_partial fit, explicitly use --allow-failed-pairs to test its successful pairs.

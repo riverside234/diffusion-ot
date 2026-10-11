@@ -1,0 +1,270 @@
+{
+  "all_invalid_images": 0,
+  "confidence_quantiles": {
+    "max": 1.0,
+    "min": 0.0,
+    "p05": 0.04195022862404585,
+    "p50": 0.793050080537796,
+    "p95": 0.9997788071632385
+  },
+  "confidence_threshold_sweep": {
+    "active_threshold": 0.05,
+    "coverage": [
+      {
+        "all_invalid_images": 0,
+        "mean_valid_tokens": 185.4375,
+        "min_valid_tokens": 162,
+        "threshold": 0.05,
+        "valid_fraction": 0.946109693877551
+      },
+      {
+        "all_invalid_images": 0,
+        "mean_valid_tokens": 183.5625,
+        "min_valid_tokens": 161,
+        "threshold": 0.1,
+        "valid_fraction": 0.9365433673469387
+      },
+      {
+        "all_invalid_images": 0,
+        "mean_valid_tokens": 179.4375,
+        "min_valid_tokens": 157,
+        "threshold": 0.2,
+        "valid_fraction": 0.9154974489795917
+      },
+      {
+        "all_invalid_images": 0,
+        "mean_valid_tokens": 175.5625,
+        "min_valid_tokens": 150,
+        "threshold": 0.3,
+        "valid_fraction": 0.8957270408163265
+      }
+    ],
+    "mass_floor": 1e-12,
+    "note": "Counterfactual mask coverage only, from the same saved confidences; no fitting or image generation. Use held-out validation images to choose a threshold; confidence is not a semantic correctness probability."
+  },
+  "device": "cuda",
+  "failed_pair_discarded_routing_mass": {
+    "max": 0.021178920927269276,
+    "mean": 0.0022658418417631923,
+    "min": 1.3886375593778157e-07
+  },
+  "fit_pair_discarded_routing_mass": {
+    "max": 0.17535702629302738,
+    "mean": 0.12076227818849841,
+    "min": 0.07935758896879753
+  },
+  "incomplete_fit": {
+    "failed_pair_count": 13,
+    "failure_journal": {
+      "file": "pair_failures.jsonl",
+      "sha256": "3b2b77f531cb50b9a6e82ac5c8b4456b0ab982c084e480e80471c3ea72135260"
+    },
+    "failure_report": {
+      "file": "pair_batch_report.json",
+      "sha256": "13ce80a1d5ebfc364f24cbe69b1329ff8578823eb4849ffe23b32e0aee9e5b50"
+    },
+    "failures": [
+      {
+        "batch": 1,
+        "checkpoint": "plans/pairs/000156_000613_f7da03ac6af9/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_009927",
+        "source_index": 156,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_001606",
+        "target_index": 613
+      },
+      {
+        "batch": 2,
+        "checkpoint": "plans/pairs/000355_000300_9aa0d39eb9ae/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_010503",
+        "source_index": 355,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_000792",
+        "target_index": 300
+      },
+      {
+        "batch": 2,
+        "checkpoint": "plans/pairs/000355_000742_2cafa49e1e31/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_010503",
+        "source_index": 355,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_001932",
+        "target_index": 742
+      },
+      {
+        "batch": 3,
+        "checkpoint": "plans/pairs/000402_001987_1170793c2753/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_010664",
+        "source_index": 402,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_015092",
+        "target_index": 1987
+      },
+      {
+        "batch": 4,
+        "checkpoint": "plans/pairs/000579_000742_06079e1b931f/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_011144",
+        "source_index": 579,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_001932",
+        "target_index": 742
+      },
+      {
+        "batch": 4,
+        "checkpoint": "plans/pairs/000579_001916_e0b531bf15ec/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_011144",
+        "source_index": 579,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_014871",
+        "target_index": 1916
+      },
+      {
+        "batch": 6,
+        "checkpoint": "plans/pairs/000814_000613_3b805668318c/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_011791",
+        "source_index": 814,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_001606",
+        "target_index": 613
+      },
+      {
+        "batch": 9,
+        "checkpoint": "plans/pairs/001163_000300_1296747aa590/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_012744",
+        "source_index": 1163,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_000792",
+        "target_index": 300
+      },
+      {
+        "batch": 9,
+        "checkpoint": "plans/pairs/001224_001993_95711c232014/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_012916",
+        "source_index": 1224,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_015109",
+        "target_index": 1993
+      },
+      {
+        "batch": 13,
+        "checkpoint": "plans/pairs/001713_000300_030abfbc1445/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_014281",
+        "source_index": 1713,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_000792",
+        "target_index": 300
+      },
+      {
+        "batch": 13,
+        "checkpoint": "plans/pairs/001713_000658_569b74dfb2b3/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_014281",
+        "source_index": 1713,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_001715",
+        "target_index": 658
+      },
+      {
+        "batch": 13,
+        "checkpoint": "plans/pairs/001713_001296_276fe347a36b/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_014281",
+        "source_index": 1713,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_003348",
+        "target_index": 1296
+      },
+      {
+        "batch": 15,
+        "checkpoint": "plans/pairs/001952_000300_cfcca061cd6d/latest.pt",
+        "error": "Pair did not converge; last accepted plan retained.",
+        "run_id": "20261010T200111Z_b954c60f",
+        "source_id": "afhq_cat_015966",
+        "source_index": 1952,
+        "status": "inner_failed",
+        "target_id": "afhq_dog_000792",
+        "target_index": 300
+      }
+    ],
+    "fit_fingerprint": "ab463ff51e65f1fac99507299846805f4b0497882d9b920d6174c6f5233145dd",
+    "original_manifest_sha256": "05989e7bd1727311f9b94ae7845e5a2c1fd8f70eaa4bc24f0d85e90f43d1d164",
+    "original_status": "failed",
+    "policy": "skip_recorded_failed_pairs_v1",
+    "selected_pair_count": 16000,
+    "successful_pair_count": 15987,
+    "successful_pair_fraction": 0.9991875
+  },
+  "mapped": {
+    "corresponding_patch_variance_across_images": 0.17419336972038782,
+    "image_mean_variance": 0.04037344952025901,
+    "images": 16,
+    "norm_mean": 36.35847503863745,
+    "token_variance": 0.34767301136357515,
+    "valid_images": 16,
+    "valid_tokens": 2967
+  },
+  "mode": "grouped_partial",
+  "note": "Descriptive feature diagnostics only; image means do not replace patch features for fitting or conditioning. Compare fixed generated images independently.",
+  "query": {
+    "corresponding_patch_variance_across_images": 1.1068052383730733,
+    "image_mean_variance": 0.10945818577484656,
+    "images": 16,
+    "norm_mean": 47.3440262231483,
+    "token_variance": 1.5825309325723316,
+    "valid_images": 16,
+    "valid_tokens": 3136
+  },
+  "routing_note": "After image top-k/selection: intentionally excluded + failed + successful pair mass = 1. Only successful routes are renormalized; partial-OT rejection/support confidence apply afterward.",
+  "seconds": 867.9283047269855,
+  "source_support": {
+    "corresponding_patch_variance_across_images": 1.1944527979171984,
+    "image_mean_variance": 0.11986139292577687,
+    "images": 2000,
+    "norm_mean": 47.27478089941981,
+    "token_variance": 1.5971406888297335,
+    "valid_images": 2000,
+    "valid_tokens": 392000
+  },
+  "successful_pair_retained_routing_mass": {
+    "max": 0.920612879191645,
+    "mean": 0.8769718799697384,
+    "min": 0.8190664728809574
+  },
+  "target_support": {
+    "corresponding_patch_variance_across_images": 1.3976193413498168,
+    "image_mean_variance": 0.21304318680861503,
+    "images": 2000,
+    "norm_mean": 47.73769943319497,
+    "token_variance": 1.71417027572727,
+    "valid_images": 2000,
+    "valid_tokens": 392000
+  },
+  "total_pair_discarded_routing_mass": {
+    "max": 0.18093352711904265,
+    "mean": 0.12302812003026162,
+    "min": 0.07938712080835497
+  },
+  "valid_fraction": 0.946109693877551
+}

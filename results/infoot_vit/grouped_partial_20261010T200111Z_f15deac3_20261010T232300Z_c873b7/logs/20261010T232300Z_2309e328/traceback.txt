@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_test.py", line 88, in main
+    mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log)
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/mapping.py", line 169, in load
+    raise ValueError("Mapping artifact is incomplete, legacy, or its manifest fingerprint changed.")
+ValueError: Mapping artifact is incomplete, legacy, or its manifest fingerprint changed.

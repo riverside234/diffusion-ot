@@ -1,0 +1,4 @@
+{
+  "error_type": "ValueError",
+  "message": "Mapping artifact is incomplete (status='failed'). For a failed batched grouped_partial fit, explicitly use --allow-failed-pairs to test its successful pairs."
+}

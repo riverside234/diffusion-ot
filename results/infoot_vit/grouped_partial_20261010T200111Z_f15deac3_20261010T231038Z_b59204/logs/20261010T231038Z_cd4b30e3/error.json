@@ -1,0 +1,4 @@
+{
+  "error_type": "ValueError",
+  "message": "Bandwidth/top-k overrides currently apply only to whole_map; partial pair selection and low-rank kernels stay fixed."
+}

@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_test.py", line 85, in main
+    projection = projection_settings(m["config"], a.confidence_threshold,
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_test.py", line 122, in projection_settings
+    raise ValueError("Bandwidth/top-k overrides currently apply only to whole_map; partial pair selection and low-rank kernels stay fixed.")
+ValueError: Bandwidth/top-k overrides currently apply only to whole_map; partial pair selection and low-rank kernels stay fixed.

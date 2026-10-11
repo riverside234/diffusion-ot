@@ -1,0 +1,4 @@
+{
+  "error_type": "ValueError",
+  "message": "Mapping artifact is incomplete, legacy, or its manifest fingerprint changed."
+}
