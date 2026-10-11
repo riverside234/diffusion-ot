@@ -71,6 +71,21 @@ conditions. The correction is an unvalidated inference option, separate from
 ordinary mapped caches and the active fit configuration. It does not change
 the decoder or recover semantic information already lost through averaging.
 
+The [completed matched spread experiment](../docs/analysis/infoot_vit_blur_spread_20261011/README.md)
+reached its variance target but did not resolve blur. Native dog controls stayed
+much clearer even after contraction to the mapped variance. Keep the correction
+diagnostic-only; mean and token-direction mismatch remain to be separated.
+
+For the next fit-then-test experiment, use the
+[conditional-displacement run guide](DISPLACEMENT_EXPERIMENT.md).
+`compare_displacement.py --fit-config ...` fits once, requires a complete pair
+inventory, and compares the existing mapped baseline with a source-residual
+preserving estimator under identical checkpoint/noise controls. Native-dog and
+unmapped-source controls accompany both mapped rows. This is an unvalidated
+quality candidate; `infoot_test.py --patch-value-mode conditional_displacement`
+is explicit, and the existing default remains `barycentric`. The dense fitting
+objective, settings, mass/capacity checks and `.20/.20` bandwidths are unchanged.
+
 ## Start with feature banks
 
 Run from the repository root in the existing lab environment. For partial mode,

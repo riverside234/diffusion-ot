@@ -21,6 +21,7 @@ from .storage import VERSION as STORAGE_VERSION, store_plan_state, validate_plan
 from .pair_selection import select_pairs, selection_edges
 from .device import resolve_device, move
 from .plan_diagnostics import patch_plan_concentration
+from .conditional_displacement import validate_value_mode
 
 MODES = {"patch_global", "whole_map", "grouped_patch", "grouped_partial"}
 CONFIDENCE = dict(support_calibration="fit_leave_one_out_log_density", support_quantile=.01,
@@ -70,9 +71,13 @@ def validate_config(config):
         raise ValueError("Training sampling and pair fitting settings apply only to grouped_partial.")
     config["solver"] = solver_config(config.get("solver"))
     projection = config.get("projection", {})
-    if unknown := projection.keys() - (PROJECTION.keys() | {"confidence", "patch_bandwidth"}):
+    if unknown := projection.keys() - (PROJECTION.keys() | {"confidence", "patch_bandwidth", "patch_value_mode"}):
         raise ValueError(f"Unknown projection settings: {sorted(unknown)}")
     projection = PROJECTION | projection
+    if "patch_value_mode" in projection:
+        if mode != "grouped_partial":
+            raise ValueError("patch_value_mode applies only to dense grouped_partial.")
+        validate_value_mode(projection["patch_value_mode"])
     if "patch_bandwidth" in projection:
         h_patch = projection["patch_bandwidth"]
         if (mode != "grouped_partial" or isinstance(h_patch, bool)

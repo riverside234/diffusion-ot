@@ -5,6 +5,7 @@ import torch
 
 from .partial import distance
 from .plan_diagnostics import patch_plan_concentration
+from .conditional_displacement import conditional_displacement, validate_value_mode
 
 
 DEFAULT_CACHE_BYTES = 3 * 1024**3
@@ -21,13 +22,17 @@ def runtime_settings(cache_bytes=None, pair_batch_size=None):
     return dict(pair_cache_bytes=cache_bytes, pair_projection_batch_size=pair_batch_size)
 
 
-def project_pairs(logs, target, plans, a, b, ky, thresholds, tolerances):
+def project_pairs(logs, target, plans, a, b, ky, thresholds, tolerances, *,
+                  value_mode="barycentric", query=None, source=None):
     """Vectorize conditional.partial_projection over pairs in float64.
 
     Original-proposal density correction, zero retention, support gates and
     log-space score retries are unchanged. Host checks occur once per block,
     rather than once per pair. All returned statistics remain on the device.
     """
+    validate_value_mode(value_mode)
+    if value_mode == "conditional_displacement" and (query is None or source is None):
+        raise ValueError("Conditional displacement requires the original query and source tokens.")
     row_max = logs.max(-1).values
     centered = logs - torch.where(torch.isfinite(row_max), row_max, 0.)[..., None]
     log_base = torch.logsumexp(centered + a.log()[:, None], dim=-1)
@@ -65,12 +70,17 @@ def project_pairs(logs, target, plans, a, b, ky, thresholds, tolerances):
         if not torch.isfinite(log_scores.logsumexp(1)).all():
             raise ValueError("Conditional score underflow remains after float64 log-space retry.")
         weights[pair_ids, query_ids] = log_scores.softmax(1)
-    return weights @ target, raw, valid, dict(
+    extra = {}
+    if value_mode == "conditional_displacement":
+        values, extra = conditional_displacement(query, source, target, plans, logs, ky, b)
+    else:
+        values = weights @ target
+    return values, raw, valid, dict(
         weight_row_sums=weights.sum(-1),
         patch_entropy=-(weights * weights.clamp_min(1e-300).log()).sum(-1),
         projected_patch_top1_probability=weights.max(-1).values,
         query_source_effective_patches=(-torch.special.xlogy(posterior, posterior).sum(-1)).exp(),
-        confidence_underflow=underflow, score_log_retry=retry)
+        confidence_underflow=underflow, score_log_retry=retry, **extra)
 
 
 class DensePartialProjector:
@@ -140,6 +150,7 @@ class DensePartialProjector:
     def project(self, patches, theta, alpha):
         mapper = self.mapper
         p = len(patches)
+        value_mode = validate_value_mode(mapper.config["projection"].get("patch_value_mode", "barycentric"))
         routes = theta[self.indices[:, 0], self.indices[:, 1]]
         # One query-level index transfer; no GPU scalar branching per pair.
         active = (routes != 0).nonzero().flatten().cpu().tolist()
@@ -167,7 +178,10 @@ class DensePartialProjector:
             plans, a, b = [torch.stack([pair[name] for pair in pairs]).double() for name in ("plan", "a", "b")]
             tolerances = patches.new_tensor([pair["tolerance"] for pair in pairs])
             candidate, raw, valid, diag = project_pairs(logs[inverse], mapper.y[ij[:, 1]], plans, a, b,
-                mapper.projection_ky[ij[:, 1]], self.thresholds[ij[:, 0]], tolerances)
+                mapper.projection_ky[ij[:, 1]], self.thresholds[ij[:, 0]], tolerances,
+                value_mode=value_mode,
+                query=patches.expand(len(ids), -1, -1) if value_mode == "conditional_displacement" else None,
+                source=mapper.x[ij[:, 0]] if value_mode == "conditional_displacement" else None)
             clipped = raw.clamp(0, 1)
             roundoff = torch.maximum(roundoff, (raw - clipped).abs().max())
             g = clipped * valid  # Validated storage/solver roundoff only, no plan renormalization.
@@ -188,7 +202,9 @@ class DensePartialProjector:
             effective += (measure * diag["patch_entropy"].exp()).sum()
             for name, value in dict(patch_plan_concentration(plans),
                     within_image_top1_patch_probability=diag["projected_patch_top1_probability"],
-                    query_source_effective_patches=diag["query_source_effective_patches"]).items():
+                    query_source_effective_patches=diag["query_source_effective_patches"],
+                    **{key: diag[key] for key in ("displacement_source_effective_patches",
+                        "displacement_norm", "source_residual_norm") if key in diag}).items():
                 if value.ndim == 1:
                     value = value[:, None]
                 geometry[name] = geometry.get(name, 0.) + (measure * value).sum()
@@ -205,4 +221,5 @@ class DensePartialProjector:
         detail.update(zip(("ot_rejected_mass", "support_invalid_retained_mass", "support_invalid_route_mass"),
             torch.stack((rejected, support_invalid, invalid_routes)).cpu().tolist()))
         detail.update(zip(("support_invalid_confidence_underflow_rows", "score_log_retry_rows"), counts.cpu().tolist()))
+        detail["patch_value_mode"] = value_mode
         return mapped, confidence, detail

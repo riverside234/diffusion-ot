@@ -22,6 +22,7 @@ from .device import resolve_device, move
 from .mapping_manifest import load_mapping_manifest
 from .plan_diagnostics import patch_plan_concentration
 from .dense_partial_projection import DensePartialProjector, runtime_settings
+from .conditional_displacement import conditional_displacement, validate_value_mode
 
 
 @dataclass
@@ -81,6 +82,10 @@ class FeatureMapper:
         self.source_index = {sid: i for i, sid in enumerate(source.ids)}
         self.target_index = {tid: j for j, tid in enumerate(target.ids)}
         self.config, self.mode = deepcopy(manifest["config"]), manifest["config"]["mode"]
+        if "patch_value_mode" in self.config["projection"]:
+            if self.mode != "grouped_partial":
+                raise ValueError("patch_value_mode applies only to dense grouped_partial.")
+            validate_value_mode(self.config["projection"]["patch_value_mode"])
         runtime_settings(pair_cache_bytes, pair_projection_batch_size)
         if self.mode != "grouped_partial" and (pair_cache_bytes is not None or pair_projection_batch_size is not None):
             raise ValueError("Pair projection performance options apply only to dense grouped_partial.")
@@ -255,6 +260,11 @@ class FeatureMapper:
         candidate,g,diag = partial_projection(patches,self.x[i],self.y[j],pair["plan"],pair["a"],pair["b"],
             self.shared["sx"][i],self.shared["sy"][j],self.shared["h_projection"],self.shared["support"][i],
             target_kernel=self.projection_ky[j],query_logs=context)
+        if self.config["projection"].get("patch_value_mode", "barycentric") == "conditional_displacement":
+            candidate, extra = conditional_displacement(patches[None], self.x[i:i+1], self.y[j:j+1],
+                pair["plan"][None], context[None], self.projection_ky[j:j+1], pair["b"][None])
+            candidate = candidate[0]
+            diag.update({key: value[0] for key, value in extra.items()})
         diag["weight_row_sums"] = diag["weights"].sum(1)
         diag["patch_entropy"] = -(diag["weights"]*diag["weights"].clamp_min(1e-300).log()).sum(1)
         diag["projected_patch_top1_probability"] = diag["weights"].max(1).values
@@ -486,7 +496,7 @@ class FeatureMapper:
         manifest = dict(schema="infoot_mapped_features_v2", mapper_id=self.manifest["artifact_id"],
             projection_implementation_sha256=file_hash(Path(__file__)),
             projection_dependency_sha256={name: file_hash(Path(__file__).with_name(name))
-                for name in ("conditional.py", "partial.py", "feature_bank.py", "storage.py", "pair_selection.py", "device.py", "mapping_manifest.py", "plan_diagnostics.py", "dense_partial_projection.py")},
+                for name in ("conditional.py", "conditional_displacement.py", "partial.py", "feature_bank.py", "storage.py", "pair_selection.py", "device.py", "mapping_manifest.py", "plan_diagnostics.py", "dense_partial_projection.py")},
             mode=self.mode, query_bank_id=bank.artifact_id, ids=ids, query_domain=bank.manifest["domain"],
             representation=bank.representation, projection=self.config["projection"],
             output=dict(file="mapped.pt", sha256=file_hash(path)), diagnostics=result.diagnostics)
@@ -569,11 +579,17 @@ def mapping_summary(result, query, source, target, *, confidence_settings=None):
                     "image_query_source_effective_neighbors", "image_query_source_max_weight",
                     "raw_image_effective_targets", "raw_image_max_weight",
                     "fitted_pair_effective_patches", "fitted_pair_top1_probability", "fitted_pair_normalized_entropy",
-                    "query_source_effective_patches", "within_image_effective_patches", "within_image_top1_patch_probability"):
+                    "query_source_effective_patches", "within_image_effective_patches", "within_image_top1_patch_probability",
+                    "displacement_source_effective_patches", "displacement_norm", "source_residual_norm"):
             values = [r[key] for r in rows if key in r]
             if values:
                 geometry[key] = dict(min=min(values), mean=sum(values)/len(values), max=max(values))
         report["partial_geometry"] = geometry
+        report["patch_value_modes"] = sorted({row.get("patch_value_mode", "barycentric") for row in rows})
+        report["patch_value_note"] = ("within_image_effective_patches/top1 describe the unchanged smoothed target "
+            "conditional. conditional_displacement instead evaluates original plan-edge displacements and passes "
+            "the query residual through; its source-neighborhood and norm diagnostics are separate. "
+            "Feature concentration and residual preservation do not certify dog realism or source correspondence.")
         report["partial_geometry_note"] = ("Fitted row statistics precede projection; source-neighborhood and projected-patch "
             "statistics include query smoothing. Dense pair metrics are weighted by routing and retained/support-valid mass. "
             "Projected-patch metrics average individual pair conditionals, not the final mixture across pairs. "

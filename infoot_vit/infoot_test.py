@@ -17,6 +17,7 @@ from infoot_vit.infoot_helper.feature_bank import FeatureBank, digest, write_jso
 from infoot_vit.infoot_helper.mapping import FeatureMapper
 from infoot_vit.infoot_helper.mapping_manifest import load_mapping_manifest
 from infoot_vit.infoot_helper.dense_partial_projection import runtime_settings
+from infoot_vit.infoot_helper.conditional_displacement import VALUE_MODES, validate_value_mode
 from infoot_vit.infoot_helper.run_logging import RunLog
 
 
@@ -49,6 +50,8 @@ def main(argv=None):
                    help="Absolute image-router projection h (patch h for patch_global). Also scales patch kernels unless patch_bandwidth is set; saved plans stay fixed.")
     p.add_argument("--patch-projection-bandwidth", type=float,
                    help="Dense grouped_partial only: absolute patch projection h, independent of image routing. No refitting.")
+    p.add_argument("--patch-value-mode", choices=VALUE_MODES,
+                   help="Dense grouped_partial only: experimental conditional_displacement preserves query residuals; barycentric is the existing default. No refitting.")
     p.add_argument("--top-k-images", type=int,
                    help="Retain and renormalize K target-image weights; 0 keeps all. Partial modes still use saved pairs only.")
     p.add_argument("--allow-failed-pairs", action="store_true",
@@ -96,7 +99,8 @@ def main(argv=None):
             p.error("Pair projection performance options apply only to dense grouped_partial")
         a.steps, a.guidance = generation_settings(m["config"]["mode"], a.steps, a.guidance)
         projection = projection_settings(m["config"], a.confidence_threshold,
-            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth)
+            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth,
+            patch_value_mode=a.patch_value_mode)
         q = json.loads((a.query_bank / "manifest.json").read_text(encoding="utf-8"))
         training_ids = set(m["source_ids"]) | set(m["target_ids"])
         if m.get("schema") in {"siglip_infoot_mapping_v3", "siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
@@ -131,7 +135,8 @@ def main(argv=None):
         if m["config"]["mode"] != "grouped_partial" and (cache_bytes is not None or a.projection_pair_batch_size is not None):
             p.error("Pair projection performance options apply only to dense grouped_partial")
         projection = projection_settings(m["config"], a.confidence_threshold,
-            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth)
+            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth,
+            patch_value_mode=a.patch_value_mode)
         # Set overrides BEFORE loading cached KDEs, factors and support thresholds.
         if a.preview_checkpoint:
             mapper = LowRankCheckpointPreview.load(a.mapping, device=a.device, projection=projection, run_log=log)
@@ -172,9 +177,13 @@ def generation_settings(mode, steps, guidance):
             (2.0 if partial else 1.5) if guidance is None else guidance)
 
 
-def projection_settings(config, threshold, *, bandwidth=None, top_k_images=None, patch_bandwidth=None):
+def projection_settings(config, threshold, *, bandwidth=None, top_k_images=None, patch_bandwidth=None, patch_value_mode=None):
     """Projection-only comparison; never mutate fit metadata or refit a plan."""
     projection = deepcopy(config["projection"])
+    if patch_value_mode is not None:
+        if config["mode"] != "grouped_partial":
+            raise ValueError("--patch-value-mode applies only to dense grouped_partial.")
+        projection["patch_value_mode"] = validate_value_mode(patch_value_mode)
     if patch_bandwidth is not None:
         if config["mode"] != "grouped_partial":
             raise ValueError("--patch-projection-bandwidth applies only to dense grouped_partial.")
