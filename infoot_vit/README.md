@@ -767,11 +767,11 @@ reproducible sample of the router-selected pairs, without writing any mapping,
 plan or checkpoint. The existing `--tune` remains image-router-only.
 
 ```bash
-# Measured reg=.0375, lam=.030 baseline; reuse the ORIGINAL FIT's router/selection.
-python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-from "outputs/infoot_vit/<fit-directory>" --tune-pairs 64 --tune-seed 42 --partial-reg 0.0375 --partial-lam 0.030 --tune-report outputs/infoot_vit_tuning/partial_reg00375_lam0030.json
-
-# Next candidate: increase only partial lam to .035, keeping reg=.0375.
+# Measured reg=.0375, lam=.035 baseline; reuse the ORIGINAL FIT's router/selection.
 python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-from "outputs/infoot_vit/<fit-directory>" --tune-pairs 64 --tune-seed 42 --partial-reg 0.0375 --partial-lam 0.035 --tune-report outputs/infoot_vit_tuning/partial_reg00375_lam0035.json
+
+# Next candidate: increase only partial reg to .040, keeping lam=.035.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-from "outputs/infoot_vit/<fit-directory>" --tune-pairs 64 --tune-seed 42 --partial-reg 0.040 --partial-lam 0.035 --tune-report outputs/infoot_vit_tuning/partial_reg004_lam0035.json
 ```
 
 Use the same `--tune-from`, banks, pair limit, seed and solver code for comparisons.
@@ -855,25 +855,37 @@ The subsequent MI-weight comparison holds h=.35, reg=.0375 and mass=.8 fixed:
 | --- | --- | --- | --- | --- | --- | --- |
 | .025 | 1.74764 | 20.921 | .61937 | .98055 | 29 | 101.8 |
 | .030 | 1.84723 | 17.903 | .65001 | .98158 | 46 | 197.3 |
+| .035 | 1.95289 | 15.230 | .68345 | .98254 | 111 | 382.7 |
 
-Both trials converged for 64/64 pairs. At lam=.030, fitted top-1=.32863,
+All three trials converged for 64/64 pairs. At lam=.030, fitted top-1=.32863,
 projected effective patches=19.394, norm ratio=.91228, max final inner
 iterations=3331 and cost=.59764 (vs .59996). Unweighted MI rose 5.7%, fitted
 mixing decreased 14.4%, and coverage increased .103 percentage points.
 Reported solver time rose 1.94x; this remains an uncontrolled timing comparison.
-The .030 setting is a promising measured candidate for image evaluation, not
-evidence that further concentration will necessarily improve translation.
+The .030 setting remains a lower-work measured candidate for image evaluation.
 
-Next change **only partial lam=.030 -> .035** (+16.7%), holding h=.35, reg=.0375,
-mass=.8, threshold=.05 and projection .20/.20 fixed. Keep .030 as the measured
-control. This is one further bounded test of MI pressure, with no assumed
-improvement in speed, correspondence or images. Recover the next unweighted
-information as `-mi_term/.035`; compare with 1.84723. A more negative weighted
-MI term alone can simply reflect its larger coefficient. Compare raw information,
-cost, mixing, coverage, spread and iteration work on the same solver version.
-If added pressure mainly increases work or loses coverage, prefer the .030
-candidate. After this comparison, test the finalists on held-out image grids;
-do not target variance=1 or minimal effective patches as a quality criterion.
+The .035 MI trial further increased unweighted information by 5.72%, decreased
+fitted mixing by 14.93%, raised projected variance by .03344, and improved
+coverage by .096 percentage points relative to .030. Fitted top-1=.36822,
+projected effective patches=16.661 and cost=.59565. It remains numerically
+healthy: max mass/cap errors below 6e-13 and KKT below 7e-11. Its reported solve
+time rose another 1.94x. Mean outer steps rose from 42.438 to 88.578, while max
+final inner iterations stayed near 3300 (3331 -> 3311). The extra outer work
+motivates testing the MI/entropy tradeoff instead of increasing MI again or
+changing solver budgets/tolerances.
+
+Next change **only partial reg=.0375 -> .040** (+6.7%), holding h=.35, lam=.035,
+mass=.8, threshold=.05 and projection .20/.20 fixed. This combination is new:
+the earlier reg=.040 trial used lam=.025. More entropy may reduce solver work
+but may also increase averaging; measure both instead of assuming a benefit.
+Keep reg=.0375/lam=.035 as the more concentrated measured candidate, and
+reg=.0375/lam=.030 as the lower-work alternative, pending held-out image results.
+The current unweighted information is 1.95289; compute it as `-mi_term/.035`
+for the next trial as well. Compare cost, raw information, mixing, coverage,
+spread and iteration work using identical solver code. If extra entropy only
+loses feature spread without a useful reduction in work, keep the measured
+baseline. Evaluate finalists on identical held-out image grids; do not target
+variance=1 or minimal effective patches as a quality criterion.
 Compare on the same pair hash (`22babaeb9a7e`) and selection hash (`1cce4c6670b4`).
 Changing reg changes the objective itself, so .30459 vs .26866 is not a quality
 ranking. A decrease in effective patches is a geometry measurement, not proof
