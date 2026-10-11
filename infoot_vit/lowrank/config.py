@@ -141,7 +141,7 @@ def resources(ns,nt,p,d,c):
     final = factors+parameters+estimator+router+256*2**20
     working = 8*((n+m)*d + (n+m)*k + 10*(n+m)*r + 12*ns*nt + 8*c["optimizer"]["chunk_size"]*(d+k+r))
     if c["projection"]["bandwidth_multiplier"] != 1:
-        working += 8*(n+m)*k  # Separate projection-bandwidth feature evaluation/audit.
+        working += 8*(n+m)*k  # Separate projection-bandwidth feature evaluation.
     return dict(source_patches=n,target_patches=m,transport_rank=r,kernel_rank=k,
         saved_factor_bytes=factors,estimator_bytes=estimator,router_bytes=router,
         estimated_final_artifact_bytes=final,estimated_final_artifact_GB=final/1e9,

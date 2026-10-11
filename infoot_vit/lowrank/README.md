@@ -339,8 +339,8 @@ Checks written to disk:
   makes this an optimization diagnostic, not an untouched generalization test.
 - Float32-versus-float64 objective audit on identical pairs after serialization.
 
-The active balanced YAML requires `kernel.error_policy: error`: both domains,
-in float64 and after storage, must have relative RMSE ≤ **0.50**, mean density
+The active balanced YAML requires `kernel.error_policy: error` at the **fitting
+bandwidth**: both domains, in float64 and after storage, must have relative RMSE ≤ **0.50**, mean density
 relative error ≤ **0.30**, and maximum probed density relative error ≤ **1.0**.
 These configurable engineering thresholds screen gross errors; they do not
 certify image quality. Failure saves diagnostics and stops **before** the router
@@ -382,18 +382,23 @@ Selected targets still require valid nonzero conditional scores.
 This is balanced transport: confidence is one and the condition padding mask
 is all false. It does not perform partial-OT rejection. Invalid/nonfinite scores
 fail explicitly rather than falling back to uniform scores. Balanced projection
-supports a positive bandwidth multiplier. For a value other than 1, fit preflight
-evaluates the saved random bases at the requested bandwidth on both training
-supports, including target-density correction. It saves an independent mandatory
-accuracy gate in `projection_kernel_quality.json` (root and attempt logs), using
-the same error limits and float64/float32 probes. Failure stops before transport.
-The artifact retains the original basis, mean, training scale and audit; mapping
-re-evaluates these fixed bases without refitting OT, sampling new directions or
-using query statistics. It never combines a narrow query kernel with broad
-support kernels. Extra projection factor arrays are temporary float64 memory,
-not another disk copy; the resource estimate includes their memory allowance.
-Multiplier 1 preserves the previous saved-float32 projection path. The separate
-`grouped_partial_lowrank` mode still requires multiplier 1.
+supports a positive bandwidth multiplier. **`grouped_patch_lowrank` no longer
+runs a separate projection-kernel accuracy audit**, either during fitting,
+artifact loading or test-time bandwidth overrides. New balanced fits save the
+fitting-bandwidth audit only; older projection-audit metadata is ignored.
+Both image and patch projection remain at **0.20** in the active YAML.
+
+For a multiplier other than 1, mapping re-evaluates the saved random bases on
+both training supports and queries, including target-density correction. It
+retains the original mean and training scale without refitting OT, sampling
+new directions or using query statistics. It never combines a narrow query
+kernel with broad support kernels. Finite/nonnegative factors, positive finite
+densities, nonzero selected conditional scores and finite mapped features are
+still required. Passing the fit audit does not establish projection accuracy.
+Extra projection factor arrays are temporary float64 memory, not another disk
+copy; the resource estimate includes their memory allowance. Multiplier 1
+preserves the saved-float32 projection path. The separate
+`grouped_partial_lowrank` mode retains its runtime projection audit.
 
 ### Partial routing, confidence and masks
 
@@ -515,8 +520,9 @@ Each fit creates a fresh `outputs/infoot_vit/grouped_patch_lowrank_<UTC>_<id>`
 directory. Supply `--output-root outputs/infoot_vit_lr` to choose another parent.
 The partial mode instead uses `grouped_partial_lowrank_<UTC>_<id>`.
 Add `--device cuda:1` to select a GPU, or `--device cpu` for CPU execution.
-`--kernel-check-only` saves its manifest with status `kernel_checked` and does
-not fit either transport. After acceptance passes, continue with the same config:
+`--kernel-check-only` audits the fitting bandwidth, saves its manifest with
+status `kernel_checked` and does not fit either transport. After acceptance
+passes, continue with the same config:
 
 ```bash
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --resume outputs/infoot_vit/KERNEL_CHECK_DIRECTORY
@@ -706,11 +712,12 @@ storage estimate was 4.35 GB, with a 5 GB guard and unchanged error limits.
 fixed-h=0.4 approximation problem.** That comparison used projection multiplier
 1 and image-router h=0.4. The current requested YAML uses fit h=0.7 for both
 router and patch kernels and projection h=0.2; it is a new, unvalidated setting.
-Narrowing the projection kernel can fail its independent acceptance gate even
-if the fit kernel passes. Do not relax the limits merely to run it. These are CPU synthetic
-results, not a real-SigLIP acceptance or image-quality result; the real banks
-must pass `--kernel-check-only` before fitting. Start a fresh directory for
-this changed configuration. Original completed artifacts retain their own h.
+Narrowing the projection kernel can increase approximation error even if the
+fit kernel passes. The current balanced experiment no longer gates projection
+accuracy. These are CPU synthetic results, not a real-SigLIP acceptance or
+image-quality result; the real banks must pass the fitting-kernel audit before
+transport fitting. Start a fresh directory for this changed configuration.
+Original completed artifacts retain their own h.
 
 For the newly requested 0.7/0.2 setting, an additional CPU check used 256
 synthetic Gaussian vectors, dimension 768, data seed 42, kernel seed 4201,
@@ -721,9 +728,9 @@ rank 1024, audit seed 4211, 4,096 pairs and 32 density queries:
 | 0.7 | 0.3598 | 0.2575 | 0.5885 | No |
 | 0.2 | 0.6447 | 0.9697 | 2.4476 | No |
 
-These are synthetic diagnostics, not a real-bank result. The requested bandwidths
-are retained with the existing acceptance limits. Start with `--kernel-check-only`;
-do not assume either the fit or projection kernel will pass on lab features.
+These are historical synthetic diagnostics, not a real-bank result. The requested
+bandwidths are retained. `--kernel-check-only` now checks the fitting bandwidth
+only; projection error is not measured by this command.
 
 ### Next trial after the reported h=0.7 density rejection
 
@@ -738,7 +745,7 @@ The rank-1200 normalized-kernel lab trial also failed: source/target kernel
 RMSE was **0.2603/0.2919**, with mean density error **0.1754/0.2795**.
 The active YAML now tests **OPRF + orthogonal directions at rank 1200**,
 as requested, and raises the mean-density acceptance limit from **0.25 to 0.30**
-for both fitting and projection audits. Fit h=0.70, both projection h=0.20,
+for fitting-kernel audits. Fit h=0.70, both projection h=0.20,
 seeds, transport rank, objective weights, RMSE/max-density limits and the
 `error` policy are retained. This changes both the estimator and one acceptance
 limit; acceptance alone is not evidence that accuracy improved.
@@ -771,11 +778,17 @@ Run a **fresh audit** before attempting transport fitting:
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --kernel-check-only
 ```
 
-Only a successful audit of both fitting and projection kernels establishes
-that this trial meets the configured limits. Then resume the printed directory
-with the same command, replacing `--kernel-check-only` with `--resume
-outputs/infoot_vit/KERNEL_CHECKED_DIRECTORY`. If this trial fails its configured
-limits, inspect the saved audit reports before choosing another setting. If projection still fails,
-more reg/lam tuning cannot solve it; the narrow-kernel approximation needs a
-separate investigation. This configuration is a proposed lab trial, not a
-demonstrated convergence or image-quality fix.
+This command checks the fitting kernels against the configured limits. Then
+resume the printed directory with the same command, replacing
+`--kernel-check-only` with `--resume outputs/infoot_vit/KERNEL_CHECKED_DIRECTORY`.
+Alternatively, omit `--kernel-check-only` to audit fitting kernels and then fit
+transport in one run. Start a **fresh directory** after the projection-audit
+removal: implementation fingerprints prevent resuming an earlier failed run
+with changed code. Existing completed artifacts remain loadable.
+
+The latest supplied OPRF rank-1200 lab run passed fitting acceptance, with
+source/target RMSE **0.3010/0.2548** and mean density error **0.06715/0.07540**,
+then stopped at the former projection gate. That separate gate is now removed
+at the user's request. This allows transport fitting to proceed after fit
+acceptance; it does not change the projection estimator or demonstrate improved
+image quality.

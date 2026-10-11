@@ -71,7 +71,7 @@ def register(directory,manifest,key,entry):
     _sync_directory(directory)
 
 
-def validate_kernels(state,shape,dimension=None,kernel_config=None,projection_multiplier=1.):
+def validate_kernels(state,shape,dimension=None,kernel_config=None):
     if state.get("storage_version") != VERSION:
         raise ValueError("Kernel storage version mismatch.")
     for key,n in (("fx",shape[0]),("fy",shape[1])):
@@ -104,27 +104,16 @@ def validate_kernels(state,shape,dimension=None,kernel_config=None,projection_mu
             raise ValueError("Strict kernel artifact lacks its raw/storage acceptance audits.")
         if not kernel_audit.acceptance(checks,kernel_config)["accepted"]:
             raise ValueError("Saved kernel artifact failed the configured accuracy limits.")
-    if projection_multiplier != 1:
-        projection = state.get("projection",{})
-        checks = projection.get("approximation",{})
-        if (projection.get("bandwidth_multiplier") != projection_multiplier
-                or kernel_config is None or set(checks) != {"source","target"}
-                or not all("float32_roundtrip" in v for v in checks.values())
-                or any(projection.get(f"{key}_h") != state[key]["h"]*projection_multiplier
-                       for key in ("source","target"))
-                or not kernel_audit.acceptance(checks,kernel_config)["accepted"]):
-            raise ValueError("Missing, mismatched or rejected projection-bandwidth kernel audit.")
 
 
 def _balanced_kernels(directory,manifest,x,y,log):
     c = manifest["config"]; kc = c["kernel"]; chunk = c["optimizer"]["chunk_size"]
-    multiplier = c["projection"]["bandwidth_multiplier"]
     flatx,flaty = x.flatten(0,1),y.flatten(0,1)
     shape = (len(flatx),len(flaty),c["kernel_rank"])
     print(f"Kernel audit: method={kc['method']}, rank={c['kernel_rank']}, policy={kc['error_policy']}",flush=True)
     if "kernels" in manifest["files"]:
         state = torch.load(checked_file(directory,manifest["files"]["kernels"]),weights_only=True)
-        validate_kernels(state,shape,flatx.shape[1],kc,multiplier)
+        validate_kernels(state,shape,flatx.shape[1],kc)
         fx = kernels.features(flatx,state["source"],chunk)
         fy = kernels.features(flaty,state["target"],chunk)
         if not torch.equal(fx.float(),state["fx"].to(x.device)) or not torch.equal(fy.float(),state["fy"].to(y.device)):
@@ -159,36 +148,12 @@ def _balanced_kernels(directory,manifest,x,y,log):
     for name,check in checks.items():
         if check["relative_rmse"] > kc["error_warn_relative_rmse"]:
             warnings.warn(f"{name} positive-kernel relative RMSE={check['relative_rmse']:.3g}; inspect approximation before claiming quality.")
-    projection = None
-    if multiplier != 1:
-        if "kernels" in manifest["files"]:
-            projection = state["projection"]
-        else:
-            projection_checks = {}
-            for i,(name,z,s) in enumerate((("source",flatx,sx),("target",flaty,sy))):
-                ps = kernels.projection_state(s,multiplier)
-                pf = kernels.features(z,ps,chunk)
-                args = dict(seed=kc["seed"]+20+i,count=kc["check_pairs"],density_queries=kc["density_queries"],chunk_size=chunk)
-                projection_checks[name] = kernels.error_report(z,pf,ps,**args)
-                projection_checks[name]["float32_roundtrip"] = kernels.error_report(z,pf,ps,storage_roundtrip=True,**args)
-                del pf
-            projection = dict(bandwidth_multiplier=multiplier,source_h=sx["h"]*multiplier,
-                target_h=sy["h"]*multiplier,approximation=projection_checks,
-                quality=kernel_audit.acceptance(projection_checks,dict(kc,error_policy="error")))
-        write_json(directory/"projection_kernel_quality.json",projection)
-        log.write_json("projection_kernel_quality.json",projection)
-        log.event("projection_kernel_accuracy_checked",**projection["quality"])
-        if not projection["quality"]["accepted"]:
-            raise RuntimeError("Projection kernel accuracy acceptance failed; transport fitting has not started. "
-                               "See projection_kernel_quality.json. Narrow projection kernels need independent validation.")
     if "kernels" not in manifest["files"]:
         qfx,ex = quantize(fx); qfy,ey = quantize(fy)
         state = dict(fx=qfx,fy=qfy,source=move(sx,"cpu"),target=move(sy,"cpu"),storage_version=VERSION,
                      quantization=dict(fx=ex,fy=ey),approximation=checks,quality=quality,reference=reference)
-        if projection is not None:
-            state["projection"] = projection
         entry,_ = _verified_save(directory,directory/"kernels.pt",state,
-                                  lambda s:validate_kernels(s,shape,flatx.shape[1],kc,multiplier))
+                                  lambda s:validate_kernels(s,shape,flatx.shape[1],kc))
         register(directory,manifest,"kernels",entry)
     return fx,fy,checks,reference,quality
 

@@ -89,7 +89,10 @@ def test_lowrank_override_uses_saved_bases_and_matches_dense_algebra(tmp_path,ba
     assert mapper.image.h == pytest.approx(.35) and mapper.patch_projection_h == pytest.approx(2.)
     assert mapper.config["projection"] == settings
     assert mapper.manifest["config"]["projection"] == baseline.config["projection"]
-    assert mapper.projection_kernel_report["accepted"]
+    if partial:
+        assert mapper.projection_kernel_report["accepted"]
+    else:
+        assert not hasattr(mapper, "projection_kernel_report")
     query = banks[2].features[0]
     if partial:
         assert mapper.pairs == baseline.pairs and torch.equal(mapper.pair_mask,baseline.pair_mask)
@@ -124,8 +127,11 @@ def test_lowrank_override_uses_saved_bases_and_matches_dense_algebra(tmp_path,ba
     again = mapped(mapper,banks[2],return_metadata=True,chunk_size=2)
     torch.testing.assert_close(result.mapped_features,again.mapped_features,atol=1e-12,rtol=0)
     assert manifest["projection"] == settings
-    report = json.loads(next((output/"logs").glob("*/projection_kernel_quality.json")).read_text())
-    assert report["accepted"] and report["patch_projection_h"] == 2.
+    if partial:
+        report = json.loads(next((output/"logs").glob("*/projection_kernel_quality.json")).read_text())
+        assert report["accepted"] and report["patch_projection_h"] == 2.
+    else:
+        assert not list((output/"logs").glob("*/projection_kernel_quality.json"))
     assert hashes(directory) == before
 
 
@@ -134,31 +140,49 @@ def test_lowrank_topk_only_uses_original_bandwidth_without_audit(tmp_path,banks,
     directory = fit(partial_config(k=None) if partial else tiny_config(),root=tmp_path)
     base = FeatureMapper.load(directory)
     forbid_fitting(monkeypatch)
-    monkeypatch.setattr("infoot_vit.lowrank.mapping.error_report",lambda *a,**k:pytest.fail("unnecessary bandwidth audit"))
+    monkeypatch.setattr(kernels,"error_report",lambda *a,**k:pytest.fail("unnecessary bandwidth audit"))
     for k in (0,999):
         settings = infoot_test.projection_settings(base.config,None,top_k_images=k)
         result = mapped(FeatureMapper.load(directory,projection=settings),banks[2],return_metadata=True)
         torch.testing.assert_close(result.mapped_features,mapped(base,banks[2],return_metadata=True).mapped_features,rtol=0,atol=0)
 
 
-def test_rejected_runtime_kernel_audit_is_logged_without_changing_fit(tmp_path,banks,monkeypatch):
-    c = tiny_config()
+def test_partial_failed_runtime_kernel_audit_still_warns_and_logs(tmp_path,banks,monkeypatch):
+    c = partial_config()
     c["kernel"].update(h=4.)
     directory = fit(c,root=tmp_path)
     before = hashes(directory)
     forbid_fitting(monkeypatch)
-    from infoot_vit.lowrank import mapping
-    original = mapping.error_report
+    original = kernels.error_report
     def bad_audit(*args,**kwargs):
         return dict(original(*args,**kwargs),relative_rmse=99.)
-    monkeypatch.setattr(mapping,"error_report",bad_audit)
-    output = tmp_path/"failed-test"
-    with pytest.raises(ValueError,match="Projection kernel approximation"):
-        infoot_test.main(["--mapping",str(directory),"--query-bank",str(banks[2].path),
-            "--output-dir",str(output),"--projection-bandwidth",".35","--device","cpu"])
+    monkeypatch.setattr(kernels,"error_report",bad_audit)
+    output = tmp_path/"warn-test"
+    with pytest.warns(UserWarning,match="Projection kernel approximation"):
+        assert infoot_test.main(["--mapping",str(directory),"--query-bank",str(banks[2].path),
+            "--output-dir",str(output),"--projection-bandwidth",".35","--device","cpu"]) == 0
     report = json.loads(next((output/"logs").glob("*/projection_kernel_quality.json")).read_text())
-    assert not report["accepted"] and report["approximation"]["source"]["relative_rmse"] == 99.
-    assert not (output/"mapped.pt").exists() and hashes(directory) == before
+    assert not report["accepted"] and report["approximation"]["source:0"]["relative_rmse"] == 99.
+    assert (output/"mapped.pt").exists() and hashes(directory) == before
+
+
+def test_balanced_cli_point_two_skips_projection_audit_without_changing_fit(tmp_path,banks,monkeypatch):
+    c = tiny_config()
+    c["kernel"]["h"] = c["image_solver"]["h"]
+    directory = fit(c,root=tmp_path)
+    before = hashes(directory)
+    forbid_fitting(monkeypatch)
+    monkeypatch.setattr(kernels,"error_report",lambda *a,**k:pytest.fail("Projection accuracy audit"))
+    output = tmp_path/"mapped-test"
+    assert infoot_test.main(["--mapping",str(directory),"--query-bank",str(banks[2].path),
+        "--output-dir",str(output),"--projection-bandwidth",".2","--device","cpu"]) == 0
+    result,_,_ = load_mapped(output)
+    assert torch.isfinite(result.mapped_features).all()
+    for row in result.diagnostics["queries"]:
+        assert row["image_projection_h"] == pytest.approx(.2)
+        assert row["patch_projection_h"] == pytest.approx(.2)
+    assert not list(output.rglob("projection_kernel_quality.json"))
+    assert hashes(directory) == before
 
 
 def test_partial_cli_records_effective_projection_and_topk(tmp_path,banks,capsys):

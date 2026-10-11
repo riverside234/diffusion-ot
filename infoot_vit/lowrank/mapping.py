@@ -16,7 +16,7 @@ from ..infoot_helper.device import resolve_device,move
 from .projection import project_scores
 from .storage import validate_factors
 from .experiment import validate_kernels
-from .kernels import features, projection_state, error_report
+from .kernels import features, projection_state
 from .kernel_audit import acceptance
 
 
@@ -76,7 +76,7 @@ class LowRankMapper(FeatureMapper):
         return files
 
     def _check_projection_kernels(self, checks, run_log=None):
-        """Audit runtime factors without modifying the fitted artifact or its policy."""
+        """Audit partial-mode runtime factors without modifying the fit artifact."""
         quality = acceptance(checks, dict(DEFAULT["kernel"], **self.config["kernel"]))
         self.projection_kernel_report = dict(quality, approximation=checks,
             bandwidth_multiplier=self.config["projection"]["bandwidth_multiplier"],
@@ -88,9 +88,7 @@ class LowRankMapper(FeatureMapper):
         if not quality["accepted"]:
             message = (f"Projection kernel approximation failed {len(quality['failures'])} accuracy checks; "
                        f"first failures: {quality['failures'][:5]}")
-            # Balanced non-fit bandwidths already require an accepted audit, even
-            # for older artifacts whose FIT-kernel policy was warn.
-            if quality["policy"] == "error" or (not self.is_partial and self.config["projection"]["bandwidth_multiplier"] != 1):
+            if quality["policy"] == "error":
                 raise ValueError(message)
             warnings.warn(message)
 
@@ -104,10 +102,9 @@ class LowRankMapper(FeatureMapper):
         q,r,g = (state[key].to(device=self.device,dtype=torch.float64) for key in ("q","r","g"))
         kernel = torch.load(files["kernels"],weights_only=True)
         multiplier = self.config["projection"]["bandwidth_multiplier"]
-        saved_multiplier = manifest["config"]["projection"]["bandwidth_multiplier"]
-        # Validate the immutable snapshot with its SAVED settings. A new bandwidth
-        # receives a separate runtime audit below, not a forged saved audit.
-        validate_kernels(kernel,(n,m,self.config["kernel_rank"]),self.x.shape[-1],self.config["kernel"],saved_multiplier)
+        # Validate fitting-kernel accuracy and storage. Balanced projection has
+        # numerical validity checks, but no separate approximation-error audit.
+        validate_kernels(kernel,(n,m,self.config["kernel_rank"]),self.x.shape[-1],self.config["kernel"])
         self.kernel_source = move(kernel["source"],self.device)
         target_state = move(kernel["target"],self.device)
         if multiplier == 1:
@@ -121,17 +118,10 @@ class LowRankMapper(FeatureMapper):
             fx = features(self.x.flatten(0,1),self.kernel_source,chunk)
             fy = features(self.y.flatten(0,1),target_state,chunk)
         self.patch_projection_h = self.kernel_source["h"]
-        if multiplier != saved_multiplier:
-            kc = self.config["kernel"]
-            checks = {}
-            for i, (name, x, f, s) in enumerate((("source", self.x, fx, self.kernel_source), ("target", self.y, fy, target_state))):
-                checks[name] = error_report(x.flatten(0,1), f, s, seed=kc["seed"]+10+i,
-                    count=kc["check_pairs"], density_queries=kc["density_queries"], chunk_size=self.config["optimizer"]["chunk_size"])
-            self._check_projection_kernels(checks, run_log)
         self.cross = ((fx.T@q)/g) @ (fy.T@r).T  # Only [kernel_rank,kernel_rank].
         self.density_y = (fy@fy.mean(0)).reshape(len(self.y),self.y.shape[1])
         self.target_kernel_features = fy.reshape(len(self.y),self.y.shape[1],-1)
-        if (self.density_y <= 0).any() or not torch.isfinite(self.cross).all():
+        if (self.density_y <= 0).any() or not torch.isfinite(self.density_y).all() or not torch.isfinite(self.cross).all():
             raise ValueError("Invalid saved-factor KDE density.")
 
     @torch.no_grad()

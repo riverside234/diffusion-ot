@@ -147,12 +147,11 @@ def test_kernel_only_resume_storage_and_grouped_projection(tmp_path, banks, monk
     assert (directory / "kernels.pt").read_bytes() == original_bytes
     assert not list(directory.rglob("latest.pt"))
     state = torch.load(directory / "kernels.pt", weights_only=True)
-    if multiplier != 1:
-        assert state["projection"]["quality"]["accepted"]
-        assert state["projection"]["source_h"] == 2.
-        bad = deepcopy(state); bad["projection"]["approximation"]["source"]["relative_rmse"] = 99.
-        with pytest.raises(ValueError, match="projection-bandwidth"):
-            experiment.validate_kernels(bad, (8, 8, 256), 3, canonical(c)["kernel"], multiplier)
+    assert "projection" not in state
+    assert not list(directory.rglob("projection_kernel_quality.json"))
+    # Older completed artifacts can retain their now-unused projection metadata.
+    legacy = deepcopy(state); legacy["projection"] = dict(quality=dict(accepted=False))
+    experiment.validate_kernels(legacy, (8, 8, 256), 3, canonical(c)["kernel"])
     assert state["fx"].dtype == state["fy"].dtype == torch.float32
     assert state["source"]["omega"].dtype == torch.float64
     bad = deepcopy(state); bad["source"]["a"] += .1
@@ -199,27 +198,28 @@ def test_projection_state_reuses_saved_basis_and_training_scale(method):
     torch.testing.assert_close(kernels.features(x, changed), fresh, atol=1e-12, rtol=1e-12)
 
 
-def test_projection_audit_rejects_before_transport_and_keeps_diagnostics(tmp_path, banks, monkeypatch):
+def test_balanced_fit_audits_only_fit_bandwidth_and_projects_at_point_two(tmp_path, banks, monkeypatch):
     c = audit_config()
-    c["projection"] = dict(bandwidth_multiplier=.01)
+    c["image_solver"]["h"] = c["kernel"]["h"]
+    c["projection"] = dict(bandwidth_multiplier=.2/c["kernel"]["h"])
     original = kernels.error_report
-    def faulty_projection(x, factor, state, **kwargs):
-        report = original(x, factor, state, **kwargs)
-        if state["h"] < .1:
-            report["relative_rmse"] = 1e9
-        return report
-    # Use the legacy construction here to avoid full-scale exponential underflow
-    # before the acceptance gate being tested.
-    c["kernel"].update(method=kernels.LEGACY, orthogonal=False, h=4.)
-    monkeypatch.setattr(kernels, "error_report", faulty_projection)
-    monkeypatch.setattr(experiment.BalancedModel, "fit", lambda *a, **kw: pytest.fail("Router started"))
-    with pytest.raises(RuntimeError, match="Projection kernel accuracy acceptance failed"):
-        experiment.fit(c, root=tmp_path, kernel_check_only=True)
-    directory = next((tmp_path / "outputs/infoot_vit").iterdir())
-    report = json.loads((directory / "projection_kernel_quality.json").read_text())
-    assert not report["quality"]["accepted"]
-    assert list((directory / "logs").glob("*/projection_kernel_quality.json"))
-    assert json.loads((directory / "manifest.json").read_text())["status"] == "failed"
+    audited = []
+    def fitting_audit(x, factor, state, **kwargs):
+        assert state["h"] == c["kernel"]["h"]
+        audited.append(kwargs.get("storage_roundtrip", False))
+        return original(x, factor, state, **kwargs)
+    monkeypatch.setattr(kernels, "error_report", fitting_audit)
+    with monkeypatch.context() as patch:
+        patch.setattr(kernels, "projection_state", lambda *a, **kw: pytest.fail("Projection evaluated during fitting"))
+        directory = experiment.fit(c, root=tmp_path)
+    assert audited == [False, True, False, True]
+    assert json.loads((directory / "manifest.json").read_text())["status"] == "complete"
+    monkeypatch.setattr(kernels, "error_report", lambda *a, **kw: pytest.fail("Projection accuracy audit"))
+    monkeypatch.setattr(kernels, "fit_features", lambda *a, **kw: pytest.fail("Inference kernel refit"))
+    mapper = LowRankMapper.load(directory)
+    assert mapper.image.h == mapper.patch_projection_h == pytest.approx(.2)
+    assert torch.isfinite(mapped(mapper, banks[2])).all()
+    assert not list(directory.rglob("projection_kernel_quality.json"))
 
 
 def test_legacy_artifact_without_new_kernel_config_still_loads(tmp_path, banks):

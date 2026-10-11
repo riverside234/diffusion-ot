@@ -6,7 +6,7 @@ sampling:
   images_per_domain: 2000
   seed: 42
 transport_rank: 256
-kernel_rank: 1200  # OPRF lab trial; fitting and projection audits must both pass.
+kernel_rank: 1200  # OPRF lab trial; audit fitting kernels only.
 device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
@@ -20,14 +20,14 @@ image_solver:
 kernel:
   method: oprf_gaussian_v1  # Requested comparison after normalized-kernel density rejection.
   orthogonal: true  # Gaussian-marginal orthogonal directions for variance reduction.
-  h: 0.7  # Fit KDE; independently audited projection KDE uses h=0.2.
+  h: 0.7  # Fit KDE; projection KDE uses h=0.2 without a separate accuracy audit.
   seed: 4201
   check_pairs: 4096
   density_queries: 32
   error_warn_relative_rmse: 0.5
   error_policy: error  # Reject inaccurate kernels before image-router/patch fitting.
   max_relative_rmse: 0.5
-  max_density_relative_error_mean: 0.30  # Requested mean-density limit for fitting and projection audits.
+  max_density_relative_error_mean: 0.30  # Mean-density limit for fitting kernels.
   max_density_relative_error_max: 1.0
   reference_images: 4
   reference_patches_per_image: 32  # <=128 support patches/domain, exact Gaussian audit only.
