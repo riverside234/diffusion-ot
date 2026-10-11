@@ -6,6 +6,8 @@ the mass multiplier, then column potentials and the mass multiplier. Grouping
 each capacity constraint with mass avoids slow three-set Dykstra iterations
 near saturated supports. No change to the objective or feasible set. The
 mass-one control uses POT's balanced log updates, just like partial.py.
+At an inner budget boundary a primal-dual/KKT certificate can resolve a
+log-residual-only failure; the outer InfoOT stationarity check is unchanged.
 See https://pythonot.github.io/_modules/ot/partial/partial_solvers.html.
 """
 from __future__ import annotations
@@ -15,7 +17,7 @@ import torch
 
 from .partial import OBJECTIVE, capabilities, information, information_gradient, solver_config
 
-VERSION = "dense_partial_infoot_batch_v2_capped_mass"
+VERSION = "dense_partial_infoot_batch_v3_primal_dual"
 RUNNING, CONVERGED, BUDGET, STALLED, INVALID, INNER_FAILED, NONFINITE = range(7)
 STATUS = ("running", "converged", "max_outer_steps", "line_search_stalled",
           "invalid_input", "inner_failed", "nonfinite_objective_or_gradient")
@@ -72,6 +74,27 @@ def _duality_gap(plan, log_plan, base, a, b, mass, u, v, w, reg):
     return gap, gap.abs() / torch.maximum(torch.ones_like(gap), torch.maximum(primal.abs(), dual.abs()))
 
 
+def _partial_certificate(plan, log_plan, previous, base, a, b, mass, u, v, w):
+    """Primal stability and KKT residual for the SAME entropic subproblem.
+
+    Inequality potentials u,v must be nonpositive and complementary to unused
+    capacity. Stationarity is exact up to roundoff for our exponential plan.
+    Unlike unweighted log-plan L2, these checks cannot be dominated solely by
+    changes in negligible-probability entries. No plan repair is performed.
+    """
+    rows, cols = plan.sum(-1), plan.sum(-2)
+    delta = (plan - previous.exp()).abs().sum((-2, -1)) / mass
+    residuals = torch.stack((
+        ((rows - a) / a).clamp_min(0).amax(-1),
+        ((cols - b) / b).clamp_min(0).amax(-1),
+        (plan.sum((-2, -1)) - mass).abs() / mass,
+        ((u * (rows - a)).abs().sum(-1) + (v * (cols - b)).abs().sum(-1)) / mass,
+        u.clamp_min(0).amax(-1), v.clamp_min(0).amax(-1),
+        (log_plan - base - u[:, :, None] - v[:, None, :] - w[:, None, None]).abs().amax((-2, -1)),
+    ), -1)
+    return delta, residuals.amax(-1)
+
+
 @torch.no_grad()
 def entropy_subproblem_batch(a, b, cost, mass, config):
     """Exact entropic subproblems, with pair-local stopping/failure tensors.
@@ -87,6 +110,8 @@ def entropy_subproblem_batch(a, b, cost, mass, config):
     active = valid.clone()
     numerical = ~valid
     error = cost.new_full((batch,), float("inf"))
+    plan_error, kkt_error = error.clone(), error.clone()
+    stop_reason = torch.zeros(batch, dtype=torch.int64, device=cost.device)
     counts = torch.zeros(batch, dtype=torch.int64, device=cost.device)
     loga, logb = a.log(), b.log()
     u, v = torch.zeros_like(a), torch.zeros_like(b)
@@ -116,16 +141,30 @@ def entropy_subproblem_batch(a, b, cost, mass, config):
         v = torch.where(active[:, None], next_v, v)
         if mass != 1.:
             w = torch.where(active, next_w, w)
-        if iteration % 10 == 0:
+        if iteration % 10 == 0 or iteration + 1 == config["max_inner_steps"]:
             err = (torch.linalg.vector_norm(lk.exp().sum(-2) - b, dim=-1) if mass == 1.
                    else torch.linalg.vector_norm((previous - lk).flatten(1), dim=-1))
             error = torch.where(active, err, error)
-            # Keep the strict log-plan residual; feasibility alone is insufficient.
+            # Retain the legacy residual as a diagnostic and one stopping path.
             stopped = error < config["inner_tolerance"] if mass == 1. else error <= config["inner_tolerance"]
+            reason = torch.ones_like(stop_reason)
             if mass != 1.:
                 plan = lk.exp()
                 _, gap_error = _duality_gap(plan, lk, base, a, b, mass, u, v, w, config["reg"])
+                delta, kkt = _partial_certificate(plan, lk, previous, base, a, b, mass, u, v, w)
+                plan_error = torch.where(active, delta, plan_error)
+                kkt_error = torch.where(active, kkt, kkt_error)
+                # At the budget boundary, certify the convex subproblem rather
+                # than reject an optimal plan solely on an unweighted log norm.
+                # Ordinary iterations retain the legacy stopping rule. A budget
+                # stop alone is NEVER sufficient, nor is feasibility alone.
+                certified = ((iteration + 1 == config["max_inner_steps"])
+                             & (plan_error <= config["inner_tolerance"])
+                             & (kkt_error <= config["inner_tolerance"]))
+                reason = torch.where(stopped, 1, 2)
+                stopped |= certified
                 stopped &= feasible(residual_values(plan, a, b, mass), config) & (gap_error <= config["inner_tolerance"])
+            stop_reason = torch.where(active & stopped, reason, stop_reason)
             active &= ~stopped
             if not bool(active.any()):
                 break
@@ -137,6 +176,7 @@ def entropy_subproblem_batch(a, b, cost, mass, config):
     failure = torch.where(numerical, 1, torch.where(active, 2, torch.where(ok, 0, 3)))
     return plan, dict(ok=ok, error=error, iterations=counts, failure=failure,
         cost_shift=shift, residuals=residuals, duality_gap=gap, relative_duality_gap=gap_error,
+        relative_plan_delta_l1=plan_error, kkt_error=kkt_error, stop_reason=stop_reason,
         method="balanced_sinkhorn_log_s_equals_1" if mass == 1. else "partial_capped_mass_log")
 
 
@@ -242,13 +282,18 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
             (steps * delta)[:, None], (terms[:, 3]-old[:, 3])[:, None], terms, residuals,
             inner["error"][:, None], inner["iterations"][:, None], inner["failure"][:, None],
             inner["cost_shift"][:, None], inner["residuals"],
-            inner["duality_gap"][:, None], inner["relative_duality_gap"][:, None]), -1).cpu().tolist()
+            inner["duality_gap"][:, None], inner["relative_duality_gap"][:, None],
+            inner["relative_plan_delta_l1"][:, None], inner["kkt_error"][:, None],
+            inner["stop_reason"][:, None]), -1).cpu().tolist()
         emitted = [None] * batch
         for row in packed:
             idx, status, count = map(int, row[:3])
             inner_report = dict(method=inner["method"], error=_number(row[17]), iterations=int(row[18]),
                 failure_code=int(row[19]), cost_shift=_number(row[20]), warnings=[],
                 duality_gap=_number(row[25]), relative_duality_gap=_number(row[26]),
+                relative_plan_delta_l1=_number(row[27]), kkt_error=_number(row[28]),
+                convergence_reason=("not_converged", "balanced_marginal_residual" if keep_mass == 1.
+                    else "legacy_residual_and_gap", "primal_dual_certificate")[int(row[29])],
                 error_metric="column_marginal_l2" if keep_mass == 1. else "log_plan_delta_l2",
                 **dict(zip(("mass", "mass_error", "row_cap_error", "column_cap_error"), map(_number, row[21:25]))))
             record = dict(iteration=count, status=STATUS[status], step_size=row[4], backtracks=int(row[5]),

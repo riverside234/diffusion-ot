@@ -9,7 +9,7 @@ sampling:
   images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
-solver:  # Balanced IMAGE router; preserve it while revising PATCH fitting.
+solver:  # Fit logs: converged in 107 steps, 2.49 effective targets. Do not sharpen further.
   h: 0.35
   lam: 0.075
   reg: 0.06
@@ -21,14 +21,14 @@ solver:  # Balanced IMAGE router; preserve it while revising PATCH fitting.
   outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
   keep_mass: 0.80  # Preserve more condition coverage; transported mass, NOT a patch count.
-  solver:  # Revised fit: sharper patch geometry and less entropic mixing. Fresh fit required.
+  solver:  # Fitting-log review retains the sharper patch recipe. Fresh fit required.
     h: 0.35  # Was .45: reduce smoothing in the FITTED patch MI geometry.
     lam: 0.025  # Hold MI pressure fixed; do not amplify it while reducing entropy.
     reg: 0.05  # Was .10: reduce diffuse patch correspondences at their source.
     cost_scale: mean
     max_outer_steps: 600
-    max_inner_steps: 10000
-    inner_tolerance: 1.0e-10
+    max_inner_steps: 20000  # Lower reg can need more work; saturated .80-mass control needs >10k.
+    inner_tolerance: 1.0e-10  # Unchanged: budget-boundary rescue requires primal/KKT/gap checks.
     feasibility_tolerance: 1.0e-8
     mass_tolerance: 1.0e-8
     outer_tolerance: 1.0e-7

@@ -216,11 +216,18 @@ generated-image review below:
 | Image router: `solver` | 0.35 | 0.06 | 0.075 | 1,200 |
 | Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
 
-Strict log-plan, outer, capacity and mass tolerances remain unchanged; the
-partial inner solver additionally checks a relative primal-dual gap of `1e-10`.
-The router was overly diffuse: mean effective targets 1,943/2,000 and mean top-8
-retained probability only 0.445%. Narrower image kernels and less image entropy
-are proposed to improve selectivity. Patch MI pressure is reduced separately.
+The outer, capacity and mass tolerances remain unchanged. The partial inner
+solver retains its log-plan check and relative primal-dual gap of `1e-10`.
+At the final inner iteration, it can also accept a plan whose relative primal
+change, KKT residual and relative duality gap all meet `inner_tolerance`, with
+the same mass/capacity checks. This explicitly logged certificate avoids
+rejecting an optimal plan solely because tiny-probability entries change in
+log space. An unfinished inner solve still fails; the outer MI solve continues
+until its own convergence check passes.
+The earlier test2 router was overly diffuse: mean effective targets 1,943/2,000
+and mean top-8 retained probability only 0.445%. The current recipe uses narrower
+image kernels and less image entropy; the later fitting-log review below confirms
+sharper routing. Patch MI pressure was reduced separately.
 `partial.keep_mass: 0.80` and confidence `threshold: 0.05` are **coverage-first
 starting values, not visually validated optima**. No successful patch mapping
 was produced by test2. Mass is not a patch count; threshold filters smoothed
@@ -260,6 +267,18 @@ projection averages an effective 102 target patches per token, and mapped token
 variance is 20.3% of the dog bank's. Even the two >99.5% top-1 image routes
 retain broad patch mixtures. Failed routes lose only 0.23% mass on average.
 See the [analysis, reproducible statistics and comparison commands](../docs/analysis/infoot_vit_grouped_partial_20261010/README.md).
+
+The [added fitting-log review](../docs/analysis/infoot_vit_grouped_partial_20261010/fitting_review.md)
+confirms that the image router converged in 107 steps with 2.49 effective targets
+and 92.3% mean top-1 probability. All 13 patch failures had log residuals just
+above `1e-10` but tiny duality gaps/constraint errors. Solver v3 adds the
+budget-boundary certificate above; it records `relative_plan_delta_l1`,
+`kkt_error` and `convergence_reason` alongside the original log residual.
+Fitting-code fingerprints changed: use a fresh fit directory.
+The patch inner budget is now **20,000** (image router remains 10,000): a
+196-patch, mass-.80, reg-.05 saturated control needs 16,291 iterations on CPU
+to pass the original log criterion. The tolerances are unchanged; this budget
+increase supports the sharper fit and does not declare every budget stop a success.
 
 The current **fitting** change is patch `h: .45 -> .35`, `reg: .10 -> .05`;
 patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings

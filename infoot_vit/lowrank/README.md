@@ -10,7 +10,7 @@ select `device: cuda`; CPU remains an explicit supported option.
 
 | Method | Patch support and constraints | Default ranks: transport / kernel |
 |---|---|---:|
-| `grouped_patch_lowrank` | One global balanced patch coupling; original uniform marginals | 256 / 1024 |
+| `grouped_patch_lowrank` | One global balanced patch coupling; original uniform marginals | 256 / 1200 |
 | `grouped_partial_lowrank` | One capacity-constrained coupling per saved image pair; mass `0.8` | 64 / 64 |
 
 The partial default uses 64 because 256 factors for each 196-patch pair would
@@ -32,7 +32,7 @@ configurable starting rank, not an accuracy claim. No rank is silently reduced.
   **2,000 × 2,000** image maps. Its dense image-level plan is affordable.
 - Replace the global **392,000 × 392,000 patch plan** with a nonnegative,
   balanced factorization of rank at most **256**. It is not SVD compression.
-- Approximate each Gaussian KDE kernel with **1,024 positive features** in the
+- Approximate each Gaussian KDE kernel with **1,200 positive features** in the
   balanced experiment. Evaluate
   the outer sums for cost, KDE mutual information, and plan entropy using fixed
   sampled patch pairs. These are explicit changes to the dense objective.
@@ -423,18 +423,18 @@ many saved pairs still mean substantial I/O and computation.
 
 ## Storage, memory, resume
 
-At 2,000 images/domain, 196 patches/image, transport rank 256 and kernel rank 1024:
+At 2,000 images/domain, 196 patches/image, transport rank 256 and kernel rank 1200:
 
 | Component | Decimal size |
 |---|---:|
 | Q and R, float32 | 0.803 GB |
-| Fx and Fy, float32 | 3.211 GB |
+| Fx and Fy, float32 | 3.763 GB |
 | Image router, float32 | 0.016 GB |
 | Training/audit indices and costs | 0.038 GB |
-| Estimated completed directory, including parameters and 256 MiB log reserve | **4.350 GB** |
+| Estimated completed directory, including parameters and 256 MiB log reserve | **4.904 GB** |
 | One hypothetical dense float64 patch matrix | **1,229.312 GB** |
 
-The configured balanced final directory limit is **5,000,000,000 bytes**,
+The configured balanced final directory limit is **6,000,000,000 bytes**,
 excluding existing banks; the partial experiment retains its 4 GB limit.
 The fitter checks both the estimate and actual completed directory size,
 including logs. Checkpoint/atomic-write copies temporarily need
@@ -442,7 +442,7 @@ about **1.606 GB** extra for transport alone; interrupted artifacts can exceed
 the final budget. Keep additional disk headroom for diagnostics and filesystem
 overhead.
 
-The selected-support working-memory estimate is about **26.28 GiB**, not a
+The selected-support working-memory estimate is about **34.36 GiB**, not a
 measured peak. Loading existing full feature banks before selecting 2,000
 images can temporarily cost more. Float64 matrix products and repeated
 constraint projections remain substantial computation; low disk usage does
@@ -537,7 +537,7 @@ a separate YAML with that method and `kernel.orthogonal: true`. The selected
 legacy method requires `false`. Different bandwidths, methods and direction
 samplers are different experiments; retain each full configuration.
 
-`--kernel-rank` supports separate rank comparisons and still enforces the 5 GB
+`--kernel-rank` supports separate rank comparisons and still enforces the 6 GB
 budget. Preserve any CLI overrides when resuming. Existing completed artifacts
 retain their saved kernel method and remain loadable; this code change requires
 a fresh fit for old unfinished runs. Changing acceptance settings also requires
@@ -698,8 +698,8 @@ It was more stable across these draws; lower density errors alone did not
 protect the other candidates against kernel outliers. The original method
 can therefore pass these synthetic checks at a broader bandwidth. At `h=0.4`,
 none passed the initial sweep, including rank 1152 (4.75 GB); this is not proof
-that every possible estimator/rank must fail. The selected storage estimate
-remains 4.35 GB, with the 5 GB guard and all error limits unchanged.
+that every possible estimator/rank must fail. That historical candidate's
+storage estimate was 4.35 GB, with a 5 GB guard and unchanged error limits.
 
 **This selection broadens the target Gaussian kernel, rather than solving the
 fixed-h=0.4 approximation problem.** That comparison used projection multiplier
@@ -720,6 +720,55 @@ rank 1024, audit seed 4211, 4,096 pairs and 32 density queries:
 | 0.7 | 0.3598 | 0.2575 | 0.5885 | No |
 | 0.2 | 0.6447 | 0.9697 | 2.4476 | No |
 
-These are synthetic diagnostics, not a real-bank result. The requested YAML is
-retained with the existing acceptance limits. Start with `--kernel-check-only`;
+These are synthetic diagnostics, not a real-bank result. The requested bandwidths
+are retained with the existing acceptance limits. Start with `--kernel-check-only`;
 do not assume either the fit or projection kernel will pass on lab features.
+
+### Next trial after the reported h=0.7 density rejection
+
+The supplied lab console reports source/target kernel relative RMSE of
+**0.2903/0.3130** and mean density relative error of **0.1874/0.2747** at rank
+1024. The target exceeds the **0.25** density limit. Other audit fields were
+not supplied, so this is at least one rejection reason. Transport fitting had
+not started: changing `image_solver.reg/lam` or `optimizer.reg/lam` cannot
+change these kernel/density errors.
+
+The active YAML now increases **kernel_rank to 1200**, as requested, for an
+isolated next trial. It keeps fit h=0.70, both projection h=0.20, the normalized
+estimator, seeds, transport rank, objective weights and acceptance limits fixed.
+The estimated completed artifact is **4.904 GB**, with the artifact-size guard
+retained at **6 GB**. Rank 2048 would be about **7.573 GB**, exceeding
+that guard. The following rank-1152 probe is supporting diagnostic evidence,
+not an accuracy result for the active rank-1200 candidate.
+
+A local CPU stress check used 256 IID Gaussian vectors per domain, dimension
+768, data seeds 42/43, kernel seeds 4201/4202, audit seeds 4211/4212, 4096
+pair probes and 32 density queries. These are synthetic vectors, not SigLIP
+features; the numbers below are float64 diagnostics, not a lab acceptance:
+
+| Rank 1152, normalized estimator | Kernel RMSE | Mean density relative error | Max density relative error | Pass |
+|---|---:|---:|---:|---|
+| Source, fit h=0.70 | 0.3589 | 0.2179 | 0.4610 | Yes |
+| Target, fit h=0.70 | 0.3233 | 0.2346 | 0.6289 | Yes |
+| Source, projection h=0.20 | 0.6577 | 0.8248 | 1.8842 | No |
+| Target, projection h=0.20 | 0.4271 | 0.9394 | 2.6052 | No |
+
+Orthogonal PRF/OPRF at rank 1152 reduced fitting-density error on these draws
+but also failed at projection h=0.20, so they were not selected as an automatic
+replacement. The [OPRF paper](https://papers.neurips.cc/paper_files/paper/2022/hash/df2d62b96a4003203450cf89cd338bb7-Abstract-Conference.html)
+motivates variance reduction; it does not guarantee accuracy on these banks.
+
+Run a **fresh audit** before attempting transport fitting:
+
+```bash
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --kernel-check-only
+```
+
+Only a successful audit of both fitting and projection kernels establishes
+that this trial meets the configured limits. Then resume the printed directory
+with the same command, replacing `--kernel-check-only` with `--resume
+outputs/infoot_vit/KERNEL_CHECKED_DIRECTORY`. A failed audit must not be bypassed
+by relaxing thresholds or switching to warnings. If projection still fails,
+more reg/lam tuning cannot solve it; the narrow-kernel approximation needs a
+separate investigation. This rank change is a proposed lab trial, not a
+demonstrated convergence or image-quality fix.

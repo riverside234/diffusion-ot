@@ -6,7 +6,7 @@ sampling:
   images_per_domain: 2000
   seed: 42
 transport_rank: 256
-kernel_rank: 1024
+kernel_rank: 1200  # Requested rank trial after h=.7 target density error .2747 exceeded .25; lab acceptance required.
 device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
@@ -64,5 +64,5 @@ projection:
   target_chunk_size: 8
   patch_chunk_size: 64
 resources:
-  max_artifact_bytes: 5000000000  # 5 decimal GB; rank-256/1024 estimate is 4.35 GB, including logs.
+  max_artifact_bytes: 6000000000  # 6 decimal GB; rank-256/1200 estimate is 4.904 GB, including logs.
   max_working_gib: 64
