@@ -1,0 +1,11 @@
+{
+  "effective_k": 8,
+  "interpretation": "Training-source conditional routing before retained-edge renormalization; not partial OT rejection.",
+  "max_retained_probability": 0.9938910575460146,
+  "mean_discarded_probability": 0.07213187278699251,
+  "mean_retained_probability": 0.9278681272130075,
+  "median_retained_probability": 0.9372214071144876,
+  "min_retained_probability": 0.6736452111318074,
+  "projection_bandwidth_multiplier": 0.5714285714285715,
+  "projection_h": 0.2
+}

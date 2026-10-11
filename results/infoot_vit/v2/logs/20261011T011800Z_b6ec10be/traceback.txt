@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/fit_mapping.py", line 300, in fit_mapping
+    return _fit_mapping(config, root=root, directory=directory, resume=resume, log=log)
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/fit_mapping.py", line 517, in _fit_mapping
+    fit_pairs_batched(directory=directory, manifest=manifest, source=source, target=target,
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/pair_batch_fit.py", line 173, in fit_pairs_batched
+    solve_partial_batch(costs, kx, ky, keep_mass=mass, config=pc, on_step=progress)
+  File "/data/scratch/yxu209/envs/diffusion-ot/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/partial_batch.py", line 239, in solve_partial_batch
+    candidate, inner = entropy_subproblem_batch(aa, bb, effective, keep_mass, c)
+  File "/data/scratch/yxu209/envs/diffusion-ot/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+  File "/data/not_backed_up/yxu209/diffusion-ot/infoot_vit/infoot_helper/partial_batch.py", line 169, in entropy_subproblem_batch
+    if not bool(active.any()):
+KeyboardInterrupt
