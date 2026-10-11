@@ -10,9 +10,9 @@ sampling:
   images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
-solver:  # Next comparison: reduce near-single-target routing; keep h/reg fixed.
+solver:  # Bracket the .075 (2.49 targets) and .065 (64.4 targets) router fits.
   h: 0.35
-  lam: 0.065  # Was .075: 107 steps converged, ~2.5 effective targets; candidate, not a measured optimum.
+  lam: 0.070  # Midpoint candidate; inspect --tune top-8 coverage before fitting patches.
   reg: 0.06
   cost_scale: mean
   max_outer_steps: 1200

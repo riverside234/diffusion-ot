@@ -213,18 +213,22 @@ generated-image review below:
 
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
-| Image router: `solver` | 0.35 | 0.06 | **0.065** | 1,200 |
+| Image router: `solver` | 0.35 | 0.06 | **0.070** | 1,200 |
 | Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
 
-The next router comparison lowers only image `lam: .075 -> .065`. The supplied
-`grouped_partial_20261011T020500Z_2fd39d06` console log shows the .075 router
-converged in 107 iterations with ~2.5 effective targets/2,000 and 92.79% top-8
-retained mass, followed by **1,024 successful pairs and zero failures so far**.
-It contains no completed patch-geometry or generated-image results. The smaller
-MI weight tests less concentrated image routing; it is not a demonstrated blur
-fix. Patch settings, mass, confidence and .20/.20 projection remain fixed.
-See [the supplied-log analysis and objective tradeoff](../docs/analysis/infoot_vit_partial_success_tuning/README.md).
-Use `--lam .075` to reproduce the previous recipe in a fresh directory; a run
+The next router comparison uses the midpoint **image `lam=.070`**. The .075
+baseline converged in 107 iterations with 2.49 effective targets/2,000 and 92.79%
+top-8 retained mass. The new .065 router-only run converged in 784 iterations
+with **64.40 effective targets and 66.86% mean top-1 probability**, versus 92.28%
+top-1 at .075. This is a larger broadening than intended; its actual top-8
+conditional retained mass was not logged. Effective target count is not the
+number of equally weighted targets and cannot determine discarded mass.
+`--tune` now previews that coverage at the configured projection bandwidth.
+Patch settings, mass, confidence and .20/.20 projection remain fixed. No new
+image-quality result is available; .070 is a candidate, not a demonstrated blur
+fix. See [the .065 follow-up and .070 comparison](../docs/analysis/infoot_vit_router_065/README.md)
+and [the earlier supplied-log analysis](../docs/analysis/infoot_vit_partial_success_tuning/README.md).
+Use `--lam .075` or `--lam .065` to reproduce either router recipe; a run
 already in progress continues with its saved configuration. Do not resume it
 using the changed YAML.
 
@@ -311,7 +315,7 @@ fingerprint prevents resuming the old v3 run as though its solver were unchanged
 The earlier **fitting** change was patch `h: .45 -> .35`, `reg: .10 -> .05`;
 patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings
 were held fixed for that comparison. The latest candidate now changes only
-image `lam: .075 -> .065`, as described above. Projection stays at **.20**,
+image `lam: .065 -> .070`, as described above. Projection stays at **.20**,
 with .30 available for comparison;
 top-1 truncation is not enabled. These are hypotheses requiring lab images,
 not a measured optimum. Keep guidance/steps fixed while comparing fits.
@@ -611,13 +615,18 @@ Use `--tune` to run the **image router only**, using the same training-bank
 sampling/seed, float64 solver, cost scaling and convergence checks as a full fit.
 It creates no output directory, log/error files, checkpoint or transport-plan
 artifact. Plans exist only in memory; this run cannot be resumed or passed to
-`infoot_test.py`. Patch fitting, partial-pair selection and low-rank patch-kernel
-audits are skipped. Router convergence does not validate those stages or image
+`infoot_test.py`. Patch fitting, persisted pair selection and low-rank patch-kernel
+audits are skipped. Converged dense `grouped_partial` runs preview the existing
+top-K selection rule in memory at **projection h**, reporting retained/discarded
+probability and concentration after retained-edge normalization. This is a
+float64 pre-storage preview; float32 storage can slightly affect values/ties.
+Preview time is separate from router `seconds`. No pair plans are fitted or
+saved. Router convergence does not validate patch fitting or held-out image
 quality. The normal command without `--tune` still saves full fit diagnostics.
 
 ```bash
 # Existing top-8 grouped_partial recipe; optional router overrides shown.
-python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --tune --h 0.35 --lam 0.065 --reg 0.06
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --tune --h 0.35 --lam 0.070 --reg 0.06
 
 # Low-rank recipe: these overrides change image_solver.*, not patch kernel.h.
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.075 --reg 0.075

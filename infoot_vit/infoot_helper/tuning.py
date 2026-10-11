@@ -9,6 +9,30 @@ from .conditional import BalancedModel
 from .device import resolve_device
 from .feature_bank import FeatureBank, compatible_banks, digest
 from .fit_mapping import inspect_fit, resource_estimate
+from .pair_selection import select_pairs
+
+
+def _pair_selection_preview(model, config, source_ids, target_ids):
+    """Preview the existing selection rule at projection h, without saving edges."""
+    start = time.perf_counter()
+    multiplier = config["projection"]["bandwidth_multiplier"]
+    router = BalancedModel(model.source, model.target, model.state, multiplier)
+    selection = select_pairs(router, source_ids, target_ids, config["fit_pair_top_k"])
+    # Only compact selected probabilities cross to CPU via the existing selector;
+    # float64 kernel/scoring operations run on the router's configured device.
+    probabilities = torch.tensor([row["probabilities"] for row in selection["rows"]], dtype=torch.float64)
+    retained = probabilities.sum(1)
+    normalized = probabilities / retained[:, None]
+    return dict(projection_h=router.h, projection_bandwidth_multiplier=multiplier,
+        effective_k=selection["effective_k"], pair_count=selection["pair_count"],
+        mean_retained_probability=float(retained.mean()), median_retained_probability=float(retained.median()),
+        min_retained_probability=float(retained.min()), max_retained_probability=float(retained.max()),
+        mean_discarded_probability=float(1-retained.mean()),
+        mean_renormalized_top1_probability=float(normalized.max(1).values.mean()),
+        mean_renormalized_effective_targets=float((-torch.special.xlogy(normalized, normalized).sum(1)).exp().mean()),
+        seconds=time.perf_counter()-start, plan_precision="float64_before_storage",
+        interpretation="Training-source conditional routing at projection h; retained/discarded mass precedes edge renormalization. "
+            "No partial OT rejection or held-out quality measurement; no pairs saved. Full-fit float32 storage can slightly change values/ties.")
 
 
 def tune_image_router(raw, *, root, lowrank=False, log_every=25):
@@ -16,7 +40,8 @@ def tune_image_router(raw, *, root, lowrank=False, log_every=25):
 
     Patch solvers/kernel audits, RunLog and checkpoint utilities are deliberately
     outside this path. Nonconvergence is returned as a status, never accepted as
-    a fitted mapper; numerical errors propagate to the caller's terminal.
+    a fitted mapper; numerical errors propagate to the caller's terminal. A
+    converged dense partial router previews its top-K selection at projection h.
     """
     if type(log_every) is not int or log_every < 1:
         raise ValueError("Tuning log interval must be a positive integer.")
@@ -74,6 +99,12 @@ def tune_image_router(raw, *, root, lowrank=False, log_every=25):
     report = dict(context, status=model.state["status"], seconds=time.perf_counter()-start,
         cost_scale=model.state["cost_scale"], last_iteration=model.state["history"][-1],
         kernel_diagnostics=model.state["kernel_diagnostics"])
+    if not lowrank and c["mode"] == "grouped_partial" and model.state["status"] == "converged":
+        preview = _pair_selection_preview(model, c, banks[0].ids, banks[1].ids)
+        report["pair_selection_preview"] = preview
+        print(f"Top-{preview['effective_k']} selection preview: retained={preview['mean_retained_probability']:.2%}, "
+              f"discarded={preview['mean_discarded_probability']:.2%}, projection h={preview['projection_h']:g}, "
+              f"renormalized top1={preview['mean_renormalized_top1_probability']:.2%}. No pairs saved.", flush=True)
     print("Tuning result (not a saved mapping):", flush=True)
     print(json.dumps(report, indent=2, allow_nan=False), flush=True)
     return report
