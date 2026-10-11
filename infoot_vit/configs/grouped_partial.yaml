@@ -3,6 +3,7 @@ mode: grouped_partial
 device: cuda
 pair_batch_size: 1024  # Independent exact [B,196,196] partial InfoOT solves; null = serial POT.
 pair_checkpoint_every: 10  # Outer iterations; first and every terminal state are always saved.
+pair_failure_abort_batches: 1  # Stop a systemic failure after one fully failed batch; null disables.
 source_bank: data/infoot_vit/cat_train
 target_bank: data/infoot_vit/dog_train
 sampling:
@@ -21,14 +22,15 @@ solver:  # Fit logs: converged in 107 steps, 2.49 effective targets. Do not shar
   outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
   keep_mass: 0.80  # Preserve more condition coverage; transported mass, NOT a patch count.
-  solver:  # Fitting-log review retains the sharper patch recipe. Fresh fit required.
+  solver:  # v2 failures: retain sharp objective; accelerate its difficult inner solve.
     h: 0.35  # Was .45: reduce smoothing in the FITTED patch MI geometry.
     lam: 0.025  # Hold MI pressure fixed; do not amplify it while reducing entropy.
     reg: 0.05  # Was .10: reduce diffuse patch correspondences at their source.
     cost_scale: mean
     max_outer_steps: 600
-    max_inner_steps: 20000  # Lower reg can need more work; saturated .80-mass control needs >10k.
-    inner_tolerance: 1.0e-10  # Unchanged: budget-boundary rescue requires primal/KKT/gap checks.
+    max_inner_steps: 20000  # Hard ceiling; certified members stop independently.
+    inner_acceleration: newton  # Safeguarded capped-mass dual Newton after 100 block updates.
+    inner_tolerance: 1.0e-10  # Unchanged primal/KKT/gap certificate; no budget-stop acceptance.
     feasibility_tolerance: 1.0e-8
     mass_tolerance: 1.0e-8
     outer_tolerance: 1.0e-7
@@ -46,5 +48,5 @@ projection:
     mass_floor: 1.0e-12
     all_invalid_policy: error
 resources:
-  max_working_gib: 48  # B=1024 estimate ~35.2 GiB; allow workspace on the 80-GB lab GPU.
+  max_working_gib: 48  # Includes bounded (64-pair) Newton linear-algebra workspace.
   max_plan_gib: 64

@@ -32,11 +32,15 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
     started = time.perf_counter()
     initial_done = len(done)
     attempted = 0
+    failed_batches = 0
 
     def save_report(status):
         report = dict(status=status, device=str(x.device), pair_batch_size=size, attempted_pairs=attempted,
             successful_pairs=len(done)-initial_done, previously_completed_pairs=initial_done,
             failed_pairs=len(failures), elapsed_seconds=time.perf_counter()-started,
+            unfinished_attempted_pairs=attempted-(len(done)-initial_done)-len(failures),
+            unattempted_pairs=len(pending)-attempted,
+            consecutive_all_failed_batches=failed_batches,
             failures=[{k: v for k, v in row.items() if k != "report"} for row in failures],
             resume_policy="Reuse registered successful pairs; restart unfinished/failed pairs from exact float64 feasible initialization.")
         if geometry_rows:
@@ -180,7 +184,16 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
             batch_seconds=elapsed, pairs_per_second=len(batch)/elapsed,
             timing_includes="cost construction, solver, validation, checkpoint and artifact I/O")
         print(f"Pairs {len(done)}/{len(selected_pairs)} accepted; {len(failures)} failed this attempt", flush=True)
+        failed_batches = failed_batches + 1 if len(failed_members) == len(batch) else 0
         save_report("running")
+        limit = config.get("pair_failure_abort_batches")
+        if limit is not None and failed_batches >= limit:
+            log.event("pair_fitting_aborted", reason="consecutive_all_failed_batches",
+                batches=failed_batches, unattempted_pairs=len(pending)-attempted)
+            save_report("aborted_all_failed_batches")
+            raise RuntimeError(f"Stopped after {failed_batches} entirely failed pair batch(es); "
+                f"{len(done)} successful pairs remain saved, {len(pending)-attempted} pairs unattempted. "
+                f"Inspect {log.directory / 'first_failed_pair.pt'} before another full fit.")
     save_report("failed" if failures else "completed")
     if failures:
         raise RuntimeError(f"{len(failures)} partial pairs failed; {len(done)} successful pairs saved. "

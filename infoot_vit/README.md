@@ -216,14 +216,13 @@ generated-image review below:
 | Image router: `solver` | 0.35 | 0.06 | 0.075 | 1,200 |
 | Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
 
-The outer, capacity and mass tolerances remain unchanged. The partial inner
-solver retains its log-plan check and relative primal-dual gap of `1e-10`.
-At the final inner iteration, it can also accept a plan whose relative primal
-change, KKT residual and relative duality gap all meet `inner_tolerance`, with
-the same mass/capacity checks. This explicitly logged certificate avoids
-rejecting an optimal plan solely because tiny-probability entries change in
-log space. An unfinished inner solve still fails; the outer MI solve continues
-until its own convergence check passes.
+The active recipe uses `partial.solver.inner_acceleration: newton`: after 100
+log-domain block updates, safeguarded dual Newton steps accelerate unfinished
+members every 10 updates. PyTorch linear solves use chunks of at most 64 pairs.
+Convergence requires relative primal change, KKT residual and relative duality
+gap all at most `inner_tolerance=1e-10`, plus the original mass/capacity checks.
+The objective and tolerances are unchanged. `inner_acceleration: none` keeps
+the prior batched path; the serial POT path uses its original updates.
 The earlier test2 router was overly diffuse: mean effective targets 1,943/2,000
 and mean top-8 retained probability only 0.445%. The current recipe uses narrower
 image kernels and less image entropy; the later fitting-log review below confirms
@@ -275,10 +274,27 @@ above `1e-10` but tiny duality gaps/constraint errors. Solver v3 adds the
 budget-boundary certificate above; it records `relative_plan_delta_l1`,
 `kkt_error` and `convergence_reason` alongside the original log residual.
 Fitting-code fingerprints changed: use a fresh fit directory.
-The patch inner budget is now **20,000** (image router remains 10,000): a
-196-patch, mass-.80, reg-.05 saturated control needs 16,291 iterations on CPU
-to pass the original log criterion. The tolerances are unchanged; this budget
-increase supports the sharper fit and does not declare every budget stop a success.
+That budget-only revision proved insufficient in `results/infoot_vit/v2`:
+7,168 terminal pairs failed their first outer update after **20,000** inner
+steps. The earlier analytic control omitted production mean-cost scaling and
+understated the difficulty. Solver v4 adds the acceleration above; a correctly
+scaled 196-patch control now converges in 261–271 updates on CPU. This is
+numerical evidence, not a replay of the lab tensors or an image-quality result.
+See the [v2 failure analysis and fix](../docs/analysis/infoot_vit_partial_v2/README.md).
+
+The active `pair_failure_abort_batches: 1` stops after an entirely failed batch,
+preserving all completed pairs, failure records and checkpoints. Null disables
+the guard. Reports separate unattempted pairs and interrupted in-flight pairs.
+Before another full fit, replay the saved failing input on the lab GPU:
+
+```bash
+python infoot_vit/replay_partial_pair.py outputs/infoot_vit/grouped_partial_20261011T011800Z_011068f8/logs/20261011T011800Z_b6ec10be/first_failed_pair.pt --device cuda --output outputs/infoot_vit/v2_pair_replay.json
+```
+
+This records objective/constraint diagnostics, elapsed time and peak allocated
+GPU memory without changing the original run. Exit code 2 means unsuccessful;
+only a converged replay supports proceeding to a fresh full fit. The new code
+fingerprint prevents resuming the old v3 run as though its solver were unchanged.
 
 The current **fitting** change is patch `h: .45 -> .35`, `reg: .10 -> .05`;
 patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings

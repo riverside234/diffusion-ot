@@ -11,8 +11,8 @@ device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
   h: 0.7  # Requested fit bandwidth; projection uses 0.2.
-  lam: 0.075  # Retain router MI while reducing entropic averaging; h=.7 trial, not a validated optimum.
-  reg: 0.05  # Was .075; start a fresh fit for changed objective weights.
+  lam: 0.10  # Modest MI increase after the h=.7 router remained near uniform (1919.8/2000 targets).
+  reg: 0.01  # Fivefold entropy reduction from .05; provisional trial, start a fresh fit.
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000

@@ -31,7 +31,7 @@ PROJECTION = dict(bandwidth_multiplier=1., query_chunk_size=16, selection="mean"
 def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError("Mapping configuration must be a YAML mapping.")
-    if unknown := config.keys() - {"mode", "source_bank", "target_bank", "solver", "partial", "projection", "resources", "image_model", "patch_model", "sampling", "fit_pair_top_k", "device", "pair_batch_size", "pair_checkpoint_every"}:
+    if unknown := config.keys() - {"mode", "source_bank", "target_bank", "solver", "partial", "projection", "resources", "image_model", "patch_model", "sampling", "fit_pair_top_k", "device", "pair_batch_size", "pair_checkpoint_every", "pair_failure_abort_batches"}:
         raise ValueError(f"Unknown mapping settings: {sorted(unknown)}")
     config = dict(config)
     # Legacy artifacts/config dictionaries without a device retain CPU behavior.
@@ -62,7 +62,11 @@ def validate_config(config):
         if type(every) is not int or every < 1:
             raise ValueError("pair_checkpoint_every must be a positive integer.")
         config["pair_checkpoint_every"] = every
-    elif any(k in config for k in ("sampling", "fit_pair_top_k", "pair_batch_size", "pair_checkpoint_every")):
+        abort = config.get("pair_failure_abort_batches")
+        if abort is not None and (type(abort) is not int or abort < 1 or size is None):
+            raise ValueError("pair_failure_abort_batches requires batching and a positive integer, or null.")
+        config["pair_failure_abort_batches"] = abort
+    elif any(k in config for k in ("sampling", "fit_pair_top_k", "pair_batch_size", "pair_checkpoint_every", "pair_failure_abort_batches")):
         raise ValueError("Training sampling and pair fitting settings apply only to grouped_partial.")
     config["solver"] = solver_config(config.get("solver"))
     projection = config.get("projection", {})
@@ -140,6 +144,9 @@ def resource_estimate(source_shape, target_shape, mode, fit_pair_top_k=None, pai
         working += shared_pair_kernels + (32 if pair_batch_size else 24) * active_pairs * p * p * 8
         if pair_batch_size:
             working += 2 * active_pairs * p * d * 8  # Gathered feature pairs.
+            # Conservative allowance for scaled Hessians, factorization and
+            # temporary vectors; Newton uses at most 64 pair members at once.
+            working += 6 * min(active_pairs, 64) * (2*p+1)**2 * 8
     return dict(source_shape=list(source_shape), target_shape=list(target_shape), support_bytes=supports,
                 image_arrays_bytes=image_arrays, global_patch_arrays_bytes=patch_arrays,
                 shared_pair_kernels_bytes=shared_pair_kernels, plan_storage_bytes=plans,
@@ -320,7 +327,7 @@ def _fit_mapping(config, *, root, directory, resume, log):
                       for name in ("infoot.py", "partial.py", "conditional.py", "fit_mapping.py", "storage.py", "sampling.py", "pair_selection.py", "plan_diagnostics.py")}
     if config.get("pair_batch_size"):
         implementation.update({name: file_hash(Path(__file__).with_name(name))
-                               for name in ("partial_batch.py", "pair_batch_fit.py")})
+                               for name in ("partial_batch.py", "partial_newton.py", "pair_batch_fit.py")})
     fingerprint = digest(dict(config=config, source=source.artifact_id, target=target.artifact_id,
                               source_ids=source.ids, target_ids=target.ids, storage=STORAGE_VERSION if compact else "float64",
                               implementation=implementation, runtime=inspection["runtime"]))

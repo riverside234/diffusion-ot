@@ -67,7 +67,9 @@ def test_stable_feasible_but_nonoptimal_plan_has_no_kkt_certificate():
 def test_sharper_active_recipe_has_budget_for_saturated_point_eight_mass():
     root = Path(__file__).resolve().parents[1]
     recipe = yaml.safe_load((root / "infoot_vit/configs/grouped_partial.yaml").read_text())["partial"]
-    c = solver_config(recipe["solver"])
+    # Preserve the old unaccelerated budget regression as a reference. The
+    # accelerated recipe is covered by test_infoot_vit_partial_newton.py.
+    c = solver_config(dict(recipe["solver"], inner_acceleration="none"))
     n, cheap, mass = 196, 156, recipe["keep_mass"]
     cost = torch.ones(1, n, n, dtype=torch.float64)
     cost[:, :cheap, :cheap] = .005

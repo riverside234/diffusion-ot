@@ -133,7 +133,7 @@ def test_line_search_stall_is_local_and_never_accepts_uphill_plan(monkeypatch):
             cost_shift=torch.zeros(2), residuals=module.residual_values(candidate, a, b, mass),
             duality_gap=torch.zeros(2), relative_duality_gap=torch.zeros(2),
             relative_plan_delta_l1=torch.zeros(2), kkt_error=torch.zeros(2),
-            stop_reason=torch.ones(2, dtype=torch.long), method="test")
+            stop_reason=torch.ones(2, dtype=torch.long), newton_steps=torch.zeros(2, dtype=torch.long), method="test")
     monkeypatch.setattr(module, "entropy_subproblem_batch", uphill)
     plans, reports = module.solve_partial_batch(costs, kernels, kernels, config=dict(cost_scale=1., max_backtracks=1))
     assert [r["status"] for r in reports] == ["line_search_stalled", "converged"]

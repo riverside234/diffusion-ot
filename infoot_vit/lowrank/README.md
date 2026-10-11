@@ -76,7 +76,7 @@ validate this new configuration on the lab banks.
 For console-only router parameter trials, use:
 
 ```bash
-python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.075 --reg 0.05
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.10 --reg 0.01
 ```
 
 This fits only the image router on the same sampled training images. No logs,
@@ -99,7 +99,7 @@ passed but its outer residual remained above tolerance. The revised weights
 reduce MI pressure relative to entropy; they are a lab experiment, not a claim
 of optimal translation quality. The latest requested experiment sets both
 `image_solver.h` and `kernel.h` to **0.7**. Its next fitting trial uses
-**image reg=0.05, lam=0.075**, and **patch optimizer reg=0.025, lam=0.05**.
+**image reg=0.01, lam=0.10**, and **patch optimizer reg=0.025, lam=0.05**.
 Reducing image entropy targets diffuse routing. Halving both patch weights
 relative to the previous .05/.10 emphasizes geometric cost while retaining
 the patch MI/entropy ratio of 2. These are provisional choices, not values
@@ -108,6 +108,45 @@ the earlier h=0.4 failure does not establish convergence of this setting.
 `projection.bandwidth_multiplier: 0.2857142857142857` sets both projection h
 values to **0.2**. Actual Gaussian sigma is still h times each domain's saved
 training RMS scale, rather than an absolute feature-space distance of 0.2.
+
+### Router trial after the four-iteration h=0.7 log
+
+The supplied `lam=0.075, reg=0.05` run converged with undamped plan delta
+`1.97e-08`, below the `1e-07` tolerance. It is a converged, nearly uniform plan,
+not an iteration-budget failure: mean effective targets are **1919.8/2000**.
+The cost is **0.9960372**, versus **1.0** for the uniform plan under mean-cost
+scaling, a reduction of only **0.3963%**. The weighted MI term is
+`-5.7171349e-05`, corresponding to KDE MI of approximately **0.0007623**.
+
+The entropy term `-0.75803287` implies joint entropy **15.1606574**, versus
+**15.2018049** for uniform mass over 2000 by 2000 pairs. Equivalently, mean
+row entropy is **99.46%** of its maximum and KL from uniform is **0.04115 nats**.
+The large absolute entropy offset alone does not establish gradient dominance;
+the routing concentration and cost gain are the useful evidence here.
+
+The next configured trial lowers **image reg 0.05 -> 0.01** to reduce entropic
+smoothing, and raises **image lam 0.075 -> 0.10** modestly to retain neighborhood
+structure. These roles follow the [InfoOT objective](https://proceedings.mlr.press/v202/chuang23a/chuang23a.pdf);
+the exact values are a local tuning proposal, not paper-prescribed settings.
+A small MI scalar does not determine its gradient scale, so it is not a reason
+to increase lam by orders of magnitude. Patch-optimizer weights have no new
+patch-fit evidence in this router log and remain unchanged.
+
+Use the console-only tuning command above on the lab banks (add the same
+`--source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000`
+overrides as the full fit). To isolate the entropy change, compare it with
+`--lam 0.075 --reg 0.01` using the same samples. Check convergence, effective
+targets, maximum row probability, MI and cost. Compare cost/MI/entropy separately;
+total objectives with different weights are not directly comparable. If routing
+is still nearly uniform, an isolated `reg=0.005` trial is reasonable; if higher
+lam causes instability, first retry `lam=0.075` at the same reg. More iterations
+will not sharpen an already converged plan by themselves.
+
+Judge the resulting held-out routing and decoded images at projection h=0.20:
+concentration alone is not image quality, and this fit log does not establish
+that either weight change fixes blur. The full banks/checkpoints are lab-only;
+the revised settings have not been evaluated on those data here. Start a fresh
+full fit after changing weights; saved plans cannot be resumed with a new objective.
 
 When testing a new `grouped_patch_lowrank` fit from this recipe, make the
 projection setting explicit:

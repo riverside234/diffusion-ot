@@ -16,7 +16,7 @@ OBJECTIVE = "transported_kde_mi_mass_weighted_v1"
 DEFAULTS = dict(h=.4, lam=.1, reg=.05, cost_scale="mean", max_outer_steps=100,
     max_inner_steps=10000, inner_tolerance=1e-10, feasibility_tolerance=1e-8,
     mass_tolerance=1e-8, outer_tolerance=1e-7, objective_tolerance=1e-12,
-    max_backtracks=30, log_floor=1e-300)
+    max_backtracks=30, log_floor=1e-300, inner_acceleration="none")
 
 
 def solver_config(options=None):
@@ -24,6 +24,8 @@ def solver_config(options=None):
     if unknown := options.keys() - DEFAULTS.keys():
         raise ValueError(f"Unknown solver settings: {sorted(unknown)}")
     c = DEFAULTS | options
+    if c["inner_acceleration"] not in {"none", "newton"}:
+        raise ValueError("inner_acceleration must be 'none' or 'newton' (batched partial solver only).")
     for key in ("h", "reg", "inner_tolerance", "feasibility_tolerance", "mass_tolerance", "outer_tolerance"):
         if not math.isfinite(c[key]) or c[key] <= 0:
             raise ValueError(f"{key} must be finite and positive.")
