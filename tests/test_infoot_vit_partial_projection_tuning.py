@@ -160,7 +160,7 @@ def test_batched_fit_persists_plan_geometry_before_complete_summary(tmp_path, ba
 def test_revised_config_tunes_fitting_and_keeps_broad_projection():
     c = validate_config(yaml.safe_load((infoot_test.ROOT / "infoot_vit/configs/grouped_partial.yaml").read_text()))
     assert (c["solver"]["h"], c["solver"]["reg"], c["solver"]["lam"]) == (.36, .06, .070)
-    assert (c["partial"]["solver"]["h"], c["partial"]["solver"]["reg"], c["partial"]["solver"]["lam"]) == (.35, .04, .025)
+    assert (c["partial"]["solver"]["h"], c["partial"]["solver"]["reg"], c["partial"]["solver"]["lam"]) == (.35, .04, .035)
     assert c["partial"]["keep_mass"] == .8 and c["projection"]["confidence"]["threshold"] == .05
     assert c["solver"]["h"] * c["projection"]["bandwidth_multiplier"] == pytest.approx(.2)
     assert c["projection"]["patch_bandwidth"] == .2 and c["projection"]["top_k_images"] is None

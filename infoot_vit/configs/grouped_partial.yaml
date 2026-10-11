@@ -22,13 +22,13 @@ solver:  # Working baseline for full mapping; reg=.0575 raised normalized top-1 
   outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
   keep_mass: 0.80  # Preserve more condition coverage; transported mass, NOT a patch count.
-  solver:  # Next sampled trial: increase entropy only at the measured lam=.035.
+  solver:  # Retain full-run candidate pending numerical repair and matched controls.
     h: 0.35  # Hold fitted KDE geometry fixed for the entropy/MI tradeoff.
-    lam: 0.035  # Hold MI fixed; reg=.0375 converged 64/64 in <=111 outer steps.
-    reg: 0.040  # Unmeasured at lam=.035: test whether +6.7% entropy reduces solver work.
-    # reg=.0375 baseline: 15.23 effective patches, variance .6835, coverage 98.25%, solver 382.7 s.
-    # Compare reg=.0375/.040 at lam=.035 on the same solver version; timings depend on GPU load.
-    # Compare the same saved selection and 64 pairs (seed 42); then held-out images.
+    lam: 0.035  # No further MI increase without better semantic/image evidence.
+    reg: 0.040  # Full run: 15,575 saved / 425 line-search stalls; not a certified complete fit.
+    # Held-out effective patches 26.13; within-image variance ratio .3758; blur persists.
+    # Old images used .15/.20 projection; compare both fits at .20/.20 after repair.
+    # Review: docs/analysis/infoot_vit_partial_top8_full_20261011/README.md.
     cost_scale: mean
     max_outer_steps: 600
     max_inner_steps: 20000  # Hard ceiling; certified members stop independently.
@@ -51,7 +51,7 @@ projection:
   confidence:
     support_calibration: fit_leave_one_out_log_density
     support_quantile: 0.01  # Fit-only heuristic, not semantic correctness.
-    threshold: 0.05  # Hold: current valid-token coverage is 95.12%; no all-invalid images.
+    threshold: 0.05  # Hold: uploaded incomplete-fit coverage is 95.98%; no all-invalid images.
     mass_floor: 1.0e-12
     all_invalid_policy: error
 resources:

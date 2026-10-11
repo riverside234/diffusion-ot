@@ -19,7 +19,7 @@ import torch
 from .partial import OBJECTIVE, capabilities, information, information_gradient, solver_config
 from .partial_newton import dual_newton_step
 
-VERSION = "dense_partial_infoot_batch_v5_active_warm"
+VERSION = "dense_partial_infoot_batch_v6_stall_refinement"
 RUNNING, CONVERGED, BUDGET, STALLED, INVALID, INNER_FAILED, NONFINITE = range(7)
 STATUS = ("running", "converged", "max_outer_steps", "line_search_stalled",
           "invalid_input", "inner_failed", "nonfinite_objective_or_gradient")
@@ -239,6 +239,37 @@ def _number(value):
     return value if math.isfinite(value) else None
 
 
+def _outer_step(old_plan, candidate, old, cost, kx, ky, config, ok, healthy):
+    """Keep the undamped fixed-point test separate from line-search progress."""
+    delta = (candidate - old_plan).abs().sum((-2, -1))
+    status = torch.where(healthy, torch.where(ok, RUNNING, INNER_FAILED), NONFINITE)
+    stationary = ok & (delta <= config["outer_tolerance"])
+    status = torch.where(stationary, CONVERGED, status)
+    plan, terms = old_plan.clone(), old.clone()
+    steps = torch.zeros_like(delta)
+    backtracks = torch.zeros_like(status)
+    pending = ok & ~stationary
+    step = torch.ones_like(delta)
+    for _ in range(config["max_backtracks"]):
+        if not bool(pending.any()):
+            break
+        trial = old_plan + step[:, None, None] * (candidate - old_plan)
+        trial_terms = objective_values(trial, cost, kx, ky, config)
+        accepted = (pending & torch.isfinite(trial_terms).all(-1)
+                    & (trial_terms[:, 3] <= old[:, 3] + config["objective_tolerance"]))
+        stalled = accepted & (step * delta <= config["outer_tolerance"])
+        status = torch.where(stalled, STALLED, status)
+        improved = accepted & ~stalled
+        plan = torch.where(improved[:, None, None], trial, plan)
+        terms = torch.where(improved[:, None], trial_terms, terms)
+        steps = torch.where(improved, step, steps)
+        pending &= ~accepted
+        backtracks += pending
+        step = torch.where(pending, step * .5, step)
+    status = torch.where(pending, STALLED, status)
+    return plan, terms, steps, backtracks, delta, status
+
+
 @torch.no_grad()
 def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=None, on_step=None, timer=None):
     """Return [B,P,Q] last accepted plans and B independent reports.
@@ -304,35 +335,57 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
             ok = inner["ok"] & healthy
             delta = (candidate - old_plan).abs().sum((-2, -1))
             local_status = torch.where(healthy, torch.where(ok, RUNNING, INNER_FAILED), NONFINITE)
-            stationary = ok & (delta <= c["outer_tolerance"])
             accepted_plan, terms = old_plan.clone(), old.clone()
             steps = delta.new_zeros(len(indices))
             backtracks = torch.zeros_like(local_status)
+            refinements = torch.zeros_like(local_status)
+            inner_tolerances = torch.full_like(delta, c["inner_tolerance"])
             if c["lam"] == 0:
                 local_status = torch.where(ok, CONVERGED, local_status)
                 accepted_plan = torch.where(ok[:, None, None], candidate, old_plan)
                 terms = objective_values(accepted_plan, cc, xx, yy, c)
                 steps = ok.to(delta.dtype)
             else:
-                local_status = torch.where(stationary, CONVERGED, local_status)
-                pending = ok & ~stationary
-                step = torch.ones_like(delta)
-                for attempt in range(c["max_backtracks"]):
-                    if not bool(pending.any()):
-                        break
-                    trial = old_plan + step[:, None, None] * (candidate - old_plan)
-                    trial_terms = objective_values(trial, cc, xx, yy, c)
-                    accepted = pending & torch.isfinite(trial_terms).all(-1) & (trial_terms[:, 3] <= old[:, 3] + c["objective_tolerance"])
-                    stalled = accepted & (step * delta <= c["outer_tolerance"])
-                    local_status = torch.where(stalled, STALLED, local_status)
-                    improved = accepted & ~stalled
-                    accepted_plan = torch.where(improved[:, None, None], trial, accepted_plan)
-                    terms = torch.where(improved[:, None], trial_terms, terms)
-                    steps = torch.where(improved, step, steps)
-                    pending &= ~accepted
-                    backtracks += pending
-                    step = torch.where(pending, step * .5, step)
-                local_status = torch.where(pending, STALLED, local_status)
+                accepted_plan, terms, steps, backtracks, delta, local_status = _outer_step(
+                    old_plan, candidate, old, cc, xx, yy, c, ok, healthy)
+        # A certified inner error can still exceed the very small objective
+        # decrease near an outer fixed point. Refine only stalled partial pairs
+        # before retiring them; never turn a damped tiny step into convergence.
+        # The objective, outer/mass/cap tolerances and all certificates remain
+        # unchanged (inner certificates get STRICTER). Balanced controls retain
+        # their original path. Bounded retries cannot hide a genuine stall.
+        if c["lam"] and keep_mass != 1.:
+            for refinement in range(1, 3):
+                ids = (local_status == STALLED).nonzero().flatten()
+                tolerance = max(c["inner_tolerance"] * .01**refinement,
+                                32 * torch.finfo(cost.dtype).eps)
+                if not len(ids) or tolerance >= float(inner_tolerances[ids].min()):
+                    break
+                refined_config = dict(c, inner_tolerance=tolerance)
+                with phase("inner_solver"):
+                    prior_duals = inner.get("dual_state")
+                    refined, info = entropy_subproblem_batch(aa[ids], bb[ids], effective[ids], keep_mass,
+                        refined_config, initial_duals=None if prior_duals is None else tuple(v[ids] for v in prior_duals))
+                refinements[ids] += 1
+                # Account for all work, including unsuccessful refinement. The
+                # certificate fields below describe the last attempted solve.
+                for key in ("iterations", "work_iterations", "newton_steps"):
+                    info[key] += inner[key][ids]
+                for key, value in info.items():
+                    if isinstance(value, torch.Tensor):
+                        inner[key][ids] = value
+                    elif key == "dual_state":
+                        for previous, updated in zip(inner[key], value):
+                            previous[ids] = updated
+                inner_tolerances[ids] = tolerance
+                if c.get("inner_warm_start", False):
+                    dual_u[indices[ids]], dual_v[indices[ids]] = info["dual_state"]
+                with phase("outer_update_and_diagnostics"):
+                    values = _outer_step(old_plan[ids], refined, old[ids], cc[ids], xx[ids], yy[ids], c,
+                                         info["ok"] & healthy[ids], healthy[ids])
+                    for destination, value in zip((accepted_plan, terms, steps, backtracks, delta, local_status), values):
+                        destination[ids] = value
+        with phase("outer_update_and_diagnostics"):
             if iteration == c["max_outer_steps"]:
                 local_status = torch.where(local_status == RUNNING, BUDGET, local_status)
             plans[indices] = accepted_plan
@@ -349,7 +402,7 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
                 inner["duality_gap"][:, None], inner["relative_duality_gap"][:, None],
                 inner["relative_plan_delta_l1"][:, None], inner["kkt_error"][:, None],
                 inner["stop_reason"][:, None], inner["newton_steps"][:, None],
-                inner["work_iterations"][:, None]), -1).cpu().tolist()
+                inner["work_iterations"][:, None], refinements[:, None], inner_tolerances[:, None]), -1).cpu().tolist()
         emitted = [None] * batch
         for row in packed:
             idx, status, count = map(int, row[:3])
@@ -359,6 +412,7 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
                 relative_plan_delta_l1=_number(row[27]), kkt_error=_number(row[28]),
                 newton_steps=int(row[30]),
                 work_iterations=int(row[31]),
+                precision_refinements=int(row[32]), certificate_tolerance=row[33],
                 convergence_reason=("not_converged", "balanced_marginal_residual" if keep_mass == 1.
                     else "legacy_residual_and_gap", "primal_dual_certificate")[int(row[29])],
                 error_metric="column_marginal_l2" if keep_mass == 1. else "log_plan_delta_l2",

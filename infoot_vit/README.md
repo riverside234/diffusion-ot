@@ -42,6 +42,7 @@ CPU tensors; the numerical pipeline uses the selected device.
 | `infoot_fit_lowrank.py`, `lowrank/` | Balanced global and partial pair InfoOT factors; shared objective, kernels, checkpointing and projection. |
 | `infoot_helper/device.py` | Explicit CPU/CUDA selection and artifact-to-device transfers. |
 | `infoot_test.py` | Project a disjoint validation/test bank; optionally run fixed-checkpoint diffusion inference. |
+| `diagnose_blur.py` | Opt-in comparison of cached mapped tokens, a mean-preserving spread correction, and matched native-dog decoder controls; no fitting or sampling-parameter sweep. |
 | `infoot_compare.py` | Compare saved mappers on the same queries and fit populations. |
 | `infoot_helper/feature_bank.py` | Sharded tensor banks, stable IDs, representation identity, fingerprints. |
 | `infoot_helper/conditional.py` | Fixed-training-bandwidth balanced scoring and partial confidence projection. |
@@ -61,6 +62,14 @@ distances for bandwidth scaling. The new `BalancedModel.project()` is the tested
 point. The separate `../infoot/` CNN experiments remain unchanged. At inspection,
 `infoot_vit/` still contained copies of the pooled CNN bank/fit/test scripts;
 there was no existing SigLIP whole-map, grouped or partial mapper to reuse.
+
+For the dense top-8 run that remained blurred despite sharper fitted plans,
+see the [conditioning intervention and lab command](../docs/analysis/infoot_vit_blur_intervention_20261011/README.md).
+`diagnose_blur.py` reuses the saved `.20/.20` mapped cache and generation report,
+verifies the checkpoint hash, and shares the same starting noise across five
+conditions. The correction is an unvalidated inference option, separate from
+ordinary mapped caches and the active fit configuration. It does not change
+the decoder or recover semantic information already lost through averaging.
 
 ## Start with feature banks
 

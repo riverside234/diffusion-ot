@@ -127,18 +127,22 @@ def test_line_search_stall_is_local_and_never_accepts_uphill_plan(monkeypatch):
     costs = torch.tensor([[[0., 1.], [1., 0.]], [[1., 1.], [1., 1.]]], dtype=torch.float64)
     kernels = torch.stack([torch.eye(2), torch.ones(2, 2)]).double()
     def uphill(a, b, cost, mass, config, **kwargs):
-        candidate = torch.tensor([[[0., .4], [.4, 0.]], [[.2, .2], [.2, .2]]], dtype=torch.float64)
-        return candidate, dict(ok=torch.ones(2, dtype=torch.bool), error=torch.zeros(2),
-            iterations=torch.ones(2, dtype=torch.long), work_iterations=torch.ones(2, dtype=torch.long), failure=torch.zeros(2, dtype=torch.long),
-            cost_shift=torch.zeros(2), residuals=module.residual_values(candidate, a, b, mass),
-            duality_gap=torch.zeros(2), relative_duality_gap=torch.zeros(2),
-            relative_plan_delta_l1=torch.zeros(2), kkt_error=torch.zeros(2),
-            stop_reason=torch.ones(2, dtype=torch.long), newton_steps=torch.zeros(2, dtype=torch.long), method="test")
+        count = len(cost)  # Refinement operates only on the stalled member.
+        candidate = torch.tensor([[[0., .4], [.4, 0.]]], dtype=torch.float64).expand(count, -1, -1).clone()
+        candidate[(cost.amax((-2, -1)) - cost.amin((-2, -1))) == 0] = .2
+        return candidate, dict(ok=torch.ones(count, dtype=torch.bool), error=torch.zeros(count),
+            iterations=torch.ones(count, dtype=torch.long), work_iterations=torch.ones(count, dtype=torch.long), failure=torch.zeros(count, dtype=torch.long),
+            cost_shift=torch.zeros(count), residuals=module.residual_values(candidate, a, b, mass),
+            duality_gap=torch.zeros(count), relative_duality_gap=torch.zeros(count),
+            relative_plan_delta_l1=torch.zeros(count), kkt_error=torch.zeros(count),
+            stop_reason=torch.ones(count, dtype=torch.long), newton_steps=torch.zeros(count, dtype=torch.long), method="test")
     monkeypatch.setattr(module, "entropy_subproblem_batch", uphill)
     plans, reports = module.solve_partial_batch(costs, kernels, kernels, config=dict(cost_scale=1., max_backtracks=1))
     assert [r["status"] for r in reports] == ["line_search_stalled", "converged"]
     torch.testing.assert_close(plans, torch.full_like(plans, .2), atol=0, rtol=0)
     assert reports[0]["history"][-1]["accepted_plan_delta_l1"] == 0.
+    assert reports[0]["history"][-1]["inner"]["precision_refinements"] == 2
+    assert reports[1]["history"][-1]["inner"]["precision_refinements"] == 0
 
 
 def test_cli_batch_overrides_and_config_defaults(tmp_path, monkeypatch):

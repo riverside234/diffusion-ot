@@ -52,10 +52,24 @@ def test_cli_solver_overrides_do_not_cross_between_stages(tmp_path, monkeypatch)
     assert seen[0]["partial"]["keep_mass"] == .75
 
 
-def test_revised_partial_recipe_matches_serial_and_preserves_constraints():
+@pytest.mark.parametrize("reference_kind", ["legacy_pot_control", "active_certified_recipe"])
+def test_partial_recipe_reference_agreement_and_constraints(reference_kind):
     from infoot_vit import infoot_fit
-    c = yaml.safe_load((infoot_fit.ROOT / "infoot_vit/configs/grouped_partial.yaml").read_text())
-    pc, mass = c["partial"]["solver"], c["partial"]["keep_mass"]
+    from infoot_vit.infoot_helper.partial import solver_config
+    if reference_kind == "legacy_pot_control":
+        # Keep the independent POT comparison at the fixed, well-conditioned
+        # synthetic settings used by the serial-equivalence suite. This is a
+        # numerical control, not either real experiment's parameter recipe.
+        # The sharper recipes' POT log-plan residual can
+        # exhaust its budget; a mutable YAML must not silently redefine this
+        # serial-reference fixture or weaken its convergence requirement.
+        pc = solver_config(dict(h=.7, reg=.4, lam=.1,
+                                max_outer_steps=600, max_inner_steps=20000))
+        mass = .8
+    else:
+        c = validate_config(yaml.safe_load((infoot_fit.ROOT / "infoot_vit/configs/grouped_partial.yaml").read_text()))
+        pc, mass = c["partial"]["solver"], c["partial"]["keep_mass"]
+        assert (pc["h"], pc["reg"], pc["lam"]) == (.35, .04, .035)
     g = torch.Generator().manual_seed(42)
     x = torch.randn(4, 32, 16, generator=g, dtype=torch.float64)
     y = torch.randn(4, 32, 16, generator=g, dtype=torch.float64) + .3
@@ -66,10 +80,30 @@ def test_revised_partial_recipe_matches_serial_and_preserves_constraints():
     assert torch.isfinite(plans).all() and (plans >= 0).all()
     assert all(r["status"] == "converged" for r in reports)
     for i, report in enumerate(reports):
-        serial, reference = solve_partial(cost[i], kx[i], ky[i], keep_mass=mass, config=pc)
+        if reference_kind == "legacy_pot_control":
+            serial, reference = solve_partial(cost[i], kx[i], ky[i], keep_mass=mass, config=pc)
+            assert reference["history"][-1]["inner"]["error"] <= pc["inner_tolerance"]
+        else:
+            # For the active recipe compare isolated and mixed-batch execution
+            # of the certified solver, not claim new POT equivalence. This
+            # catches pair indexing, retirement and warm-start contamination.
+            single, single_reports = solve_partial_batch(cost[i:i+1], kx[i:i+1], ky[i:i+1],
+                                                        keep_mass=mass, config=pc)
+            serial, reference = single[0], single_reports[0]
+            for audited in (report, reference):
+                for step in audited["history"]:
+                    inner = step["inner"]
+                    assert inner["convergence_reason"] == "primal_dual_certificate"
+                    tolerance = inner.get("certificate_tolerance", pc["inner_tolerance"])
+                    assert 0 < tolerance <= pc["inner_tolerance"]
+                    assert max(inner[k] for k in ("kkt_error", "relative_duality_gap",
+                                                 "relative_plan_delta_l1")) <= tolerance
         assert reference["status"] == "converged"
         torch.testing.assert_close(plans[i], serial, atol=1e-10, rtol=1e-7)
         assert report["history"][-1]["objective"] == pytest.approx(reference["history"][-1]["objective"], abs=1e-9)
+        assert report["history"][-1]["plan_delta_l1"] <= pc["outer_tolerance"]
+        assert reference["history"][-1]["plan_delta_l1"] <= pc["outer_tolerance"]
+        assert all(step["objective_delta"] <= pc["objective_tolerance"] for step in report["history"])
         assert report["mass_error"] <= pc["mass_tolerance"]
         assert max(report["row_cap_error"], report["column_cap_error"]) <= pc["feasibility_tolerance"]
         assert float(plans[i].sum()) == pytest.approx(mass, abs=pc["mass_tolerance"])

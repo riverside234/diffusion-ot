@@ -292,6 +292,21 @@ def _read_pair_inventory(path, *, resume, log):
     return entries
 
 
+def fit_identity(config, source, target, runtime):
+    """Shared exact identity for fitting and an explicit failed-pair repair."""
+    implementation = {name: file_hash(Path(__file__).with_name(name))
+        for name in ("infoot.py", "partial.py", "conditional.py", "fit_mapping.py", "storage.py",
+                     "sampling.py", "pair_selection.py", "plan_diagnostics.py")}
+    if config.get("pair_batch_size"):
+        implementation.update({name: file_hash(Path(__file__).with_name(name))
+            for name in ("partial_batch.py", "partial_newton.py", "pair_batch_fit.py", "pair_timing.py")})
+    fingerprint = digest(dict(config=config, source=source.artifact_id, target=target.artifact_id,
+        source_ids=source.ids, target_ids=target.ids,
+        storage=STORAGE_VERSION if config["mode"] == "grouped_partial" else "float64",
+        implementation=implementation, runtime=runtime))
+    return fingerprint, implementation
+
+
 def fit_mapping(config, *, root, output_root=None, resume=None):
     root = Path(root).resolve()
     if resume:
@@ -325,14 +340,7 @@ def _fit_mapping(config, *, root, directory, resume, log):
     compact = config["mode"] == "grouped_partial"
     source = source.subset(inspection["sampling"]["source"]["ordered_ids"])
     target = target.subset(inspection["sampling"]["target"]["ordered_ids"])
-    implementation = {name: file_hash(Path(__file__).with_name(name))
-                      for name in ("infoot.py", "partial.py", "conditional.py", "fit_mapping.py", "storage.py", "sampling.py", "pair_selection.py", "plan_diagnostics.py")}
-    if config.get("pair_batch_size"):
-        implementation.update({name: file_hash(Path(__file__).with_name(name))
-                               for name in ("partial_batch.py", "partial_newton.py", "pair_batch_fit.py", "pair_timing.py")})
-    fingerprint = digest(dict(config=config, source=source.artifact_id, target=target.artifact_id,
-                              source_ids=source.ids, target_ids=target.ids, storage=STORAGE_VERSION if compact else "float64",
-                              implementation=implementation, runtime=inspection["runtime"]))
+    fingerprint, implementation = fit_identity(config, source, target, inspection["runtime"])
     if resume:
         manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
         if manifest["fit_fingerprint"] != fingerprint:
