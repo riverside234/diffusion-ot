@@ -10,10 +10,10 @@ sampling:
   images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
-solver:  # Entropy-only trial after h=.36 retained 69.21% mass, with 94.47% normalized top-1.
+solver:  # Working baseline for full mapping; reg=.0575 raised normalized top-1 to 98.40%.
   h: 0.36  # Hold the neighborhood geometry and .20/.20 projection fixed.
-  lam: 0.070  # Hold MI fixed; do not change both objective weights in this trial.
-  reg: 0.0575  # Was .06; test coverage recovery, checking for stronger top-1 dominance.
+  lam: 0.070  # Hold MI fixed pending patch-plan and held-out image diagnostics.
+  reg: 0.06  # Restore measured baseline: 69.21% retained mass, 94.47% normalized top-1.
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000

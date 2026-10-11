@@ -213,7 +213,7 @@ generated-image review below:
 
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
-| Image router: `solver` | 0.36 | **0.0575** | 0.070 | 1,200 |
+| Image router: `solver` | 0.36 | **0.06** | 0.070 | 1,200 |
 | Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
 
 At fixed lam=.070/reg=.06, h=.35 gave 85.42% mean top-8 retained mass but
@@ -223,14 +223,23 @@ At fixed lam=.070/reg=.06, h=.35 gave 85.42% mean top-8 retained mass but
 This improves coverage over .375, but still leaves 30.79% discarded mass on
 average and little contribution from the other retained targets.
 
-The next candidate holds h=.36/lam=.070 and changes **only image reg from .06
-to .0575**. The small entropy reduction tests coverage recovery. It may also
-increase top-1 dominance; it is not a demonstrated diversity or image-quality
-improvement. Compare both metrics against the .06 baseline (`--reg .06`) and
-then use matched held-out images. Do not keep sharpening merely to maximize
-retained mass. Patch settings, mass, confidence, top-8 and .20/.20 projection
-stay fixed. See [the h=.36 analysis and entropy trial](../docs/analysis/infoot_vit_router_h036/README.md)
-and [the preceding bandwidth comparison](../docs/analysis/infoot_vit_router_h0375/README.md).
+The matched reg=.0575 trial converged in 258 iterations and recovered mean
+retained mass to **80.88%**, but normalized top-1 rose to **98.40%** (effective
+retained targets 1.091). The other seven targets receive only 1.60% of normalized
+weight on average. The coverage gain did not produce meaningful multi-target
+routing on these training-source probes. This does not prove reference copying
+or establish held-out image quality.
+
+The active recipe therefore **restores reg=.06**, keeping h=.36/lam=.070 as a
+working baseline for full fitting and matched held-out image evaluation. It
+still has concentrated routing and is not a validated optimum. Do not continue
+lowering entropy or raising MI solely to improve retained mass. The supplied
+`--tune` runs do not measure patch blur, confidence masks or generated images.
+Patch settings, mass, confidence, top-8 and .20/.20 projection stay fixed.
+Run without `--tune` to save a mapping; `--reg .0575` reproduces the sharper
+comparison settings if needed. See [the entropy-trial result and decision](../docs/analysis/infoot_vit_router_reg0575/README.md),
+[the earlier h=.36 review](../docs/analysis/infoot_vit_router_h036/README.md)
+and [the bandwidth comparison](../docs/analysis/infoot_vit_router_h0375/README.md).
 Use a fresh fit for changed settings. To reproduce an older h=.35 recipe,
 also restore `projection.bandwidth_multiplier` to `.20/.35`; a `--h` override
 alone changes the effective projection bandwidth as well as fitting h.
