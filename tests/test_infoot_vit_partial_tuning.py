@@ -60,7 +60,11 @@ def test_exact_pairs_match_serial_and_chunk_invariance_without_writes(tmp_path, 
         assert a["last_iteration"]["objective"] == pytest.approx(b["last_iteration"]["objective"], abs=1e-12)
     assert files(tmp_path) == before
     output = capsys.readouterr().out
-    assert '"mi_term"' in output and '"kkt_error"' in output and '"threshold_sweep"' in output
+    assert "mi_term=" in output and "kkt_error=" in output and "threshold:valid_fraction" in output
+    assert '"last_iteration"' not in output and "Partial pair 1/" not in output
+    summary_text = output.split("Partial tuning summary (not a saved mapping):")[-1]
+    assert len(summary_text.splitlines()) <= 20
+    assert report["pair_sampling"]["ordered_pairs_sha256"][:12] in summary_text
 
 
 def test_saved_selection_reused_with_changed_partial_settings_and_json_report(tmp_path, banks, monkeypatch, capsys):
@@ -77,6 +81,10 @@ def test_saved_selection_reused_with_changed_partial_settings_and_json_report(tm
     assert report["selection"]["kind"] == "saved_selection" and report["partial_solver"]["h"] == .9
     assert report["keep_mass"] == .75
     assert json.loads(output.read_text())["pairs"] == report["pairs"]
+    terminal = capsys.readouterr().out
+    assert "Saved partial tuning diagnostics:" in terminal and "Partial tuning summary" in terminal
+    assert '"implementation_sha256"' not in terminal and '"threshold_sweep"' not in terminal
+    assert "implementation_sha256" in json.loads(output.read_text())
     assert files(directory) == before
     with pytest.raises(FileExistsError):
         tune.tune_partial(c, root=tmp_path, from_fit=directory, report_path=output)
@@ -120,7 +128,9 @@ def test_mixed_failure_excluded_and_partial_cli_returns_failure_report(tmp_path,
     assert report["summary"]["feasibility_all_pairs"]["mass_error"]["count"] == 2
     assert report["partial_solver"]["h"] == .8 and report["image_solver"]["h"] == .7
     assert report["keep_mass"] == .75 and report["pairs"][0]["last_iteration"] == {}
-    assert "Partial pair failure" in capsys.readouterr().out
+    terminal = capsys.readouterr().out
+    assert "invalid_input:1" in terminal and "failure " in terminal
+    assert "objective terms(mean, converged)" in terminal
 
 
 def test_serial_tuning_and_all_invalid_projection_are_explicit(tmp_path, banks, capsys):
@@ -165,6 +175,15 @@ def test_outer_budget_and_serial_exception_are_not_accepted(tmp_path, banks, mon
     assert report["summary"]["status_counts"] == {"solver_error":2}
     assert all(r["error"] == "test inner failure" for r in report["pairs"])
     capsys.readouterr()
+    # A wholly failed large trial must stay pasteable and not claim zero errors
+    # when no residual measurements exist. Full pair details remain in report.
+    report["pairs"] *= 32
+    report["summary"] = tune._summary(report["pairs"])
+    tune._print_summary(report)
+    terminal = capsys.readouterr().out
+    assert "solver_error:64" in terminal and "mass_error=n/a" in terminal
+    assert terminal.count("  failure ") == 3 and "+61 other failed pairs" in terminal
+    assert len(terminal.splitlines()) <= 23
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA hardware unavailable locally")

@@ -704,8 +704,9 @@ partial h/lam/reg/mass exercises the actual candidate objective on the same pair
 - Pair sampling is uniform without replacement over selected `(source_id,
   target_id)` edges sorted by stable IDs. Defaults: 64 pairs, seed 42. If fewer
   pairs exist, all are tested and requested/actual counts are both reported.
-  Ordered sampled pairs, their hash, router ranks and probabilities are logged.
-  This is not a router-weighted sample; inspect the logged rank counts.
+  The console prints the sampling seed and a short pair hash. The optional JSON
+  report retains ordered pairs, full hashes, router ranks and probabilities.
+  This is not a router-weighted sample; inspect the report's rank counts.
 - Use `--partial-h`, `--partial-reg`, `--partial-lam`, `--partial-max-steps` and
   `--keep-mass`. Plain `--h/--reg/--lam` still change the **image router**.
 - `--pair-batch-size` controls the same exact batched solver as fitting, capped
@@ -713,18 +714,20 @@ partial h/lam/reg/mass exercises the actual candidate objective on the same pair
   selects the POT reference. Float64 costs, cached per-image fit kernels, solver
   arithmetic and projection stay on the configured CUDA/CPU device. CUDA is
   never silently replaced with CPU.
-- `--tune-log-every` controls outer progress (default 25, plus initial/terminal
-  states). The trial records independent pair failures and continues through the
+- `--tune-log-every` controls compact batch progress (default 25, plus the first
+  iteration and batch completion). Individual pair completions are not printed.
+  The trial records independent pair failures and continues through the
   sampled pairs; the full-fit's consecutive-failed-batch abort rule does not
   truncate this bounded diagnostic sample. Exit code 2 indicates a solver or
   projection diagnostic failure; 0 indicates successful sampled solves/probes.
-- Console output includes weighted/unweighted cost, MI and entropy; outer
-  deltas and line search; inner errors, KKT/duality diagnostics when the solver
-  exposes them; mass/capacity errors; iterations; failure reasons; runtime; and
-  fitted patch concentration. Summaries exclude failed pairs from success
-  metrics and explicitly count them. Final JSON retains each pair's last solver
-  record, inner-iteration/backtrack summaries, configuration and implementation
-  hashes. No complete 600-step histories or transport tensors are printed.
+- The final console summary is about 16 lines, ready to paste for tuning: image
+  and partial settings, projection settings, status counts, iterations, worst
+  residuals, signed weighted objective terms, kernel neighborhoods, fitted patch
+  concentration and projection coverage/spread. Missing measurements show `n/a`.
+  Failed pairs are counted separately and excluded from success metrics; at most
+  three failure examples are printed. Full JSON is **not dumped to the terminal**.
+  The optional JSON report retains every pair's last solver record, unweighted
+  MI/entropy, line-search and inner diagnostics, configuration and full hashes.
 - A **training-patch self-query** projection probe logs effective patch mixing,
   confidence, valid-token coverage, threshold sweeps and mapped-to-target
   variance/norm ratios. It uses the configured independent patch projection

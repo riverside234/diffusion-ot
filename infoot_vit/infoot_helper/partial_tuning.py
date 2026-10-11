@@ -165,6 +165,76 @@ def _summary(rows):
         note="Unweighted sampled-pair summaries; failures excluded from success metrics. No full routed image or held-out quality measurement.")
 
 
+def _fmt(value):
+    return f"{value:.5g}" if value is not None and math.isfinite(value) else "n/a"
+
+
+def _print_summary(report):
+    """Bound console output; keep full identities and pair records in JSON only."""
+    s, pc, ic = report["summary"], report["partial_solver"], report["image_solver"]
+    pairs, sample = report["pairs"], report["pair_sampling"]
+    def fields(stats, names, metric="mean"):
+        return " ".join(f"{label}={_fmt(stats.get(key, {}).get(metric))}" for label, key in names)
+    objective = fields(s["successful_objectives"], [(k, k) for k in ("objective", "cost", "mi_term", "entropy_term")])
+    delta = _stats([r["last_iteration"].get("plan_delta_l1") for r in pairs])
+    kernel = {name: {k:_stats([v[k] for v in values.values()])["mean"]
+        for k in ("mean_effective_neighbors", "mean_self_probability")}
+        for name, values in report["kernel_diagnostics"].items()}
+    projected = [r["projection"] for r in pairs if "projection" in r]
+    thresholds = sorted({v["threshold"] for r in projected for v in r["threshold_sweep"]})
+    coverage_by_threshold = {t: _stats([v["valid_fraction"] for r in projected
+        for v in r["threshold_sweep"] if v["threshold"] == t])["mean"] for t in thresholds}
+    coverage = " ".join(f"{t:g}:{_fmt(v)}" for t,v in coverage_by_threshold.items()) or "n/a"
+    statuses = ",".join(f"{k}:{v}" for k,v in sorted(s["status_counts"].items()))
+    lines = [
+        "Partial tuning summary (not a saved mapping):",
+        f"  {report['mode']} device={report['device']} float64 batch={report['actual_batch_limit']} "
+        f"pairs={sample['selected_pairs']}/{sample['population_pairs']} top_k={sample['effective_top_k']} "
+        f"seed={sample['seed']} pair_hash={sample['ordered_pairs_sha256'][:12]}",
+        f"  router={report['selection']['kind']} selection_hash={report['selection']['selection_sha256'][:12]} "
+        f"image h/reg/lam={ic['h']:g}/{ic['reg']:g}/{ic['lam']:g}",
+        f"  partial h/reg/lam={pc['h']:g}/{pc['reg']:g}/{pc['lam']:g} keep_mass={report['keep_mass']:g} "
+        f"cost_scale={pc['cost_scale']} acceleration={pc['inner_acceleration']}",
+        f"  projection image_h={report['image_projection_h']:g} patch_h={report['patch_projection_h']:g} "
+        f"threshold={report['confidence']['threshold']:g}",
+        f"  status={report['status']} [{statuses}] projection_failures={s['projection_failures']} "
+        f"seconds={report['seconds']:.1f} solver_seconds={report['solver_seconds']:.1f}",
+        f"  outer mean/max={_fmt(s['iterations_all_pairs']['mean'])}/{_fmt(s['iterations_all_pairs']['max'])} "
+        f"budget={pc['max_outer_steps']} candidate_delta_max={_fmt(delta['max'])} tol={pc['outer_tolerance']:g}",
+        "  feasibility(max): " + fields(s["feasibility_all_pairs"], [(k, k) for k in (
+            "mass_error", "row_cap_error", "column_cap_error")], "max") +
+        f" mass_tol={pc['mass_tolerance']:g} cap_tol={pc['feasibility_tolerance']:g}",
+        "  inner(max): " + fields(s["last_inner_diagnostics_all_pairs"], [(k, k) for k in (
+            "iterations", "error", "kkt_error", "relative_duality_gap")], "max") +
+        f" budget={pc['max_inner_steps']} tol={pc['inner_tolerance']:g}",
+        f"  objective terms(mean, converged): {objective}",
+        "  kernels(mean): " + " ".join(f"{name} neighbors={_fmt(v['mean_effective_neighbors'])} "
+            f"self_prob={_fmt(v['mean_self_probability'])}" for name,v in kernel.items()),
+        "  fitted(mean, converged): " + fields(s["successful_geometry"], [
+            ("effective_patches", "fitted_pair_effective_patches"), ("top1", "fitted_pair_top1_probability"),
+            ("cost_row_std", "mean_row_cost_std"), ("reg/cost_std", "reg_over_mean_row_cost_std")]),
+        "  projection(mean): " + fields(s["successful_projection"], [
+            ("effective_patches", "projected_effective_patches"), ("variance_ratio", "mapped_to_target_variance_ratio"),
+            ("norm_ratio", "mapped_to_target_norm_ratio")]),
+        "  coverage(mean): " + fields(s["successful_projection"], [
+            ("valid", "valid_fraction"), ("support_valid", "support_valid_fraction"), ("confidence", "confidence_mean")]) +
+        f" all_invalid_pairs={s['all_invalid_projection_pairs']}",
+        f"  threshold:valid_fraction(mean) {coverage}",
+    ]
+    failures = [r for r in pairs if r["status"] != "converged" or "projection_error" in r]
+    for row in failures[:3]:
+        reason = row.get("projection_error") or row.get("error")
+        inner = row["last_iteration"].get("inner", {})
+        detail = " ".join(str(reason).split())[:200] if reason else (
+            f"delta={_fmt(row['last_iteration'].get('plan_delta_l1'))} inner_error={_fmt(inner.get('error'))}")
+        lines.append(f"  failure {row['source_id']} -> {row['target_id']}: "
+                     f"{('projection_error' if 'projection_error' in row else row['status'])}; {detail}")
+    if len(failures) > 3:
+        lines.append(f"  +{len(failures)-3} other failed pairs; full details available with --tune-report.")
+    lines.append("  Training-patch probes only; not held-out image quality. n/a means no valid measurements.")
+    print("\n".join(lines), flush=True)
+
+
 @torch.no_grad()
 def tune_partial(raw, *, root, from_fit=None, pair_limit=64, seed=42, log_every=25, report_path=None):
     """Fit selected TRAINING pairs with exact production solvers, then discard plans."""
@@ -210,7 +280,9 @@ def tune_partial(raw, *, root, from_fit=None, pair_limit=64, seed=42, log_every=
         implementation_sha256={n:file_hash(Path(__file__).with_name(n)) for n in (
             "partial_tuning.py", "partial.py", "partial_batch.py", "partial_newton.py", "conditional.py")},
         projection_probe_note="Self-query training patches, float64 before storage; confidence/variance are not semantic quality. No decoder, held-out queries, or image-router mixture is evaluated.")
-    print(json.dumps(context, indent=2, allow_nan=False), flush=True)
+    print(f"Partial trial: h={pc['h']:g} reg={pc['reg']:g} lam={pc['lam']:g} "
+          f"keep_mass={mass:g} pairs={len(pairs)} batch={context['actual_batch_limit']} "
+          f"seed={seed} device={device}", flush=True)
     xi, yi = [{sid:i for i,sid in enumerate(bank.ids)} for bank in banks]
     cache_x, cache_y = {}, {}
     for row in pairs:
@@ -230,25 +302,23 @@ def tune_partial(raw, *, root, from_fit=None, pair_limit=64, seed=42, log_every=
         kx = torch.stack([cache_x[r["source_id"]][0] for r in block])
         ky = torch.stack([cache_y[r["target_id"]][0] for r in block])
         observed = [None]*len(block)
+        last_progress = -1
         def progress(plans, reports):
-            due = False
+            nonlocal last_progress
             for i,r in enumerate(reports):
-                if r is None:
-                    continue
-                observed[i] = r
-                last = r["history"][-1] if r["history"] else {}
-                iteration = last.get("iteration", 0)
-                due |= iteration == 1 or iteration % log_every == 0 or r["status"] != "running"
-                if r["status"] not in {"running", "converged"}:
-                    print("Partial pair failure: " + json.dumps(dict(block[i], status=r["status"],
-                        error=r.get("error"), last_iteration=last), allow_nan=False), flush=True)
-            if due:
-                last = [r["history"][-1] for r in observed if r is not None and r["history"]]
-                stats = {k:_stats([v.get(k) for v in last])["mean"] for k in ("objective", "cost", "information", "entropy", "plan_delta_l1")}
-                print("Partial batch progress: " + json.dumps(dict(batch=offset//size, pairs=len(block),
-                    outer_iteration=max((v["iteration"] for v in last), default=0),
-                    statuses=dict(Counter(r["status"] for r in observed if r)), **_weighted_terms(stats, pc)),
-                    allow_nan=False), flush=True)
+                if r is not None:
+                    observed[i] = r
+            last = [r["history"][-1] for r in observed if r is not None and r["history"]]
+            iteration = max((v["iteration"] for v in last), default=0)
+            done = sum(r is not None and r["status"] != "running" for r in observed)
+            if iteration != last_progress and (iteration == 1 or iteration % log_every == 0 or done == len(block)):
+                last_progress = iteration
+                failed = sum(r is not None and r["status"] not in {"running", "converged"} for r in observed)
+                objective = _stats([v.get("objective") for v in last])["mean"]
+                delta = _stats([v.get("plan_delta_l1") for v in last])["max"]
+                print(f"Partial batch {offset//size+1}/{math.ceil(len(pairs)/size)} outer={iteration}: "
+                      f"done={done}/{len(block)} failed={failed} objective_mean={_fmt(objective)} "
+                      f"delta_max={_fmt(delta)}", flush=True)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         begin = time.perf_counter()
@@ -291,9 +361,6 @@ def tune_partial(raw, *, root, from_fit=None, pair_limit=64, seed=42, log_every=
                 except (RuntimeError, ValueError) as error:
                     row["projection_error"] = str(error)
             rows.append(row)
-            print(f"Partial pair {len(rows)}/{len(pairs)}: {pair['source_id']} -> {pair['target_id']}, "
-                  f"status={row['status']}, outer={row['iterations']}, "
-                  f"effective_patches={row.get('geometry', {}).get('fitted_pair_effective_patches')}", flush=True)
     summary = _summary(rows)
     report = dict(context, status="converged" if not summary["failed_pairs"] and not summary["projection_failures"] else "failed",
         seconds=time.perf_counter()-started, solver_seconds=solver_seconds,
@@ -304,6 +371,5 @@ def tune_partial(raw, *, root, from_fit=None, pair_limit=64, seed=42, log_every=
             raise FileExistsError(f"Tuning report appeared during the run: {report_path}")
         write_json(report_path, report)
         print(f"Saved partial tuning diagnostics: {report_path}", flush=True)
-    print("Partial tuning result (not a saved mapping):", flush=True)
-    print(json.dumps(report, indent=2, allow_nan=False), flush=True)
+    _print_summary(report)
     return report
