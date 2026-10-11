@@ -9,10 +9,10 @@ sampling:
   images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
-solver:  # Balanced IMAGE router; separate from partial.solver below.
-  h: 0.35  # Less image-KDE smoothing after test2's near-uniform router.
+solver:  # Balanced IMAGE router; preserve it while revising PATCH fitting.
+  h: 0.35
   lam: 0.075
-  reg: 0.06  # Between the previous .05 and over-diffuse .075 recipes.
+  reg: 0.06
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000
@@ -21,10 +21,10 @@ solver:  # Balanced IMAGE router; separate from partial.solver below.
   outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
   keep_mass: 0.80  # Preserve more condition coverage; transported mass, NOT a patch count.
-  solver:  # Exact PARTIAL patch-pair InfoOT; visual quality still needs lab validation.
-    h: 0.45
-    lam: 0.025  # Reduce MI amplification of cost contrast after the first update.
-    reg: 0.10
+  solver:  # Revised fit: sharper patch geometry and less entropic mixing. Fresh fit required.
+    h: 0.35  # Was .45: reduce smoothing in the FITTED patch MI geometry.
+    lam: 0.025  # Hold MI pressure fixed; do not amplify it while reducing entropy.
+    reg: 0.05  # Was .10: reduce diffuse patch correspondences at their source.
     cost_scale: mean
     max_outer_steps: 600
     max_inner_steps: 10000
@@ -33,7 +33,8 @@ partial:
     mass_tolerance: 1.0e-8
     outer_tolerance: 1.0e-7
 projection:
-  bandwidth_multiplier: 0.5  # Projection AND pair-selection h: image .175; patches .225.
+  bandwidth_multiplier: 0.5714285714285715  # Image projection AND pair-selection h = .20.
+  patch_bandwidth: 0.20  # Absolute patch projection h; independent of image bandwidth.
   selection: mean
   top_k_images: null
   seed: 0

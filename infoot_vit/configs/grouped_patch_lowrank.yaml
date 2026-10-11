@@ -11,8 +11,8 @@ device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
   h: 0.7  # Requested fit bandwidth; projection uses 0.2.
-  lam: 0.075  # Reduce router MI/entropy ratio from 2.0 to 1.0.
-  reg: 0.075
+  lam: 0.075  # Retain router MI while reducing entropic averaging; h=.7 trial, not a validated optimum.
+  reg: 0.05  # Was .075; start a fresh fit for changed objective weights.
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000
@@ -39,8 +39,8 @@ estimator:
   exact: false  # Tiny dense-reference tests only; never use for full banks.
 optimizer:
   seed: 4203
-  lam: 0.1
-  reg: 0.05
+  lam: 0.05  # Was .10; halve MI with entropy, preserving their ratio and emphasizing geometric cost.
+  reg: 0.025  # Was .05; less patch-plan averaging with broad h=.7 kernels.
   step_size: 1.0
   max_steps: 300
   max_backtracks: 12

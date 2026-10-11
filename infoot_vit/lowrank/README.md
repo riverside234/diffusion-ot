@@ -75,7 +75,7 @@ The active recipe retains that method but now requests fit `h=0.7` and projectio
 For console-only router parameter trials, use:
 
 ```bash
-python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.075 --reg 0.075
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.075 --reg 0.05
 ```
 
 This fits only the image router on the same sampled training images. No logs,
@@ -97,10 +97,30 @@ The old router used lam = 0.10, reg = 0.05, 300 steps. Its inner Sinkhorn solves
 passed but its outer residual remained above tolerance. The revised weights
 reduce MI pressure relative to entropy; they are a lab experiment, not a claim
 of optimal translation quality. The latest requested experiment sets both
-`image_solver.h` and `kernel.h` to **0.7**, keeping lam/reg unchanged.
+`image_solver.h` and `kernel.h` to **0.7**. Its next fitting trial uses
+**image reg=0.05, lam=0.075**, and **patch optimizer reg=0.025, lam=0.05**.
+Reducing image entropy targets diffuse routing. Halving both patch weights
+relative to the previous .05/.10 emphasizes geometric cost while retaining
+the patch MI/entropy ratio of 2. These are provisional choices, not values
+determined by h alone or validated on real banks at h=0.7. Start a fresh fit;
+the earlier h=0.4 failure does not establish convergence of this setting.
 `projection.bandwidth_multiplier: 0.2857142857142857` sets both projection h
 values to **0.2**. Actual Gaussian sigma is still h times each domain's saved
 training RMS scale, rather than an absolute feature-space distance of 0.2.
+
+When testing a new `grouped_patch_lowrank` fit from this recipe, make the
+projection setting explicit:
+
+```bash
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/FIT_DIRECTORY --query-bank data/infoot_vit/cat_val --count 16 --projection-bandwidth 0.20 --generate --device cuda
+```
+
+Testing reads the **saved fit configuration**, not the current YAML. With both
+saved fit bandwidths at `0.70`, this override sets **image and patch projection
+h to 0.20**. Check `image_projection_h` and `patch_projection_h` in the test's
+`logs/<attempt>/queries.jsonl`. An older fit with different image/patch fit
+bandwidths will not necessarily produce two equal projection bandwidths from
+this shared multiplier. Saved transport plans remain unchanged.
 
 The shared balanced solver now checks the **full cost - lam*MI + reg*entropy**
 objective before accepting a Sinkhorn update. If needed, it halves the step

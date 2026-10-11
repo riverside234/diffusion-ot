@@ -11,6 +11,7 @@ from .feature_bank import digest, save_tensor, write_json
 from .partial import distance
 from .partial_batch import solve_partial_batch
 from .storage import store_plan_state, validate_plan
+from .plan_diagnostics import patch_plan_concentration
 
 
 def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, selected_pairs, done, log):
@@ -26,6 +27,7 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
                for i, sid in enumerate(source.ids) for j, tid in enumerate(target.ids)
                if (sid, tid) in selected_pairs and (sid, tid) not in done]
     failures = []
+    geometry_rows = []
     index_path = directory / "pairs.jsonl"
     started = time.perf_counter()
     initial_done = len(done)
@@ -37,6 +39,12 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
             failed_pairs=len(failures), elapsed_seconds=time.perf_counter()-started,
             failures=[{k: v for k, v in row.items() if k != "report"} for row in failures],
             resume_policy="Reuse registered successful pairs; restart unfinished/failed pairs from exact float64 feasible initialization.")
+        if geometry_rows:
+            report["completed_pair_geometry"] = dict(
+                count=len(geometry_rows), population="new successes in this attempt; excludes failures and previously registered pairs",
+                statistics={key: dict(min=min(r[key] for r in geometry_rows),
+                    mean=sum(r[key] for r in geometry_rows)/len(geometry_rows), max=max(r[key] for r in geometry_rows))
+                    for key in ("fitted_pair_effective_patches", "fitted_pair_top1_probability", "fitted_pair_normalized_entropy", "mean_row_cost_std")})
         write_json(directory / "pair_batch_report.json", report)
         log.write_json("pair_batch_report.json", report)
         manifest.update(pair_count=len(done), failed_pair_count=len(failures))
@@ -60,6 +68,10 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
         indices = torch.tensor([(i, j) for i, j, *_ in batch], device=x.device, dtype=torch.long)
         # Costs and cached per-image kernels are gathered on the selected device.
         costs = distance(x[indices[:, 0]], y[indices[:, 1]])
+        scales = costs.mean((-1, -2)) if pc["cost_scale"] == "mean" else costs.new_full((len(batch),), pc["cost_scale"])
+        # One small transfer outside solver loops. Compare entropy strength with
+        # within-row geometric contrast, not just the mean-normalized cost (~1).
+        cost_spread = (costs.std(-1, unbiased=False).mean(-1) / scales).detach().cpu().tolist()
         kx, ky = shared["kx"][indices[:, 0]], shared["ky"][indices[:, 1]]
         a = x.new_full((x.shape[1],), 1 / x.shape[1])
         b = y.new_full((y.shape[1],), 1 / y.shape[1])
@@ -148,9 +160,14 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
                 journal(index_path, entry)
                 done[sid, tid] = entry
                 _cleanup_latest(directory, entry, log)
+                geometry = {k: float(v) for k, v in patch_plan_concentration(snapshots[member]).items()}
+                geometry.update(mean_row_cost_std=cost_spread[member],
+                    reg_over_mean_row_cost_std=pc["reg"]/cost_spread[member] if cost_spread[member] > 0 else None)
+                geometry_rows.append(geometry)
+                log.append_jsonl("pair_geometry.jsonl", dict(source_id=sid, target_id=tid, **geometry))
                 log.event("pair_completed", source_id=sid, target_id=tid, completed_pairs=len(done),
                     total_pairs=len(selected_pairs), status=report["status"], last_iteration=record,
-                    storage=saved["storage"])
+                    storage=saved["storage"], geometry=geometry)
 
         try:
             solve_partial_batch(costs, kx, ky, keep_mass=mass, config=pc, on_step=progress)

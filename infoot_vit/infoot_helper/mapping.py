@@ -20,6 +20,7 @@ from .pair_selection import selection_edges
 from .sampling import sample_ids, sampling_record
 from .device import resolve_device, move
 from .mapping_manifest import load_mapping_manifest
+from .plan_diagnostics import patch_plan_concentration
 
 
 @dataclass
@@ -112,6 +113,7 @@ class FeatureMapper:
                 p = ys.shape[1]
                 self.patch_groups = {tid: list(range(j * p, (j + 1) * p)) for j, tid in enumerate(ti)}
         self.pairs = {}
+        self._pair_geometry = {}  # Scalar diagnostics only; do not cache dense plans.
         if self.mode == "grouped_partial":
             if "pair_selection" in manifest:
                 selection = json.loads(checked_file(directory, manifest["pair_selection"]).read_text(encoding="utf-8"))
@@ -150,7 +152,8 @@ class FeatureMapper:
             if manifest["schema"] == "siglip_infoot_mapping_v3" and kernel_state.get("storage", {}).get("version") != STORAGE_VERSION:
                 raise ValueError("Compact mappings require float32 kernel storage metadata.")
             self.shared = move(load_kernels(kernel_state),self.device)
-            projection_h = self.config["partial"]["solver"]["h"] * multiplier
+            patch_fit_h = self.config["partial"]["solver"]["h"]
+            projection_h = self.config["projection"].get("patch_bandwidth", patch_fit_h * multiplier)
             if (projection_h != self.shared["h_projection"] or
                     self.config["projection"]["confidence"] != manifest["config"]["projection"]["confidence"]):
                 # Calibrate on TRAINING support at the actual projection h, never on queries.
@@ -158,7 +161,7 @@ class FeatureMapper:
                     self.config["projection"]["confidence"]) for i, x in enumerate(self.x)]
             self.shared["h_projection"] = projection_h
             self.patch_projection_h = projection_h
-            if multiplier == 1:
+            if projection_h == patch_fit_h:
                 self.projection_ky = self.shared["ky"]
             else:
                 self.projection_ky = torch.stack([
@@ -236,6 +239,11 @@ class FeatureMapper:
             target_kernel=self.projection_ky[j],query_logs=context)
         diag["weight_row_sums"] = diag["weights"].sum(1)
         diag["patch_entropy"] = -(diag["weights"]*diag["weights"].clamp_min(1e-300).log()).sum(1)
+        if (sid, tid) not in self._pair_geometry:
+            self._pair_geometry[sid, tid] = patch_plan_concentration(pair["plan"])
+        diag["plan_geometry"] = self._pair_geometry[sid, tid]
+        posterior = (context + pair["a"].log()[None]).softmax(1)
+        diag["query_source_effective_patches"] = (-torch.special.xlogy(posterior, posterior).sum(1)).exp()
         return candidate,g,diag,pair["storage_validation"]["confidence_roundoff_tolerance"]
 
     @torch.no_grad()
@@ -333,6 +341,7 @@ class FeatureMapper:
                         accounting_error, effective = 0., 0.
                         underflow_rows = log_retry_rows = 0
                         retention_roundoff_max = 0.
+                        geometry_totals = {}
                         for i, sid in enumerate(self.source.ids):
                             logs = self._partial_query(patches,i)
                             for tid in self.neighbors[sid]:
@@ -358,6 +367,10 @@ class FeatureMapper:
                                 accounting_error = max(accounting_error, float((budget - route).abs().max()))
                                 patch_entropy = diag["patch_entropy"]
                                 effective += float((route * g * patch_entropy.exp()).sum())
+                                if "plan_geometry" in diag:  # Exact dense partial diagnostics.
+                                    for name, value in dict(diag["plan_geometry"],
+                                            query_source_effective_patches=diag["query_source_effective_patches"]).items():
+                                        geometry_totals[name] = geometry_totals.get(name, 0.) + (route * g * value).sum()
                         cf = settings["confidence"]
                         positive = confidence > cf["mass_floor"]
                         mapped = torch.zeros_like(feature_sum)
@@ -370,6 +383,8 @@ class FeatureMapper:
                             within_image_effective_patches=effective / float(confidence.sum()) if confidence.sum() > 0 else 0.,
                             confidence_min=float(confidence.min()), confidence_mean=float(confidence.mean()))
                         detail["retention_roundoff_clipped_max"] = retention_roundoff_max
+                        detail.update({name: float(value / confidence.sum()) if confidence.sum() > 0 else 0.
+                                       for name, value in geometry_totals.items()})
                 cf = settings["confidence"]
                 mask = ((confidence > cf["mass_floor"]) & (confidence >= cf["threshold"])) if self.is_partial else torch.ones(p, dtype=torch.bool,device=self.device)
                 if not torch.isfinite(mapped).all():
@@ -435,7 +450,7 @@ class FeatureMapper:
         manifest = dict(schema="infoot_mapped_features_v2", mapper_id=self.manifest["artifact_id"],
             projection_implementation_sha256=file_hash(Path(__file__)),
             projection_dependency_sha256={name: file_hash(Path(__file__).with_name(name))
-                for name in ("conditional.py", "partial.py", "feature_bank.py", "storage.py", "pair_selection.py", "device.py", "mapping_manifest.py")},
+                for name in ("conditional.py", "partial.py", "feature_bank.py", "storage.py", "pair_selection.py", "device.py", "mapping_manifest.py", "plan_diagnostics.py")},
             mode=self.mode, query_bank_id=bank.artifact_id, ids=ids, query_domain=bank.manifest["domain"],
             representation=bank.representation, projection=self.config["projection"],
             output=dict(file="mapped.pt", sha256=file_hash(path)), diagnostics=result.diagnostics)
@@ -453,6 +468,7 @@ def mapping_summary(result, query, source, target, *, confidence_settings=None):
         if mask is None:
             population, means = x.flatten(0, 1), x.mean(1)
             position_variance = float(x.var(0, unbiased=False).mean())
+            within_variance = float(x.var(1, unbiased=False).mean())
         else:
             valid = mask.detach().to(x.device)
             population = x[valid]
@@ -465,9 +481,12 @@ def mapping_summary(result, query, source, target, *, confidence_settings=None):
             observed_positions = position_counts > 0
             position_variance = (float((position_energy[observed_positions]
                 / position_counts[observed_positions, None]).mean()) if observed_positions.any() else None)
+            within_variance = (float(((x.square() * valid[..., None]).sum((1, 2))[active]
+                / (counts[active] * x.shape[-1]) - means.square().mean(1)).clamp_min(0).mean()) if active.any() else None)
         return dict(images=len(x), valid_images=len(means), valid_tokens=len(population),
             norm_mean=float(population.norm(dim=1).mean()) if len(population) else None,
             token_variance=float(population.var(0, unbiased=False).mean()) if len(population) else None,
+            within_image_token_variance=within_variance,
             corresponding_patch_variance_across_images=position_variance,
             image_mean_variance=float(means.var(0, unbiased=False).mean()) if len(means) else None)
     confidence = result.match_confidence.detach().double()
@@ -501,12 +520,25 @@ def mapping_summary(result, query, source, target, *, confidence_settings=None):
             if values:
                 routing[key] = dict(min=min(values), mean=sum(values)/len(values), max=max(values))
         report["whole_map_routing"] = routing
-        report["mapped_to_target_spread_ratio"] = {key: report["mapped"][key] / report["target_support"][key]
-            if report["mapped"][key] is not None and report["target_support"][key] else None
-            for key in ("norm_mean", "token_variance", "image_mean_variance", "corresponding_patch_variance_across_images")}
         report["routing_note"] = "Raw routing precedes top-k/selection; retained routes are explicitly normalized. " \
             "Feature spread compares this query set with the full target bank; it is descriptive, not a quality score. " \
             "Top-1 whole-map conditioning is target-code retrieval, not evidence of source-preserving translation."
+    report["mapped_to_target_spread_ratio"] = {key: report["mapped"][key] / report["target_support"][key]
+        if report["mapped"][key] is not None and report["target_support"][key] else None
+        for key in ("norm_mean", "token_variance", "within_image_token_variance", "image_mean_variance", "corresponding_patch_variance_across_images")}
+    if result.diagnostics["mode"] == "grouped_partial":
+        rows = result.diagnostics["queries"]
+        geometry = {}
+        for key in ("image_projection_h", "patch_projection_h", "image_effective_targets", "image_max_weight",
+                    "fitted_pair_effective_patches", "fitted_pair_top1_probability", "fitted_pair_normalized_entropy",
+                    "query_source_effective_patches", "within_image_effective_patches"):
+            values = [r[key] for r in rows if key in r]
+            if values:
+                geometry[key] = dict(min=min(values), mean=sum(values)/len(values), max=max(values))
+        report["partial_geometry"] = geometry
+        report["partial_geometry_note"] = ("Fitted row statistics precede projection; source-neighborhood and projected-patch "
+            "statistics include query smoothing. Dense pair metrics are weighted by routing and retained/support-valid mass. "
+            "Their effective counts are descriptive, not additive or semantic correctness scores.")
     if confidence_settings is not None and result.diagnostics["mode"] in {"grouped_partial", "grouped_partial_lowrank"}:
         active_threshold = confidence_settings["threshold"]
         mass_floor = confidence_settings["mass_floor"]

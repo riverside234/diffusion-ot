@@ -41,7 +41,9 @@ def main(argv=None):
     p.add_argument("--confidence-threshold", type=float,
                    help="Partial mapping only: override token validity threshold without refitting. Recorded in mapped metadata.")
     p.add_argument("--projection-bandwidth", type=float,
-                   help="Absolute image-router projection h (patch h for patch_global). The same multiplier scales patch kernels; saved plans stay fixed.")
+                   help="Absolute image-router projection h (patch h for patch_global). Also scales patch kernels unless patch_bandwidth is set; saved plans stay fixed.")
+    p.add_argument("--patch-projection-bandwidth", type=float,
+                   help="Dense grouped_partial only: absolute patch projection h, independent of image routing. No refitting.")
     p.add_argument("--top-k-images", type=int,
                    help="Retain and renormalize K target-image weights; 0 keeps all. Partial modes still use saved pairs only.")
     p.add_argument("--allow-failed-pairs", action="store_true",
@@ -53,6 +55,8 @@ def main(argv=None):
         p.error("--confidence-threshold must be finite and in [0,1]")
     if a.projection_bandwidth is not None and (not math.isfinite(a.projection_bandwidth) or a.projection_bandwidth <= 0):
         p.error("--projection-bandwidth must be finite and positive")
+    if a.patch_projection_bandwidth is not None and (not math.isfinite(a.patch_projection_bandwidth) or a.patch_projection_bandwidth <= 0):
+        p.error("--patch-projection-bandwidth must be finite and positive")
     if a.top_k_images is not None and a.top_k_images < 0:
         p.error("--top-k-images must be nonnegative (0 keeps all)")
     torch.set_num_threads(a.threads)
@@ -61,7 +65,7 @@ def main(argv=None):
         m = load_mapping_manifest(a.mapping, allow_failed_pairs=a.allow_failed_pairs)
         a.steps, a.guidance = generation_settings(m["config"]["mode"], a.steps, a.guidance)
         projection = projection_settings(m["config"], a.confidence_threshold,
-            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images)
+            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth)
         q = json.loads((a.query_bank / "manifest.json").read_text(encoding="utf-8"))
         training_ids = set(m["source_ids"]) | set(m["target_ids"])
         if m.get("schema") in {"siglip_infoot_mapping_v3", "siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
@@ -86,7 +90,7 @@ def main(argv=None):
     with RunLog(output, "mapping_test", vars(a)) as log:
         m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
         projection = projection_settings(m["config"], a.confidence_threshold,
-            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images)
+            bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth)
         # Set overrides BEFORE loading cached KDEs, factors and support thresholds.
         mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log,
                                     allow_failed_pairs=a.allow_failed_pairs)
@@ -112,9 +116,15 @@ def generation_settings(mode, steps, guidance):
             (2.0 if partial else 1.5) if guidance is None else guidance)
 
 
-def projection_settings(config, threshold, *, bandwidth=None, top_k_images=None):
+def projection_settings(config, threshold, *, bandwidth=None, top_k_images=None, patch_bandwidth=None):
     """Projection-only comparison; never mutate fit metadata or refit a plan."""
     projection = deepcopy(config["projection"])
+    if patch_bandwidth is not None:
+        if config["mode"] != "grouped_partial":
+            raise ValueError("--patch-projection-bandwidth applies only to dense grouped_partial.")
+        if isinstance(patch_bandwidth, bool) or not math.isfinite(patch_bandwidth) or patch_bandwidth <= 0:
+            raise ValueError("Patch projection bandwidth must be finite and positive.")
+        projection["patch_bandwidth"] = patch_bandwidth
     if threshold is not None:
         if config["mode"] not in {"grouped_partial", "grouped_partial_lowrank"}:
             raise ValueError("--confidence-threshold applies only to partial mappings.")

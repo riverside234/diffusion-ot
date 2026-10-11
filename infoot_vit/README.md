@@ -120,8 +120,11 @@ For grouped modes, **`--projection-bandwidth` is the absolute image-router h**:
 the multiplier is `requested_h / saved_router_fit_h`, and that same multiplier
 scales the patch fit bandwidth. Example: router fit h=0.35 and patch fit h=0.45,
 with `--projection-bandwidth 0.20`, gives router projection h=0.20 and patch
-projection h≈0.25714. This is not two independent bandwidth settings. Each
-query log records `image_projection_h` and `patch_projection_h`.
+projection h≈0.25714 when no independent patch bandwidth is set. Dense
+`grouped_partial` now also accepts **`--patch-projection-bandwidth`**, or
+`projection.patch_bandwidth` in YAML. That absolute patch bandwidth takes
+precedence over the shared multiplier. Old artifacts without this field keep
+their original behavior. Each query logs both actual bandwidths.
 
 ```bash
 python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<partial-fit> --query-bank data/infoot_vit/cat_val --projection-bandwidth 0.20 --top-k-images 4 --generate --steps 40 --guidance 2.0
@@ -184,7 +187,7 @@ images. Train/validation/test manifests are never mixed. Replace `--dry-run`
 with an actual fit only after reviewing its resource estimate.
 
 For each fitted source image, the saved router's conditional probabilities at
-the fit bandwidth rank target images, with stable target-ID tie breaking. The
+the configured image projection bandwidth rank target images, with stable target-ID tie breaking. The
 eight selected pairs and probabilities are saved in `pair_selection.json`.
 Selection uses the serialized router promoted to float64, so new and resumed
 fits use the same router. Only these pairs are solved. Set `fit_pair_top_k: null`
@@ -201,16 +204,17 @@ these estimates are neither measured peak memory nor a disk reservation.
 
 ### Exact GPU batches for the top-8 experiment
 
-The latest `results/vit_infoot_top8/test2` run passed the image router in 141
+The earlier `results/vit_infoot_top8/test2` run passed the image router in 141
 iterations, but all 9,797 recorded pairs exhausted the inner 10,000-step budget.
 Passing mass/capacity checks alone did not establish an optimal partial plan.
 The batched solver now groups each capacity projection with fixed mass, using
-exact log-domain dual block updates. The revised experimental recipe is:
+exact log-domain dual block updates. The current recipe incorporates the later
+generated-image review below:
 
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
 | Image router: `solver` | 0.35 | 0.06 | 0.075 | 1,200 |
-| Partial patch pairs: `partial.solver` | 0.45 | 0.10 | 0.025 | 600 |
+| Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
 
 Strict log-plan, outer, capacity and mass tolerances remain unchanged; the
 partial inner solver additionally checks a relative primal-dual gap of `1e-10`.
@@ -224,9 +228,10 @@ query confidence and does not fix solver convergence or top-8 discarded mass.
 See [the test2 analysis](../docs/analysis/vit_infoot_top8_test2/README.md), and
 [the earlier router failure](../docs/analysis/vit_infoot_top8_300/README.md).
 
-The top-8 dense partial recipe uses `projection.bandwidth_multiplier: 0.5`:
-projection `h` is 0.175 for the image router and 0.225 for patch pairs, while fit
-`h` is 0.35/0.45. **New pair selection uses the same image projection bandwidth
+The top-8 dense partial recipe uses `projection.bandwidth_multiplier: 0.20/0.35`
+(the YAML stores the numeric value) and `projection.patch_bandwidth: 0.20`:
+projection `h` is **0.20 for both stages**, while fit `h` is 0.35/0.35.
+**New pair selection uses the same image projection bandwidth
 as mapping** (previously it incorrectly used the broader fitting bandwidth).
 Selection records its bandwidth and retained/discarded routing mass in
 `pair_selection.json` and `pair_selection_report.json`. This setting is stored in new mapping artifacts; editing
@@ -246,6 +251,35 @@ python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml
 CLI `--h/--reg/--lam/--max-outer-steps` affect only `solver`. The independent
 `--partial-h/--partial-reg/--partial-lam/--partial-max-steps` affect only
 `partial.solver`. Use `--keep-mass` for a fresh matched mass ablation.
+
+#### Generated-image review: revise fitting, retain broad projection
+
+The `grouped_partial_20261010T200111Z_f15deac3_20261010T235605Z_66fa3e`
+test used 15,987 successful pairs out of 16,000. Its images remain blurred:
+projection averages an effective 102 target patches per token, and mapped token
+variance is 20.3% of the dog bank's. Even the two >99.5% top-1 image routes
+retain broad patch mixtures. Failed routes lose only 0.23% mass on average.
+See the [analysis, reproducible statistics and comparison commands](../docs/analysis/infoot_vit_grouped_partial_20261010/README.md).
+
+The current **fitting** change is patch `h: .45 -> .35`, `reg: .10 -> .05`;
+patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings
+remain fixed. Projection stays at **.20**, with .30 available for comparison;
+top-1 truncation is not enabled. These are hypotheses requiring lab images,
+not a measured optimum. Keep guidance/steps fixed while comparing fits.
+
+```bash
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<new-fit> --query-bank data/infoot_vit/cat_val16 --count 16 --projection-bandwidth 0.20 --patch-projection-bandwidth 0.20 --generate --steps 40 --guidance 1.5 --solver euler --seed 20260903
+```
+
+New batched fitting logs `pair_geometry.jsonl` on each completed pair, and
+`pair_batch_report.json` summarizes the successes in that attempt even if other
+pairs fail. Metrics include retained-mass-weighted fitted row entropy/effective
+patch count/top-1 probability and mean-normalized cost contrast. Complete
+`fit_report.json` and `pair_diagnostics.jsonl` cover all registered successes.
+Mapping now separates fitted-plan concentration, query patch-neighborhood
+concentration and final projected-patch concentration, and reports variance
+within each token set. Support thresholds are recalibrated on training patches
+when patch projection h changes. No plan is fitted during mapping.
 
 After fitting, compare thresholds on the **same validation IDs and noise seeds**
 without refitting or modifying the fit artifact:

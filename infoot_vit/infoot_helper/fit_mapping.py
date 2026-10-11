@@ -20,6 +20,7 @@ from .sampling import sample_ids, sampling_record
 from .storage import VERSION as STORAGE_VERSION, store_plan_state, validate_plan, store_kernels, load_kernels
 from .pair_selection import select_pairs, selection_edges
 from .device import resolve_device, move
+from .plan_diagnostics import patch_plan_concentration
 
 MODES = {"patch_global", "whole_map", "grouped_patch", "grouped_partial"}
 CONFIDENCE = dict(support_calibration="fit_leave_one_out_log_density", support_quantile=.01,
@@ -65,9 +66,14 @@ def validate_config(config):
         raise ValueError("Training sampling and pair fitting settings apply only to grouped_partial.")
     config["solver"] = solver_config(config.get("solver"))
     projection = config.get("projection", {})
-    if unknown := projection.keys() - (PROJECTION.keys() | {"confidence"}):
+    if unknown := projection.keys() - (PROJECTION.keys() | {"confidence", "patch_bandwidth"}):
         raise ValueError(f"Unknown projection settings: {sorted(unknown)}")
     projection = PROJECTION | projection
+    if "patch_bandwidth" in projection:
+        h_patch = projection["patch_bandwidth"]
+        if (mode != "grouped_partial" or isinstance(h_patch, bool)
+                or not isinstance(h_patch, (int, float)) or not math.isfinite(h_patch) or h_patch <= 0):
+            raise ValueError("patch_bandwidth must be finite and positive, and applies only to dense grouped_partial.")
     if (not math.isfinite(projection["bandwidth_multiplier"]) or projection["bandwidth_multiplier"] <= 0
             or type(projection["query_chunk_size"]) is not int or projection["query_chunk_size"] < 1
             or projection["selection"] not in {"mean", "argmax", "sample"}
@@ -311,7 +317,7 @@ def _fit_mapping(config, *, root, directory, resume, log):
     source = source.subset(inspection["sampling"]["source"]["ordered_ids"])
     target = target.subset(inspection["sampling"]["target"]["ordered_ids"])
     implementation = {name: file_hash(Path(__file__).with_name(name))
-                      for name in ("infoot.py", "partial.py", "conditional.py", "fit_mapping.py", "storage.py", "sampling.py", "pair_selection.py")}
+                      for name in ("infoot.py", "partial.py", "conditional.py", "fit_mapping.py", "storage.py", "sampling.py", "pair_selection.py", "plan_diagnostics.py")}
     if config.get("pair_batch_size"):
         implementation.update({name: file_hash(Path(__file__).with_name(name))
                                for name in ("partial_batch.py", "pair_batch_fit.py")})
@@ -465,7 +471,7 @@ def _fit_mapping(config, *, root, directory, resume, log):
                 print("Router diagnostic: selected pairs retain less than 5% of probability. "
                       "Inspect router h/reg/lam and mapping images; fit convergence alone does not establish useful routing.", flush=True)
             pc = config["partial"]["solver"]
-            h_projection = pc["h"] * config["projection"]["bandwidth_multiplier"]
+            h_projection = config["projection"].get("patch_bandwidth", pc["h"] * config["projection"]["bandwidth_multiplier"])
             if "pair_kernels" in manifest:
                 saved_shared = torch.load(checked_file(directory, manifest["pair_kernels"]), weights_only=True)
                 shared = load_kernels(saved_shared)
@@ -579,6 +585,7 @@ def summarize_fit(directory, manifest):
                 p.new_full((len(p),), 1/len(p)), p.new_full((p.shape[1],), 1/p.shape[1]), 1., state["config"], balanced=True)
     if manifest["config"]["mode"] == "grouped_partial":
         stats = dict(pair_count=0, fitted_mass_min=1., fitted_mass_max=0., row_cap_error_max=0., column_cap_error_max=0.)
+        geometry_rows = []
         stats.update(quantization_l1_error_max=0., quantization_underflow_entries=0, stored_mass_min=1., stored_mass_max=0.)
         with (Path(directory) / "pairs.jsonl").open(encoding="utf-8") as index, (
                 Path(directory) / "pair_diagnostics.jsonl").open("w", encoding="utf-8") as handle:
@@ -592,6 +599,9 @@ def summarize_fit(directory, manifest):
                     source_mass_weighted_retention=float((r * state["a"]).sum()), target_mass_weighted_retention=float((c * state["b"]).sum()))
                 summary.update({k: state["report"][k] for k in ("status", "mass", "mass_error", "row_cap_error", "column_cap_error", "cost_scale")})
                 summary["last_iteration"] = state["report"]["history"][-1]
+                geometry = {k: float(v) for k, v in patch_plan_concentration(state["plan"].double()).items()}
+                summary["geometry"] = geometry
+                geometry_rows.append(geometry)
                 summary["storage"] = state.get("storage")
                 stored = validate_plan(state, state["a"], state["b"], manifest["config"]["partial"]["keep_mass"], manifest["config"]["partial"]["solver"])
                 summary["storage_validation"] = stored
@@ -610,6 +620,10 @@ def summarize_fit(directory, manifest):
         report["partial"] = dict(stats, keep_mass=manifest["config"]["partial"]["keep_mass"],
             fit_pair_top_k=manifest["config"].get("fit_pair_top_k"), full_pair_count=len(manifest["source_ids"])*len(manifest["target_ids"]),
             diagnostics_file="pair_diagnostics.jsonl", confidence_note="Raw retention differs from smoothed query confidence and thresholded mask coverage.")
+        if geometry_rows:
+            report["partial"]["fitted_pair_geometry"] = {key: dict(min=min(r[key] for r in geometry_rows),
+                mean=sum(r[key] for r in geometry_rows)/len(geometry_rows), max=max(r[key] for r in geometry_rows))
+                for key in geometry_rows[0]}
         if "pair_selection" in manifest:
             selection = json.loads(checked_file(directory, manifest["pair_selection"]).read_text(encoding="utf-8"))
             retained = [r["retained_probability"] for r in selection["rows"]]
