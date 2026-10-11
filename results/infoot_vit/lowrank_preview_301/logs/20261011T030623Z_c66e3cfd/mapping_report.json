@@ -1,0 +1,62 @@
+{
+  "all_invalid_images": 0,
+  "confidence_quantiles": {
+    "max": 1.0,
+    "min": 1.0,
+    "p05": 1.0,
+    "p50": 1.0,
+    "p95": 1.0
+  },
+  "device": "cuda",
+  "mapped": {
+    "corresponding_patch_variance_across_images": 0.02472594099556558,
+    "image_mean_variance": 0.024664639802388616,
+    "images": 16,
+    "norm_mean": 32.152578367526395,
+    "token_variance": 0.024734422037629655,
+    "valid_images": 16,
+    "valid_tokens": 3136,
+    "within_image_token_variance": 6.978223524108096e-05
+  },
+  "mapped_to_target_spread_ratio": {
+    "corresponding_patch_variance_across_images": 0.01769147024803287,
+    "image_mean_variance": 0.1157729574546114,
+    "norm_mean": 0.673525929177239,
+    "token_variance": 0.014429384517903623,
+    "within_image_token_variance": 4.64865605025814e-05
+  },
+  "mode": "grouped_patch_lowrank",
+  "note": "Descriptive feature diagnostics only; image means do not replace patch features for fitting or conditioning. Compare fixed generated images independently.",
+  "query": {
+    "corresponding_patch_variance_across_images": 1.1068052383730733,
+    "image_mean_variance": 0.10945818577484656,
+    "images": 16,
+    "norm_mean": 47.3440262231483,
+    "token_variance": 1.5825309325723316,
+    "valid_images": 16,
+    "valid_tokens": 3136,
+    "within_image_token_variance": 1.473072746797485
+  },
+  "seconds": 5.1400205029931385,
+  "source_support": {
+    "corresponding_patch_variance_across_images": 1.1944527979171984,
+    "image_mean_variance": 0.11986139292577687,
+    "images": 2000,
+    "norm_mean": 47.27478089941981,
+    "token_variance": 1.5971406888297335,
+    "valid_images": 2000,
+    "valid_tokens": 392000,
+    "within_image_token_variance": 1.4772792959039567
+  },
+  "target_support": {
+    "corresponding_patch_variance_across_images": 1.3976193413498168,
+    "image_mean_variance": 0.21304318680861503,
+    "images": 2000,
+    "norm_mean": 47.73769943319497,
+    "token_variance": 1.71417027572727,
+    "valid_images": 2000,
+    "valid_tokens": 392000,
+    "within_image_token_variance": 1.5011270889186552
+  },
+  "valid_fraction": 0.9999999999999999
+}
