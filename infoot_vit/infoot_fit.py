@@ -74,6 +74,10 @@ def main(argv=None):
         config["fit_pair_top_k"] = None if args.full_pairs else args.fit_pair_top_k
     if args.serial_pairs or args.pair_batch_size is not None:
         config["pair_batch_size"] = None if args.serial_pairs else args.pair_batch_size
+    if args.serial_pairs:
+        # The explicit POT reference does not use batched acceleration/guards.
+        config["pair_failure_abort_batches"] = None
+        config.setdefault("partial", {}).setdefault("solver", {})["inner_acceleration"] = "none"
     if args.tune:
         from infoot_vit.infoot_helper.tuning import tune_image_router
         report = tune_image_router(config, root=args.project_root, log_every=args.tune_log_every)

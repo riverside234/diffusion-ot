@@ -50,6 +50,7 @@ def main(argv=None):
     success = all(report["status"] == "converged" for report in reports)
     record = dict(status="converged" if success else "failed", input=str(args.input), input_sha256=file_hash(args.input),
         source_id=example.get("source_id"), target_id=example.get("target_id"), device=str(device), solver=VERSION,
+        torch_version=str(torch.__version__), gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         config=config, keep_mass=example["keep_mass"], copies=args.copies, seconds=elapsed,
         copies_per_second=args.copies/elapsed,
         peak_gpu_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,

@@ -10,9 +10,9 @@ kernel_rank: 1200  # OPRF lab trial; audit fitting kernels only.
 device: cuda  # Explicit --device cpu remains supported; no silent GPU fallback.
 threads: 4
 image_solver:
-  h: 0.7  # Requested fit bandwidth; projection uses 0.2.
-  lam: 0.10  # Modest MI increase after the h=.7 router remained near uniform (1919.8/2000 targets).
-  reg: 0.01  # Fivefold entropy reduction from .05; provisional trial, start a fresh fit.
+  h: 0.75  # Requested broader fit KDE; projection stays at 0.2.
+  lam: 0.10  # Retain the h=.7 follow-up weights: 676.4 effective targets, converged in 7 steps.
+  reg: 0.01  # Isolate the bandwidth change; start a fresh fit.
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000
@@ -20,7 +20,7 @@ image_solver:
 kernel:
   method: oprf_gaussian_v1  # Requested comparison after normalized-kernel density rejection.
   orthogonal: true  # Gaussian-marginal orthogonal directions for variance reduction.
-  h: 0.7  # Fit KDE; projection KDE uses h=0.2 without a separate accuracy audit.
+  h: 0.75  # Broader fit KDE trial; check its approximation audit. Projection stays at h=0.2.
   seed: 4201
   check_pairs: 4096
   density_queries: 32
@@ -40,7 +40,7 @@ estimator:
 optimizer:
   seed: 4203
   lam: 0.05  # Was .10; halve MI with entropy, preserving their ratio and emphasizing geometric cost.
-  reg: 0.025  # Was .05; less patch-plan averaging with broad h=.7 kernels.
+  reg: 0.025  # Was .05; retain patch weights for the h=.75 comparison.
   step_size: 1.0
   max_steps: 300
   max_backtracks: 12
@@ -56,7 +56,7 @@ optimizer:
   checkpoint_every: 10
   log_every: 1
 projection:
-  bandwidth_multiplier: 0.2857142857142857 # 0.2 / 0.7; router and patch projection h=0.2
+  bandwidth_multiplier: 0.26666666666666666 # 0.2 / 0.75; router and patch projection h=0.2
   selection: mean
   top_k_images: null
   seed: 42

@@ -68,7 +68,7 @@ directions can reduce estimator variance; this is not a guarantee for SigLIP
 features at `h=0.4`. Accuracy is measured before fitting. Repeated synthetic
 checks favored the legacy normalized IID method at patch `h=0.75`.
 The active recipe now tests **OPRF with orthogonal directions**, rank **1200**,
-fit `h=0.7` and projection `h=0.2`. The earlier acceptance evidence does not
+fit `h=0.75` and projection `h=0.2`. The earlier acceptance evidence does not
 validate this new configuration on the lab banks.
 
 ## Image-router convergence
@@ -76,7 +76,7 @@ validate this new configuration on the lab banks.
 For console-only router parameter trials, use:
 
 ```bash
-python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.10 --reg 0.01
+python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.75 --lam 0.10 --reg 0.01
 ```
 
 This fits only the image router on the same sampled training images. No logs,
@@ -98,14 +98,14 @@ The old router used lam = 0.10, reg = 0.05, 300 steps. Its inner Sinkhorn solves
 passed but its outer residual remained above tolerance. The revised weights
 reduce MI pressure relative to entropy; they are a lab experiment, not a claim
 of optimal translation quality. The latest requested experiment sets both
-`image_solver.h` and `kernel.h` to **0.7**. Its next fitting trial uses
+`image_solver.h` and `kernel.h` to **0.75**. Its next fitting trial uses
 **image reg=0.01, lam=0.10**, and **patch optimizer reg=0.025, lam=0.05**.
 Reducing image entropy targets diffuse routing. Halving both patch weights
 relative to the previous .05/.10 emphasizes geometric cost while retaining
 the patch MI/entropy ratio of 2. These are provisional choices, not values
-determined by h alone or validated on real banks at h=0.7. Start a fresh fit;
+determined by h alone or validated on real banks at h=0.75. Start a fresh fit;
 the earlier h=0.4 failure does not establish convergence of this setting.
-`projection.bandwidth_multiplier: 0.2857142857142857` sets both projection h
+`projection.bandwidth_multiplier: 0.26666666666666666` sets both projection h
 values to **0.2**. Actual Gaussian sigma is still h times each domain's saved
 training RMS scale, rather than an absolute feature-space distance of 0.2.
 
@@ -124,8 +124,8 @@ row entropy is **99.46%** of its maximum and KL from uniform is **0.04115 nats**
 The large absolute entropy offset alone does not establish gradient dominance;
 the routing concentration and cost gain are the useful evidence here.
 
-The next configured trial lowers **image reg 0.05 -> 0.01** to reduce entropic
-smoothing, and raises **image lam 0.075 -> 0.10** modestly to retain neighborhood
+That follow-up lowered **image reg 0.05 -> 0.01** to reduce entropic
+smoothing, and raised **image lam 0.075 -> 0.10** modestly to retain neighborhood
 structure. These roles follow the [InfoOT objective](https://proceedings.mlr.press/v202/chuang23a/chuang23a.pdf);
 the exact values are a local tuning proposal, not paper-prescribed settings.
 A small MI scalar does not determine its gradient scale, so it is not a reason
@@ -134,8 +134,9 @@ patch-fit evidence in this router log and remain unchanged.
 
 Use the console-only tuning command above on the lab banks (add the same
 `--source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000`
-overrides as the full fit). To isolate the entropy change, compare it with
-`--lam 0.075 --reg 0.01` using the same samples. Check convergence, effective
+overrides as the full fit). For the original h=0.7 weight comparison, explicitly
+use `--h 0.7`; the active command now tests h=0.75. To isolate the entropy
+change, compare `--lam 0.075 --reg 0.01` at the same h and samples. Check convergence, effective
 targets, maximum row probability, MI and cost. Compare cost/MI/entropy separately;
 total objectives with different weights are not directly comparable. If routing
 is still nearly uniform, an isolated `reg=0.005` trial is reasonable; if higher
@@ -145,8 +146,43 @@ will not sharpen an already converged plan by themselves.
 Judge the resulting held-out routing and decoded images at projection h=0.20:
 concentration alone is not image quality, and this fit log does not establish
 that either weight change fixes blur. The full banks/checkpoints are lab-only;
-the revised settings have not been evaluated on those data here. Start a fresh
+the reported follow-up is analyzed below, but no image-quality comparison is
+available here. Start a fresh
 full fit after changing weights; saved plans cannot be resumed with a new objective.
+
+### Seven-iteration follow-up and h=0.75 trial
+
+The new supplied h=0.7 router log supports retaining `lam=0.10, reg=0.01`:
+
+| Metric | Previous lam=.075, reg=.05 | Follow-up lam=.10, reg=.01 |
+|---|---:|---:|
+| Converged iteration | 4 | 7 |
+| Undamped plan L1 delta | 1.97e-08 | 2.68e-08 |
+| Mean effective targets (of 2000) | 1919.8 | 676.4 |
+| Mean-cost-scaled transport cost | 0.9960372 | 0.9772166 |
+| Unweighted KDE MI | 0.0007623 | 0.0054944 |
+| Cost reduction from uniform | 0.3963% | 2.2783% |
+
+Effective targets decrease **64.8%**, and KDE MI increases **7.21x** at the same
+fit bandwidth. Routing is more selective while both runs meet the convergence
+tolerance. The larger total objective (0.23794715 -> 0.83669001) reflects changed
+weights and is not evidence of worse optimization. These are fitting-plan
+metrics, not the held-out conditional routing weights or image-quality results.
+
+The requested next trial raises both `image_solver.h` and `kernel.h` to **0.75**,
+keeping router/patch weights, ranks and seeds fixed. The approximation-error
+motivation applies to the low-rank patch KDE; the image router uses exact dense
+Gaussian kernels. A broader KDE changes smoothing and the MI objective as
+described in the [InfoOT paper](https://proceedings.mlr.press/v202/chuang23a/chuang23a.pdf).
+It may help kernel approximation but does not guarantee lower measured errors,
+and routing may become broader. Check fitting `kernel_quality.json` and compare
+held-out mapping/decoded images. MI at h=.75 is a different KDE estimate, so it
+is not directly comparable with the h=.7 MI as evidence of improved alignment.
+
+The shared multiplier is now **0.20 / 0.75 = 0.26666666666666666**, preserving
+both image and patch projection at **0.20**. The separate projection accuracy
+audit remains removed; fitting acceptance and numerical validity checks remain.
+The h=.75 experiment requires a fresh fit, not resuming the h=.7 artifact.
 
 When testing a new `grouped_patch_lowrank` fit from this recipe, make the
 projection setting explicit:
@@ -156,7 +192,7 @@ python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/FIT_DIRECTORY --qu
 ```
 
 Testing reads the **saved fit configuration**, not the current YAML. With both
-saved fit bandwidths at `0.70`, this override sets **image and patch projection
+saved fit bandwidths at `0.75`, this override sets **image and patch projection
 h to 0.20**. Check `image_projection_h` and `patch_projection_h` in the test's
 `logs/<attempt>/queries.jsonl`. An older fit with different image/patch fit
 bandwidths will not necessarily produce two equal projection bandwidths from
@@ -749,7 +785,7 @@ storage estimate was 4.35 GB, with a 5 GB guard and unchanged error limits.
 
 **This selection broadens the target Gaussian kernel, rather than solving the
 fixed-h=0.4 approximation problem.** That comparison used projection multiplier
-1 and image-router h=0.4. The current requested YAML uses fit h=0.7 for both
+1 and image-router h=0.4. The current requested YAML uses fit h=0.75 for both
 router and patch kernels and projection h=0.2; it is a new, unvalidated setting.
 Narrowing the projection kernel can increase approximation error even if the
 fit kernel passes. The current balanced experiment no longer gates projection
@@ -782,9 +818,9 @@ change these kernel/density errors.
 
 The rank-1200 normalized-kernel lab trial also failed: source/target kernel
 RMSE was **0.2603/0.2919**, with mean density error **0.1754/0.2795**.
-The active YAML now tests **OPRF + orthogonal directions at rank 1200**,
-as requested, and raises the mean-density acceptance limit from **0.25 to 0.30**
-for fitting-kernel audits. Fit h=0.70, both projection h=0.20,
+That next trial used **OPRF + orthogonal directions at rank 1200**,
+as requested, and raised the mean-density acceptance limit from **0.25 to 0.30**
+for fitting-kernel audits. Fit h=0.70 (now 0.75 in the active YAML), both projection h=0.20,
 seeds, transport rank, objective weights, RMSE/max-density limits and the
 `error` policy are retained. This changes both the estimator and one acceptance
 limit; acceptance alone is not evidence that accuracy improved.

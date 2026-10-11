@@ -198,3 +198,13 @@ def test_replay_keeps_objective_and_records_success_or_failure(tmp_path):
     assert file_hash(example) == before and output.with_suffix(".pt").exists()
     assert main([str(example), "--output", str(output), "--device", "cpu", "--max-inner-steps", "1", "--threads", "1"]) == 2
     assert json.loads(output.read_text())["status"] == "failed"
+
+
+def test_serial_cli_clears_batch_only_recipe_options(monkeypatch, tmp_path):
+    from infoot_vit import infoot_fit
+    seen = []
+    monkeypatch.setattr(infoot_fit, "fit_mapping", lambda config, **kw: seen.append(validate_config(config)) or tmp_path)
+    assert infoot_fit.main(["--config", str(infoot_fit.ROOT/"infoot_vit/configs/grouped_partial.yaml"),
+                           "--device", "cpu", "--serial-pairs"]) == 0
+    assert seen[0]["pair_batch_size"] is None and seen[0]["pair_failure_abort_batches"] is None
+    assert seen[0]["partial"]["solver"]["inner_acceleration"] == "none"
