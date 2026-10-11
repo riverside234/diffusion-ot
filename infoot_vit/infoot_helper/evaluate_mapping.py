@@ -65,6 +65,9 @@ def generate(mapper, query_bank, result, output, *, root, train_config, eval_con
         row_names.append("top1_routed_target_reference_not_ground_truth")
     rows.append(images); row_names.append("translated")
     save_image(torch.cat(rows).clamp(0, 1), output / "translation_grid.png", nrow=count, padding=4)
+    if "checkpoint_preview" in mapper.manifest:
+        from .lowrank_preview import label_preview_grid
+        label_preview_grid(output / "translation_grid.png", mapper.manifest["checkpoint_preview"])
     # Confidence is separate from image colors; never multiplied through LayerNorm.
     gh, gw = representation["grid"]
     heat = result.match_confidence.cpu().reshape(count, 1, gh, gw)
@@ -82,5 +85,7 @@ def generate(mapper, query_bank, result, output, *, root, train_config, eval_con
         report["incomplete_fit"] = mapper.manifest["incomplete_fit"]
         report["failed_pair_discarded_routing_mass"] = {
             row["query_id"]: row["failed_pair_discarded_routing_mass"] for row in result.diagnostics["queries"]}
+    if "checkpoint_preview" in mapper.manifest:
+        report["checkpoint_preview"] = mapper.manifest["checkpoint_preview"]
     write_json(output / "generation_report.json", report)
     return report

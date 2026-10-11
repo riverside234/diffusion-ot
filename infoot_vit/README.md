@@ -213,23 +213,23 @@ generated-image review below:
 
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
-| Image router: `solver` | **0.375** | 0.06 | 0.070 | 1,200 |
+| Image router: `solver` | **0.36** | 0.06 | 0.070 | 1,200 |
 | Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
 
-The .070 router at h=.35 converged in 394 iterations with 7.26 effective targets
-and 84.36% fitted-row top-1 probability. However, its training-source top-8
-preview at projection h=.20 retained 85.42% of probability and then assigned
-**98.69% to top-1 after normalization** (1.07 effective retained targets).
-This remains almost single-target routing on that probe. It is not evidence
-that held-out generated images necessarily copy a reference.
+At fixed lam=.070/reg=.06, h=.35 gave 85.42% mean top-8 retained mass but
+98.69% normalized top-1 probability. The h=.375 trial converged in 744
+iterations, yet mean retained mass fell to **25.47%**, with **1.81% median**
+retention. Its 49.90% normalized top-1 mean therefore does not establish a
+useful tradeoff: most probability is discarded for many training sources.
 
-The next candidate changes **only fitting h from .35 to .375**; image lam=.070
-and reg=.06 stay fixed. The fit kernels currently give 57.40%/58.51% normalized
-weight to their own sample. A modest bandwidth increase tests less self-focused
-neighborhoods without changing the projection bandwidth. Its benefit is untested.
-Patch settings, mass, confidence, top-8 selection and .20/.20 projection stay
-fixed. See [the .070 analysis and next trial](../docs/analysis/infoot_vit_router_070/README.md)
-and [the preceding lambda comparison](../docs/analysis/infoot_vit_router_065/README.md).
+The next candidate is **fitting h=.36**, closer to the better-covered .35
+baseline; lam=.070 and reg=.06 stay fixed. This refines the observed bandwidth
+bracket, not an assumption of linear interpolation or a known optimum. Judge
+retained mass and its median alongside normalized concentration before fitting
+all pairs. Patch settings, mass, confidence, top-8 selection and .20/.20
+projection stay fixed. The new fit and held-out image quality are unverified.
+See [the h=.375 analysis and h=.36 trial](../docs/analysis/infoot_vit_router_h0375/README.md)
+and [the preceding .070 analysis](../docs/analysis/infoot_vit_router_070/README.md).
 Use a fresh fit for changed settings. To reproduce an older h=.35 recipe,
 also restore `projection.bandwidth_multiplier` to `.20/.35`; a `--h` override
 alone changes the effective projection bandwidth as well as fitting h.
@@ -252,9 +252,9 @@ query confidence and does not fix solver convergence or top-8 discarded mass.
 See [the test2 analysis](../docs/analysis/vit_infoot_top8_test2/README.md), and
 [the earlier router failure](../docs/analysis/vit_infoot_top8_300/README.md).
 
-The top-8 dense partial recipe uses `projection.bandwidth_multiplier: 0.20/0.375`
+The top-8 dense partial recipe uses `projection.bandwidth_multiplier: 0.20/0.36`
 (the YAML stores the numeric value) and `projection.patch_bandwidth: 0.20`:
-projection `h` is **0.20 for both stages**, while fit `h` is 0.375/0.35.
+projection `h` is **0.20 for both stages**, while fit `h` is 0.36/0.35.
 **New pair selection uses the same image projection bandwidth
 as mapping** (previously it incorrectly used the broader fitting bandwidth).
 Selection records its bandwidth and retained/discarded routing mass in
@@ -317,7 +317,7 @@ fingerprint prevents resuming the old v3 run as though its solver were unchanged
 The earlier **fitting** change was patch `h: .45 -> .35`, `reg: .10 -> .05`;
 patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings
 were held fixed for that comparison. The latest candidate now changes only
-image fitting `h: .35 -> .375`, holding lam=.070 and reg=.06, as described above.
+image fitting `h: .375 -> .36`, holding lam=.070 and reg=.06, as described above.
 Projection stays at **.20**,
 with .30 available for comparison;
 top-1 truncation is not enabled. These are hypotheses requiring lab images,
@@ -532,7 +532,7 @@ override the balanced solver; patch-pair settings are under `partial.solver`.
 
 Kernel widths follow the local convention:
 `h * sqrt(mean(training_pairwise_distances**2)/2)`. Projection uses the saved
-multiplier (0.20/0.375 in the top-8 dense partial recipe; 0.2/0.7 in balanced low-rank,
+multiplier (0.20/0.36 in the top-8 dense partial recipe; 0.2/0.7 in balanced low-rank,
 1.0 in partial low-rank) and
 never estimates a query-batch scale.
 An explicit multiplier is part of the fit configuration/artifact identity.

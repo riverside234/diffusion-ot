@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 import torch
-from infoot_vit.infoot_helper.feature_bank import FeatureBank, digest
+from infoot_vit.infoot_helper.feature_bank import FeatureBank, digest, write_json
 from infoot_vit.infoot_helper.mapping import FeatureMapper
 from infoot_vit.infoot_helper.mapping_manifest import load_mapping_manifest
 from infoot_vit.infoot_helper.run_logging import RunLog
@@ -48,7 +48,11 @@ def main(argv=None):
                    help="Retain and renormalize K target-image weights; 0 keeps all. Partial modes still use saved pairs only.")
     p.add_argument("--allow-failed-pairs", action="store_true",
                    help="Test successful pairs from a failed batched grouped_partial fit; record skipped routing mass without modifying the fit.")
+    p.add_argument("--preview-checkpoint", action="store_true",
+                   help="Preview factors/latest.pt from a stopped failed/interrupted grouped_patch_lowrank fit. Never refit or mark it complete.")
     a = p.parse_args(argv)
+    if a.preview_checkpoint and a.allow_failed_pairs:
+        p.error("--preview-checkpoint cannot be combined with --allow-failed-pairs")
     if min(a.count, a.chunk_size, a.threads) < 1 or (a.steps is not None and a.steps < 1):
         p.error("Counts, chunk size, threads and steps must be positive")
     if a.confidence_threshold is not None and not 0 <= a.confidence_threshold <= 1:
@@ -62,7 +66,13 @@ def main(argv=None):
     torch.set_num_threads(a.threads)
     if a.dry_run:
         # Validate small metadata before allocating supports/kernels or the DiT.
-        m = load_mapping_manifest(a.mapping, allow_failed_pairs=a.allow_failed_pairs)
+        if a.preview_checkpoint:
+            from infoot_vit.infoot_helper.lowrank_preview import load_preview_snapshot, check_preview_output
+            if a.output_dir is not None:
+                check_preview_output(a.mapping, a.output_dir)
+            m, _ = load_preview_snapshot(a.mapping)
+        else:
+            m = load_mapping_manifest(a.mapping, allow_failed_pairs=a.allow_failed_pairs)
         a.steps, a.guidance = generation_settings(m["config"]["mode"], a.steps, a.guidance)
         projection = projection_settings(m["config"], a.confidence_threshold,
             bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth)
@@ -83,17 +93,27 @@ def main(argv=None):
         print(json.dumps(dict(mapper_id=m["artifact_id"], mode=m["config"]["mode"], fit_resources=m["resources"],
             query_count=min(a.count, len(q["ids"])), mask="existing condition_padding_mask; True is padding",
             generate=a.generate, projection=projection, incomplete_fit=m.get("incomplete_fit"),
+            checkpoint_preview=m.get("checkpoint_preview"),
             sampling=dict(num_steps=a.steps, guidance_scale=a.guidance)), indent=2))
         return 0
     output = a.output_dir or ROOT / "results/infoot_vit" / f"{a.mapping.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:6]}"
+    if a.preview_checkpoint:
+        from infoot_vit.infoot_helper.lowrank_preview import LowRankCheckpointPreview, check_preview_output
+        check_preview_output(a.mapping, output)
     output.mkdir(parents=True, exist_ok=False)
     with RunLog(output, "mapping_test", vars(a)) as log:
         m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
         projection = projection_settings(m["config"], a.confidence_threshold,
             bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth)
         # Set overrides BEFORE loading cached KDEs, factors and support thresholds.
-        mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log,
-                                    allow_failed_pairs=a.allow_failed_pairs)
+        if a.preview_checkpoint:
+            mapper = LowRankCheckpointPreview.load(a.mapping, device=a.device, projection=projection, run_log=log)
+            log.write_json("checkpoint_preview_snapshot.json", mapper.manifest)
+            write_json(output / "checkpoint_preview.json", mapper.manifest["checkpoint_preview"])
+            print(mapper.manifest["checkpoint_preview"]["label"], flush=True)
+        else:
+            mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log,
+                                        allow_failed_pairs=a.allow_failed_pairs)
         bank = FeatureBank.load(a.query_bank)
         a.steps, a.guidance = generation_settings(mapper.mode, a.steps, a.guidance)
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)

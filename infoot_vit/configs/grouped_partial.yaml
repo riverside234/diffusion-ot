@@ -10,8 +10,8 @@ sampling:
   images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
-solver:  # Bandwidth-only trial: h=.35/lam=.070 gave 98.69% normalized top-8 top-1.
-  h: 0.375  # Reduce fit-kernel self-preference; validate coverage before a full fit.
+solver:  # Refine the .35 (sharp) to .375 (low top-8 coverage) bandwidth bracket.
+  h: 0.36  # Smaller change from .35; .375 retained only 1.81% mass at the median.
   lam: 0.070  # Hold MI/entropy weights fixed while testing the fitting bandwidth.
   reg: 0.06
   cost_scale: mean
@@ -35,7 +35,7 @@ partial:
     mass_tolerance: 1.0e-8
     outer_tolerance: 1.0e-7
 projection:
-  bandwidth_multiplier: 0.5333333333333333  # .20/.375: image projection AND pair selection stay at .20.
+  bandwidth_multiplier: 0.5555555555555556  # .20/.36: image projection AND pair selection stay at .20.
   patch_bandwidth: 0.20  # Absolute patch projection h; independent of image bandwidth.
   selection: mean
   top_k_images: null
