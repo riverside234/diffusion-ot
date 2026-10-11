@@ -1,0 +1,41 @@
+{
+  "attempted_pairs": 16000,
+  "completed_pair_geometry": {
+    "count": 16000,
+    "population": "new successes in this attempt; excludes failures and previously registered pairs",
+    "statistics": {
+      "fitted_pair_effective_patches": {
+        "max": 65.51187040218193,
+        "mean": 34.76150743288667,
+        "min": 18.660642754778465
+      },
+      "fitted_pair_normalized_entropy": {
+        "max": 0.7288455855531019,
+        "mean": 0.5907833277071205,
+        "min": 0.48135384092116174
+      },
+      "fitted_pair_top1_probability": {
+        "max": 0.3034627258335588,
+        "mean": 0.21826621357462384,
+        "min": 0.14236025021768658
+      },
+      "mean_row_cost_std": {
+        "max": 0.13672536686006972,
+        "mean": 0.09508455384150015,
+        "min": 0.063479926828303
+      }
+    }
+  },
+  "consecutive_all_failed_batches": 0,
+  "device": "cuda:0",
+  "elapsed_seconds": 5168.397603885009,
+  "failed_pairs": 0,
+  "failures": [],
+  "pair_batch_size": 1024,
+  "previously_completed_pairs": 0,
+  "resume_policy": "Reuse registered successful pairs; restart unfinished/failed pairs from exact float64 feasible initialization.",
+  "status": "completed",
+  "successful_pairs": 16000,
+  "unattempted_pairs": 0,
+  "unfinished_attempted_pairs": 0
+}

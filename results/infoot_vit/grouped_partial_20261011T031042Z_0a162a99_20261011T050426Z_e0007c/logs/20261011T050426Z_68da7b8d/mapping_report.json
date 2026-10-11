@@ -1,0 +1,151 @@
+{
+  "all_invalid_images": 0,
+  "confidence_quantiles": {
+    "max": 1.0,
+    "min": 0.0,
+    "p05": 0.05243496596813202,
+    "p50": 0.8019530177116394,
+    "p95": 0.9998799562454224
+  },
+  "confidence_threshold_sweep": {
+    "active_threshold": 0.05,
+    "coverage": [
+      {
+        "all_invalid_images": 0,
+        "mean_valid_tokens": 186.4375,
+        "min_valid_tokens": 162,
+        "threshold": 0.05,
+        "valid_fraction": 0.9512117346938774
+      },
+      {
+        "all_invalid_images": 0,
+        "mean_valid_tokens": 183.9375,
+        "min_valid_tokens": 161,
+        "threshold": 0.1,
+        "valid_fraction": 0.9384566326530611
+      },
+      {
+        "all_invalid_images": 0,
+        "mean_valid_tokens": 180.0,
+        "min_valid_tokens": 157,
+        "threshold": 0.2,
+        "valid_fraction": 0.9183673469387754
+      },
+      {
+        "all_invalid_images": 0,
+        "mean_valid_tokens": 174.625,
+        "min_valid_tokens": 150,
+        "threshold": 0.3,
+        "valid_fraction": 0.8909438775510203
+      }
+    ],
+    "mass_floor": 1e-12,
+    "note": "Counterfactual mask coverage only, from the same saved confidences; no fitting or image generation. Use held-out validation images to choose a threshold; confidence is not a semantic correctness probability."
+  },
+  "device": "cuda",
+  "fit_pair_discarded_routing_mass": {
+    "max": 0.7833994029328405,
+    "mean": 0.5473629296752643,
+    "min": 0.31753840883104456
+  },
+  "mapped": {
+    "corresponding_patch_variance_across_images": 0.330504676008364,
+    "image_mean_variance": 0.05154559672783861,
+    "images": 16,
+    "norm_mean": 38.831036292406154,
+    "token_variance": 0.5956003832494863,
+    "valid_images": 16,
+    "valid_tokens": 2983,
+    "within_image_token_variance": 0.5428834277479826
+  },
+  "mapped_to_target_spread_ratio": {
+    "corresponding_patch_variance_across_images": 0.23647689054529217,
+    "image_mean_variance": 0.24194905033102054,
+    "norm_mean": 0.8134249608477055,
+    "token_variance": 0.34745695435466073,
+    "within_image_token_variance": 0.36165054361856297
+  },
+  "mode": "grouped_partial",
+  "note": "Descriptive feature diagnostics only; image means do not replace patch features for fitting or conditioning. Compare fixed generated images independently.",
+  "partial_geometry": {
+    "fitted_pair_effective_patches": {
+      "max": 44.977771195547135,
+      "mean": 33.34604242370554,
+      "min": 25.919006617253704
+    },
+    "fitted_pair_normalized_entropy": {
+      "max": 0.6346898896728788,
+      "mean": 0.584411504348097,
+      "min": 0.5427472359129
+    },
+    "fitted_pair_top1_probability": {
+      "max": 0.2389613694196769,
+      "mean": 0.21969633381538264,
+      "min": 0.19862934783438074
+    },
+    "image_effective_targets": {
+      "max": 129.0569415522936,
+      "mean": 45.09108147172324,
+      "min": 1.2294763854042212
+    },
+    "image_max_weight": {
+      "max": 0.968949143962179,
+      "mean": 0.3511253786968693,
+      "min": 0.05321878771375424
+    },
+    "image_projection_h": {
+      "max": 0.15,
+      "mean": 0.14999999999999997,
+      "min": 0.15
+    },
+    "patch_projection_h": {
+      "max": 0.2,
+      "mean": 0.20000000000000004,
+      "min": 0.2
+    },
+    "query_source_effective_patches": {
+      "max": 7.346163054137145,
+      "mean": 6.192000574051296,
+      "min": 3.5570890049872927
+    },
+    "within_image_effective_patches": {
+      "max": 51.25732403582763,
+      "mean": 42.11571890708978,
+      "min": 28.221563187259058
+    }
+  },
+  "partial_geometry_note": "Fitted row statistics precede projection; source-neighborhood and projected-patch statistics include query smoothing. Dense pair metrics are weighted by routing and retained/support-valid mass. Their effective counts are descriptive, not additive or semantic correctness scores.",
+  "query": {
+    "corresponding_patch_variance_across_images": 1.1068052383730733,
+    "image_mean_variance": 0.10945818577484656,
+    "images": 16,
+    "norm_mean": 47.3440262231483,
+    "token_variance": 1.5825309325723316,
+    "valid_images": 16,
+    "valid_tokens": 3136,
+    "within_image_token_variance": 1.473072746797485
+  },
+  "routing_note": "Confidence/rejection are conditional on renormalized saved routes. Discarded routing mass is reported separately.",
+  "seconds": 1028.596081975993,
+  "source_support": {
+    "corresponding_patch_variance_across_images": 1.1944527979171984,
+    "image_mean_variance": 0.11986139292577687,
+    "images": 2000,
+    "norm_mean": 47.27478089941981,
+    "token_variance": 1.5971406888297335,
+    "valid_images": 2000,
+    "valid_tokens": 392000,
+    "within_image_token_variance": 1.4772792959039567
+  },
+  "target_support": {
+    "corresponding_patch_variance_across_images": 1.3976193413498168,
+    "image_mean_variance": 0.21304318680861503,
+    "images": 2000,
+    "norm_mean": 47.73769943319497,
+    "token_variance": 1.71417027572727,
+    "valid_images": 2000,
+    "valid_tokens": 392000,
+    "within_image_token_variance": 1.5011270889186552
+  },
+  "valid_fraction": 0.9512117346938774
+}
