@@ -213,24 +213,26 @@ generated-image review below:
 
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
-| Image router: `solver` | 0.35 | 0.06 | **0.070** | 1,200 |
+| Image router: `solver` | **0.375** | 0.06 | 0.070 | 1,200 |
 | Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
 
-The next router comparison uses the midpoint **image `lam=.070`**. The .075
-baseline converged in 107 iterations with 2.49 effective targets/2,000 and 92.79%
-top-8 retained mass. The new .065 router-only run converged in 784 iterations
-with **64.40 effective targets and 66.86% mean top-1 probability**, versus 92.28%
-top-1 at .075. This is a larger broadening than intended; its actual top-8
-conditional retained mass was not logged. Effective target count is not the
-number of equally weighted targets and cannot determine discarded mass.
-`--tune` now previews that coverage at the configured projection bandwidth.
-Patch settings, mass, confidence and .20/.20 projection remain fixed. No new
-image-quality result is available; .070 is a candidate, not a demonstrated blur
-fix. See [the .065 follow-up and .070 comparison](../docs/analysis/infoot_vit_router_065/README.md)
-and [the earlier supplied-log analysis](../docs/analysis/infoot_vit_partial_success_tuning/README.md).
-Use `--lam .075` or `--lam .065` to reproduce either router recipe; a run
-already in progress continues with its saved configuration. Do not resume it
-using the changed YAML.
+The .070 router at h=.35 converged in 394 iterations with 7.26 effective targets
+and 84.36% fitted-row top-1 probability. However, its training-source top-8
+preview at projection h=.20 retained 85.42% of probability and then assigned
+**98.69% to top-1 after normalization** (1.07 effective retained targets).
+This remains almost single-target routing on that probe. It is not evidence
+that held-out generated images necessarily copy a reference.
+
+The next candidate changes **only fitting h from .35 to .375**; image lam=.070
+and reg=.06 stay fixed. The fit kernels currently give 57.40%/58.51% normalized
+weight to their own sample. A modest bandwidth increase tests less self-focused
+neighborhoods without changing the projection bandwidth. Its benefit is untested.
+Patch settings, mass, confidence, top-8 selection and .20/.20 projection stay
+fixed. See [the .070 analysis and next trial](../docs/analysis/infoot_vit_router_070/README.md)
+and [the preceding lambda comparison](../docs/analysis/infoot_vit_router_065/README.md).
+Use a fresh fit for changed settings. To reproduce an older h=.35 recipe,
+also restore `projection.bandwidth_multiplier` to `.20/.35`; a `--h` override
+alone changes the effective projection bandwidth as well as fitting h.
 
 The active recipe uses `partial.solver.inner_acceleration: newton`: after 100
 log-domain block updates, safeguarded dual Newton steps accelerate unfinished
@@ -250,9 +252,9 @@ query confidence and does not fix solver convergence or top-8 discarded mass.
 See [the test2 analysis](../docs/analysis/vit_infoot_top8_test2/README.md), and
 [the earlier router failure](../docs/analysis/vit_infoot_top8_300/README.md).
 
-The top-8 dense partial recipe uses `projection.bandwidth_multiplier: 0.20/0.35`
+The top-8 dense partial recipe uses `projection.bandwidth_multiplier: 0.20/0.375`
 (the YAML stores the numeric value) and `projection.patch_bandwidth: 0.20`:
-projection `h` is **0.20 for both stages**, while fit `h` is 0.35/0.35.
+projection `h` is **0.20 for both stages**, while fit `h` is 0.375/0.35.
 **New pair selection uses the same image projection bandwidth
 as mapping** (previously it incorrectly used the broader fitting bandwidth).
 Selection records its bandwidth and retained/discarded routing mass in
@@ -315,7 +317,8 @@ fingerprint prevents resuming the old v3 run as though its solver were unchanged
 The earlier **fitting** change was patch `h: .45 -> .35`, `reg: .10 -> .05`;
 patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings
 were held fixed for that comparison. The latest candidate now changes only
-image `lam: .065 -> .070`, as described above. Projection stays at **.20**,
+image fitting `h: .35 -> .375`, holding lam=.070 and reg=.06, as described above.
+Projection stays at **.20**,
 with .30 available for comparison;
 top-1 truncation is not enabled. These are hypotheses requiring lab images,
 not a measured optimum. Keep guidance/steps fixed while comparing fits.
@@ -529,7 +532,7 @@ override the balanced solver; patch-pair settings are under `partial.solver`.
 
 Kernel widths follow the local convention:
 `h * sqrt(mean(training_pairwise_distances**2)/2)`. Projection uses the saved
-multiplier (0.5 in the top-8 dense partial recipe; 0.2/0.7 in balanced low-rank,
+multiplier (0.20/0.375 in the top-8 dense partial recipe; 0.2/0.7 in balanced low-rank,
 1.0 in partial low-rank) and
 never estimates a query-batch scale.
 An explicit multiplier is part of the fit configuration/artifact identity.
@@ -625,8 +628,8 @@ saved. Router convergence does not validate patch fitting or held-out image
 quality. The normal command without `--tune` still saves full fit diagnostics.
 
 ```bash
-# Existing top-8 grouped_partial recipe; optional router overrides shown.
-python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --tune --h 0.35 --lam 0.070 --reg 0.06
+# Current top-8 grouped_partial trial; includes matched .20/.20 projection.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --tune
 
 # Low-rank recipe: these overrides change image_solver.*, not patch kernel.h.
 python infoot_vit/infoot_fit_lowrank.py --config infoot_vit/configs/grouped_patch_lowrank.yaml --tune --h 0.7 --lam 0.075 --reg 0.075
