@@ -256,7 +256,7 @@ def tune_partial(raw, *, root, from_fit=None, pair_limit=64, seed=42, log_every=
     # Bound actual trial batch workspace, not the full 16,000-pair fit/storage.
     size = min(c["pair_batch_size"] or 1, pair_limit)
     estimate = resource_estimate(banks[0].features.shape, banks[1].features.shape,
-                                 "grouped_partial", c["fit_pair_top_k"], size)
+                                 "grouped_partial", c["fit_pair_top_k"], size, pc.get("newton_batch_size", 64))
     if estimate["estimated_working_gib"] >= c["resources"]["max_working_gib"]:
         raise MemoryError("Partial tuning exceeds resources.max_working_gib; reduce --pair-batch-size or --tune-pairs.")
     x, y = [bank.features.to(device=device, dtype=torch.float64) for bank in banks]

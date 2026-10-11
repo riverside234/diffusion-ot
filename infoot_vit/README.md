@@ -202,6 +202,37 @@ and a temporary shared-kernel copy. It excludes container metadata, IDs and
 logs and retained failed checkpoints: reserve extra disk space. Float64 fitting is still substantial work;
 these estimates are neither measured peak memory nor a disk reservation.
 
+### Saved-pair mapping performance
+
+Dense `grouped_partial` mapping now projects saved pairs in blocks of **32**
+and caches validated plan tensors on the selected device, with a **3 GiB**
+limit. At 16,000 pairs of 196 patches, float32 plans plus float64 proposal
+marginals occupy about **2.34 GiB**, so the default cache can retain them all.
+It fills lazily; a smaller limit uses LRU eviction, and zero disables caching.
+Report histories and float64 smoothing matrices are not retained in the cache.
+Checksums, identities and quantized marginals are validated on a cache miss;
+file signatures are checked on hits to detect replaced, modified or missing
+artifacts. Existing fit directories and the serial reference remain usable.
+
+Pair computations and reductions stay on the device. Numerical failure checks
+are transferred per block, and aggregate diagnostics per query. Original
+target-density correction, saved-pair routing, partial rejection, confidence
+masks and underflow retries remain unchanged. These are runtime options,
+independent of `pair_batch_size` used for fitting; no refit is needed:
+
+```bash
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/<completed-fit> --query-bank data/infoot_vit/cat_val --device cuda --count 16 --pair-cache-mib 3072 --projection-pair-batch-size 32 --generate
+```
+
+`diagnostics.performance` records the actual limits, cache hits, file loads
+and resident/peak cache tensor bytes. The limit excludes feature banks, kernels,
+temporary projection blocks and diffusion generation memory. A cache too small
+for a complete pair sweep can reread evicted plans on subsequent queries.
+Floating-point reduction order can change at roundoff scale. GPU speed and
+peak memory still require measurement on the lab machine; CPU equivalence
+tests do not establish a CUDA speedup. Other mapping modes keep their existing
+projection paths.
+
 ### Exact GPU batches for the top-8 experiment
 
 The earlier `results/vit_infoot_top8/test2` run passed the image router in 141
@@ -385,7 +416,7 @@ value. That sweep does not generate extra images or choose a threshold. Use
 validation to select it, then keep it fixed for test; keep the explicit
 all-invalid error policy.
 
-`grouped_partial.yaml` now sets **`device: cuda`**, **`pair_batch_size: 1024`**,
+`grouped_partial.yaml` now sets **`device: cuda`**, **`pair_batch_size: 2048`**,
 and `pair_checkpoint_every: 10`. Selected pairs are fitted as `[B,196,196]`
 costs, cached per-image kernels, plans and solver updates. The last batch uses
 its actual size. Batching preserves patch features, sampling, router selection,
@@ -402,9 +433,11 @@ MI, cost scaling, entropy or feasible set. It does not approximate
 plans/kernels or substitute balanced marginals for partial constraints. Only the
 existing `keep_mass: 1` control uses balanced log-Sinkhorn, as in the serial
 reference. Inner stopping is checked at iterations 1, 11, 21,
-etc.; a single host check per ten updates replaces per-pair synchronization.
-Converged/failed inner states are frozen on device. Outer iterations compact
-the remaining active pairs and retain independent full-objective line searches.
+etc. Converged/failed states are frozen on device; with `inner_compact: true`,
+the work batch is compacted at these checks after at least 25% retires.
+Outer iterations also compact active pairs and retain independent
+full-objective line searches. Newton performs an additional group-wide check
+every `newton_check_every` backtracks when enabled.
 
 Each pair records its inner error/count, primal-dual gap, mass/cap residuals, outer count,
 objective terms, accepted step and status. A failed member does not cancel its
@@ -428,14 +461,15 @@ their original feasible initialization, preserving the existing recovery policy;
 quantized checkpoints are diagnostics, not silently repaired warm starts.
 Registered successful pairs are validated and reused without refitting.
 
-The resource estimate for 2,000 images/domain, 196 patches and B=1024 is about
-**35.21 GiB working memory** (conservative workspace allowance), with a
-**48 GiB configured limit** for the 80-GB lab GPU. Active checkpoints/temporary plans add about
-300 MiB; required plan/kernel storage is about 3.74 GiB before logs, file/container
+The resource estimate for 2,000 images/domain, 196 patches, B=2048 and Newton
+sub-batch 128 is about **60.33 GiB working memory** (conservative workspace
+allowance), with a **64 GiB configured limit** for the 80-GB lab GPU.
+Active checkpoints/temporary plans add about 600 MiB; required plan/kernel
+storage is about 4.04 GiB before logs, file/container
 overhead and failed checkpoints. These are estimates, not measured GPU peaks.
 
 ```bash
-# Default: CUDA, 1,024 pairs, a fresh fit directory.
+# Default: CUDA, 2,048 pairs, a fresh fit directory.
 python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --dry-run
 python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml
 
@@ -451,6 +485,9 @@ python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml
 
 # Lab CUDA benchmark: identical seeded synthetic pairs, including MI.
 python infoot_vit/benchmark_partial_batch.py --pairs 1024 --pair-batch-size 1024 --repeats 3 --output outputs/infoot_vit/partial_batch_benchmark.json
+
+# Optimized vs cold/fixed-work batched reference, at IDENTICAL batch size.
+python infoot_vit/benchmark_partial_batch.py --reference batched-reference --pairs 2048 --pair-batch-size 2048 --repeats 3 --output outputs/infoot_vit/partial_batch_optimized.json
 ```
 
 Missing/null `pair_batch_size` or `--serial-pairs` keeps the serial reference.
@@ -463,6 +500,52 @@ costs. Solver failures or mismatched results set `valid_speed_comparison: false`
 and are reported explicitly. This workspace has PyTorch `2.14.0+cpu`: **CUDA runtime, throughput and
 peak memory remain unverified**. The benchmark records `unverified` when CUDA
 is unavailable, without silently timing CPU instead.
+
+#### Batched fitting performance controls
+
+The active partial solver enables the following execution settings. They do
+not change h/lam/reg, mass, cost scaling, KDE MI or convergence tolerances.
+Older configurations omit them and retain the cold/fixed-work defaults.
+
+| `partial.solver` setting | Active | Default if omitted | Meaning |
+|---|---:|---:|---|
+| `newton_batch_size` | 128 | 64 | Bound Hessian/linear-solve workspace independently of pair batch size. |
+| `newton_check_every` | 5 | 0 | Stop Newton backtracking once every valid member accepts; 0 runs all 30 trials. |
+| `inner_compact` | true | false | Remove retired inner members after 25% becomes inactive; preserve output ordering and individual counts. |
+| `inner_warm_start` | true | false | Reuse each pair's previous inner dual potentials across outer iterations. |
+
+Warm starts reconstruct the mass multiplier for the **new effective cost**.
+Primal feasibility, KKT, primal stability and duality-gap checks are unchanged;
+warm starts do not mean accepting the previous plan. They apply only within a
+running solve. Failed/interrupted pairs still restart cold on resume, while
+registered successful artifacts are reused. Different optimization paths can
+differ within numerical tolerances; bitwise equality is not promised.
+
+`logs/<attempt>/pair_batch_performance.jsonl` and `pair_batch_report.json`
+record per-batch total seconds, successful pairs/second, allocated/reserved
+GPU peaks (including resident banks/kernels), and these phase timings:
+
+- `cost_and_kernel_gather`
+- `mi_and_gradient`
+- `inner_solver`
+- `outer_update_and_diagnostics`
+- `checkpoint_and_logging` (host time including transfer, validation and saves)
+
+CUDA events are resolved at batch boundaries. Host wall times and CUDA stream
+times overlap and must **not** be added; stream timings can include launch gaps.
+Small orchestration/report-building overhead is outside these phase subtotals.
+Inner reports add `work_iterations` alongside active `iterations`, showing
+work on retired members before compaction. Central iteration events are
+appended in one file open per outer callback; individual pair logs and durable
+atomic save/verify/register/cleanup remain intact. There is no asynchronous
+artifact writer or weakened recovery guarantee.
+
+Benchmark `--newton-batch-size 64/128/256` and `--no-inner-warm-start` isolate
+these choices without editing the YAML. Synthetic benchmark timing excludes
+file I/O and is not evidence of AFHQ throughput or image quality. Also compare
+production phase logs for identical selected pairs. CUDA speedup/peak memory
+remain unmeasured locally. New solver source/config fingerprints require a
+fresh fit directory; do not force-resume a fit made with the old solver.
 
 Run `--dry-run` before fitting. Other modes' dense patch kernels/plans can be
 much larger. Resource limits fail explicitly; raise them only when the machine
@@ -684,15 +767,17 @@ reproducible sample of the router-selected pairs, without writing any mapping,
 plan or checkpoint. The existing `--tune` remains image-router-only.
 
 ```bash
-# Fresh in-memory router, then a 64-pair patch trial using the active recipe.
-python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-pairs 64 --tune-seed 42 --partial-reg 0.04 --tune-report outputs/infoot_vit_tuning/partial_reg004.json
+# Measured reg=.0375, lam=.030 baseline; reuse the ORIGINAL FIT's router/selection.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-from "outputs/infoot_vit/<fit-directory>" --tune-pairs 64 --tune-seed 42 --partial-reg 0.0375 --partial-lam 0.030 --tune-report outputs/infoot_vit_tuning/partial_reg00375_lam0030.json
 
-# Preferred matched comparison: reuse the ORIGINAL FIT directory's registered
-# image router and saved top-8 selection, then vary only partial parameters.
-python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-from outputs/infoot_vit/<fit-directory> --tune-pairs 64 --tune-seed 42 --partial-reg 0.05 --tune-report outputs/infoot_vit_tuning/partial_reg005.json
+# Next candidate: increase only partial lam to .035, keeping reg=.0375.
+python infoot_vit/infoot_fit.py --config infoot_vit/configs/grouped_partial.yaml --source-bank data/infoot_vit/cat_train_4000 --target-bank data/infoot_vit/dog_train_4000 --tune-partial --tune-from "outputs/infoot_vit/<fit-directory>" --tune-pairs 64 --tune-seed 42 --partial-reg 0.0375 --partial-lam 0.035 --tune-report outputs/infoot_vit_tuning/partial_reg00375_lam0035.json
 ```
 
-Use the same `--tune-from`, banks, pair limit and seed for both .04/.05 runs.
+Use the same `--tune-from`, banks, pair limit, seed and solver code for comparisons.
+If the solver implementation changes, rerun the baseline before attributing
+timing or numerical differences to parameters; full reports contain code hashes.
+Omit `--tune-from` to fit a fresh router in memory when no saved fit is available.
 `--tune-from` requires the original fitting artifact (including `plans/image.pt`
 and `pair_selection.json`), **not a testing-results folder or logs-only copy**.
 An interrupted fit is usable once those two artifacts have been registered.
@@ -742,11 +827,64 @@ partial h/lam/reg/mass exercises the actual candidate objective on the same pair
   Neither tuning mode accepts `--resume`, `--output-root` or `--dry-run`, and
   `--tune`/`--tune-partial` are mutually exclusive.
 
-Start with the matched .05/.04 entropy comparison before changing bandwidth or
-MI weight. A decrease in effective patches is a geometry measurement, not proof
-of sharper or more faithful generated images. Save a full mapping and evaluate
-identical held-out images once the sampled solver and projection diagnostics
-justify a candidate.
+Matched 64-pair trials (seed 42) with h=.35, lam=.025 and mass=.8:
+
+| Partial reg | Converged | Max outer steps | Fitted effective patches | Projected variance ratio | Valid fraction | Solver seconds |
+| --- | --- | --- | --- | --- | --- | --- |
+| .04 | 64/64 | 26 | 23.578 | .59959 | .98326 | 47.3 |
+| .0375 | 64/64 | 29 | 20.921 | .61937 | .98055 | 101.8 |
+| .035 | 64/64 | 34 | 18.379 | .63947 | .97760 | 188.8 |
+
+Reducing reg sharpened correspondence: effective patches fell 22.1%, fitted
+top-1 rose from .27567 to .31955, and projected effective patches fell from
+25.107 to 19.943. Coverage fell only .566 percentage points. All three trials met
+the existing strict feasibility and stationarity checks. However, reported
+solver time increased 3.99x; max final inner iterations rose from 1491 to 4521.
+The timings are single runs with uncontrolled GPU load, not a throughput benchmark.
+
+The measured **reg=.0375** midpoint retained 49.6% of the projected-variance gain
+over .04, with 46.1% less reported solver time than .035. It is the working
+baseline for the next ablation, not a demonstrated optimum for image quality.
+At this midpoint with lam=.025, fitted top-1=.29610, projected effective patches=22.469 and
+max final inner iterations=2901. Keep .035 as the more concentrated candidate
+for matched held-out image evaluation.
+
+The subsequent MI-weight comparison holds h=.35, reg=.0375 and mass=.8 fixed:
+
+| Partial lam | Unweighted information | Fitted effective patches | Projected variance ratio | Valid fraction | Max outer steps | Solver seconds |
+| --- | --- | --- | --- | --- | --- | --- |
+| .025 | 1.74764 | 20.921 | .61937 | .98055 | 29 | 101.8 |
+| .030 | 1.84723 | 17.903 | .65001 | .98158 | 46 | 197.3 |
+
+Both trials converged for 64/64 pairs. At lam=.030, fitted top-1=.32863,
+projected effective patches=19.394, norm ratio=.91228, max final inner
+iterations=3331 and cost=.59764 (vs .59996). Unweighted MI rose 5.7%, fitted
+mixing decreased 14.4%, and coverage increased .103 percentage points.
+Reported solver time rose 1.94x; this remains an uncontrolled timing comparison.
+The .030 setting is a promising measured candidate for image evaluation, not
+evidence that further concentration will necessarily improve translation.
+
+Next change **only partial lam=.030 -> .035** (+16.7%), holding h=.35, reg=.0375,
+mass=.8, threshold=.05 and projection .20/.20 fixed. Keep .030 as the measured
+control. This is one further bounded test of MI pressure, with no assumed
+improvement in speed, correspondence or images. Recover the next unweighted
+information as `-mi_term/.035`; compare with 1.84723. A more negative weighted
+MI term alone can simply reflect its larger coefficient. Compare raw information,
+cost, mixing, coverage, spread and iteration work on the same solver version.
+If added pressure mainly increases work or loses coverage, prefer the .030
+candidate. After this comparison, test the finalists on held-out image grids;
+do not target variance=1 or minimal effective patches as a quality criterion.
+Compare on the same pair hash (`22babaeb9a7e`) and selection hash (`1cce4c6670b4`).
+Changing reg changes the objective itself, so .30459 vs .26866 is not a quality
+ranking. A decrease in effective patches is a geometry measurement, not proof
+of sharper or more faithful images. Save a full mapping and compare identical
+held-out images before selecting the final setting.
+
+With Newton acceleration, partial `inner.error` is the legacy **log-plan change**,
+not a marginal violation. Small-probability entries can change greatly in log
+space. Acceptance uses the relative primal-plan change, KKT certificate,
+duality gap and feasibility; inspect those and `convergence_reason` in the JSON
+report before treating a large legacy error as solver failure.
 
 ### Weighted objective terms
 

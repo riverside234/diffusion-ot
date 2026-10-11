@@ -12,6 +12,7 @@ from .partial import distance
 from .partial_batch import solve_partial_batch
 from .storage import store_plan_state, validate_plan
 from .plan_diagnostics import patch_plan_concentration
+from .pair_timing import PairTimer
 
 
 def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, selected_pairs, done, log):
@@ -28,6 +29,7 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
                if (sid, tid) in selected_pairs and (sid, tid) not in done]
     failures = []
     geometry_rows = []
+    performance = []
     index_path = directory / "pairs.jsonl"
     started = time.perf_counter()
     initial_done = len(done)
@@ -41,6 +43,7 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
             unfinished_attempted_pairs=attempted-(len(done)-initial_done)-len(failures),
             unattempted_pairs=len(pending)-attempted,
             consecutive_all_failed_batches=failed_batches,
+            batch_performance=performance,
             failures=[{k: v for k, v in row.items() if k != "report"} for row in failures],
             resume_policy="Reuse registered successful pairs; restart unfinished/failed pairs from exact float64 feasible initialization.")
         if geometry_rows:
@@ -67,16 +70,18 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
         attempted += len(batch)
         batch_start = time.perf_counter()
         batch_done = len(done)
+        timer = PairTimer(x.device)
+        if x.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(x.device)
         log.event("pair_batch_started", batch=offset // size, pairs=len(batch), configured_batch_size=size,
                   device=str(x.device), completed_pairs=len(done), total_pairs=len(selected_pairs))
-        indices = torch.tensor([(i, j) for i, j, *_ in batch], device=x.device, dtype=torch.long)
-        # Costs and cached per-image kernels are gathered on the selected device.
-        costs = distance(x[indices[:, 0]], y[indices[:, 1]])
-        scales = costs.mean((-1, -2)) if pc["cost_scale"] == "mean" else costs.new_full((len(batch),), pc["cost_scale"])
-        # One small transfer outside solver loops. Compare entropy strength with
-        # within-row geometric contrast, not just the mean-normalized cost (~1).
-        cost_spread = (costs.std(-1, unbiased=False).mean(-1) / scales).detach().cpu().tolist()
-        kx, ky = shared["kx"][indices[:, 0]], shared["ky"][indices[:, 1]]
+        with timer.section("cost_and_kernel_gather"):
+            indices = torch.tensor([(i, j) for i, j, *_ in batch], device=x.device, dtype=torch.long)
+            # Costs and cached per-image kernels are gathered on the selected device.
+            costs = distance(x[indices[:, 0]], y[indices[:, 1]])
+            scales = costs.mean((-1, -2)) if pc["cost_scale"] == "mean" else costs.new_full((len(batch),), pc["cost_scale"])
+            cost_spread = (costs.std(-1, unbiased=False).mean(-1) / scales).detach().cpu().tolist()
+            kx, ky = shared["kx"][indices[:, 0]], shared["ky"][indices[:, 1]]
         a = x.new_full((x.shape[1],), 1 / x.shape[1])
         b = y.new_full((y.shape[1],), 1 / y.shape[1])
         a_cpu, b_cpu = a.cpu(), b.cpu()  # Storage metadata, once per batch.
@@ -109,7 +114,12 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
                 print(f"First failed pair: {sid}/{tid}, {status}; inner={last.get('inner', {})}. "
                       f"{reproduction}", flush=True)
 
-        def progress(plans, reports):
+        def _progress(plans, reports):
+            # Persist all iteration events before terminal artifact processing,
+            # using one open/close instead of one per pair in the central log.
+            log.events(("solver_iteration", dict(unit=f"pairs/{batch[i][-1]}",
+                **(r["history"][-1] if r["history"] else dict(iteration=0, status=r["status"], error=r["error"]))))
+                for i, r in enumerate(reports) if r is not None and i not in failed_members)
             # One bulk transfer only at checkpoint/terminal boundaries. Metrics
             # arrived in one packed transfer from the numerical solver.
             checkpoint_members = [i for i, r in enumerate(reports) if r is not None
@@ -131,7 +141,6 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
                 with (pair_directory / "iterations.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(dict(record, run_id=log.run_id,
                         elapsed_seconds=time.perf_counter() - started), allow_nan=False) + "\n")
-                log.event("solver_iteration", unit=f"pairs/{key}", **record)
                 if member not in snapshots:
                     continue
                 # Validate each accepted float64 plan before any quantization.
@@ -173,11 +182,33 @@ def fit_pairs_batched(*, directory, manifest, source, target, x, y, shared, sele
                     total_pairs=len(selected_pairs), status=report["status"], last_iteration=record,
                     storage=saved["storage"], geometry=geometry)
 
+        def progress(plans, reports):
+            with timer.section("checkpoint_and_logging", cuda=False):
+                _progress(plans, reports)
+
+        def record_performance(status):
+            # Coarse CUDA events resolve once per batch, outside solver loops.
+            try:
+                timings = timer.report()
+            except Exception as error:
+                timings = dict(timing_error=str(error), host_wall_seconds=dict(timer.host))
+            elapsed = time.perf_counter() - batch_start
+            record = dict(batch=offset // size, pairs=len(batch), status=status,
+                seconds=elapsed, successful_pairs_per_second=(len(done)-batch_done)/elapsed,
+                peak_gpu_allocated_bytes=torch.cuda.max_memory_allocated(x.device) if x.device.type == "cuda" else None,
+                peak_gpu_reserved_bytes=torch.cuda.max_memory_reserved(x.device) if x.device.type == "cuda" else None,
+                timing=timings)
+            performance.append(record)
+            log.append_jsonl("pair_batch_performance.jsonl", record)
+            return record
+
         try:
-            solve_partial_batch(costs, kx, ky, keep_mass=mass, config=pc, on_step=progress)
+            solve_partial_batch(costs, kx, ky, keep_mass=mass, config=pc, on_step=progress, timer=timer)
         except BaseException:
+            record_performance("interrupted_or_failed")
             save_report("interrupted_or_failed")
             raise
+        record_performance("completed_with_failures" if failed_members else "completed")
         elapsed = time.perf_counter() - batch_start
         log.event("pair_batch_finished", batch=offset // size, pairs=len(batch),
             successful_pairs=len(done)-batch_done, failed_pairs=len(failed_members),

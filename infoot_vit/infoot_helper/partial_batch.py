@@ -13,12 +13,13 @@ See https://pythonot.github.io/_modules/ot/partial/partial_solvers.html.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 import torch
 
 from .partial import OBJECTIVE, capabilities, information, information_gradient, solver_config
 from .partial_newton import dual_newton_step
 
-VERSION = "dense_partial_infoot_batch_v4_newton"
+VERSION = "dense_partial_infoot_batch_v5_active_warm"
 RUNNING, CONVERGED, BUDGET, STALLED, INVALID, INNER_FAILED, NONFINITE = range(7)
 STATUS = ("running", "converged", "max_outer_steps", "line_search_stalled",
           "invalid_input", "inner_failed", "nonfinite_objective_or_gradient")
@@ -97,12 +98,14 @@ def _partial_certificate(plan, log_plan, previous, base, a, b, mass, u, v, w):
 
 
 @torch.no_grad()
-def entropy_subproblem_batch(a, b, cost, mass, config):
+def entropy_subproblem_batch(a, b, cost, mass, config, *, initial_duals=None):
     """Exact entropic subproblems, with pair-local stopping/failure tensors.
 
-    Only one batch-wide host check per ten iterations. Converged/failed state
-    is frozen by GPU masks. Counts include every update, including the first
-    convergence check at iteration 1 (POT cpt=0).
+    Converged/failed state is frozen by GPU masks. Optional compaction at the
+    existing ten-step checks stops computing retired members once at least 25%
+    of the current work batch is inactive. Independent certificates, iteration
+    counts and original output order are preserved. Warm starts reuse only
+    inequality potentials; mass normalization is rebuilt for the NEW cost.
     """
     batch = len(cost)
     valid = torch.isfinite(cost).all((-2, -1))
@@ -114,17 +117,48 @@ def entropy_subproblem_batch(a, b, cost, mass, config):
     plan_error, kkt_error = error.clone(), error.clone()
     stop_reason = torch.zeros(batch, dtype=torch.int64, device=cost.device)
     counts = torch.zeros(batch, dtype=torch.int64, device=cost.device)
+    work_iterations = torch.zeros_like(counts)
     newton_steps = torch.zeros_like(counts)
     accelerate = mass != 1. and config.get("inner_acceleration", "none") == "newton"
     loga, logb = a.log(), b.log()
     u, v = torch.zeros_like(a), torch.zeros_like(b)
+    if initial_duals is not None:
+        iu, iv = initial_duals
+        if iu.shape != a.shape or iv.shape != b.shape or iu.device != cost.device or iv.device != cost.device:
+            raise ValueError("Warm-start potentials must match the capacities' shapes and device.")
+        usable = (torch.isfinite(iu).all(-1) & torch.isfinite(iv).all(-1)
+                  & (iu <= 0).all(-1) & (iv <= 0).all(-1)) if mass != 1. else (
+                      torch.isfinite(iu).all(-1) & torch.isfinite(iv).all(-1))
+        u = torch.where(usable[:, None], iu.to(a), u).clone()
+        v = torch.where(usable[:, None], iv.to(b), v).clone()
     w = cost.new_zeros(batch)
     if mass == 1.:
-        lk = base.clone()
+        lk = base + u[:, :, None] + v[:, None, :]
     else:
-        w = math.log(mass) - base.logsumexp((-2, -1))
-        lk = base + w[:, None, None]
+        lk = base + u[:, :, None] + v[:, None, :]
+        w = math.log(mass) - lk.logsumexp((-2, -1))
+        lk = lk + w[:, None, None]
+    indices = torch.arange(batch, device=cost.device)
+    completed = {}
+
+    def capture():
+        plan = lk.exp()
+        residuals = residual_values(plan, a, b, mass)
+        gap, gap_error = _duality_gap(plan, lk, base, a, b, mass, u, v, w, config["reg"])
+        ok = valid & ~numerical & ~active & feasible(residuals, config)
+        failure = torch.where(numerical, 1, torch.where(active, 2, torch.where(ok, 0, 3)))
+        values = dict(plan=plan, u=u, v=v, ok=ok, error=error, iterations=counts,
+            work_iterations=work_iterations, failure=failure, cost_shift=shift,
+            residuals=residuals, duality_gap=gap, relative_duality_gap=gap_error,
+            relative_plan_delta_l1=plan_error, kkt_error=kkt_error,
+            stop_reason=stop_reason, newton_steps=newton_steps)
+        for key, value in values.items():
+            if key not in completed:
+                completed[key] = value.new_empty((batch, *value.shape[1:]))
+            completed[key][indices] = value
+
     for iteration in range(config["max_inner_steps"]):
+        work_iterations += 1
         previous = lk
         if mass == 1.:
             next_v = logb - (base + u[:, :, None]).logsumexp(-2)
@@ -147,9 +181,10 @@ def entropy_subproblem_batch(a, b, cost, mass, config):
         if accelerate and iteration >= 100 and iteration % 10 == 0:
             # Small linear-algebra chunks bound memory independently of the
             # requested pair batch. Inactive members are never accelerated.
-            indices = active.nonzero().flatten()
-            for ids in indices.split(64):
-                nu, nv, nw, accepted = dual_newton_step(base[ids], a[ids], b[ids], mass, u[ids], v[ids], w[ids])
+            live = active.nonzero().flatten()
+            for ids in live.split(config.get("newton_batch_size", 64)):
+                nu, nv, nw, accepted = dual_newton_step(base[ids], a[ids], b[ids], mass, u[ids], v[ids], w[ids],
+                    check_every=config.get("newton_check_every", 0))
                 u[ids], v[ids], w[ids] = nu, nv, nw
                 newton_steps[ids] += accepted
                 lk[ids] = base[ids] + nu[:, :, None] + nv[:, None, :] + nw[:, None, None]
@@ -178,19 +213,26 @@ def entropy_subproblem_batch(a, b, cost, mass, config):
                 stopped &= feasible(residual_values(plan, a, b, mass), config) & (gap_error <= config["inner_tolerance"])
             stop_reason = torch.where(active & stopped, reason, stop_reason)
             active &= ~stopped
-            if not bool(active.any()):
+            if config.get("inner_compact", False):
+                live = active.nonzero().flatten()
+                if not len(live):
+                    break
+                if len(live) <= .75 * len(indices):
+                    capture()
+                    (base, a, b, loga, logb, u, v, w, lk, valid, active,
+                     numerical, error, plan_error, kkt_error, counts, work_iterations,
+                     stop_reason, newton_steps, shift) = [value[live] for value in (
+                         base, a, b, loga, logb, u, v, w, lk, valid, active,
+                         numerical, error, plan_error, kkt_error, counts, work_iterations,
+                         stop_reason, newton_steps, shift)]
+                    indices = indices[live]
+            elif not bool(active.any()):
                 break
-    plan = lk.exp()
-    residuals = residual_values(plan, a, b, mass)
-    gap, gap_error = _duality_gap(plan, lk, base, a, b, mass, u, v, w, config["reg"])
-    ok = valid & ~numerical & ~active & feasible(residuals, config)
-    # 0 success, 1 input/numerical failure, 2 iteration budget, 3 feasibility.
-    failure = torch.where(numerical, 1, torch.where(active, 2, torch.where(ok, 0, 3)))
-    return plan, dict(ok=ok, error=error, iterations=counts, failure=failure,
-        cost_shift=shift, residuals=residuals, duality_gap=gap, relative_duality_gap=gap_error,
-        relative_plan_delta_l1=plan_error, kkt_error=kkt_error, stop_reason=stop_reason,
-        newton_steps=newton_steps,
-        method="balanced_sinkhorn_log_s_equals_1" if mass == 1. else "partial_capped_mass_log")
+    capture()
+    plan = completed.pop("plan")
+    completed["dual_state"] = (completed.pop("u"), completed.pop("v"))
+    completed["method"] = "balanced_sinkhorn_log_s_equals_1" if mass == 1. else "partial_capped_mass_log"
+    return plan, completed
 
 
 def _number(value):
@@ -198,7 +240,7 @@ def _number(value):
 
 
 @torch.no_grad()
-def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=None, on_step=None):
+def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=None, on_step=None, timer=None):
     """Return [B,P,Q] last accepted plans and B independent reports.
 
     A numerical/iteration failure retires just that pair. ``on_step(plans,
@@ -231,6 +273,9 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
     counts = torch.zeros(batch, dtype=torch.int64, device=cost.device)
     reports = [None] * batch
     histories = [[] for _ in range(batch)]
+    dual_u, dual_v = torch.zeros_like(a), torch.zeros_like(b)
+    def phase(name):
+        return timer.section(name) if timer is not None else nullcontext()
     runtime = dict(capabilities(), batch_solver=VERSION, device=str(cost.device))
     initial = torch.stack((statuses.double(), scales), -1).cpu().tolist()
     for idx, (status, scale) in enumerate(initial):
@@ -245,59 +290,66 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
         if not len(indices):
             break
         old_plan, cc, xx, yy, aa, bb = (v[indices] for v in (plans, cost, kx, ky, a, b))
-        old = objective_values(old_plan, cc, xx, yy, c)
-        gradient = information_gradient(old_plan, xx, yy, c["log_floor"]) if c["lam"] else torch.zeros_like(old_plan)
-        healthy = torch.isfinite(old).all(-1) & torch.isfinite(gradient).all((-2, -1))
-        effective = cc - c["lam"] * gradient
-        candidate, inner = entropy_subproblem_batch(aa, bb, effective, keep_mass, c)
-        ok = inner["ok"] & healthy
-        delta = (candidate - old_plan).abs().sum((-2, -1))
-        local_status = torch.where(healthy, torch.where(ok, RUNNING, INNER_FAILED), NONFINITE)
-        stationary = ok & (delta <= c["outer_tolerance"])
-        accepted_plan, terms = old_plan.clone(), old.clone()
-        steps = delta.new_zeros(len(indices))
-        backtracks = torch.zeros_like(local_status)
-        if c["lam"] == 0:
-            local_status = torch.where(ok, CONVERGED, local_status)
-            accepted_plan = torch.where(ok[:, None, None], candidate, old_plan)
-            terms = objective_values(accepted_plan, cc, xx, yy, c)
-            steps = ok.to(delta.dtype)
-        else:
-            local_status = torch.where(stationary, CONVERGED, local_status)
-            pending = ok & ~stationary
-            step = torch.ones_like(delta)
-            for attempt in range(c["max_backtracks"]):
-                if not bool(pending.any()):
-                    break
-                trial = old_plan + step[:, None, None] * (candidate - old_plan)
-                trial_terms = objective_values(trial, cc, xx, yy, c)
-                accepted = pending & torch.isfinite(trial_terms).all(-1) & (trial_terms[:, 3] <= old[:, 3] + c["objective_tolerance"])
-                stalled = accepted & (step * delta <= c["outer_tolerance"])
-                local_status = torch.where(stalled, STALLED, local_status)
-                improved = accepted & ~stalled
-                accepted_plan = torch.where(improved[:, None, None], trial, accepted_plan)
-                terms = torch.where(improved[:, None], trial_terms, terms)
-                steps = torch.where(improved, step, steps)
-                pending &= ~accepted
-                backtracks += pending
-                step = torch.where(pending, step * .5, step)
-            local_status = torch.where(pending, STALLED, local_status)
-        if iteration == c["max_outer_steps"]:
-            local_status = torch.where(local_status == RUNNING, BUDGET, local_status)
-        plans[indices] = accepted_plan
-        statuses[indices] = local_status
-        counts[indices] += 1
-        residuals = residual_values(accepted_plan, aa, bb, keep_mass)
-        # Pack diagnostics for one device-to-host copy per outer iteration;
-        # all objective/gradient/feasibility computation above stays on device.
-        packed = torch.cat((indices[:, None], local_status[:, None], counts[indices, None],
-            scales[indices, None], steps[:, None], backtracks[:, None], delta[:, None],
-            (steps * delta)[:, None], (terms[:, 3]-old[:, 3])[:, None], terms, residuals,
-            inner["error"][:, None], inner["iterations"][:, None], inner["failure"][:, None],
-            inner["cost_shift"][:, None], inner["residuals"],
-            inner["duality_gap"][:, None], inner["relative_duality_gap"][:, None],
-            inner["relative_plan_delta_l1"][:, None], inner["kkt_error"][:, None],
-            inner["stop_reason"][:, None], inner["newton_steps"][:, None]), -1).cpu().tolist()
+        with phase("mi_and_gradient"):
+            old = objective_values(old_plan, cc, xx, yy, c)
+            gradient = information_gradient(old_plan, xx, yy, c["log_floor"]) if c["lam"] else torch.zeros_like(old_plan)
+            healthy = torch.isfinite(old).all(-1) & torch.isfinite(gradient).all((-2, -1))
+            effective = cc - c["lam"] * gradient
+        with phase("inner_solver"):
+            warm = (dual_u[indices], dual_v[indices]) if c.get("inner_warm_start", False) and iteration > 1 else None
+            candidate, inner = entropy_subproblem_batch(aa, bb, effective, keep_mass, c, initial_duals=warm)
+            if c.get("inner_warm_start", False):
+                dual_u[indices], dual_v[indices] = inner["dual_state"]
+        with phase("outer_update_and_diagnostics"):
+            ok = inner["ok"] & healthy
+            delta = (candidate - old_plan).abs().sum((-2, -1))
+            local_status = torch.where(healthy, torch.where(ok, RUNNING, INNER_FAILED), NONFINITE)
+            stationary = ok & (delta <= c["outer_tolerance"])
+            accepted_plan, terms = old_plan.clone(), old.clone()
+            steps = delta.new_zeros(len(indices))
+            backtracks = torch.zeros_like(local_status)
+            if c["lam"] == 0:
+                local_status = torch.where(ok, CONVERGED, local_status)
+                accepted_plan = torch.where(ok[:, None, None], candidate, old_plan)
+                terms = objective_values(accepted_plan, cc, xx, yy, c)
+                steps = ok.to(delta.dtype)
+            else:
+                local_status = torch.where(stationary, CONVERGED, local_status)
+                pending = ok & ~stationary
+                step = torch.ones_like(delta)
+                for attempt in range(c["max_backtracks"]):
+                    if not bool(pending.any()):
+                        break
+                    trial = old_plan + step[:, None, None] * (candidate - old_plan)
+                    trial_terms = objective_values(trial, cc, xx, yy, c)
+                    accepted = pending & torch.isfinite(trial_terms).all(-1) & (trial_terms[:, 3] <= old[:, 3] + c["objective_tolerance"])
+                    stalled = accepted & (step * delta <= c["outer_tolerance"])
+                    local_status = torch.where(stalled, STALLED, local_status)
+                    improved = accepted & ~stalled
+                    accepted_plan = torch.where(improved[:, None, None], trial, accepted_plan)
+                    terms = torch.where(improved[:, None], trial_terms, terms)
+                    steps = torch.where(improved, step, steps)
+                    pending &= ~accepted
+                    backtracks += pending
+                    step = torch.where(pending, step * .5, step)
+                local_status = torch.where(pending, STALLED, local_status)
+            if iteration == c["max_outer_steps"]:
+                local_status = torch.where(local_status == RUNNING, BUDGET, local_status)
+            plans[indices] = accepted_plan
+            statuses[indices] = local_status
+            counts[indices] += 1
+            residuals = residual_values(accepted_plan, aa, bb, keep_mass)
+            # Pack diagnostics for one device-to-host copy per outer iteration;
+            # all objective/gradient/feasibility computation above stays on device.
+            packed = torch.cat((indices[:, None], local_status[:, None], counts[indices, None],
+                scales[indices, None], steps[:, None], backtracks[:, None], delta[:, None],
+                (steps * delta)[:, None], (terms[:, 3]-old[:, 3])[:, None], terms, residuals,
+                inner["error"][:, None], inner["iterations"][:, None], inner["failure"][:, None],
+                inner["cost_shift"][:, None], inner["residuals"],
+                inner["duality_gap"][:, None], inner["relative_duality_gap"][:, None],
+                inner["relative_plan_delta_l1"][:, None], inner["kkt_error"][:, None],
+                inner["stop_reason"][:, None], inner["newton_steps"][:, None],
+                inner["work_iterations"][:, None]), -1).cpu().tolist()
         emitted = [None] * batch
         for row in packed:
             idx, status, count = map(int, row[:3])
@@ -306,6 +358,7 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
                 duality_gap=_number(row[25]), relative_duality_gap=_number(row[26]),
                 relative_plan_delta_l1=_number(row[27]), kkt_error=_number(row[28]),
                 newton_steps=int(row[30]),
+                work_iterations=int(row[31]),
                 convergence_reason=("not_converged", "balanced_marginal_residual" if keep_mass == 1.
                     else "legacy_residual_and_gap", "primal_dual_certificate")[int(row[29])],
                 error_metric="column_marginal_l2" if keep_mass == 1. else "log_plan_delta_l2",

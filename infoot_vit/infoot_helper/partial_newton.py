@@ -10,7 +10,7 @@ import torch
 
 
 @torch.no_grad()
-def dual_newton_step(base, a, b, mass, u, v, w):
+def dual_newton_step(base, a, b, mass, u, v, w, *, check_every=0):
     """One projected, dual-descent Newton step per independent partial problem.
 
     Minimize sum(exp(base+u+v+w)) - a.u - b.v - mass*w, with u,v <= 0.
@@ -46,7 +46,7 @@ def dual_newton_step(base, a, b, mass, u, v, w):
     step = base.new_ones(batch)
     accepted = torch.zeros_like(valid)
     result = z.clone()
-    for _ in range(30):
+    for attempt in range(30):
         trial = z + step[:, None] * direction
         trial[:, :-1].clamp_max_(0)
         tu, tv, tw = trial[:, :n], trial[:, n:n+m], trial[:, -1]
@@ -56,6 +56,9 @@ def dual_newton_step(base, a, b, mass, u, v, w):
         ok = valid & torch.isfinite(value) & (slope <= 0) & (value <= old + 1e-4*slope + roundoff)
         result = torch.where((~accepted & ok)[:, None], trial, result)
         accepted |= ok
-        # No GPU-to-CPU check per backtrack; fixed bounded work with pair masks.
+        # Optional periodic host check trades one synchronization for skipping
+        # redundant backtracks. Invalid linear solves never need more trials.
         step = torch.where(accepted, step, step*.5)
+        if check_every and (attempt + 1) % check_every == 0 and bool((accepted | ~valid).all()):
+            break
     return result[:, :n], result[:, n:n+m], result[:, -1], accepted

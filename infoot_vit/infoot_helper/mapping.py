@@ -21,6 +21,7 @@ from .sampling import sample_ids, sampling_record
 from .device import resolve_device, move
 from .mapping_manifest import load_mapping_manifest
 from .plan_diagnostics import patch_plan_concentration
+from .dense_partial_projection import DensePartialProjector, runtime_settings
 
 
 @dataclass
@@ -73,12 +74,16 @@ def select_images(alpha, target_ids, query_id, settings):
 
 
 class FeatureMapper:
-    def __init__(self, directory, manifest, source, target, *, device=None, projection=None):
+    def __init__(self, directory, manifest, source, target, *, device=None, projection=None,
+                 pair_cache_bytes=None, pair_projection_batch_size=None):
         self.directory, self.manifest = Path(directory), manifest
         self.source, self.target = source, target
         self.source_index = {sid: i for i, sid in enumerate(source.ids)}
         self.target_index = {tid: j for j, tid in enumerate(target.ids)}
         self.config, self.mode = deepcopy(manifest["config"]), manifest["config"]["mode"]
+        runtime_settings(pair_cache_bytes, pair_projection_batch_size)
+        if self.mode != "grouped_partial" and (pair_cache_bytes is not None or pair_projection_batch_size is not None):
+            raise ValueError("Pair projection performance options apply only to dense grouped_partial.")
         if projection is not None:
             from .fit_mapping import validate_config
             self.config["projection"] = validate_config(dict(self.config, projection=projection))["projection"]
@@ -143,11 +148,12 @@ class FeatureMapper:
                 raise ValueError("Incomplete or unexpected selected pair bank; intentionally excluded pairs need no file, selected pairs do. Projection never fits missing pairs.")
             self.neighbors = {sid: [tid for tid in target.ids if (sid, tid) in successful] for sid in source.ids}
             self.pair_mask = torch.zeros(len(source.ids), len(target.ids), dtype=torch.bool,device=self.device)
-            for sid, tid in successful:
-                self.pair_mask[self.source_index[sid], self.target_index[tid]] = True
             self.failed_pair_mask = torch.zeros_like(self.pair_mask)
-            for sid, tid in failed:
-                self.failed_pair_mask[self.source_index[sid], self.target_index[tid]] = True
+            for mask, keys in ((self.pair_mask, successful), (self.failed_pair_mask, failed)):
+                if keys:
+                    indices = torch.tensor([(self.source_index[s], self.target_index[t])
+                        for s, t in keys], device=self.device, dtype=torch.long)
+                    mask[indices[:, 0], indices[:, 1]] = True
             kernel_state = torch.load(checked_file(directory, manifest["pair_kernels"]), weights_only=True)
             if manifest["schema"] == "siglip_infoot_mapping_v3" and kernel_state.get("storage", {}).get("version") != STORAGE_VERSION:
                 raise ValueError("Compact mappings require float32 kernel storage metadata.")
@@ -172,11 +178,17 @@ class FeatureMapper:
                 # fit, even if top-k routing will not use some of them.
                 for sid, tid in self.pairs:
                     self._pair(sid, tid)
+            self._dense_projector = DensePartialProjector(self, cache_bytes=pair_cache_bytes,
+                pair_batch_size=pair_projection_batch_size)
 
     @classmethod
-    def load(cls, directory, *, device=None, projection=None, run_log=None, allow_failed_pairs=False):
+    def load(cls, directory, *, device=None, projection=None, run_log=None, allow_failed_pairs=False,
+             pair_cache_bytes=None, pair_projection_batch_size=None):
         directory = Path(directory).resolve()
         m = load_mapping_manifest(directory, allow_failed_pairs=allow_failed_pairs)
+        runtime_settings(pair_cache_bytes, pair_projection_batch_size)
+        if m["config"]["mode"] != "grouped_partial" and (pair_cache_bytes is not None or pair_projection_batch_size is not None):
+            raise ValueError("Pair projection performance options apply only to dense grouped_partial.")
         if m.get("schema") in {"siglip_lowrank_grouped_patch_v1", "siglip_lowrank_grouped_partial_v1"}:
             from infoot_vit.lowrank.mapping import LowRankMapper
             return LowRankMapper.load(directory,device=device,projection=projection,run_log=run_log)
@@ -198,7 +210,8 @@ class FeatureMapper:
             elif ids != bank.ids:
                 raise ValueError("Referenced bank ordered IDs changed.")
         compatible_banks(*banks)
-        mapper = cls(directory, m, *banks,device=device,projection=projection)
+        mapper = cls(directory, m, *banks,device=device,projection=projection,
+            pair_cache_bytes=pair_cache_bytes, pair_projection_batch_size=pair_projection_batch_size)
         if "incomplete_fit" in m:
             if file_hash(directory / "manifest.json") != m["incomplete_fit"]["original_manifest_sha256"]:
                 raise ValueError("Fit changed while validating successful pairs; stop fitting before testing failed pairs.")
@@ -210,11 +223,11 @@ class FeatureMapper:
                   "Original fit remains failed.", flush=True)
         return mapper
 
-    def _pair(self, sid, tid):
+    def _read_pair(self, sid, tid):
         if (sid, tid) not in self.pairs:
             raise KeyError(f"Pair {sid}/{tid} is intentionally excluded by the saved fit selection; no inference fit is allowed.")
         entry = self.pairs[sid, tid]
-        state = torch.load(checked_file(self.directory, entry), weights_only=True)
+        state = torch.load(checked_file(self.directory, entry), map_location="cpu", weights_only=True)
         if self.manifest["schema"] == "siglip_infoot_mapping_v3" and state.get("storage", {}).get("version") != STORAGE_VERSION:
             raise ValueError("Compact mappings require float32 pair storage metadata.")
         if (state["source_id"] != sid or state["target_id"] != tid
@@ -227,7 +240,12 @@ class FeatureMapper:
         plan = state["plan"].double()
         if not torch.equal(state["r"], plan.sum(1)) or not torch.equal(state["c"], plan.sum(0)):
             raise ValueError("Stored retained marginals disagree with the raw partial plan.")
-        return move(dict(state, plan=plan, storage_validation=validation),self.device)
+        return dict(state, storage_validation=validation)
+
+    def _pair(self, sid, tid):
+        """Uncached serial reference, also used for strict artifact validation."""
+        state = self._read_pair(sid, tid)
+        return move(dict(state, plan=state["plan"].double()), self.device)
 
     def _partial_query(self, patches, i):
         return log_query_kernel(patches,self.x[i],self.shared["sx"][i],self.shared["h_projection"])
@@ -345,58 +363,62 @@ class FeatureMapper:
                             detail.update(failed_pair_discarded_routing_mass=failed_mass,
                                 successful_pair_retained_routing_mass=retained_pairs,
                                 total_pair_discarded_routing_mass=max(0., 1. - retained_pairs))
-                        feature_sum, confidence = torch.zeros_like(patches), patches.new_zeros(p)
-                        rejected_ot, support_invalid = torch.zeros_like(confidence), torch.zeros_like(confidence)
-                        invalid_routes = torch.zeros_like(confidence)
-                        group_budgets = patches.new_zeros(p, len(self.target.ids))
-                        accounting_error, effective = 0., 0.
-                        underflow_rows = log_retry_rows = 0
-                        retention_roundoff_max = 0.
-                        geometry_totals = {}
-                        for i, sid in enumerate(self.source.ids):
-                            logs = self._partial_query(patches,i)
-                            for tid in self.neighbors[sid]:
-                                j = self.target_index[tid]
-                                route = theta[i, j]
-                                if route == 0:
-                                    continue
-                                candidate,g,diag,tolerance = self._partial_projection(patches,i,j,sid,tid,logs)
-                                if (g < -tolerance).any() or (g > 1 + tolerance).any():
-                                    raise ValueError("Retained confidence violates [0,1].")
-                                raw_confidence = diag["raw_confidence"].clamp(0, 1)
-                                retention_roundoff_max = max(retention_roundoff_max, float((diag["raw_confidence"] - raw_confidence).abs().max()))
-                                g = raw_confidence * diag["support_valid"]  # Only validated storage/solver roundoff; no plan renormalization.
-                                confidence += route * g
-                                feature_sum += route * g[:, None] * candidate
-                                rejected_ot += route * (1 - raw_confidence)
-                                support_invalid += route * raw_confidence * (~diag["support_valid"])
-                                invalid_routes += route * (~diag["support_valid"])
-                                underflow_rows += int(diag["confidence_underflow"].sum())
-                                log_retry_rows += int(diag["score_log_retry"].sum())
-                                budget = route * g * diag["weight_row_sums"] + route * (1 - g)
-                                group_budgets[:, j] += budget
-                                accounting_error = max(accounting_error, float((budget - route).abs().max()))
-                                patch_entropy = diag["patch_entropy"]
-                                effective += float((route * g * patch_entropy.exp()).sum())
-                                if "plan_geometry" in diag:  # Exact dense partial diagnostics.
-                                    for name, value in dict(diag["plan_geometry"],
-                                            within_image_top1_patch_probability=diag["projected_patch_top1_probability"],
-                                            query_source_effective_patches=diag["query_source_effective_patches"]).items():
-                                        geometry_totals[name] = geometry_totals.get(name, 0.) + (route * g * value).sum()
-                        cf = settings["confidence"]
-                        positive = confidence > cf["mass_floor"]
-                        mapped = torch.zeros_like(feature_sum)
-                        mapped[positive] = feature_sum[positive] / confidence[positive, None]
-                        detail.update(matched_rejected_accounting_error=accounting_error,
-                            matched_rejected_group_mass_residual=float((group_budgets - alpha[None]).abs().max()),
-                            ot_rejected_mass=rejected_ot.tolist(), support_invalid_retained_mass=support_invalid.tolist(),
-                            support_invalid_route_mass=invalid_routes.tolist(),
-                            support_invalid_confidence_underflow_rows=underflow_rows, score_log_retry_rows=log_retry_rows,
-                            within_image_effective_patches=effective / float(confidence.sum()) if confidence.sum() > 0 else 0.,
-                            confidence_min=float(confidence.min()), confidence_mean=float(confidence.mean()))
-                        detail["retention_roundoff_clipped_max"] = retention_roundoff_max
-                        detail.update({name: float(value / confidence.sum()) if confidence.sum() > 0 else 0.
-                                       for name, value in geometry_totals.items()})
+                        if self.mode == "grouped_partial":
+                            mapped, confidence, projection_detail = self._dense_projector.project(patches, theta, alpha)
+                            detail.update(projection_detail)
+                        else:  # Low-rank partial keeps its existing projection implementation.
+                            feature_sum, confidence = torch.zeros_like(patches), patches.new_zeros(p)
+                            rejected_ot, support_invalid = torch.zeros_like(confidence), torch.zeros_like(confidence)
+                            invalid_routes = torch.zeros_like(confidence)
+                            group_budgets = patches.new_zeros(p, len(self.target.ids))
+                            accounting_error, effective = 0., 0.
+                            underflow_rows = log_retry_rows = 0
+                            retention_roundoff_max = 0.
+                            geometry_totals = {}
+                            for i, sid in enumerate(self.source.ids):
+                                logs = self._partial_query(patches,i)
+                                for tid in self.neighbors[sid]:
+                                    j = self.target_index[tid]
+                                    route = theta[i, j]
+                                    if route == 0:
+                                        continue
+                                    candidate,g,diag,tolerance = self._partial_projection(patches,i,j,sid,tid,logs)
+                                    if (g < -tolerance).any() or (g > 1 + tolerance).any():
+                                        raise ValueError("Retained confidence violates [0,1].")
+                                    raw_confidence = diag["raw_confidence"].clamp(0, 1)
+                                    retention_roundoff_max = max(retention_roundoff_max, float((diag["raw_confidence"] - raw_confidence).abs().max()))
+                                    g = raw_confidence * diag["support_valid"]  # Only validated storage/solver roundoff; no plan renormalization.
+                                    confidence += route * g
+                                    feature_sum += route * g[:, None] * candidate
+                                    rejected_ot += route * (1 - raw_confidence)
+                                    support_invalid += route * raw_confidence * (~diag["support_valid"])
+                                    invalid_routes += route * (~diag["support_valid"])
+                                    underflow_rows += int(diag["confidence_underflow"].sum())
+                                    log_retry_rows += int(diag["score_log_retry"].sum())
+                                    budget = route * g * diag["weight_row_sums"] + route * (1 - g)
+                                    group_budgets[:, j] += budget
+                                    accounting_error = max(accounting_error, float((budget - route).abs().max()))
+                                    patch_entropy = diag["patch_entropy"]
+                                    effective += float((route * g * patch_entropy.exp()).sum())
+                                    if "plan_geometry" in diag:  # Exact dense partial diagnostics.
+                                        for name, value in dict(diag["plan_geometry"],
+                                                within_image_top1_patch_probability=diag["projected_patch_top1_probability"],
+                                                query_source_effective_patches=diag["query_source_effective_patches"]).items():
+                                            geometry_totals[name] = geometry_totals.get(name, 0.) + (route * g * value).sum()
+                            cf = settings["confidence"]
+                            positive = confidence > cf["mass_floor"]
+                            mapped = torch.zeros_like(feature_sum)
+                            mapped[positive] = feature_sum[positive] / confidence[positive, None]
+                            detail.update(matched_rejected_accounting_error=accounting_error,
+                                matched_rejected_group_mass_residual=float((group_budgets - alpha[None]).abs().max()),
+                                ot_rejected_mass=rejected_ot.tolist(), support_invalid_retained_mass=support_invalid.tolist(),
+                                support_invalid_route_mass=invalid_routes.tolist(),
+                                support_invalid_confidence_underflow_rows=underflow_rows, score_log_retry_rows=log_retry_rows,
+                                within_image_effective_patches=effective / float(confidence.sum()) if confidence.sum() > 0 else 0.,
+                                confidence_min=float(confidence.min()), confidence_mean=float(confidence.mean()))
+                            detail["retention_roundoff_clipped_max"] = retention_roundoff_max
+                            detail.update({name: float(value / confidence.sum()) if confidence.sum() > 0 else 0.
+                                           for name, value in geometry_totals.items()})
                 cf = settings["confidence"]
                 mask = ((confidence > cf["mass_floor"]) & (confidence >= cf["threshold"])) if self.is_partial else torch.ones(p, dtype=torch.bool,device=self.device)
                 if not torch.isfinite(mapped).all():
@@ -413,6 +435,8 @@ class FeatureMapper:
                                     note="Feature diagnostics are not independent image-quality validation."))
         if "incomplete_fit" in self.manifest:
             result.diagnostics["incomplete_fit"] = self.manifest["incomplete_fit"]
+        if self.mode == "grouped_partial":
+            result.diagnostics["performance"] = self._dense_projector.report()
         # Enforce the chosen all-invalid policy at the public boundary.
         result.conditioning(query_ids, all_invalid_policy=cf["all_invalid_policy"])
         return result if return_metadata else result.mapped_features
@@ -462,7 +486,7 @@ class FeatureMapper:
         manifest = dict(schema="infoot_mapped_features_v2", mapper_id=self.manifest["artifact_id"],
             projection_implementation_sha256=file_hash(Path(__file__)),
             projection_dependency_sha256={name: file_hash(Path(__file__).with_name(name))
-                for name in ("conditional.py", "partial.py", "feature_bank.py", "storage.py", "pair_selection.py", "device.py", "mapping_manifest.py", "plan_diagnostics.py")},
+                for name in ("conditional.py", "partial.py", "feature_bank.py", "storage.py", "pair_selection.py", "device.py", "mapping_manifest.py", "plan_diagnostics.py", "dense_partial_projection.py")},
             mode=self.mode, query_bank_id=bank.artifact_id, ids=ids, query_domain=bank.manifest["domain"],
             representation=bank.representation, projection=self.config["projection"],
             output=dict(file="mapped.pt", sha256=file_hash(path)), diagnostics=result.diagnostics)

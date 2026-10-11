@@ -126,10 +126,10 @@ def test_line_search_stall_is_local_and_never_accepts_uphill_plan(monkeypatch):
     module = importlib.import_module("infoot_vit.infoot_helper.partial_batch")
     costs = torch.tensor([[[0., 1.], [1., 0.]], [[1., 1.], [1., 1.]]], dtype=torch.float64)
     kernels = torch.stack([torch.eye(2), torch.ones(2, 2)]).double()
-    def uphill(a, b, cost, mass, config):
+    def uphill(a, b, cost, mass, config, **kwargs):
         candidate = torch.tensor([[[0., .4], [.4, 0.]], [[.2, .2], [.2, .2]]], dtype=torch.float64)
         return candidate, dict(ok=torch.ones(2, dtype=torch.bool), error=torch.zeros(2),
-            iterations=torch.ones(2, dtype=torch.long), failure=torch.zeros(2, dtype=torch.long),
+            iterations=torch.ones(2, dtype=torch.long), work_iterations=torch.ones(2, dtype=torch.long), failure=torch.zeros(2, dtype=torch.long),
             cost_shift=torch.zeros(2), residuals=module.residual_values(candidate, a, b, mass),
             duality_gap=torch.zeros(2), relative_duality_gap=torch.zeros(2),
             relative_plan_delta_l1=torch.zeros(2), kkt_error=torch.zeros(2),
@@ -152,7 +152,7 @@ def test_cli_batch_overrides_and_config_defaults(tmp_path, monkeypatch):
         assert infoot_fit.main(["--config", str(path), "--device", "cpu", *option]) == 0
         assert seen[-1]["pair_batch_size"] == expected and seen[-1]["device"] == "cpu"
     actual = yaml.safe_load((infoot_fit.ROOT / "infoot_vit/configs/grouped_partial.yaml").read_text())
-    assert actual["device"] == "cuda" and actual["pair_batch_size"] == 1024
+    assert actual["device"] == "cuda" and actual["pair_batch_size"] == 2048
     assert actual["fit_pair_top_k"] == 8 and actual["partial"]["keep_mass"] == .80
 
 

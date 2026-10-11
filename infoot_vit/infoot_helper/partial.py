@@ -17,15 +17,28 @@ DEFAULTS = dict(h=.4, lam=.1, reg=.05, cost_scale="mean", max_outer_steps=100,
     max_inner_steps=10000, inner_tolerance=1e-10, feasibility_tolerance=1e-8,
     mass_tolerance=1e-8, outer_tolerance=1e-7, objective_tolerance=1e-12,
     max_backtracks=30, log_floor=1e-300, inner_acceleration="none")
+# Opt-in execution settings: do not add keys to historical solver dictionaries
+# or inject execution fields into unrelated balanced/image-router configs.
+PERFORMANCE_DEFAULTS = dict(newton_batch_size=64, newton_check_every=0,
+                            inner_compact=False, inner_warm_start=False)
 
 
 def solver_config(options=None):
     options = options or {}
-    if unknown := options.keys() - DEFAULTS.keys():
+    if unknown := options.keys() - (DEFAULTS.keys() | PERFORMANCE_DEFAULTS.keys()):
         raise ValueError(f"Unknown solver settings: {sorted(unknown)}")
     c = DEFAULTS | options
     if c["inner_acceleration"] not in {"none", "newton"}:
         raise ValueError("inner_acceleration must be 'none' or 'newton' (batched partial solver only).")
+    for key in ("inner_compact", "inner_warm_start"):
+        if type(c.get(key, PERFORMANCE_DEFAULTS[key])) is not bool:
+            raise ValueError(f"{key} must be boolean (batched partial solver only).")
+    size = c.get("newton_batch_size", 64)
+    if type(size) is not int or size < 1:
+        raise ValueError("newton_batch_size must be a positive integer.")
+    every = c.get("newton_check_every", 0)
+    if type(every) is not int or not 0 <= every <= 30:
+        raise ValueError("newton_check_every must be an integer in [0,30]; 0 keeps fixed backtracking.")
     for key in ("h", "reg", "inner_tolerance", "feasibility_tolerance", "mass_tolerance", "outer_tolerance"):
         if not math.isfinite(c[key]) or c[key] <= 0:
             raise ValueError(f"{key} must be finite and positive.")

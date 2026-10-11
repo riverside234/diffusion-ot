@@ -16,6 +16,7 @@ import torch
 from infoot_vit.infoot_helper.feature_bank import FeatureBank, digest, write_json
 from infoot_vit.infoot_helper.mapping import FeatureMapper
 from infoot_vit.infoot_helper.mapping_manifest import load_mapping_manifest
+from infoot_vit.infoot_helper.dense_partial_projection import runtime_settings
 from infoot_vit.infoot_helper.run_logging import RunLog
 
 
@@ -38,6 +39,10 @@ def main(argv=None):
     p.add_argument("--solver", choices=["euler", "heun"], default="euler")
     p.add_argument("--seed", type=int, default=20260903)
     p.add_argument("--device",help="Mapping AND generation device; defaults to the saved experiment device.")
+    p.add_argument("--pair-cache-mib", type=int,
+                   help="Dense grouped_partial: device plan-cache limit in MiB (default 3072; 0 disables). Does not change fitting.")
+    p.add_argument("--projection-pair-batch-size", type=int,
+                   help="Dense grouped_partial: project this many saved pairs at once (default 32). Independent of fitting batch size.")
     p.add_argument("--confidence-threshold", type=float,
                    help="Partial mapping only: override token validity threshold without refitting. Recorded in mapped metadata.")
     p.add_argument("--projection-bandwidth", type=float,
@@ -63,6 +68,10 @@ def main(argv=None):
         p.error("--preview-checkpoint cannot be combined with --allow-failed-pairs")
     if min(a.count, a.chunk_size, a.threads) < 1 or (a.steps is not None and a.steps < 1):
         p.error("Counts, chunk size, threads and steps must be positive")
+    if ((a.pair_cache_mib is not None and a.pair_cache_mib < 0)
+            or (a.projection_pair_batch_size is not None and a.projection_pair_batch_size < 1)):
+        p.error("Pair cache MiB must be nonnegative and projection pair batch size must be positive")
+    cache_bytes = None if a.pair_cache_mib is None else a.pair_cache_mib * 1024**2
     if a.confidence_threshold is not None and not 0 <= a.confidence_threshold <= 1:
         p.error("--confidence-threshold must be finite and in [0,1]")
     if a.projection_bandwidth is not None and (not math.isfinite(a.projection_bandwidth) or a.projection_bandwidth <= 0):
@@ -83,6 +92,8 @@ def main(argv=None):
             m, _ = load_preview_snapshot(a.mapping)
         else:
             m = load_mapping_manifest(a.mapping, allow_failed_pairs=a.allow_failed_pairs)
+        if m["config"]["mode"] != "grouped_partial" and (cache_bytes is not None or a.projection_pair_batch_size is not None):
+            p.error("Pair projection performance options apply only to dense grouped_partial")
         a.steps, a.guidance = generation_settings(m["config"]["mode"], a.steps, a.guidance)
         projection = projection_settings(m["config"], a.confidence_threshold,
             bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth)
@@ -103,6 +114,8 @@ def main(argv=None):
         print(json.dumps(dict(mapper_id=m["artifact_id"], mode=m["config"]["mode"], fit_resources=m["resources"],
             query_count=min(a.count, len(q["ids"])), mask="existing condition_padding_mask; True is padding",
             generate=a.generate, projection=projection, incomplete_fit=m.get("incomplete_fit"),
+            projection_performance=(runtime_settings(cache_bytes, a.projection_pair_batch_size)
+                if m["config"]["mode"] == "grouped_partial" else None),
             checkpoint_preview=m.get("checkpoint_preview"),
             umap=dict(enabled=a.umap, level=a.umap_level, max_points=a.umap_max_points,
                       seed=a.umap_seed, n_neighbors=a.umap_neighbors, min_dist=a.umap_min_dist, metric=a.umap_metric),
@@ -115,6 +128,8 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=False)
     with RunLog(output, "mapping_test", vars(a)) as log:
         m = json.loads((a.mapping / "manifest.json").read_text(encoding="utf-8"))
+        if m["config"]["mode"] != "grouped_partial" and (cache_bytes is not None or a.projection_pair_batch_size is not None):
+            p.error("Pair projection performance options apply only to dense grouped_partial")
         projection = projection_settings(m["config"], a.confidence_threshold,
             bandwidth=a.projection_bandwidth, top_k_images=a.top_k_images, patch_bandwidth=a.patch_projection_bandwidth)
         # Set overrides BEFORE loading cached KDEs, factors and support thresholds.
@@ -125,7 +140,8 @@ def main(argv=None):
             print(mapper.manifest["checkpoint_preview"]["label"], flush=True)
         else:
             mapper = FeatureMapper.load(a.mapping, device=a.device, projection=projection, run_log=log,
-                                        allow_failed_pairs=a.allow_failed_pairs)
+                allow_failed_pairs=a.allow_failed_pairs, pair_cache_bytes=cache_bytes,
+                pair_projection_batch_size=a.projection_pair_batch_size)
         bank = FeatureBank.load(a.query_bank)
         a.steps, a.guidance = generation_settings(mapper.mode, a.steps, a.guidance)
         log.event("artifacts_loaded", mapper_id=mapper.manifest["artifact_id"], query_bank_id=bank.artifact_id)

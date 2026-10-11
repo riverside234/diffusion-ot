@@ -117,7 +117,7 @@ def validate_config(config):
     return config
 
 
-def resource_estimate(source_shape, target_shape, mode, fit_pair_top_k=None, pair_batch_size=None):
+def resource_estimate(source_shape, target_shape, mode, fit_pair_top_k=None, pair_batch_size=None, newton_batch_size=64):
     n, p, d = source_shape
     m = target_shape[0]
     supports = (n + m) * p * d * 8
@@ -145,8 +145,8 @@ def resource_estimate(source_shape, target_shape, mode, fit_pair_top_k=None, pai
         if pair_batch_size:
             working += 2 * active_pairs * p * d * 8  # Gathered feature pairs.
             # Conservative allowance for scaled Hessians, factorization and
-            # temporary vectors; Newton uses at most 64 pair members at once.
-            working += 6 * min(active_pairs, 64) * (2*p+1)**2 * 8
+            # temporary vectors; Newton has an independently bounded sub-batch.
+            working += 6 * min(active_pairs, newton_batch_size) * (2*p+1)**2 * 8
     return dict(source_shape=list(source_shape), target_shape=list(target_shape), support_bytes=supports,
                 image_arrays_bytes=image_arrays, global_patch_arrays_bytes=patch_arrays,
                 shared_pair_kernels_bytes=shared_pair_kernels, plan_storage_bytes=plans,
@@ -159,6 +159,7 @@ def resource_estimate(source_shape, target_shape, mode, fit_pair_top_k=None, pai
                 estimated_working_gib=2 * working / 2**30, plan_storage_gib=plans / 2**30,
                 pairs=pairs, full_pairs=n*m if mode == "grouped_partial" else 0,
                 fit_pair_top_k=fit_pair_top_k, pair_batch_size=pair_batch_size, active_pairs=active_pairs,
+                newton_batch_size=newton_batch_size,
                 note="Grouped partial: float32 final plans/kernels + active-batch checkpoints/temps and kernel temp; completed latest files removed. Other methods retain float64 dense behavior. Excludes logs, failed checkpoints, tensor/JSON/filesystem overhead; memory is an estimate, not a measurement.")
 
 
@@ -195,7 +196,8 @@ def inspect_fit(config, root):
     r = source["representation"]
     p = r["grid"][0] * r["grid"][1]
     estimate = resource_estimate((selected["source"]["selected_count"], p, r["dim"]),
-                                (selected["target"]["selected_count"], p, r["dim"]), config["mode"], config.get("fit_pair_top_k"), config.get("pair_batch_size"))
+                                (selected["target"]["selected_count"], p, r["dim"]), config["mode"], config.get("fit_pair_top_k"), config.get("pair_batch_size"),
+                                config.get("partial", {}).get("solver", {}).get("newton_batch_size", 64))
     runtime = capabilities()
     if config["mode"] == "grouped_partial" and runtime["partial_method"] == "unavailable":
         raise RuntimeError("Log-domain partial OT requires POT>=0.9.7; install it explicitly for this experiment.")
@@ -327,7 +329,7 @@ def _fit_mapping(config, *, root, directory, resume, log):
                       for name in ("infoot.py", "partial.py", "conditional.py", "fit_mapping.py", "storage.py", "sampling.py", "pair_selection.py", "plan_diagnostics.py")}
     if config.get("pair_batch_size"):
         implementation.update({name: file_hash(Path(__file__).with_name(name))
-                               for name in ("partial_batch.py", "partial_newton.py", "pair_batch_fit.py")})
+                               for name in ("partial_batch.py", "partial_newton.py", "pair_batch_fit.py", "pair_timing.py")})
     fingerprint = digest(dict(config=config, source=source.artifact_id, target=target.artifact_id,
                               source_ids=source.ids, target_ids=target.ids, storage=STORAGE_VERSION if compact else "float64",
                               implementation=implementation, runtime=inspection["runtime"]))

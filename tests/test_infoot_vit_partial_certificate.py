@@ -64,13 +64,11 @@ def test_stable_feasible_but_nonoptimal_plan_has_no_kkt_certificate():
     assert delta.item() == 0. and kkt.item() > 1.
 
 
-def test_sharper_active_recipe_has_budget_for_saturated_point_eight_mass():
-    root = Path(__file__).resolve().parents[1]
-    recipe = yaml.safe_load((root / "infoot_vit/configs/grouped_partial.yaml").read_text())["partial"]
-    # Preserve the old unaccelerated budget regression as a reference. The
-    # accelerated recipe is covered by test_infoot_vit_partial_newton.py.
-    c = solver_config(dict(recipe["solver"], inner_acceleration="none"))
-    n, cheap, mass = 196, 156, recipe["keep_mass"]
+def test_unaccelerated_point_eight_mass_budget_reference():
+    # Historical reg=.05 regression: later sharper recipes need Newton and
+    # should not silently change this reference problem's convergence budget.
+    c = solver_config(dict(reg=.05, max_inner_steps=20000, inner_acceleration="none"))
+    n, cheap, mass = 196, 156, .8
     cost = torch.ones(1, n, n, dtype=torch.float64)
     cost[:, :cheap, :cheap] = .005
     a = cost.new_full((1, n), 1/n)
@@ -88,6 +86,22 @@ def test_sharper_active_recipe_has_budget_for_saturated_point_eight_mass():
     expected[:, :cheap] *= exp_u
     expected[:cheap, :cheap] /= k
     torch.testing.assert_close(plan[0], expected, atol=2e-13, rtol=1e-9)
+
+
+def test_current_recipe_matches_analytic_196_patch_optimum():
+    from test_infoot_vit_partial_newton import sharp_blocks, analytic_block
+    root = Path(__file__).resolve().parents[1]
+    recipe = yaml.safe_load((root/"infoot_vit/configs/grouped_partial.yaml").read_text())["partial"]
+    c = solver_config(recipe["solver"])
+    cost = sharp_blocks()
+    a = cost.new_full((2,196), 1/196)
+    plan, report = entropy_subproblem_batch(a, a, cost, recipe["keep_mass"], c)
+    assert report["ok"].all()
+    for i, cheap in enumerate((155,156)):
+        torch.testing.assert_close(plan[i], analytic_block(cost[i],cheap,recipe["keep_mass"],c["reg"]),
+                                   atol=2e-12, rtol=1e-8)
+        for key in ("kkt_error", "relative_duality_gap", "relative_plan_delta_l1"):
+            assert report[key][i] <= c["inner_tolerance"]
 
 
 def test_capacity_complementarity_is_required_even_with_stationarity():

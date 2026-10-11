@@ -88,6 +88,8 @@ def main(argv=None):
         # The explicit POT reference does not use batched acceleration/guards.
         config["pair_failure_abort_batches"] = None
         config.setdefault("partial", {}).setdefault("solver", {})["inner_acceleration"] = "none"
+        for key in ("newton_batch_size", "newton_check_every", "inner_compact", "inner_warm_start"):
+            config["partial"]["solver"].pop(key, None)
     if args.tune_partial:
         from infoot_vit.infoot_helper.partial_tuning import tune_partial
         report = tune_partial(config, root=args.project_root, from_fit=args.tune_from,

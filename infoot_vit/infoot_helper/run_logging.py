@@ -73,8 +73,15 @@ class RunLog:
             handle.write(json.dumps(payload, default=_json_value, allow_nan=False) + "\n")
 
     def event(self, event, **fields):
-        self.append_jsonl("events.jsonl", dict(event=event, timestamp=datetime.now(timezone.utc).isoformat(),
-            elapsed_seconds=time.perf_counter() - self.start, **fields))
+        self.events([(event, fields)])
+
+    def events(self, records):
+        """Append a bounded group of events with one file open; preserve rows."""
+        with (self.directory / "events.jsonl").open("a", encoding="utf-8") as handle:
+            for event, fields in records:
+                payload = dict(event=event, timestamp=datetime.now(timezone.utc).isoformat(),
+                               elapsed_seconds=time.perf_counter() - self.start, **fields)
+                handle.write(json.dumps(payload, default=_json_value, allow_nan=False) + "\n")
 
     def write_json(self, filename, payload):
         write_json(self.directory / filename, json.loads(json.dumps(payload, default=_json_value, allow_nan=False)))

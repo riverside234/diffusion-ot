@@ -1,7 +1,7 @@
 # Storage-efficient experiment: 2000 seeded images/domain; 8 saved pairs/source.
 mode: grouped_partial
 device: cuda
-pair_batch_size: 1024  # Independent exact [B,196,196] partial InfoOT solves; null = serial POT.
+pair_batch_size: 2048  # Independent exact [B,196,196] partial InfoOT solves; null = serial POT.
 pair_checkpoint_every: 10  # Outer iterations; first and every terminal state are always saved.
 pair_failure_abort_batches: 1  # Stop a systemic failure after one fully failed batch; null disables.
 source_bank: data/infoot_vit/cat_train
@@ -22,16 +22,21 @@ solver:  # Working baseline for full mapping; reg=.0575 raised normalized top-1 
   outer_tolerance: 1.0e-7  # Keep the fixed-point check strict; do not accept a budget stop.
 partial:
   keep_mass: 0.80  # Preserve more condition coverage; transported mass, NOT a patch count.
-  solver:  # 16000/16000 converged; patch entropy is the ONLY new fitting change.
-    h: 0.35  # Hold fitted KDE geometry fixed for the entropy ablation.
-    lam: 0.025  # Hold MI pressure fixed; do not amplify it while reducing entropy.
-    reg: 0.04  # Trial from .05: fitted rows still average 34.76 patches (top-1 21.83%).
-    # First evaluate the saved .05 baseline at .20/.20; its uploaded grid used .15/.20.
-    # Compare this fresh fit with identical raw checkpoint, IDs, noise, steps and guidance.
+  solver:  # Next sampled trial: increase only MI weight; lam=.035 is unmeasured.
+    h: 0.35  # Hold fitted KDE geometry fixed to isolate the MI-weight change.
+    lam: 0.035  # From .030: +16.7% MI-weight trial; preserve .030 as the measured control.
+    reg: 0.0375  # Hold entropy fixed: lam=.030 converged 64/64 in <=46 outer steps.
+    # .030 baseline: 17.90 effective patches, variance .6500, coverage 98.16%, solver 197.3 s.
+    # Compare lam=.030/.035 using the same solver version; timings depend on GPU load.
+    # Compare the same saved selection and 64 pairs (seed 42); then held-out images.
     cost_scale: mean
     max_outer_steps: 600
     max_inner_steps: 20000  # Hard ceiling; certified members stop independently.
     inner_acceleration: newton  # Safeguarded capped-mass dual Newton after 100 block updates.
+    newton_batch_size: 128  # Bounded linear-algebra sub-batch; benchmark 64/128/256 on the lab GPU.
+    newton_check_every: 5  # Stop backtracking when all valid members have accepted.
+    inner_compact: true  # Remove retired members when at least 25% of a work batch is inactive.
+    inner_warm_start: true  # Reuse dual potentials across outer steps; certificates remain strict.
     inner_tolerance: 1.0e-10  # Unchanged primal/KKT/gap certificate; no budget-stop acceptance.
     feasibility_tolerance: 1.0e-8
     mass_tolerance: 1.0e-8
@@ -50,5 +55,5 @@ projection:
     mass_floor: 1.0e-12
     all_invalid_policy: error
 resources:
-  max_working_gib: 48  # Includes bounded (64-pair) Newton linear-algebra workspace.
+  max_working_gib: 90  # Estimate guard only; not a GPU memory reservation or physical capacity.
   max_plan_gib: 64

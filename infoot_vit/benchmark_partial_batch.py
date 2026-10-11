@@ -24,6 +24,10 @@ def main(argv=None):
     p.add_argument("--device", default="cuda")
     p.add_argument("--pairs", type=int, default=256)
     p.add_argument("--pair-batch-size", type=int, default=256)
+    p.add_argument("--reference", choices=["serial", "batched-reference"], default="serial",
+                   help="Compare with POT serial or the cold, fixed-work batched solver at the same batch size.")
+    p.add_argument("--newton-batch-size", type=int, help="Override optimized Newton sub-batch only.")
+    p.add_argument("--inner-warm-start", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--patches", type=int, default=196)
     p.add_argument("--feature-dim", type=int, default=768)
     p.add_argument("--seed", type=int, default=42)
@@ -44,6 +48,14 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))["partial"]
     c, mass = solver_config(cfg.get("solver")), cfg.get("keep_mass", .8)
+    if args.newton_batch_size is not None:
+        c["newton_batch_size"] = args.newton_batch_size
+    if args.inner_warm_start is not None:
+        c["inner_warm_start"] = args.inner_warm_start
+    c = solver_config(c)
+    reference = args.reference
+    reference_config = dict(c, newton_batch_size=64, newton_check_every=0,
+                            inner_compact=False, inner_warm_start=False)
     rng = torch.Generator().manual_seed(args.seed)
     shape = (args.pairs, args.patches, args.feature_dim)
     x, y = (torch.randn(shape, generator=rng, dtype=torch.float64).to(device) for _ in range(2))
@@ -70,16 +82,18 @@ def main(argv=None):
                 plans.append(plan[None]); reports.append(report)
             else:
                 end = min(start + args.pair_batch_size, count)
-                plan, report = solve_partial_batch(costs[start:end], kx[start:end], ky[start:end], keep_mass=mass, config=c)
+                plan, report = solve_partial_batch(costs[start:end], kx[start:end], ky[start:end], keep_mass=mass,
+                    config=reference_config if kind == "batched-reference" else c)
                 plans.append(plan); reports.extend(report)
         return torch.cat(plans), reports
 
     # Both methods see exactly the same matrices; warm-up is outside timing.
-    for kind in ("serial", "batched"):
+    kinds = (reference, "batched")
+    for kind in kinds:
         run(kind, min(2, args.pairs))
-    results, timing = {}, {name: [] for name in ("serial", "batched")}
+    results, timing = {}, {name: [] for name in kinds}
     for repeat in range(args.repeats):
-        for kind in (("serial", "batched") if repeat % 2 == 0 else ("batched", "serial")):
+        for kind in (kinds if repeat % 2 == 0 else tuple(reversed(kinds))):
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
                 with torch.cuda.device(device):
@@ -92,12 +106,14 @@ def main(argv=None):
             elapsed = time.perf_counter() - started
             timing[kind].append(dict(seconds=elapsed, pairs_per_second=args.pairs / elapsed,
                 converged_pairs=sum(r["status"] == "converged" for r in reports),
+                inner_iterations=sum(h.get("inner", {}).get("iterations", 0) for r in reports for h in r.get("history", [])),
+                inner_work_iterations=sum(h.get("inner", {}).get("work_iterations", 0) for r in reports for h in r.get("history", [])),
                 peak_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
                 peak_reserved_bytes=torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None))
             results[kind] = (plans.cpu(), reports)
             del plans
-    serial, batched = results["serial"], results["batched"]
-    all_converged = all(r["status"] == "converged" for result in results.values() for r in result[1])
+    serial, batched = results[reference], results["batched"]
+    all_converged = all(r["converged_pairs"] == args.pairs for rows in timing.values() for r in rows)
     plan_error = float((serial[0] - batched[0]).abs().max())
     objective_error = max(abs(a["history"][-1]["objective"]-b["history"][-1]["objective"])
                           for a, b in zip(serial[1], batched[1]))
@@ -109,13 +125,14 @@ def main(argv=None):
         gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         workload="seeded synthetic features; not AFHQ image-quality evidence",
         seed=args.seed, pairs=args.pairs, patches=args.patches, feature_dim=args.feature_dim,
-        pair_batch_size=args.pair_batch_size, solver=c, keep_mass=mass,
+        pair_batch_size=args.pair_batch_size, solver=c, keep_mass=mass, reference=reference,
+        reference_solver=reference_config if reference == "batched-reference" else c,
         timing_scope="solver including diagnostics; excludes cost/kernel construction and file I/O; peak includes cached inputs",
         runs=timing, summary={name: dict(median_seconds=statistics.median(r["seconds"] for r in rows),
             median_pairs_per_second=statistics.median(r["pairs_per_second"] for r in rows)) for name, rows in timing.items()},
         agreement=dict(max_plan_abs_error=plan_error, max_objective_abs_error=objective_error, finite=finite,
             plan_comparison_atol=1e-8, objective_comparison_atol=1e-6,
-            serial_statuses=[r["status"] for r in serial[1]], batched_statuses=[r["status"] for r in batched[1]],
+            **{f"{reference}_statuses": [r["status"] for r in serial[1]]}, batched_statuses=[r["status"] for r in batched[1]],
             failures={name: [dict(pair=i, status=r["status"], error=r.get("error"), last_iteration=r["history"][-1])
                             for i, r in enumerate(result[1]) if r["status"] != "converged"]
                       for name, result in results.items()}))
