@@ -10,10 +10,10 @@ sampling:
   images_per_domain: 2000  # Exactly this many, no replacement or silent reduction.
   seed: 42
 fit_pair_top_k: 8  # null = full pairs; K >= target count is equivalent to full.
-solver:  # Refine the .35 (sharp) to .375 (low top-8 coverage) bandwidth bracket.
-  h: 0.36  # Smaller change from .35; .375 retained only 1.81% mass at the median.
-  lam: 0.070  # Hold MI/entropy weights fixed while testing the fitting bandwidth.
-  reg: 0.06
+solver:  # Entropy-only trial after h=.36 retained 69.21% mass, with 94.47% normalized top-1.
+  h: 0.36  # Hold the neighborhood geometry and .20/.20 projection fixed.
+  lam: 0.070  # Hold MI fixed; do not change both objective weights in this trial.
+  reg: 0.0575  # Was .06; test coverage recovery, checking for stronger top-1 dominance.
   cost_scale: mean
   max_outer_steps: 1200
   max_inner_steps: 10000

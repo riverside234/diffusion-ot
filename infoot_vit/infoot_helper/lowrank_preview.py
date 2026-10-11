@@ -116,7 +116,7 @@ class LowRankCheckpointPreview(LowRankMapper):
         target_state = move(kernel["target"], self.device)
         multiplier = self.config["projection"]["bandwidth_multiplier"]
         # Same saved-factor algebra as LowRankMapper, kept here to preserve OLD
-        # solver fingerprints. Dense-reference and final-loader parity are tested.
+        # solver fingerprints. Dense-reference parity is tested.
         if multiplier == 1:
             fx, fy = kernel["fx"].to(self.x), kernel["fy"].to(self.y)
         else:

@@ -723,6 +723,63 @@ query IDs plus per-image noise seeds. Confirm those fields agree between
 `generation_report.json` files. The grid is original source / top-1 routed
 target reference / translation; the reference is not paired ground truth.
 
+### Preview an unfinished global low-rank checkpoint
+
+When `grouped_patch_lowrank` stops with `Low-rank InfoOT max_steps`, its
+`factors/latest.pt` can be used for a visual preview. The fit must be stopped
+(`failed` or `interrupted`), with a registered, converged image router and saved
+kernels/samples. This option does not apply to per-pair `grouped_partial_lowrank`.
+
+```bash
+# Validate the saved checkpoint and held-out query metadata; write nothing.
+python infoot_vit/infoot_test.py --mapping outputs/infoot_vit/FIT_DIRECTORY --query-bank data/infoot_vit/cat_val --preview-checkpoint --dry-run
+
+# Generate the same first 16 validation IDs with fixed per-ID noise.
+python infoot_vit/infoot_test.py \
+  --mapping outputs/infoot_vit/FIT_DIRECTORY \
+  --query-bank data/infoot_vit/cat_val \
+  --preview-checkpoint --count 16 --generate --device cuda \
+  --train-config configs/stage1a_pdae_v2_l/dog.yaml \
+  --eval-config configs/stage1a_eval/pdae_v2_l.yaml \
+  --checkpoint outputs/pdae_v2_l_dog/checkpoints/latest.pt \
+  --weights ema --steps 50 --guidance 1.5 --seed 20260903 \
+  --output-dir results/infoot_vit/lr_checkpoint_preview_300
+```
+
+Replace `FIT_DIRECTORY` with the **original failed fit directory**, not the
+`factors/latest.pt` filename. The output directory must be new and outside that
+fit directory. Use a new output folder for each preview. Keep the query bank,
+PDAE checkpoint, weights, projection settings and seed fixed when comparing
+steps; checkpoint hashes and ordered query IDs/noise seeds are recorded.
+
+The translation grid retains original source / top-1 reference / translation,
+with an **UNCONVERGED CHECKPOINT PREVIEW** header showing the factor step/status.
+`checkpoint_preview.json`, the mapped manifest, the attempt's
+`checkpoint_preview_snapshot.json` and `generation_report.json` identify the
+checkpoint hash, original fit status, last optimization record and recomputed
+float32 storage constraint residuals. Query/mapped-feature diagnostics use the
+existing test pipeline. Fewer than 16 available queries yields that smaller set.
+
+Preview checks the saved fit fingerprint, ordered supports, artifact/checkpoint
+checksums, factor shapes, nonnegativity, finite values and original marginals
+with existing float32 storage tolerances. It reuses the saved kernel bases and
+target-density correction, and does not refit, repair, renormalize or certify
+the factor plan. Standard completed-artifact loading remains strict. Even
+`--dry-run` reads/verifies the checkpoint, so it needs CPU memory for the factors.
+
+The original manifest/checkpoint are untouched and can still be resumed with a
+larger `--max-steps` under the original fit configuration. This preview addition
+changes no files included in the fit implementation fingerprint. It does not
+remove earlier code/configuration compatibility requirements. All new preview
+outputs are separate; the original fit is never marked `complete`. Preview
+image quality is an observation, not evidence of solver convergence.
+
+Focused coverage: `tests/test_infoot_vit_lowrank_preview.py` checks dense
+projection agreement, fixed query/noise identities, corruption/constraint
+rejection, unchanged fit files and budget-extension resume. Generation wiring
+uses a small mocked PDAE in CPU tests; real CUDA generation and visual quality
+still require the lab banks and checkpoint.
+
 For a dense-versus-low-rank check, first build small separate banks (for example
 32 training images/domain using `bank_cat.py`/`bank_dog.py --sample-images 32
 --sample-seed 42 --output-dir ...`). Fit the old `grouped_patch` and the new mode

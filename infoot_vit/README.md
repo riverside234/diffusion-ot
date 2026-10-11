@@ -213,23 +213,24 @@ generated-image review below:
 
 | Stage / YAML section | `h` | `reg` | `lam` | Outer budget |
 |---|---:|---:|---:|---:|
-| Image router: `solver` | **0.36** | 0.06 | 0.070 | 1,200 |
+| Image router: `solver` | 0.36 | **0.0575** | 0.070 | 1,200 |
 | Partial patch pairs: `partial.solver` | **0.35** | **0.05** | 0.025 | 600 |
 
 At fixed lam=.070/reg=.06, h=.35 gave 85.42% mean top-8 retained mass but
-98.69% normalized top-1 probability. The h=.375 trial converged in 744
-iterations, yet mean retained mass fell to **25.47%**, with **1.81% median**
-retention. Its 49.90% normalized top-1 mean therefore does not establish a
-useful tradeoff: most probability is discarded for many training sources.
+98.69% normalized top-1 probability. The h=.375 trial lost too much coverage
+(25.47% mean, 1.81% median). The h=.36 follow-up converged in 564 iterations:
+**69.21% mean / 73.88% median retained mass**, with **94.47% normalized top-1**.
+This improves coverage over .375, but still leaves 30.79% discarded mass on
+average and little contribution from the other retained targets.
 
-The next candidate is **fitting h=.36**, closer to the better-covered .35
-baseline; lam=.070 and reg=.06 stay fixed. This refines the observed bandwidth
-bracket, not an assumption of linear interpolation or a known optimum. Judge
-retained mass and its median alongside normalized concentration before fitting
-all pairs. Patch settings, mass, confidence, top-8 selection and .20/.20
-projection stay fixed. The new fit and held-out image quality are unverified.
-See [the h=.375 analysis and h=.36 trial](../docs/analysis/infoot_vit_router_h0375/README.md)
-and [the preceding .070 analysis](../docs/analysis/infoot_vit_router_070/README.md).
+The next candidate holds h=.36/lam=.070 and changes **only image reg from .06
+to .0575**. The small entropy reduction tests coverage recovery. It may also
+increase top-1 dominance; it is not a demonstrated diversity or image-quality
+improvement. Compare both metrics against the .06 baseline (`--reg .06`) and
+then use matched held-out images. Do not keep sharpening merely to maximize
+retained mass. Patch settings, mass, confidence, top-8 and .20/.20 projection
+stay fixed. See [the h=.36 analysis and entropy trial](../docs/analysis/infoot_vit_router_h036/README.md)
+and [the preceding bandwidth comparison](../docs/analysis/infoot_vit_router_h0375/README.md).
 Use a fresh fit for changed settings. To reproduce an older h=.35 recipe,
 also restore `projection.bandwidth_multiplier` to `.20/.35`; a `--h` override
 alone changes the effective projection bandwidth as well as fitting h.
@@ -317,7 +318,7 @@ fingerprint prevents resuming the old v3 run as though its solver were unchanged
 The earlier **fitting** change was patch `h: .45 -> .35`, `reg: .10 -> .05`;
 patch `lam: .025`, mass `.80`, threshold `.05`, and image-router fit settings
 were held fixed for that comparison. The latest candidate now changes only
-image fitting `h: .375 -> .36`, holding lam=.070 and reg=.06, as described above.
+image fitting `reg: .06 -> .0575`, holding h=.36 and lam=.070, as described above.
 Projection stays at **.20**,
 with .30 available for comparison;
 top-1 truncation is not enabled. These are hypotheses requiring lab images,
