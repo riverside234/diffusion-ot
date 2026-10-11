@@ -1,0 +1,77 @@
+{
+  "checkpoint": {
+    "file": "factors/latest.pt",
+    "sha256": "d3f8f581c982a47379eaefbfc445431a7ddb58f67109b184763218e68ba2832f"
+  },
+  "converged": false,
+  "factor_validation": {
+    "g_min": 0.0036354821640998125,
+    "g_sum_error": 1.1641532182693481e-09,
+    "mass_error": 1.1106684461026362e-09,
+    "plan_column_relative_max": 9.547132240328438e-08,
+    "plan_row_relative_max": 9.75655898294292e-08,
+    "q_column_relative_max": 5.825877455801013e-08,
+    "q_row_relative_max": 4.4518443598207114e-08,
+    "r_column_relative_max": 5.8236240491141225e-08,
+    "r_row_relative_max": 4.4402161614165436e-08,
+    "storage_relative_tolerance": 5.314023990865136e-07
+  },
+  "fit_fingerprint": "46332ce88ddadae17d2683aef0225523e3cfffff2ae60b0abe1851c753b4dbdc",
+  "interpretation": "Read-only float32 checkpoint preview, not a converged mapping or proof of image quality. No refit or factor repair.",
+  "label": "UNCONVERGED CHECKPOINT PREVIEW | step 300 | max_steps",
+  "last_record": {
+    "audit": {
+      "cost": 0.999762246522331,
+      "entropy": -26.756891189797408,
+      "estimated_mass": 1.0001721834424557,
+      "estimated_mean_row_entropy": 12.877874071019741,
+      "estimated_normalized_row_entropy": 0.9999112472836772,
+      "exact_mass": 1.0000000000001967,
+      "latent_component_entropy": 5.5450168706892455,
+      "mi": 2.514191334509118e-07,
+      "objective": 0.3308399542064391,
+      "standard_error": {
+        "cost": 0.000606966813388727,
+        "entropy": 0.00029116007602557076,
+        "estimated_mass": 0.0002482100013591901,
+        "mi": 1.907439740133887e-09,
+        "objective": 0.0006069730353323994
+      }
+    },
+    "audit_objective_gap": 0.07820692964789899,
+    "backtracks": 0,
+    "constraints": {
+      "g_min": 0.0036354821799675836,
+      "g_sum_error": 1.9673151996357774e-13,
+      "mass_error": 1.9673151996357774e-13,
+      "plan_column_relative_max": 2.000621890374532e-13,
+      "plan_row_relative_max": 1.9984014443252818e-13,
+      "q_column_relative_max": 9.16323211933409e-16,
+      "q_row_relative_max": 2.013944566670034e-13,
+      "r_column_relative_max": 8.84044630833873e-16,
+      "r_row_relative_max": 2.0095036745715333e-13,
+      "warnings": []
+    },
+    "cost": 0.8943928051702122,
+    "entropy": -25.670389810346872,
+    "estimated_mass": 1.192596036361861,
+    "estimated_mean_row_entropy": 11.79137269156942,
+    "estimated_normalized_row_entropy": 0.9155491123916732,
+    "exact_mass": 1.0000000000001967,
+    "factor_delta_l1_mean": 0.0002495274544023832,
+    "gradient_max": 108.65629124387245,
+    "latent_component_entropy": 5.5450168706892455,
+    "mi": 7.070600066181938e-07,
+    "mirror_step_residual": 0.027112727758887453,
+    "objective": 0.2526330245585401,
+    "objective_change": -0.0006799511291440963,
+    "status": "max_steps",
+    "step": 300,
+    "step_size": 0.009203332715963596
+  },
+  "original_manifest_sha256": "9bbd25c80f7deddf7aff4441c680eb3d36b6bb3b5fdf8aad4f15adf12bbdefa3",
+  "original_status": "failed",
+  "policy": "lowrank_checkpoint_preview_v1",
+  "solver_status": "max_steps",
+  "step": 300
+}
