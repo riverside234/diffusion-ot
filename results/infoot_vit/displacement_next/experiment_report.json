@@ -1,0 +1,28 @@
+{
+  "checkpoint": "outputs/pdae_v2_l_dog/checkpoints/latest.pt",
+  "checkpoint_sha256": "361fccb4827ab67a67b89232c860c458fb99809733082dbe0da8a5b2b29f6d73",
+  "code_sha256": {
+    "infoot_vit/compare_displacement.py": "4d3479a13c2b3e3babdffe1ea4b7fb2c7426245d5b4311d22344ad2de7acb8c9",
+    "infoot_vit/diagnose_blur.py": "c6d1e7cc0bc89c07ce093937d7a1acd4fb152b0e265492dfdb29d2696afbd6a4",
+    "infoot_vit/infoot_helper/conditional_displacement.py": "c27802089fd7c923830ed4aa8bf1f4a42036df4ce87a2a78287926ce511aca4c",
+    "infoot_vit/infoot_helper/dense_partial_projection.py": "c1f2945b89453f310e1f22b52e9113adc245836d5c446dd2f38d77869b67379c",
+    "src/diffusion_ot/evaluation/stage1a_eval.py": "3cf95821dc90d2a01cf385d3422c146dd7f813e6bab5b1d9af3fcd9ce01e8c9b",
+    "src/diffusion_ot/models/pdae_v2/branch.py": "c4971b7ee6952ccbd6a5517f07df6b2e7221b7cb4bbeb48ada6a445e2f827b54",
+    "src/diffusion_ot/models/pdae_v2/cross_attention.py": "e91133c3ec1f69af5b80990598d3a25848f079c3a5c25b116ef2629261a34cf1"
+  },
+  "config_sha256": {
+    "evaluation": "747545a322433d27bd0d42ccbe0b37c3e89000dbca44e324686d1f2fa199ce8c",
+    "train": "d3d0d40fc806ae07673b52a30472aba7cac6545f20b37b3d83156b526ca5620d"
+  },
+  "error": "RuntimeError: 37 partial pairs failed; 15963 successful pairs saved. See /data/not_backed_up/yxu209/diffusion-ot/results/infoot_vit/displacement_next/fit/grouped_partial_20261011T194322Z_3802c31a/pair_failures.jsonl and pair_batch_report.json.",
+  "hypothesis": "Transport local source-to-target displacements while preserving query residuals; may reduce conditioning blur but can retain cat attributes or wrong semantic matches.",
+  "quality_acceptance": "unreviewed",
+  "reference_files_sha256": {
+    "fit": "2e3d187e2d2068e93b047f2b188c034b662c902e1e79c47bf9a16f65f440d446",
+    "generation": "ea756263c4312e468d8043d087389fbf8328de72b97d0b8a4fb4b4473a86fe3e",
+    "mapped": "00203fd3d0cea16d517a23b0d2b4bd1f0a77a4782ae9900840aae5b0f28def57"
+  },
+  "reference_run": "results/infoot_vit/grouped_partial_20261011T073017Z_39614958_20261011T164734Z_771361",
+  "schema": "infoot_displacement_comparison_v1",
+  "status": "failed"
+}

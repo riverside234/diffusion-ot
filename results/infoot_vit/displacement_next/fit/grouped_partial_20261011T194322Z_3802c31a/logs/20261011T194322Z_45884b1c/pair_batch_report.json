@@ -1,0 +1,651 @@
+{
+  "attempted_pairs": 16000,
+  "batch_performance": [
+    {
+      "batch": 0,
+      "pairs": 2048,
+      "peak_gpu_allocated_bytes": 22065411072,
+      "peak_gpu_reserved_bytes": 23775412224,
+      "seconds": 1090.2832296949928,
+      "status": "completed_with_failures",
+      "successful_pairs_per_second": 1.876576603468779,
+      "timing": {
+        "cuda_stream_seconds": {
+          "cost_and_kernel_gather": 0.17113900756835937,
+          "inner_solver": 83.4765581893921,
+          "mi_and_gradient": 1.7559567365646362,
+          "outer_update_and_diagnostics": 1.4416543632149696
+        },
+        "host_wall_seconds": {
+          "checkpoint_and_logging": 1001.3287355651264,
+          "cost_and_kernel_gather": 0.17033730103867128,
+          "inner_solver": 84.89927829732187,
+          "mi_and_gradient": 0.4010392082273029,
+          "outer_update_and_diagnostics": 1.451405701925978
+        },
+        "note": "Host times include waits. CUDA stream intervals may include host launch gaps; do not add host and CUDA times. Checkpoint/logging includes device-to-host copy, CPU validation and file I/O."
+      }
+    },
+    {
+      "batch": 1,
+      "pairs": 2048,
+      "peak_gpu_allocated_bytes": 22068059648,
+      "peak_gpu_reserved_bytes": 26241662976,
+      "seconds": 1098.6209429100272,
+      "status": "completed_with_failures",
+      "successful_pairs_per_second": 1.8605143231530366,
+      "timing": {
+        "cuda_stream_seconds": {
+          "cost_and_kernel_gather": 0.17162864685058593,
+          "inner_solver": 79.73675781059265,
+          "mi_and_gradient": 1.7152879095077516,
+          "outer_update_and_diagnostics": 1.810313733637333
+        },
+        "host_wall_seconds": {
+          "checkpoint_and_logging": 1013.5156327626319,
+          "cost_and_kernel_gather": 0.17086112400284037,
+          "inner_solver": 81.14061079878593,
+          "mi_and_gradient": 0.3486689458368346,
+          "outer_update_and_diagnostics": 1.8506118382210843
+        },
+        "note": "Host times include waits. CUDA stream intervals may include host launch gaps; do not add host and CUDA times. Checkpoint/logging includes device-to-host copy, CPU validation and file I/O."
+      }
+    },
+    {
+      "batch": 2,
+      "pairs": 2048,
+      "peak_gpu_allocated_bytes": 22065622016,
+      "peak_gpu_reserved_bytes": 26241662976,
+      "seconds": 1087.7737552860053,
+      "status": "completed_with_failures",
+      "successful_pairs_per_second": 1.8772285965504865,
+      "timing": {
+        "cuda_stream_seconds": {
+          "cost_and_kernel_gather": 0.17170399475097656,
+          "inner_solver": 80.45328811311722,
+          "mi_and_gradient": 1.723208280324936,
+          "outer_update_and_diagnostics": 2.0015477516055107
+        },
+        "host_wall_seconds": {
+          "checkpoint_and_logging": 1001.6614544645417,
+          "cost_and_kernel_gather": 0.17093218100490049,
+          "inner_solver": 81.88005403405987,
+          "mi_and_gradient": 0.36962866014800966,
+          "outer_update_and_diagnostics": 2.0054299187031575
+        },
+        "note": "Host times include waits. CUDA stream intervals may include host launch gaps; do not add host and CUDA times. Checkpoint/logging includes device-to-host copy, CPU validation and file I/O."
+      }
+    },
+    {
+      "batch": 3,
+      "pairs": 2048,
+      "peak_gpu_allocated_bytes": 22065410560,
+      "peak_gpu_reserved_bytes": 26243760128,
+      "seconds": 1112.0591487019556,
+      "status": "completed_with_failures",
+      "successful_pairs_per_second": 1.8362332636564451,
+      "timing": {
+        "cuda_stream_seconds": {
+          "cost_and_kernel_gather": 0.17167683410644533,
+          "inner_solver": 78.73966952085495,
+          "mi_and_gradient": 1.7356991043090821,
+          "outer_update_and_diagnostics": 1.7177928314208983
+        },
+        "host_wall_seconds": {
+          "checkpoint_and_logging": 1027.7513188581215,
+          "cost_and_kernel_gather": 0.17090849997475743,
+          "inner_solver": 80.15871955401963,
+          "mi_and_gradient": 0.3728586513316259,
+          "outer_update_and_diagnostics": 1.7393519500037655
+        },
+        "note": "Host times include waits. CUDA stream intervals may include host launch gaps; do not add host and CUDA times. Checkpoint/logging includes device-to-host copy, CPU validation and file I/O."
+      }
+    },
+    {
+      "batch": 4,
+      "pairs": 2048,
+      "peak_gpu_allocated_bytes": 22065411584,
+      "peak_gpu_reserved_bytes": 26243760128,
+      "seconds": 1137.0871682439465,
+      "status": "completed_with_failures",
+      "successful_pairs_per_second": 1.7984549092732995,
+      "timing": {
+        "cuda_stream_seconds": {
+          "cost_and_kernel_gather": 0.17185987854003906,
+          "inner_solver": 121.72941377592086,
+          "mi_and_gradient": 1.7421156516075134,
+          "outer_update_and_diagnostics": 2.114569181829691
+        },
+        "host_wall_seconds": {
+          "checkpoint_and_logging": 1009.6332544867764,
+          "cost_and_kernel_gather": 0.1711266100173816,
+          "inner_solver": 123.15525514131878,
+          "mi_and_gradient": 0.37373667379142717,
+          "outer_update_and_diagnostics": 2.135086240072269
+        },
+        "note": "Host times include waits. CUDA stream intervals may include host launch gaps; do not add host and CUDA times. Checkpoint/logging includes device-to-host copy, CPU validation and file I/O."
+      }
+    },
+    {
+      "batch": 5,
+      "pairs": 2048,
+      "peak_gpu_allocated_bytes": 22065410560,
+      "peak_gpu_reserved_bytes": 26243760128,
+      "seconds": 1154.591050187999,
+      "status": "completed_with_failures",
+      "successful_pairs_per_second": 1.7685915715936882,
+      "timing": {
+        "cuda_stream_seconds": {
+          "cost_and_kernel_gather": 0.1717752685546875,
+          "inner_solver": 98.7079734890461,
+          "mi_and_gradient": 1.7151590123176574,
+          "outer_update_and_diagnostics": 1.6423953993022442
+        },
+        "host_wall_seconds": {
+          "checkpoint_and_logging": 1050.4063889020472,
+          "cost_and_kernel_gather": 0.17100270598893985,
+          "inner_solver": 100.13352478999877,
+          "mi_and_gradient": 0.3552826039958745,
+          "outer_update_and_diagnostics": 1.6544753380003385
+        },
+        "note": "Host times include waits. CUDA stream intervals may include host launch gaps; do not add host and CUDA times. Checkpoint/logging includes device-to-host copy, CPU validation and file I/O."
+      }
+    },
+    {
+      "batch": 6,
+      "pairs": 2048,
+      "peak_gpu_allocated_bytes": 22065621504,
+      "peak_gpu_reserved_bytes": 26243760128,
+      "seconds": 1192.0957050290308,
+      "status": "completed_with_failures",
+      "successful_pairs_per_second": 1.7146274341708354,
+      "timing": {
+        "cuda_stream_seconds": {
+          "cost_and_kernel_gather": 0.17170182800292969,
+          "inner_solver": 94.62455858373642,
+          "mi_and_gradient": 1.731007073879242,
+          "outer_update_and_diagnostics": 2.2563346505761146
+        },
+        "host_wall_seconds": {
+          "checkpoint_and_logging": 1091.9756934830802,
+          "cost_and_kernel_gather": 0.1709271500003524,
+          "inner_solver": 96.04429600521689,
+          "mi_and_gradient": 0.3705887268297374,
+          "outer_update_and_diagnostics": 2.274946714285761
+        },
+        "note": "Host times include waits. CUDA stream intervals may include host launch gaps; do not add host and CUDA times. Checkpoint/logging includes device-to-host copy, CPU validation and file I/O."
+      }
+    },
+    {
+      "batch": 7,
+      "pairs": 1664,
+      "peak_gpu_allocated_bytes": 19341263872,
+      "peak_gpu_reserved_bytes": 26243760128,
+      "seconds": 938.7804167050053,
+      "status": "completed_with_failures",
+      "successful_pairs_per_second": 1.7661212041675942,
+      "timing": {
+        "cuda_stream_seconds": {
+          "cost_and_kernel_gather": 0.13976985168457032,
+          "inner_solver": 90.35423464727401,
+          "mi_and_gradient": 1.4248090596199037,
+          "outer_update_and_diagnostics": 1.2625187877118587
+        },
+        "host_wall_seconds": {
+          "checkpoint_and_logging": 843.906886231096,
+          "cost_and_kernel_gather": 0.13917487999424338,
+          "inner_solver": 91.46686145704007,
+          "mi_and_gradient": 0.36257163871778175,
+          "outer_update_and_diagnostics": 1.2727353621739894
+        },
+        "note": "Host times include waits. CUDA stream intervals may include host launch gaps; do not add host and CUDA times. Checkpoint/logging includes device-to-host copy, CPU validation and file I/O."
+      }
+    }
+  ],
+  "completed_pair_geometry": {
+    "count": 15963,
+    "population": "new successes in this attempt; excludes failures and previously registered pairs",
+    "statistics": {
+      "fitted_pair_effective_patches": {
+        "max": 34.478526019487006,
+        "mean": 17.156166254592453,
+        "min": 8.441434455354392
+      },
+      "fitted_pair_normalized_entropy": {
+        "max": 0.5694762499030565,
+        "mean": 0.4475219218893513,
+        "min": 0.3443212196912924
+      },
+      "fitted_pair_top1_probability": {
+        "max": 0.4630611139700684,
+        "mean": 0.34216774938904476,
+        "min": 0.2409337560360853
+      },
+      "mean_row_cost_std": {
+        "max": 0.13672536686006972,
+        "mean": 0.09508594195711897,
+        "min": 0.063479926828303
+      }
+    }
+  },
+  "consecutive_all_failed_batches": 0,
+  "device": "cuda:0",
+  "elapsed_seconds": 8811.741781362973,
+  "failed_pairs": 37,
+  "failures": [
+    {
+      "batch": 0,
+      "checkpoint": "plans/pairs/000012_001497_20655ed920d5/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_009518",
+      "source_index": 12,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_003867",
+      "target_index": 1497
+    },
+    {
+      "batch": 0,
+      "checkpoint": "plans/pairs/000143_000420_d401b481f0c3/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_009901",
+      "source_index": 143,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_001142",
+      "target_index": 420
+    },
+    {
+      "batch": 1,
+      "checkpoint": "plans/pairs/000348_000569_6c435d43c40e/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_010469",
+      "source_index": 348,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_001486",
+      "target_index": 569
+    },
+    {
+      "batch": 1,
+      "checkpoint": "plans/pairs/000489_000368_e6f6ca3d3f5b/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_010917",
+      "source_index": 489,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_000974",
+      "target_index": 368
+    },
+    {
+      "batch": 1,
+      "checkpoint": "plans/pairs/000290_000549_ef5317568466/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_010310",
+      "source_index": 290,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_001443",
+      "target_index": 549
+    },
+    {
+      "batch": 1,
+      "checkpoint": "plans/pairs/000300_001904_aef07e1b0a29/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_010346",
+      "source_index": 300,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_014838",
+      "target_index": 1904
+    },
+    {
+      "batch": 2,
+      "checkpoint": "plans/pairs/000602_001863_8e82bb2b67a9/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011208",
+      "source_index": 602,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_014742",
+      "target_index": 1863
+    },
+    {
+      "batch": 2,
+      "checkpoint": "plans/pairs/000713_001681_e8a82e15aa96/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011516",
+      "source_index": 713,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_004337",
+      "target_index": 1681
+    },
+    {
+      "batch": 2,
+      "checkpoint": "plans/pairs/000748_001054_f97994748a4c/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011615",
+      "source_index": 748,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_002710",
+      "target_index": 1054
+    },
+    {
+      "batch": 2,
+      "checkpoint": "plans/pairs/000600_001806_c299a59b7068/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011205",
+      "source_index": 600,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_004679",
+      "target_index": 1806
+    },
+    {
+      "batch": 2,
+      "checkpoint": "plans/pairs/000641_001370_e29af705bdc7/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011306",
+      "source_index": 641,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_003532",
+      "target_index": 1370
+    },
+    {
+      "batch": 2,
+      "checkpoint": "plans/pairs/000525_000063_c93af903cf7c/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011005",
+      "source_index": 525,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_000203",
+      "target_index": 63
+    },
+    {
+      "batch": 3,
+      "checkpoint": "plans/pairs/000898_001576_5d6ab5e09e63/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011995",
+      "source_index": 898,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_004068",
+      "target_index": 1576
+    },
+    {
+      "batch": 3,
+      "checkpoint": "plans/pairs/000888_001213_384ec9a0b8c8/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011964",
+      "source_index": 888,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_003151",
+      "target_index": 1213
+    },
+    {
+      "batch": 3,
+      "checkpoint": "plans/pairs/000980_001259_bd5b489f3a18/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_012186",
+      "source_index": 980,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_003255",
+      "target_index": 1259
+    },
+    {
+      "batch": 3,
+      "checkpoint": "plans/pairs/000786_001050_bb4e682706a0/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_011713",
+      "source_index": 786,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_002704",
+      "target_index": 1050
+    },
+    {
+      "batch": 3,
+      "checkpoint": "plans/pairs/000993_000838_24b9bdd01575/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_012224",
+      "source_index": 993,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_002170",
+      "target_index": 838
+    },
+    {
+      "batch": 3,
+      "checkpoint": "plans/pairs/001004_001955_1e85112c9001/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_012263",
+      "source_index": 1004,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_015003",
+      "target_index": 1955
+    },
+    {
+      "batch": 4,
+      "checkpoint": "plans/pairs/001143_001738_6d6ae60637b2/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_012688",
+      "source_index": 1143,
+      "status": "inner_failed",
+      "target_id": "afhq_dog_004514",
+      "target_index": 1738
+    },
+    {
+      "batch": 4,
+      "checkpoint": "plans/pairs/001084_000290_12641218006d/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_012518",
+      "source_index": 1084,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_000760",
+      "target_index": 290
+    },
+    {
+      "batch": 4,
+      "checkpoint": "plans/pairs/001064_001336_81951ee4f235/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_012431",
+      "source_index": 1064,
+      "status": "inner_failed",
+      "target_id": "afhq_dog_003456",
+      "target_index": 1336
+    },
+    {
+      "batch": 5,
+      "checkpoint": "plans/pairs/001413_001161_fdb85b011bf9/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_013431",
+      "source_index": 1413,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_003019",
+      "target_index": 1161
+    },
+    {
+      "batch": 5,
+      "checkpoint": "plans/pairs/001524_001114_a64be75bc057/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_013755",
+      "source_index": 1524,
+      "status": "inner_failed",
+      "target_id": "afhq_dog_002920",
+      "target_index": 1114
+    },
+    {
+      "batch": 5,
+      "checkpoint": "plans/pairs/001296_000600_5a8bdab2515b/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_013106",
+      "source_index": 1296,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_001572",
+      "target_index": 600
+    },
+    {
+      "batch": 5,
+      "checkpoint": "plans/pairs/001442_001237_11a1dc582f62/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_013507",
+      "source_index": 1442,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_003206",
+      "target_index": 1237
+    },
+    {
+      "batch": 5,
+      "checkpoint": "plans/pairs/001481_000120_c44bea3377b6/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_013613",
+      "source_index": 1481,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_000347",
+      "target_index": 120
+    },
+    {
+      "batch": 5,
+      "checkpoint": "plans/pairs/001487_001877_868e85d93f34/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_013632",
+      "source_index": 1487,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_014787",
+      "target_index": 1877
+    },
+    {
+      "batch": 6,
+      "checkpoint": "plans/pairs/001573_001839_5aeab4a06695/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_013876",
+      "source_index": 1573,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_014653",
+      "target_index": 1839
+    },
+    {
+      "batch": 6,
+      "checkpoint": "plans/pairs/001768_001405_dca813d1ae28/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_014419",
+      "source_index": 1768,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_003620",
+      "target_index": 1405
+    },
+    {
+      "batch": 6,
+      "checkpoint": "plans/pairs/001637_001050_da7458cb95f6/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_014042",
+      "source_index": 1637,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_002704",
+      "target_index": 1050
+    },
+    {
+      "batch": 6,
+      "checkpoint": "plans/pairs/001545_000160_3a0c69fd8fca/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_013808",
+      "source_index": 1545,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_000433",
+      "target_index": 160
+    },
+    {
+      "batch": 7,
+      "checkpoint": "plans/pairs/001838_001002_0b8efa228d21/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_014597",
+      "source_index": 1838,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_002565",
+      "target_index": 1002
+    },
+    {
+      "batch": 7,
+      "checkpoint": "plans/pairs/001838_000654_d3596f45ee51/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_014597",
+      "source_index": 1838,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_001705",
+      "target_index": 654
+    },
+    {
+      "batch": 7,
+      "checkpoint": "plans/pairs/001825_001097_4835ad521933/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_014563",
+      "source_index": 1825,
+      "status": "inner_failed",
+      "target_id": "afhq_dog_002870",
+      "target_index": 1097
+    },
+    {
+      "batch": 7,
+      "checkpoint": "plans/pairs/001916_000531_aa4c22cc1dcb/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_015840",
+      "source_index": 1916,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_001403",
+      "target_index": 531
+    },
+    {
+      "batch": 7,
+      "checkpoint": "plans/pairs/001956_001419_9bd3ed9bdbcc/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_015981",
+      "source_index": 1956,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_003660",
+      "target_index": 1419
+    },
+    {
+      "batch": 7,
+      "checkpoint": "plans/pairs/001812_000242_bf12cb995bcf/latest.pt",
+      "error": "Pair did not converge; last accepted plan retained.",
+      "run_id": "20261011T194322Z_45884b1c",
+      "source_id": "afhq_cat_014532",
+      "source_index": 1812,
+      "status": "line_search_stalled",
+      "target_id": "afhq_dog_000628",
+      "target_index": 242
+    }
+  ],
+  "pair_batch_size": 2048,
+  "previously_completed_pairs": 0,
+  "resume_policy": "Reuse registered successful pairs; restart unfinished/failed pairs from exact float64 feasible initialization.",
+  "status": "failed",
+  "successful_pairs": 15963,
+  "unattempted_pairs": 0,
+  "unfinished_attempted_pairs": 0
+}
