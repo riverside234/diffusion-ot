@@ -278,10 +278,14 @@ class FeatureMapper:
         return candidate,g,diag,pair["storage_validation"]["confidence_roundoff_tolerance"]
 
     @torch.no_grad()
-    def map_features(self, features, query_ids, *, valid_mask=None, return_metadata=False, chunk_size=None, on_query=None):
+    def map_features(self, features, query_ids, *, valid_mask=None, return_metadata=False, chunk_size=None,
+                     on_query=None, edge_observer=None):
         if self.is_partial and not return_metadata:
             raise ValueError("grouped_partial requires return_metadata=True; features alone erase rejection.")
         validate_maps(features, query_ids, self.source.representation, valid_mask)
+        if edge_observer is not None and (self.mode != "grouped_partial"
+                or self.config["projection"].get("patch_value_mode") != "conditional_edge_mean"):
+            raise ValueError("Edge-weight diagnostics require dense conditional_edge_mean projection.")
         start = time.perf_counter()
         q = features.detach().to(device=self.device,dtype=torch.float64)
         outputs, confidences, masks, records = [], [], [], []
@@ -376,7 +380,10 @@ class FeatureMapper:
                                 successful_pair_retained_routing_mass=retained_pairs,
                                 total_pair_discarded_routing_mass=max(0., 1. - retained_pairs))
                         if self.mode == "grouped_partial":
-                            mapped, confidence, projection_detail = self._dense_projector.project(patches, theta, alpha)
+                            if edge_observer is not None:
+                                edge_observer.begin(query_id, patches, alpha)
+                            mapped, confidence, projection_detail = self._dense_projector.project(
+                                patches, theta, alpha, edge_observer=edge_observer)
                             detail.update(projection_detail)
                         else:  # Low-rank partial keeps its existing projection implementation.
                             feature_sum, confidence = torch.zeros_like(patches), patches.new_zeros(p)
@@ -435,6 +442,8 @@ class FeatureMapper:
                 mask = ((confidence > cf["mass_floor"]) & (confidence >= cf["threshold"])) if self.is_partial else torch.ones(p, dtype=torch.bool,device=self.device)
                 if not torch.isfinite(mapped).all():
                     raise ValueError(f"Nonfinite mapped features for {query_id}")
+                if edge_observer is not None:
+                    edge_observer.finish(mapped, confidence, mask)
                 detail.update(valid_fraction=float(mask.double().mean()), all_invalid=bool(not mask.any()),
                               mapped_norm_mean=float(mapped.norm(dim=1).mean()))
                 outputs.append(mapped); confidences.append(confidence); masks.append(mask); records.append(detail)
@@ -453,7 +462,7 @@ class FeatureMapper:
         result.conditioning(query_ids, all_invalid_policy=cf["all_invalid_policy"])
         return result if return_metadata else result.mapped_features
 
-    def project_bank(self, bank, output, *, count=None, chunk_size=None, run_log=None):
+    def project_bank(self, bank, output, *, count=None, chunk_size=None, run_log=None, edge_observer=None):
         from .run_logging import RunLog
 
         output = Path(output)
@@ -483,7 +492,8 @@ class FeatureMapper:
             log.event("mapping_started", query_count=n, query_ids=ids, mode=self.mode,device=str(self.device),
                       projection=self.config["projection"])
             result = self.map_features(features, ids, valid_mask=torch.ones(features.shape[:2], dtype=torch.bool,device=self.device),
-                                       return_metadata=True, chunk_size=chunk_size, on_query=on_query)
+                                       return_metadata=True, chunk_size=chunk_size, on_query=on_query,
+                                       edge_observer=edge_observer)
             report = mapping_summary(result, features, self.x, self.y, confidence_settings=self.config["projection"]["confidence"])
             log.write_json("mapping_report.json", report)
             manifest = self._save_mapping(bank, output, ids, result)

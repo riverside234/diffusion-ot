@@ -23,7 +23,7 @@ def runtime_settings(cache_bytes=None, pair_batch_size=None):
 
 
 def project_pairs(logs, target, plans, a, b, ky, thresholds, tolerances, *,
-                  value_mode="barycentric", query=None, source=None):
+                  value_mode="barycentric", query=None, source=None, return_edge_weights=False):
     """Vectorize conditional.partial_projection over pairs in float64.
 
     Original-proposal density correction, zero retention, support gates and
@@ -31,6 +31,8 @@ def project_pairs(logs, target, plans, a, b, ky, thresholds, tolerances, *,
     rather than once per pair. All returned statistics remain on the device.
     """
     validate_value_mode(value_mode)
+    if return_edge_weights and value_mode != "conditional_edge_mean":
+        raise ValueError("Edge-weight diagnostics require conditional_edge_mean.")
     if value_mode != "barycentric" and (query is None or source is None):
         raise ValueError("Plan-edge projection requires the original query and source tokens.")
     row_max = logs.max(-1).values
@@ -73,7 +75,8 @@ def project_pairs(logs, target, plans, a, b, ky, thresholds, tolerances, *,
     extra = {}
     if value_mode != "barycentric":
         values, extra = conditional_displacement(query, source, target, plans, logs, ky, b,
-            retain_source_residual=value_mode == "conditional_displacement")
+            retain_source_residual=value_mode == "conditional_displacement",
+            return_edge_weights=return_edge_weights)
     else:
         values = weights @ target
     return values, raw, valid, dict(
@@ -148,7 +151,7 @@ class DensePartialProjector:
             cache_resident_bytes=self.resident_bytes, cache_peak_bytes=self.peak_bytes,
             pair_file_loads=self.loads, pair_cache_hits=self.hits)
 
-    def project(self, patches, theta, alpha):
+    def project(self, patches, theta, alpha, *, edge_observer=None):
         mapper = self.mapper
         p = len(patches)
         value_mode = validate_value_mode(mapper.config["projection"].get("patch_value_mode", "barycentric"))
@@ -182,7 +185,8 @@ class DensePartialProjector:
                 mapper.projection_ky[ij[:, 1]], self.thresholds[ij[:, 0]], tolerances,
                 value_mode=value_mode,
                 query=patches.expand(len(ids), -1, -1) if value_mode != "barycentric" else None,
-                source=mapper.x[ij[:, 0]] if value_mode != "barycentric" else None)
+                source=mapper.x[ij[:, 0]] if value_mode != "barycentric" else None,
+                return_edge_weights=edge_observer is not None)
             clipped = raw.clamp(0, 1)
             roundoff = torch.maximum(roundoff, (raw - clipped).abs().max())
             g = clipped * valid  # Validated storage/solver roundoff only, no plan renormalization.
@@ -196,6 +200,8 @@ class DensePartialProjector:
             budget = measure * diag["weight_row_sums"] + route * (1 - g)
             # Reduce duplicate target indices deterministically, without CUDA atomic adds.
             targets = [mapper.target_index[t] for _, t in keys]
+            if edge_observer is not None:
+                edge_observer.add(targets, measure, diag["edge_weights"])
             unique_targets = list(dict.fromkeys(targets))
             membership = patches.new_tensor([[float(t == j) for j in unique_targets] for t in targets])
             budgets[:, unique_targets] += budget.T @ membership

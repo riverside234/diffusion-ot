@@ -79,12 +79,22 @@ diagnostic-only; mean and token-direction mismatch remain to be separated.
 The completed v7 run passed all 37 formerly failing pairs and all 16,000 full-fit
 pairs. Displacement improved visible detail but retained cat traits and produced
 some distorted faces. Keep the v7 solver and fitting settings; the value estimator
-remains experimental. The next test is the
-[residual-removal experiment with UMAP](DISPLACEMENT_EXPERIMENT.md#next-experiment-residual-removal-with-umap):
+remains experimental. The completed
+[residual-removal experiment with UMAP](DISPLACEMENT_EXPERIMENT.md#completed-v8-residual-removal-with-umap):
 `compare_displacement.py --experiment residual_ablation --mapping ...`
 reuses the exact completed v7 fit, with the v7 result directory as `--reference-run`.
 It compares `conditional_displacement` with `conditional_edge_mean`, retaining
 barycentric and native/source decoder controls. No refit or co-training occurs.
+
+The v8 residual-removed output returned to the blurry baseline. The next test is
+[separating averaging within and across dogs](DISPLACEMENT_EXPERIMENT.md#next-experiment-separate-averaging-within-and-across-dogs):
+`compare_displacement.py --experiment averaging_ablation --mapping ...`
+with `results/infoot_vit/residual_ablation_v8` as its reference. It reuses the same
+fit, reconstructs the edge-mean map from per-dog contributions, checks a conditional
+variance decomposition, and compares the mixture, dominant-dog mean and dominant-
+dog patch argmax on a shared mask. A separate row controls for mask changes.
+Argmax is diagnostic only and may break spatial coherence. This experiment also
+saves exactly three analysis files: report, comparison grid and matching UMAP.
 
 The residual experiment keeps **three analysis files**: `experiment_report.json`,
 `comparison_grid.png`, and required `umap.png`. UMAP coordinates and settings are

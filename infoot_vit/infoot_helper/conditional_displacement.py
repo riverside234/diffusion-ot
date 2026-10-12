@@ -26,7 +26,7 @@ def validate_value_mode(mode):
 
 
 def conditional_displacement(query, source, target, plans, logs, target_kernel, b, *,
-                             retain_source_residual=True):
+                             retain_source_residual=True, return_edge_weights=False):
     """Batched float64 [B,Q,D] values; never materialize [B,Q,P,P,D].
 
     Normalize latent plan rows and query weights in log space. Zero retained
@@ -36,9 +36,13 @@ def conditional_displacement(query, source, target, plans, logs, target_kernel, 
     edge weights, rather than q + E_w[y_j-x_i]. This is not the KDE-smoothed
     barycentric estimator E[y_k]. Residual diagnostics describe q-E_w[x_i]
     whether that residual is retained or removed.
+    Optional edge_weights marginalize source patches and retain original target
+    patch indices; they are for the averaging diagnostic, not target KDE values.
     """
     if type(retain_source_residual) is not bool:
         raise ValueError("retain_source_residual must be boolean, not a gain.")
+    if type(return_edge_weights) is not bool:
+        raise ValueError("return_edge_weights must be boolean.")
     if (plans.dtype != torch.float64 or any(x.dtype != torch.float64 for x in
             (query, source, target, logs, target_kernel, b))):
         raise ValueError("Conditional displacement requires float64 projection.")
@@ -85,4 +89,6 @@ def conditional_displacement(query, source, target, plans, logs, target_kernel, 
     failures += [~torch.isfinite(value).all() for value in (*stats.values(), query, source, target)]
     if bool(torch.stack(failures).any()):
         raise ValueError("Nonfinite/invalid conditional-displacement projection.")
+    if return_edge_weights:
+        stats["edge_weights"] = weights @ row_weights
     return values, stats

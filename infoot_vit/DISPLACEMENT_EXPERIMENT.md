@@ -9,13 +9,104 @@ keep displacement experimental.** The default estimator remains unchanged.
 
 The [detailed local review](../docs/analysis/infoot_vit_displacement_v7_20261012/README.md)
 records numerical checks, matched controls and observations for all 16 columns.
-The next test is implemented as `--experiment residual_ablation`. It reuses the
-exact completed v7 fit and compares plan-edge target means with and without the
-source residual. No new fit or co-training is needed.
+The completed **v8 residual ablation** returned almost the same blurry images as
+barycentric (mean RGB difference 0.235 on the 0-255 scale). Variance after the
+decoder projector was 0.4285, versus 0.4265 for barycentric and 0.7996 with the
+residual retained. Neither endpoint passes the combined quality goal.
 
-## Next experiment: residual removal with UMAP
+## Next experiment: separate averaging within and across dogs
 
-After syncing this code to the lab machine, run from the repository root:
+Use `--experiment averaging_ablation` with the completed **v8** result directory
+as the reference. It reuses the exact v7 fit and the same plans, bandwidths,
+support calibration, decoder weights and starting noise. After syncing the code,
+run from the repository root on the lab machine:
+
+```bash
+python infoot_vit/compare_displacement.py \
+  --experiment averaging_ablation \
+  --mapping outputs/infoot_vit/displacement_v7_4deed6d4/fit/grouped_partial_20261012T014020Z_df15945b \
+  --reference-run results/infoot_vit/residual_ablation_v8 \
+  --query-bank data/infoot_vit/cat_val16 \
+  --checkpoint outputs/pdae_v2_l_dog/checkpoints/latest.pt \
+  --output-dir results/infoot_vit/averaging_ablation_v9 \
+  --device cuda --batch-size 8 --threads 4
+```
+
+The output directory must be new. Keep the original fitted plans and checkpoint
+on the lab machine. No refit or bank override is permitted. UMAP uses the same
+dependencies and shared plotting code as v8.
+
+The three primary readouts are:
+
+1. **All dogs, edge mean:** the original v8 residual-removed map, on the common
+   comparison mask.
+2. **Dominant dog, patch mean:** aggregate the same fitted edge weights within
+   one dog and decode that dog's conditional target-patch mean. The dog is the
+   highest original post-pruning image route, with stable-ID tie breaking. It
+   stays fixed across all query patches and matches the native reference.
+3. **Dominant dog, patch argmax:** for that same dog and distribution, select the
+   highest-weight target token at each query position. Ties use the first saved
+   row-major patch index. No source residual, nearest-neighbor retrieval, gain
+   or temperature sweep is added.
+
+Readouts 1 versus 2 diagnose averaging across dogs. Readouts 2 versus 3 test
+replacing within-dog patch averaging by a hard selection. Argmax can duplicate
+patches, break spatial coherence and copy the reference; it does not preserve
+soft-plan marginals and is not a new default transport estimator. Source-image
+uncertainty is still marginalized inside each dog's distribution.
+
+The observer collects
+`A[j,q,k] = sum_i theta[i,j] * g[i,j,q] * w[i,j,q,k]`, where `w` is the original
+plan-edge target-patch distribution including the target-density correction.
+The sums over `k` give dog masses. Normalizing within dogs gives `beta[j,q,k]`;
+normalizing dog masses gives `pi[j,q]`. The mixture
+`sum_j pi[j,q] * sum_k beta[j,q,k] * y[j,k]` must reconstruct the unchanged v8
+edge mean and confidence within float64 tolerance.
+
+For each query position the report checks the law of total variance:
+`total target-token dispersion = within-dog patch dispersion + between-dog mean dispersion`.
+These are conditional squared Euclidean dispersions per feature dimension.
+They are separate from spatial variance within a conditioning map; their
+fractions are not percentages of image blur. Input, LayerNorm and learned-
+projector spatial variances are also recorded for every decoded condition.
+
+The three primary readouts share the original v8 valid mask intersected with
+positive dominant-dog mass and dominant-dog conditional confidence at least the
+original 0.05 threshold. Conditional confidence is that dog's retained mass
+divided by its original image route. A separate original-mask mixture row
+isolates the effect of dropping additional tokens. Coverage and excluded
+positions are recorded. If a query has no common tokens, the runner records a
+failed diagnostic and stops before decoding, without filling unsupported tokens.
+
+Exactly **three files** are saved in the result directory:
+
+- `experiment_report.json`: identity checks, original mapping report, variance
+  decomposition, masks, selected patch indices, concentration, duplication and
+  adjacency diagnostics, decoder statistics, noise controls and UMAP coordinates.
+- `comparison_grid.png`: nine rows: source cat; routed dog RGB; native dog with
+  all tokens; native dog with common mask; cat tokens through dog decoder with
+  common mask; all-dog edge mean with original mask; all-dog edge mean with
+  common mask; dominant-dog mean; dominant-dog patch argmax.
+- `umap.png`: the final three readouts in shared image-mean and patch spaces,
+  fitted only on real training banks and using the existing test UMAP style.
+
+Tensors, selected-dog probabilities and exact noise stay in the ignored
+`outputs/infoot_vit/` work directory. The CPU accumulator holds one query's
+target-patch masses (586.2 MiB for 2,000 dogs and 196 tokens); moments are computed
+in blocks of 16 targets on the mapping device. All-target feature maps and
+all-query mass tensors are never stored. Mapping caches are released before
+the decoder is loaded.
+
+Review especially column 12, already routed 94.97% to one dog in v8. A sharp but
+incoherent argmax output only diagnoses averaging. If the dominant-dog mean stays
+blurry, cross-dog mixing alone is insufficient. Judge anatomy, source pose,
+expression/color and reference copying together with patch duplication. Execution
+completion and UMAP proximity remain separate from visual acceptance. The actual
+experiment needs the lab run; local tests use synthetic features and a stub decoder.
+
+## Completed v8: residual removal with UMAP
+
+The completed v8 experiment used this command (use a new output name to repeat):
 
 ```bash
 python infoot_vit/compare_displacement.py \
@@ -94,8 +185,8 @@ Removing the residual may reduce retained cat traits or facial artifacts, but
 may restore blur or lose pose/expression. Inspect all columns and especially
 2, 6, 12, 14 and 15. Accept only a coherent, clearer dog translation that also
 preserves source correspondence. Neither completion, higher variance nor a
-UMAP cluster is a quality pass. The actual experiment still needs to run on the
-lab machine; local tests use synthetic features and a stubbed decoder.
+UMAP cluster is a quality pass. The completed v8 run confirmed the blur/detail
+tradeoff described above.
 
 ## Earlier v7 experiment
 

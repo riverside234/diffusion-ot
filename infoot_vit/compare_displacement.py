@@ -3,6 +3,8 @@
 Use --fit-config for a fresh fit or --mapping for a certified complete fit.
 --experiment residual_ablation requires the completed fit and v7 reference
 report, compares residual retention/removal, and always includes a UMAP.
+--experiment averaging_ablation reuses that fit with the completed v8 reference
+to separate within-dog patch averaging from averaging across dogs.
 The reviewed run supplies query, bank, solver and generation identities.
 Execution completion is explicitly separate from visual quality acceptance.
 """
@@ -149,6 +151,9 @@ def review_template(ids, reference_ids):
 
 def run_experiment(args):
     experiment = getattr(args, "experiment", "displacement")
+    if experiment == "averaging_ablation":
+        from infoot_vit.averaging_experiment import run_experiment as run_averaging
+        return run_averaging(args)
     if experiment not in {"displacement", "residual_ablation"}:
         raise ValueError("Unknown projection experiment.")
     residual_ablation = experiment == "residual_ablation"
@@ -364,17 +369,17 @@ def run_experiment(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment", choices=("displacement", "residual_ablation"), default="displacement",
-                        help="Residual ablation reuses the exact completed v7 fit and always saves a UMAP.")
+    parser.add_argument("--experiment", choices=("displacement", "residual_ablation", "averaging_ablation"), default="displacement",
+                        help="Residual/averaging ablations reuse the exact completed fit and always save a UMAP.")
     fitting = parser.add_mutually_exclusive_group(required=True)
     fitting.add_argument("--fit-config", type=Path, help="Fit once in the work directory, then compare both estimators.")
     fitting.add_argument("--mapping", type=Path, help="Reuse an already complete, identity-matched fit.")
-    parser.add_argument("--reference-run", required=True, type=Path, help="Completed experiment-report directory (required for residual ablation), or legacy reviewed result directory.")
+    parser.add_argument("--reference-run", required=True, type=Path, help="Reviewed result directory: completed v7 for residual ablation, completed v8 for averaging ablation.")
     parser.add_argument("--query-bank", required=True, type=Path)
     parser.add_argument("--source-bank", type=Path, help="Fresh fit only: original source bank path.")
     parser.add_argument("--target-bank", type=Path, help="Fresh fit only: original target bank path.")
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path, help="New directory: report + grid; residual ablation also includes umap.png.")
+    parser.add_argument("--output-dir", required=True, type=Path, help="New directory: report + grid; residual/averaging ablations also include umap.png.")
     parser.add_argument("--work-dir", type=Path, help="New directory outside results/ for resumable state; defaults to ignored outputs/infoot_vit/.")
     parser.add_argument("--train-config", default="configs/stage1a_pdae_v2_l/dog.yaml")
     parser.add_argument("--eval-config", default="configs/stage1a_eval/pdae_v2_l.yaml")
@@ -388,8 +393,8 @@ def main(argv=None):
         parser.error("Positive batch/thread counts and nonnegative pair-cache MiB are required.")
     if args.mapping and (args.source_bank is not None or args.target_bank is not None):
         parser.error("Bank overrides apply only to --fit-config.")
-    if args.experiment == "residual_ablation" and args.mapping is None:
-        parser.error("Residual ablation requires --mapping; reuse the completed v7 fit.")
+    if args.experiment != "displacement" and args.mapping is None:
+        parser.error("Residual/averaging ablation requires --mapping; reuse the completed v7 fit.")
     torch.set_num_threads(args.threads)
     run_experiment(args)
     return 0
