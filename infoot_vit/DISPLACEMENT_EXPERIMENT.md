@@ -10,9 +10,11 @@ The first lab attempt finished **15,963 of 16,000 pairs** and stopped with
 33 outer line-search stalls and four inner-certificate failures. Mapping and
 generation did not run. The [compact analysis](../results/infoot_vit/displacement_next_analysis.json)
 records the evidence; the original result folder was deleted at the user's
-request. Resolve these numerical failures before repeating a full fit with
-unchanged settings. The command below defines the comparison protocol, not a
-validated fix for those remaining failures or the blurred images.
+request. The v7 solver now evaluates log-plan stationarity without repeated
+subtraction and allows an accepted small damped step to continue after precision
+refinement. Convergence still requires the original **undamped** residual;
+objective, mass, capacity and convergence tolerances are unchanged. Synthetic
+checks pass, but the 37 real GPU cases still need to be replayed on the lab machine.
 
 The completed `blur_spread_20261011T174849Z` experiment showed that native dog
 tokens remain clear at the mapped variance, whereas increasing mapped variance
@@ -22,23 +24,36 @@ included.
 
 ## Run once on the lab machine
 
-From the repository root, using the existing CUDA environment and this updated
-code, run:
+From the repository root on the lab machine, using the existing CUDA environment,
+first pull the committed updated code. Then run this **single Bash block**. The
+first command retries exactly the 37 recorded failed training pairs, without a
+router refit, per-pair files or checkpoints. It saves one JSON report and exits
+nonzero if any pair fails. `&&` starts the full experiment only after all 37 pass.
 
 ```bash
-python infoot_vit/compare_displacement.py \
+python infoot_vit/check_failed_pairs.py \
+  --source-bank data/infoot_vit/cat_train_4000 \
+  --target-bank data/infoot_vit/dog_train_4000 \
+  --output results/infoot_vit/remaining_pairs_v7.json \
+  --device cuda --threads 4 \
+&& python infoot_vit/compare_displacement.py \
   --fit-config infoot_vit/configs/grouped_partial.yaml \
   --source-bank data/infoot_vit/cat_train_4000 \
   --target-bank data/infoot_vit/dog_train_4000 \
   --query-bank data/infoot_vit/cat_val16 \
   --reference-run results/infoot_vit/grouped_partial_20261011T073017Z_39614958_20261011T164734Z_771361 \
   --checkpoint outputs/pdae_v2_l_dog/checkpoints/latest.pt \
-  --output-dir results/infoot_vit/displacement_check \
+  --output-dir results/infoot_vit/displacement_v7 \
   --device cuda --batch-size 4 --threads 4
 ```
 
-`displacement_check` must not exist; use another new name for a repeat. The
-4000-image bank paths are the **original bank identities**. Fitting still selects
+`remaining_pairs_v7.json` and `displacement_v7` must not exist; use new names for
+a repeat. Passing this targeted check is not proof that all 16,000 pairs will
+converge; the full runner independently requires a complete fit before mapping.
+If the check fails, return only its JSON report for analysis and do not start
+the full fit. No feature/checkpoint tensors are needed to read that report.
+
+The 4000-image bank paths are the **original bank identities**. Fitting still selects
 the exact same **2000 training images per domain, seed 42**. Do not substitute
 newly extracted banks or use validation images for fitting.
 
@@ -64,7 +79,7 @@ existing strict repair tool can supply such a completed fit. An unrepaired
 | Transported mass / threshold | 0.80 / 0.05, unchanged |
 | Image / patch projection h | 0.20 / 0.20, unchanged |
 | Selected pairs | Same top-8 policy per training source; require 16,000 successes |
-| Numerical solver | Existing v6 stall refinement, strict certificates, float64 computation / float32 plans |
+| Numerical solver | v7 stable stationarity calculation and certified damped progress, strict certificates, float64 computation / float32 plans |
 | Decoder | Same frozen checkpoint; no training or co-training |
 | Baseline values | Existing KDE conditional mean of target tokens (`barycentric`) |
 | Candidate values | Original query token plus a conditional mean of fitted source-to-target displacements |
@@ -95,6 +110,9 @@ The result directory contains **only two files** for Git push/pull and analysis:
   mapping manifests and statistics, generation controls, hashes and review fields.
 - `comparison_grid.png`: all seven rows and all queries at original resolution;
   zoom in to inspect individual columns. No duplicate row images or panels.
+
+Together with `remaining_pairs_v7.json`, this workflow produces **three analysis
+files total**. The deleted `displacement_next` directory is not recreated.
 
 Fitted plans, per-pair logs, mapped tensor caches and `conditioning_variants.pt`
 with exact shared noise stay under **`outputs/infoot_vit/`**, already ignored by

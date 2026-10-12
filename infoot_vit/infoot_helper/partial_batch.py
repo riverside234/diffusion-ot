@@ -19,7 +19,7 @@ import torch
 from .partial import OBJECTIVE, capabilities, information, information_gradient, solver_config
 from .partial_newton import dual_newton_step
 
-VERSION = "dense_partial_infoot_batch_v6_stall_refinement"
+VERSION = "dense_partial_infoot_batch_v7_certified_progress"
 RUNNING, CONVERGED, BUDGET, STALLED, INVALID, INNER_FAILED, NONFINITE = range(7)
 STATUS = ("running", "converged", "max_outer_steps", "line_search_stalled",
           "invalid_input", "inner_failed", "nonfinite_objective_or_gradient")
@@ -92,7 +92,9 @@ def _partial_certificate(plan, log_plan, previous, base, a, b, mass, u, v, w):
         (plan.sum((-2, -1)) - mass).abs() / mass,
         ((u * (rows - a)).abs().sum(-1) + (v * (cols - b)).abs().sum(-1)) / mass,
         u.clamp_min(0).amax(-1), v.clamp_min(0).amax(-1),
-        (log_plan - base - u[:, :, None] - v[:, None, :] - w[:, None, None]).abs().amax((-2, -1)),
+        # Compare the two log plans directly. Successive subtraction can add
+        # cancellation error above 1e-14 even when these are identical floats.
+        (log_plan - (base + u[:, :, None] + v[:, None, :] + w[:, None, None])).abs().amax((-2, -1)),
     ), -1)
     return delta, residuals.amax(-1)
 
@@ -239,7 +241,7 @@ def _number(value):
     return value if math.isfinite(value) else None
 
 
-def _outer_step(old_plan, candidate, old, cost, kx, ky, config, ok, healthy):
+def _outer_step(old_plan, candidate, old, cost, kx, ky, config, ok, healthy, *, allow_damped_progress=False):
     """Keep the undamped fixed-point test separate from line-search progress."""
     delta = (candidate - old_plan).abs().sum((-2, -1))
     status = torch.where(healthy, torch.where(ok, RUNNING, INNER_FAILED), NONFINITE)
@@ -257,7 +259,9 @@ def _outer_step(old_plan, candidate, old, cost, kx, ky, config, ok, healthy):
         trial_terms = objective_values(trial, cost, kx, ky, config)
         accepted = (pending & torch.isfinite(trial_terms).all(-1)
                     & (trial_terms[:, 3] <= old[:, 3] + config["objective_tolerance"]))
-        stalled = accepted & (step * delta <= config["outer_tolerance"])
+        no_progress = ((trial - old_plan).abs().sum((-2, -1)) == 0 if allow_damped_progress
+                       else step * delta <= config["outer_tolerance"])
+        stalled = accepted & no_progress
         status = torch.where(stalled, STALLED, status)
         improved = accepted & ~stalled
         plan = torch.where(improved[:, None, None], trial, plan)
@@ -378,11 +382,23 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
                         for previous, updated in zip(inner[key], value):
                             previous[ids] = updated
                 inner_tolerances[ids] = tolerance
+                candidate[ids] = refined
                 if c.get("inner_warm_start", False):
                     dual_u[indices[ids]], dual_v[indices[ids]] = info["dual_state"]
                 with phase("outer_update_and_diagnostics"):
                     values = _outer_step(old_plan[ids], refined, old[ids], cc[ids], xx[ids], yy[ids], c,
                                          info["ok"] & healthy[ids], healthy[ids])
+                    for destination, value in zip((accepted_plan, terms, steps, backtracks, delta, local_status), values):
+                        destination[ids] = value
+            # A positive damped step is progress, not a convergence certificate.
+            # After precision refinement, permit such an accepted step and test
+            # the NEW iterate on the next outer iteration. Only the undamped
+            # residual can mark convergence; the original budget still applies.
+            ids = (local_status == STALLED).nonzero().flatten()
+            if len(ids):
+                with phase("outer_update_and_diagnostics"):
+                    values = _outer_step(old_plan[ids], candidate[ids], old[ids], cc[ids], xx[ids], yy[ids], c,
+                                         inner["ok"][ids] & healthy[ids], healthy[ids], allow_damped_progress=True)
                     for destination, value in zip((accepted_plan, terms, steps, backtracks, delta, local_status), values):
                         destination[ids] = value
         with phase("outer_update_and_diagnostics"):
@@ -419,6 +435,8 @@ def solve_partial_batch(cost, kx, ky, *, a=None, b=None, keep_mass=.8, config=No
                 **dict(zip(("mass", "mass_error", "row_cap_error", "column_cap_error"), map(_number, row[21:25]))))
             record = dict(iteration=count, status=STATUS[status], step_size=row[4], backtracks=int(row[5]),
                 plan_delta_l1=_number(row[6]), accepted_plan_delta_l1=_number(row[7]), objective_delta=_number(row[8]),
+                small_damped_progress=bool(row[4] > 0 and row[6] > c["outer_tolerance"]
+                                          and row[7] <= c["outer_tolerance"]),
                 inner=inner_report, **dict(zip(("cost", "information", "entropy", "objective"), map(_number, row[9:13]))))
             histories[idx].append(record)
             reports[idx] = dict(status=STATUS[status], objective_version=OBJECTIVE, cost_scale=row[3], config=c,

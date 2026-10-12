@@ -78,6 +78,9 @@ diagnostic-only; mean and token-direction mismatch remain to be separated.
 
 For the next fit-then-test experiment, use the
 [conditional-displacement run guide](DISPLACEMENT_EXPERIMENT.md).
+Start with `check_failed_pairs.py`: it replays the 37 remaining failures against
+the original training banks, saves one JSON report and returns nonzero if any
+strict certificate fails. The guide chains this check to the full experiment.
 Both `compare_displacement.py` and `diagnose_blur.py` now keep **two analysis
 files** in their result directory: one JSON report and one full-resolution
 comparison grid. Raw plans, logs and tensors stay under Git-ignored

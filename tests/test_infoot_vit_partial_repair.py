@@ -11,7 +11,7 @@ from infoot_vit.infoot_helper.feature_bank import digest, file_hash, write_json,
 from infoot_vit.infoot_helper.fit_mapping import fit_mapping
 from infoot_vit.infoot_helper.mapping import FeatureMapper
 from infoot_vit.infoot_helper.partial import solver_config, kernel_state, distance
-from infoot_vit.infoot_helper.partial_repair import REPAIR_PREDECESSOR, prepare_partial_repair, repair_partial_fit
+from infoot_vit.infoot_helper.partial_repair import REPAIR_PREDECESSOR, REPAIR_PREDECESSOR_V6, prepare_partial_repair, repair_partial_fit
 from infoot_vit.infoot_helper.storage import VERSION as STORAGE_VERSION
 
 
@@ -85,13 +85,13 @@ def test_certified_inner_precision_can_stall_then_refine_without_relaxing_outer(
 
 
 @pytest.fixture
-def failed_fit(tmp_path, banks, monkeypatch):
+def failed_fit(tmp_path, banks, monkeypatch, request):
     orchestration = importlib.import_module("infoot_vit.infoot_helper.fit_mapping")
     batch = importlib.import_module("infoot_vit.infoot_helper.pair_batch_fit")
     real_identity, real_solve = orchestration.fit_identity, batch.solve_partial_batch
     def old_identity(config, source, target, runtime):
         _, implementation = real_identity(config, source, target, runtime)
-        implementation.update(REPAIR_PREDECESSOR)
+        implementation.update(REPAIR_PREDECESSOR_V6 if getattr(request, "param", "v5") == "v6" else REPAIR_PREDECESSOR)
         return digest(dict(config=config, source=source.artifact_id, target=target.artifact_id,
             source_ids=source.ids, target_ids=target.ids, storage=STORAGE_VERSION,
             implementation=implementation, runtime=runtime)), implementation
@@ -111,6 +111,7 @@ def failed_fit(tmp_path, banks, monkeypatch):
     return next((tmp_path / "outputs/infoot_vit").iterdir())
 
 
+@pytest.mark.parametrize("failed_fit", ["v5", "v6"], indirect=True)
 def test_repair_migrates_known_solver_and_retries_only_failure(tmp_path, failed_fit, monkeypatch):
     original = {p.relative_to(failed_fit).as_posix(): file_hash(p) for p in failed_fit.rglob("*") if p.is_file()}
     with pytest.raises(ValueError, match="Resume fingerprint mismatch"):
@@ -138,7 +139,8 @@ def test_repair_migrates_known_solver_and_retries_only_failure(tmp_path, failed_
     assert manifest["config"] == old_manifest["config"]
     assert manifest["repair"]["reused_successful_pairs"] == 3
     assert manifest["repair"]["pairs_to_retry"] == 1
-    assert set(manifest["repair"]["changed_implementation_files"]) == set(REPAIR_PREDECESSOR)
+    changes = set(manifest["repair"]["changed_implementation_files"])
+    assert "partial_batch.py" in changes and changes <= set(REPAIR_PREDECESSOR)
     assert manifest["models"] == old_manifest["models"]
     assert manifest["pair_selection"] == old_manifest["pair_selection"]
     assert manifest["pair_kernels"] == old_manifest["pair_kernels"]
@@ -191,3 +193,58 @@ def test_repair_refuses_overwrite_and_unknown_solver_lineage(tmp_path, failed_fi
     with pytest.raises(ValueError, match="unrelated implementation"):
         prepare_partial_repair(failed_fit, tmp_path / "repaired", root=tmp_path)
     assert not (tmp_path / "repaired").exists()
+
+
+@pytest.mark.parametrize("budget,expected_status", [(1, "max_outer_steps"), (2, "converged")])
+def test_small_damped_step_continues_without_weakening_convergence(monkeypatch, budget, expected_status):
+    module = importlib.import_module("infoot_vit.infoot_helper.partial_batch")
+    cost = torch.ones((1, 2, 2), dtype=torch.float64)
+    def curved_objective(plan, *unused):
+        value = 1e4 * (plan[:, 0, 0] - (.2 + 1e-8)).square()
+        return torch.stack((value, value * 0, value * 0, value), -1)
+    def proposal(a, b, cost, mass, config, **kwargs):
+        count = len(cost)
+        plan = torch.tensor([[[.2+4e-8, .2-4e-8], [.2-4e-8, .2+4e-8]]], dtype=torch.float64).expand(count, -1, -1).clone()
+        zeros = cost.new_zeros(count)
+        ints = torch.zeros(count, dtype=torch.long)
+        return plan, dict(ok=torch.ones(count, dtype=torch.bool), error=zeros, iterations=ints+1,
+            work_iterations=ints+1, failure=ints, cost_shift=zeros, residuals=module.residual_values(plan,a,b,mass),
+            duality_gap=zeros, relative_duality_gap=zeros, relative_plan_delta_l1=zeros, kkt_error=zeros,
+            stop_reason=ints+2, newton_steps=ints, method="synthetic_certified_controller_input")
+    # Isolate controller behavior; other tests exercise real inner solves/POT.
+    monkeypatch.setattr(module, "objective_values", curved_objective)
+    monkeypatch.setattr(module, "entropy_subproblem_batch", proposal)
+    pc = solver_config(dict(max_outer_steps=budget, cost_scale=1.))
+    plans, reports = module.solve_partial_batch(cost, cost, cost, config=pc)
+    report = reports[0]
+    first = report["history"][0]
+    assert report["status"] == expected_status
+    assert first["step_size"] == .5 and first["small_damped_progress"]
+    assert first["accepted_plan_delta_l1"] < pc["outer_tolerance"] < first["plan_delta_l1"]
+    assert first["status"] != "converged" and first["inner"]["precision_refinements"] == 2
+    assert first["objective_delta"] <= pc["objective_tolerance"]
+    assert report["mass_error"] <= pc["mass_tolerance"]
+    if budget == 2:
+        assert report["history"][-1]["plan_delta_l1"] <= pc["outer_tolerance"]
+    torch.testing.assert_close(plans[0, 0, 0], torch.tensor(.2+2e-8, dtype=torch.float64), atol=1e-16, rtol=0)
+
+
+def test_stationarity_certificate_avoids_cancellation_and_detects_inconsistent_log_plan():
+    from infoot_vit.infoot_helper.partial_batch import _partial_certificate
+    desired = torch.full((1, 3, 3), 1e-25, dtype=torch.float64)
+    desired[0, 0, 0] = desired[0, 1, 1] = 1/3
+    desired[0, 2, 2] = .8-2/3
+    caps = torch.full((1, 3), 1/3, dtype=torch.float64)
+    u = torch.tensor([[-1.7517395944361136, -11.950302617666845, 0.]], dtype=torch.float64)
+    v = torch.tensor([[-5.537476790125609, -.33502441025332064, 0.]], dtype=torch.float64)
+    w = (desired.log()-u[:, :, None]-v[:, None, :]).amax((-2, -1))
+    base = desired.log()-u[:, :, None]-v[:, None, :]-w[:, None, None]
+    log_plan = base+u[:, :, None]+v[:, None, :]+w[:, None, None]
+    plan = log_plan.exp()
+    legacy = (log_plan-base-u[:, :, None]-v[:, None, :]-w[:, None, None]).abs().max()
+    _, actual = _partial_certificate(plan, log_plan, log_plan, base, caps, caps, .8, u, v, w)
+    assert legacy > 1e-14 and actual.item() <= 1e-14
+    corrupt = log_plan.clone()
+    corrupt[0, 0, 1] += 1e-7
+    _, bad = _partial_certificate(corrupt.exp(), corrupt, log_plan, base, caps, caps, .8, u, v, w)
+    assert bad.item() > 1e-8

@@ -15,11 +15,14 @@ from .partial import OBJECTIVE
 from .partial_batch import VERSION as BATCH_VERSION
 from .storage import validate_plan, load_kernels
 
-# The only migration approved by this repair: the reviewed v5 implementation
-# from the 2026-10-11 run, or the currently installed implementation unchanged.
+# Only the reviewed v5/v6 implementations, or the current implementation.
 REPAIR_PREDECESSOR = {
     "partial_batch.py": "1ec14d02ba871e93275dc392c0ccc4b8f0bccfa5203c420e58f68bda39e9f3cb",
     "fit_mapping.py": "bb42c285b180288529ab74ae086f7e8933f8bb295f25b3d9aaadeca80ba50ee9",
+}
+REPAIR_PREDECESSOR_V6 = {
+    "partial_batch.py": "56df523725f66358c1f4290b675d1992719ea5db4f8fcb07cfcc3960334531c2",
+    "fit_mapping.py": "4100b67e08841d69a8ae5e34416bbdc099da7db3bfa389f9e335bf8cd7148c28",
 }
 
 
@@ -69,8 +72,8 @@ def prepare_partial_repair(source, output, *, root):
     snapshot = load_mapping_manifest(source, allow_failed_pairs=True)
     if snapshot.get("status") != "failed" or "incomplete_fit" not in snapshot:
         raise ValueError("Repair requires a stopped, failed batched grouped_partial fit.")
-    if BATCH_VERSION != "dense_partial_infoot_batch_v6_stall_refinement":
-        raise ValueError("This repair migration requires the reviewed v6 stall-refinement solver.")
+    if BATCH_VERSION != "dense_partial_infoot_batch_v7_certified_progress":
+        raise ValueError("This repair migration requires the v7 certified-progress solver.")
     original = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
     config = original["config"]
     if not config.get("pair_batch_size"):
@@ -89,7 +92,8 @@ def prepare_partial_repair(source, output, *, root):
     previous = original["solver_implementation_sha256"]
     changed = {name for name in previous.keys() | implementation.keys()
                if previous.get(name) != implementation.get(name)}
-    if changed - REPAIR_PREDECESSOR.keys() or any(previous.get(name) != REPAIR_PREDECESSOR[name] for name in changed):
+    if changed - REPAIR_PREDECESSOR.keys() or any(previous.get(name) not in
+            {REPAIR_PREDECESSOR[name], REPAIR_PREDECESSOR_V6[name]} for name in changed):
         raise ValueError(f"Repair cannot migrate unrelated implementation changes: {sorted(changed)}")
     # Verify the immutable support artifacts before preparing any output.
     entries = list(original["models"].values()) + [original["pair_selection"], original["pair_kernels"]]
