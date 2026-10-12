@@ -23,7 +23,7 @@ def require_dependencies():
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_agg import FigureCanvasAgg
     except ImportError as exc:
-        raise RuntimeError("The residual experiment requires umap-learn and matplotlib. "
+        raise RuntimeError("Comparison experiments require umap-learn and matplotlib. "
                            "Install with: python -m pip install umap-learn matplotlib") from exc
     return UMAP, Figure, FigureCanvasAgg
 
@@ -34,14 +34,16 @@ def _point_hash(points):
 
 def save_comparison_umap(mapper, query_bank, results, output, *, mapped_ids,
                          max_points=1000, seed=42, n_neighbors=15, min_dist=.1,
-                         method_titles=None, title="Residual ablation: one training-fitted UMAP per row"):
+                         method_titles=None, title="Residual ablation: one training-fitted UMAP per row",
+                         readout="mapped_tokens"):
     """Training-only reducers, shared per level by every estimator, no refitting OT.
 
     Image means are display readouts, never pooled transport inputs. Patch panels
     use exactly the same valid query token positions for all estimators. UMAPs
     for image means and patches are separate spaces and cannot be compared by xy.
     """
-    if (type(max_points) is not int or max_points < 2 or type(seed) is not int
+    if (readout not in {"mapped_tokens", "generated_images"}
+            or type(max_points) is not int or max_points < 2 or type(seed) is not int
             or not 0 <= seed < 2**32 or type(n_neighbors) is not int or n_neighbors < 2
             or not 0 <= min_dist <= 1):
         raise ValueError("Invalid comparison UMAP point limit, seed, neighbors or min_dist.")
@@ -59,6 +61,8 @@ def save_comparison_umap(mapper, query_bank, results, output, *, mapped_ids,
             or set(ids) & (set(mapper.source.ids) | set(mapper.target.ids))):
         raise ValueError("Comparison UMAP queries must be held out from the training banks.")
     valid = results[modes[0]].valid_mask.detach().cpu()
+    if readout == "generated_images" and not valid.all():
+        raise ValueError("Generated-image UMAP uses full re-encoded images, not conditioning masks.")
     if (mapper.source.representation != mapper.target.representation
             or query_bank.representation != mapper.source.representation
             or mapper.source.features.shape[1:] != query_bank.features.shape[1:]
@@ -119,7 +123,8 @@ def save_comparison_umap(mapper, query_bank, results, output, *, mapped_ids,
             panel_coordinates["mapped_query"] = coordinates[mode]
             draw_umap_panel(axes[row, col], panel_coordinates, records, ids, level=level,
                 title=f"{panel_title}\n{'Valid-token image means' if level == 'image' else 'Matched individual patches'}",
-                ylabel="UMAP 2" if col == 0 else "", legend_fontsize=8)
+                ylabel="UMAP 2" if col == 0 else "", legend_fontsize=8,
+                mapped_label="Generated images" if readout == "generated_images" else None)
         panels[level] = dict(reducer=kwargs, fit_groups=["source_training", "target_training"],
             transform_groups=list(query_groups), training_points_sha256=_point_hash(training),
             groups={name: dict(features_sha256=_point_hash(points),
@@ -131,18 +136,25 @@ def save_comparison_umap(mapper, query_bank, results, output, *, mapped_ids,
                     "all query variants use transform. Proximity is not a translation-quality score.", fontsize=9)
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, dpi=160)
-    return dict(schema="infoot_projection_comparison_umap_v1", file=path.name, sha256=file_hash(path),
+    return dict(schema=("infoot_generated_image_comparison_umap_v1" if readout == "generated_images"
+                        else "infoot_projection_comparison_umap_v1"), file=path.name, sha256=file_hash(path),
         mapper_id=mapper.manifest["artifact_id"], mapped_artifact_ids=mapped_ids, method_titles=method_titles,
         query_bank_id=query_bank.artifact_id, query_ids=ids,
         training_banks={name: dict(artifact_id=bank.artifact_id, selected_ids_sha256=digest(bank.ids))
                         for name, bank in (("source", mapper.source), ("target", mapper.target))},
         versions={name: importlib.metadata.version(name) for name in
                   ("umap-learn", "matplotlib", "numpy", "scikit-learn", "numba")},
-        feature_space="raw encoder patch tokens; valid-token means for image display only",
-        style=dict(source="infoot_vit.infoot_helper.umap_plot", point_styles=POINT_STYLES, arrow_style=ARROW_STYLE),
+        feature_space=("Generated RGB re-encoded by the frozen encoder; all output patches; "
+                       "not the input conditioning tokens." if readout == "generated_images" else
+                       "raw encoder patch tokens; valid-token means for image display only"),
+        style=dict(source="infoot_vit.infoot_helper.umap_plot", point_styles=POINT_STYLES, arrow_style=ARROW_STYLE,
+                   mapped_label="Generated images" if readout == "generated_images" else "Mapped queries"),
         feature_normalization="none", max_points_per_training_group_and_patch_variant=max_points,
         all_invalid_query_ids=[sid for sid, active in zip(ids, valid.any(1).tolist()) if not active],
         panels=panels, seconds=time.perf_counter() - started,
-        interpretation="No query or mapped points fit either reducer. Matched query records/masks across methods. "
-            "Image means are display-only; transport uses unchanged patch tokens. UMAP is not a semantic score, "
-            "and coordinates cannot be compared between rows or separately fitted runs.")
+        interpretation=("No generated or held-out query points fit either reducer. All output patches are re-encoded; "
+            "corresponding grid indices are display records, not verified semantic correspondences. "
+            if readout == "generated_images" else
+            "No query or mapped points fit either reducer. Matched query records/masks across methods. "
+            "Image means are display-only; transport uses unchanged patch tokens. ") +
+            "UMAP is not a semantic score, and coordinates cannot be compared between rows or separately fitted runs.")

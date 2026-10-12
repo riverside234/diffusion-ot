@@ -86,15 +86,26 @@ reuses the exact completed v7 fit, with the v7 result directory as `--reference-
 It compares `conditional_displacement` with `conditional_edge_mean`, retaining
 barycentric and native/source decoder controls. No refit or co-training occurs.
 
-The v8 residual-removed output returned to the blurry baseline. The next test is
-[separating averaging within and across dogs](DISPLACEMENT_EXPERIMENT.md#next-experiment-separate-averaging-within-and-across-dogs):
+The v8 residual-removed output returned to the blurry baseline. The completed
+[v9 averaging test](DISPLACEMENT_EXPERIMENT.md#completed-v9-separate-averaging-within-and-across-dogs):
 `compare_displacement.py --experiment averaging_ablation --mapping ...`
 with `results/infoot_vit/residual_ablation_v8` as its reference. It reuses the same
 fit, reconstructs the edge-mean map from per-dog contributions, checks a conditional
 variance decomposition, and compares the mixture, dominant-dog mean and dominant-
 dog patch argmax on a shared mask. A separate row controls for mask changes.
-Argmax is diagnostic only and may break spatial coherence. This experiment also
+Argmax is diagnostic only and may overrepresent repeated target patches. This experiment also
 saves exactly three analysis files: report, comparison grid and matching UMAP.
+
+The [v9 review and next command](DISPLACEMENT_EXPERIMENT.md#v9-review-sharpness-recovered-translation-still-fails)
+find that argmax restores sharp detail but largely reproduces the reference dog.
+The decoder consumes unordered condition tokens, so spatially rearranging them
+cannot enforce source pose. `python infoot_vit/edit_source.py --help` describes
+the new v10 source-latent experiment: reuse the exact cached v9 dog tokens and
+compare noise generation, source-initialized denoising and a FlowEdit-inspired
+source/target velocity update. It performs no fit or remapping, retains matched
+decoder controls, and saves three result files. Its existing-style UMAP plots
+re-encoded generated images. Real GPU results are required to judge improvement;
+neither a sharp reference copy nor an unchanged cat counts as successful translation.
 
 The residual experiment keeps **three analysis files**: `experiment_report.json`,
 `comparison_grid.png`, and required `umap.png`. UMAP coordinates and settings are

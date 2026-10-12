@@ -14,7 +14,144 @@ barycentric (mean RGB difference 0.235 on the 0-255 scale). Variance after the
 decoder projector was 0.4285, versus 0.4265 for barycentric and 0.7996 with the
 residual retained. Neither endpoint passes the combined quality goal.
 
-## Next experiment: separate averaging within and across dogs
+## V9 review: sharpness recovered, translation still fails
+
+Reviewed all 16 columns of `results/infoot_vit/averaging_ablation_v9`, including
+native-resolution tiles, mask controls and the UMAP. This is a useful diagnostic
+success, **not an accepted translation method**. Dominant-dog argmax restores
+clear fur and dog anatomy in many images, but outputs largely follow the routed
+reference dog's appearance, pose and background. The source yawn (2), sideways
+pose (6), closed eyes (14) and raised paw (15) are not preserved.
+
+The run used the exact completed v7 fit (16,000 successful pairs), checkpoint,
+query order, routing and initial noise. V9's original-mask edge-mean conditioning
+statistics and generated pixels equal v8 exactly. Reported code hashes and PNG
+hashes verified; per-dog decomposition reconstructs the original map to maximum
+absolute error `7.82e-14`, confidence to `2.22e-15`, and the variance identity to
+`5.11e-15`. The saved lab tensors are not in this local checkout; this review
+checks their recorded identities, the report, code and rendered results.
+
+| Shared-mask condition | Input spatial variance | After decoder projector |
+|---|---:|---:|
+| All-dog mean | 0.5443 | 0.4129 |
+| Dominant-dog mean | 0.7858 | 0.5054 |
+| Dominant-dog patch argmax | 1.3511 | 0.8779 |
+| Native dog control | 1.4593 | 0.8902 |
+
+Argmax reaches **98.6%** of native projector variance, versus **56.8%** for the
+single-dog mean. Across common valid tokens, 57.8% of conditional target-token
+dispersion lies within dogs. In column 12, where the original image route gives
+one dog 94.97%, the within-dog fraction is 94.35%; the mean still looks soft and
+argmax is visibly clearer. These fractions describe feature dispersion, not
+fractions of image blur. The dominant conditional distribution averages an
+effective 27.25 target patches per valid query token.
+
+The common mask retains 2,728/3,136 tokens (86.99%), removing another 281 from
+the original 3,009 valid tokens. The original-mask row must remain a control:
+mask changes alone visibly alter some expressions, and the source-token/common-
+mask control already loses the wide-open yawn and raised paw. Argmax duplicates
+55.39% of its selected patch occurrences across queries. This changes the
+decoder's attention weighting; it does not establish a spatial rearrangement.
+
+**Architecture finding:** `TokenConditionedSiT` adds positions to latent queries,
+but applies only a shared per-token projector to the image conditions. Its
+cross-attention treats those conditions as an unordered set. Permuting tokens
+and their masks leaves its output unchanged (verified with nonzero attention
+weights). Therefore the recorded 4.6–6.0-patch neighbor jumps are a description
+of the selected indices, not evidence of a decoder-visible spatial scrambling.
+A one-to-one permutation of a complete reference dog's tokens would still feed
+the same set. Spatial sorting or assignment alone cannot recover source pose.
+
+| Column | Visual finding for dominant-dog argmax |
+|---|---|
+| 1 | Clearer fur, eyes and nose; strongly follows the Chihuahua reference. |
+| 2 | Clearer dog face; loses the source's wide-open yawn and squint. |
+| 3 | Clear long-haired dog; adopts the reference's tan markings and face. |
+| 4 | Sharp Schnauzer-like face, dominated by reference appearance. |
+| 5 | Copies the tan long-haired dog and grass instead of the tabby appearance. |
+| 6 | Frontal retriever; loses the source's sideways head pose. |
+| 7 | More detail, but enlarged round eyes and changed head orientation. |
+| 8 | Clear white dog, close to the routed reference rather than a new correspondence. |
+| 9 | Reference dog's blue eyes and coat replace source appearance. |
+| 10 | Dark shaggy reference dog replaces the white cat; mouth opens. |
+| 11 | Reference shepherd appearance; source narrow-eyed expression is lost. |
+| 12 | Clearer white retriever; source gray markings and feline head pose are lost. |
+| 13 | Copies the lying bulldog pose rather than the upright source. |
+| 14 | Clearer tan dog; closed eyes are not retained. |
+| 15 | Clearer small dog; raised paw is absent. |
+| 16 | Sharp pit bull appearance, blue eyes and reference head tilt. |
+
+The UMAP has the existing test style, two reducers fitted only to real training
+anchors, matched query records and finite coordinates. Selecting one dog spreads
+image means toward individual reference regions; argmax and one-dog mean often
+have similar image coordinates despite different sharpness. This is not a
+quality score; column 13 is also away from the main dog cluster.
+
+## Next experiment: preserve source structure during generation
+
+Run the new `edit_source.py` experiment on the lab machine after syncing code:
+
+```bash
+python infoot_vit/edit_source.py \
+  --mapping outputs/infoot_vit/displacement_v7_4deed6d4/fit/grouped_partial_20261012T014020Z_df15945b \
+  --reference-run results/infoot_vit/averaging_ablation_v9 \
+  --query-bank data/infoot_vit/cat_val16 \
+  --checkpoint outputs/pdae_v2_l_dog/checkpoints/latest.pt \
+  --output-dir results/infoot_vit/source_edit_v10 \
+  --device cuda --batch-size 8 --threads 4
+```
+
+No refitting or remapping is performed. Preserve the v9 work directory
+`outputs/infoot_vit/averaging_ablation_v9_ca9e6f84`, especially
+`conditioning_variants.pt`. The default reads its recorded path; if relocated,
+add `--reference-work-dir /path/to/that/directory`. The runner checks its hash,
+all condition identities, common mask, source tokens, native references,
+checkpoint, configs and exact instantiated baseline noise. It does not download
+models or regenerate a missing cache.
+
+All three primary methods use **exactly the same v9 argmax dog tokens and mask**:
+
+1. Original noise-to-image baseline: 40 midpoint Euler steps, CFG 1.5, original noise.
+2. Source-initialized denoising: encode the source RGB with the VAE posterior
+   mode and training scale, start at `0.5 * source_latent + 0.5 * original_noise`,
+   then use the final 20 steps of the same grid.
+3. Source/target velocity editing: start an edit state at the source latent.
+   At each of those 20 times, evaluate the source- and target-conditioned fields
+   with paired noisy states, then update by their velocity difference. Source
+   and target fields use the same frozen dog decoder and CFG 1.5. Each step has
+   fresh deterministic per-query noise; no inversion, gradient optimization,
+   raw source-feature residual, finishing-stage sweep or per-image tuning.
+
+The third method adapts [FlowEdit Algorithm 1](https://arxiv.org/abs/2412.08629)
+to image-token conditions and this model's noise-to-data time convention:
+`s=(1-t)*noise+t*source`, `target_state=s+(edit-source)`, and
+`edit += dt*(v_target-v_source)`. This is an experimental adaptation; the paper's
+results do not establish its quality for this decoder. The second method uses
+the source-noising principle of [SDEdit](https://arxiv.org/abs/2108.01073), adapted
+to the existing deterministic linear-flow sampler. Neither changes model weights.
+
+The dog decoder's source-cat conditioning is outside its training domain. The
+VAE latent gives a direct spatial source signal, but this still needs a real
+run: it may retain too much cat anatomy or continue copying the reference.
+The preset start time is a first controlled test, not a tuned optimum.
+
+Exactly **three result files** are produced: `experiment_report.json`,
+`comparison_grid.png`, and `umap.png`. Eight grid rows are source RGB, source VAE
+reconstruction, routed dog RGB, native/common-mask dog control, v9 argmax/noise
+baseline, source-conditioned denoising control, argmax/source denoising, and
+argmax/velocity editing. Raw images, latents and generated feature tensors stay
+in the ignored work directory. Failure retains those diagnostic caches.
+
+The UMAP reuses the same plotting/reducer code, colors, markers, arrows and
+column numbers. This time it plots **generated RGB re-encoded with the frozen
+SigLIP encoder**, using all output patches, since plotting the three identical
+input conditions would hide the experiment's effect. Training banks alone fit
+each reducer. Conditioning masks are unchanged; full output-image UMAP masks
+are a separate display choice. RGB change/reference distances are diagnostics,
+not a quality ranking. Review all 16 outputs for coherent dogs, visible detail,
+source pose/expression and reference copying before accepting either method.
+
+## Completed v9: separate averaging within and across dogs
 
 Use `--experiment averaging_ablation` with the completed **v8** result directory
 as the reference. It reuses the exact v7 fit and the same plans, bandwidths,
@@ -51,7 +188,7 @@ The three primary readouts are:
 
 Readouts 1 versus 2 diagnose averaging across dogs. Readouts 2 versus 3 test
 replacing within-dog patch averaging by a hard selection. Argmax can duplicate
-patches, break spatial coherence and copy the reference; it does not preserve
+patches, remove content from the conditioning set and copy the reference; it does not preserve
 soft-plan marginals and is not a new default transport estimator. Source-image
 uncertainty is still marginalized inside each dog's distribution.
 

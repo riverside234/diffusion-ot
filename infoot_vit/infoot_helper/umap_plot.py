@@ -19,10 +19,12 @@ ARROW_STYLE = dict(arrowstyle="->", color="#64748b", alpha=.45, lw=.8)
 
 
 def draw_umap_panel(axis, coordinates, records, query_ids, *, level, title,
-                    ylabel="UMAP 2", legend_fontsize=None):
+                    ylabel="UMAP 2", legend_fontsize=None, mapped_label=None):
     """Draw the shared offline-test/comparison style on an existing axis."""
     for name, values in coordinates.items():
         color, marker, label, size, alpha = POINT_STYLES[name]
+        if name == "mapped_query" and mapped_label is not None:
+            label = mapped_label
         axis.scatter(values[:, 0], values[:, 1], c=color, marker=marker, s=size, alpha=alpha, label=label)
     if level == "image":
         query_index = {sid: i + 1 for i, sid in enumerate(query_ids)}
