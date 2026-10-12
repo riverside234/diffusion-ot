@@ -1,6 +1,8 @@
-"""One dense-partial fit, then a matched baseline/displacement translation test.
+"""Matched dense-partial projection experiments with a frozen dog decoder.
 
 Use --fit-config for a fresh fit or --mapping for a certified complete fit.
+--experiment residual_ablation requires the completed fit and v7 reference
+report, compares residual retention/removal, and always includes a UMAP.
 The reviewed run supplies query, bank, solver and generation identities.
 Execution completion is explicitly separate from visual quality acceptance.
 """
@@ -33,9 +35,29 @@ from infoot_vit.infoot_helper.sampling import sample_ids
 
 def read_reference(directory):
     """Metadata only: do not require the old multi-GB plans or mapped tensors."""
-    paths = {"mapped": directory / "manifest.json", "generation": directory / "generation_report.json",
-             "fit": directory / "fitting_logs/manifest.json"}
-    data = {key: json.loads(path.read_text(encoding="utf-8")) for key, path in paths.items()}
+    experiment_path = directory / "experiment_report.json"
+    if experiment_path.is_file():
+        report = json.loads(experiment_path.read_text(encoding="utf-8"))
+        if (report.get("schema") not in {"infoot_displacement_comparison_v1", "infoot_residual_ablation_v1"}
+                or report.get("status") != "complete" or report.get("failed_pairs") != 0):
+            raise ValueError("Reference experiment must be completed with zero failed pairs.")
+        baseline = report["mapping_outputs"]["barycentric"]
+        data = dict(mapped=baseline["manifest"], generation=baseline["generation"],
+            fit=report["fit_diagnostics"]["files"]["manifest.json"]["data"],
+            complete_mapper_id=report["mapper_id"], initial_noise_sha256=report["initial_noise_sha256"],
+            confidence_sha256=report["confidence_sha256"], valid_mask_sha256=report["valid_mask_sha256"],
+            config_sha256=report["config_sha256"])
+        if (data["fit"].get("status") != "complete" or data["fit"]["artifact_id"] != report["mapper_id"]
+                or data["fit"]["pair_count"] != report["successful_pairs"]
+                or data["generation"]["checkpoint_sha256"] != report["checkpoint_sha256"]
+                or data["generation"]["initial_noise_sha256"] != report["initial_noise_sha256"]
+                or any(data["generation"].get(k) != v for k, v in report["generation"].items())):
+            raise ValueError("Reference experiment controls and fitted identities disagree.")
+        paths = {"experiment_report": experiment_path}
+    else:
+        paths = {"mapped": directory / "manifest.json", "generation": directory / "generation_report.json",
+                 "fit": directory / "fitting_logs/manifest.json"}
+        data = {key: json.loads(path.read_text(encoding="utf-8")) for key, path in paths.items()}
     mapped, generation, fit = (data[key] for key in ("mapped", "generation", "fit"))
     ids = mapped["ids"]
     if (digest({k: v for k, v in mapped.items() if k != "artifact_id"}) != mapped["artifact_id"]
@@ -88,6 +110,8 @@ def validate_fit_config(config, reference):
 
 def validate_complete_fit(fit, reference):
     validate_fit_config(fit["config"], reference)
+    if reference.get("complete_mapper_id") and fit["artifact_id"] != reference["complete_mapper_id"]:
+        raise ValueError("Reuse the exact completed mapper recorded in the reference experiment; do not refit.")
     expected = len(fit["source_ids"]) * min(fit["config"]["fit_pair_top_k"] or len(fit["target_ids"]), len(fit["target_ids"]))
     if (fit.get("status") != "complete" or fit.get("incomplete_fit")
             or fit.get("failed_pair_count", 0) != 0 or fit["pair_count"] != expected):
@@ -124,12 +148,27 @@ def review_template(ids, reference_ids):
 
 
 def run_experiment(args):
+    experiment = getattr(args, "experiment", "displacement")
+    if experiment not in {"displacement", "residual_ablation"}:
+        raise ValueError("Unknown projection experiment.")
+    residual_ablation = experiment == "residual_ablation"
+    if residual_ablation and (args.mapping is None or args.fit_config is not None):
+        raise ValueError("Residual ablation requires --mapping to reuse the completed fit; no refitting.")
+    modes = ("barycentric", "conditional_displacement", "conditional_edge_mean") if residual_ablation else (
+        "barycentric", "conditional_displacement")
     output = args.output_dir.resolve()
     if output.exists():
         raise FileExistsError(f"Comparison output must be new: {output}")
     if args.mapping and args.mapping.resolve() in output.parents:
         raise ValueError("Write comparison outputs outside the immutable fitted mapper.")
     reference = read_reference(args.reference_run)
+    if reference.get("complete_mapper_id") and args.fit_config is not None:
+        raise ValueError("A completed experiment reference requires --mapping to reuse its exact fit.")
+    if residual_ablation and not reference.get("complete_mapper_id"):
+        raise ValueError("Residual ablation requires --reference-run pointing to the completed v7 experiment report directory.")
+    if residual_ablation:
+        from infoot_vit.infoot_helper.comparison_umap import require_dependencies
+        require_dependencies()
     checkpoint_hash = file_hash(args.checkpoint)
     if checkpoint_hash != reference["generation"]["checkpoint_sha256"]:
         raise ValueError("Checkpoint hash differs from the reviewed dog decoder; stop before fitting.")
@@ -145,6 +184,9 @@ def run_experiment(args):
     train = load_yaml_config(train_path)
     # Check both config paths before committing to the expensive fit.
     file_hash(eval_path)
+    if reference.get("config_sha256") and reference["config_sha256"] != dict(
+            train=file_hash(train_path), evaluation=file_hash(eval_path)):
+        raise ValueError("Decoder configuration hashes differ from the completed reference experiment.")
     if train["domain"] != reference["fit"]["target_domain"]:
         raise ValueError("Training config must select the original target-domain decoder.")
     fit_config = None
@@ -166,9 +208,10 @@ def run_experiment(args):
         validate_complete_fit(load_mapping_manifest(args.mapping), reference)
     work = create_work_directory(ROOT, output, getattr(args, "work_dir", None))
     output.mkdir(parents=True, exist_ok=False)
-    report = dict(schema="infoot_displacement_comparison_v1", status="running", quality_acceptance="unreviewed",
+    report = dict(schema="infoot_residual_ablation_v1" if residual_ablation else "infoot_displacement_comparison_v1",
+        experiment=experiment, status="running", quality_acceptance="unreviewed",
         reference_run=str(args.reference_run), reference_files_sha256=reference["file_sha256"],
-        work_directory=str(work), analysis_files=["experiment_report.json", "comparison_grid.png"],
+        work_directory=str(work), analysis_files=["experiment_report.json", "comparison_grid.png"] + (["umap.png"] if residual_ablation else []),
         checkpoint=str(args.checkpoint), checkpoint_sha256=checkpoint_hash,
         hypothesis="Transport local source-to-target displacements while preserving query residuals; "
                    "may reduce conditioning blur but can retain cat attributes or wrong semantic matches.",
@@ -181,6 +224,16 @@ def run_experiment(args):
             ROOT / "src/diffusion_ot/evaluation/stage1a_eval.py",
             ROOT / "src/diffusion_ot/models/pdae_v2/branch.py",
             ROOT / "src/diffusion_ot/models/pdae_v2/cross_attention.py")})
+    if residual_ablation:
+        report.update(hypothesis="Remove only q-E_w[x_i] from E_w[y_j]+q-E_w[x_i], using the same "
+            "plan edges, routing, masks and decoder; may reduce cat traits but may restore blur or lose correspondence.",
+            primary_comparison=["conditional_displacement", "conditional_edge_mean"],
+            estimators=dict(barycentric="KDE-smoothed target conditional mean E[y_k]",
+                conditional_displacement="E_w[y_j] + q - E_w[x_i]",
+                conditional_edge_mean="E_w[y_j]; identical edge weights, source residual removed"))
+        for name in ("comparison_umap.py", "umap_plot.py"):
+            path = ROOT / "infoot_vit/infoot_helper" / name
+            report["code_sha256"][path.relative_to(ROOT).as_posix()] = file_hash(path)
     report_path = output / "experiment_report.json"
     write_json(report_path, report)
     try:
@@ -200,24 +253,41 @@ def run_experiment(args):
         mapper = FeatureMapper.load(directory, device=str(device), projection=projection,
             pair_cache_bytes=args.pair_cache_mib * 1024**2, pair_projection_batch_size=args.projection_pair_batch_size)
         results, manifests = {}, {}
-        for mode in ("barycentric", "conditional_displacement"):
+        for mode in modes:
             # Only the value estimator changes; reuse the same validated kernels,
             # support thresholds, mapper and bounded read-only plan cache.
             mapper.config["projection"] = projection_settings(mapper.config, None, patch_value_mode=mode)
             results[mode], manifests[mode] = mapper.project_bank(query, work / mode, chunk_size=args.batch_size)
         report["mapping_outputs"] = {mode: mapping_diagnostics(work / mode, manifest)
                                      for mode, manifest in manifests.items()}
-        verify_paired_mapping(results["barycentric"], results["conditional_displacement"])
+        for mode in modes[1:]:
+            verify_paired_mapping(results["barycentric"], results[mode])
         baseline, candidate = results["barycentric"], results["conditional_displacement"]
         valid = baseline.valid_mask.cpu()
+        if reference.get("complete_mapper_id"):
+            if (tensor_hash(baseline.match_confidence) != reference["confidence_sha256"]
+                    or tensor_hash(valid) != reference["valid_mask_sha256"]):
+                raise ValueError("Confidence or masks changed from the completed reference experiment.")
+            old_rows = reference["mapped"]["diagnostics"]["queries"]
+            new_rows = baseline.diagnostics["queries"]
+            if (len(new_rows) != len(old_rows) or any(new["query_id"] != old["query_id"]
+                    or new["image_weights"] != old["image_weights"] or new["target_ids"] != old["target_ids"]
+                    for new, old in zip(new_rows, old_rows))):
+                raise ValueError("Image routing changed from the completed reference experiment.")
+        if residual_ablation:
+            report["status"] = "umap"
+            write_json(report_path, report)
+            from infoot_vit.infoot_helper.comparison_umap import save_comparison_umap
+            report["umap"] = save_comparison_umap(mapper, query, results, output,
+                mapped_ids={mode: manifests[mode]["artifact_id"] for mode in modes})
+            write_json(report_path, report)
         refs = [min(range(len(mapper.target.ids)), key=lambda j: (-row["image_weights"][j], mapper.target.ids[j]))
                 for row in baseline.diagnostics["queries"]]
         native = mapper.target.features[refs].cpu()
         variants = dict(native_reference_full=(native, torch.ones_like(valid)),
             native_reference_mapped_mask=(native, valid),
             source_tokens_dog_decoder_control=(query.features.cpu(), valid),
-            mapped_barycentric=(baseline.mapped_features.cpu(), valid),
-            mapped_conditional_displacement=(candidate.mapped_features.cpu(), valid))
+            **{f"mapped_{mode}": (results[mode].mapped_features.cpu(), valid) for mode in modes})
         generation = {key: deepcopy(reference["generation"][key]) for key in
             ("weights", "num_steps", "guidance_scale", "solver", "seed", "per_image_noise_seeds", "query_ids")}
         reference_ids = [mapper.target.ids[j] for j in refs]
@@ -249,17 +319,24 @@ def run_experiment(args):
                 "not paired targets. The source control detects apparent improvements caused by leaving cats untranslated. "
                 "The new fit may have repaired pairs, so comparison with the previous grid also changes pair inventory.")
         report["quality_review"] = review_template(query.ids, reference_ids)
+        if residual_ablation:
+            report["quality_review"]["primary_comparison"] = report["primary_comparison"]
+            report["quality_review"]["baseline_definition"] = "Primary baseline: residual retained; barycentric is an additional blurry reference."
+            report["interpretation"] = ("Displacement versus edge mean isolates source-residual removal. "
+                "Barycentric also changes target KDE smoothing. Native dog and unmapped cat rows are decoder controls, "
+                "not paired targets. UMAP is training-fitted feature geometry, not a quality pass.")
         write_json(report_path, report)
         images, noise = decode_variants(evaluator, variants, generation,
             null_label=train["class_conditioning"]["null_label"], batch_size=args.batch_size,
-            integrate=integrate_pdae_flow, decode=decode_vae_latents)
+            integrate=integrate_pdae_flow, decode=decode_vae_latents,
+            expected_noise_sha256=reference.get("initial_noise_sha256"))
         rows = dict(original_source=load_ground_truth_images(ROOT / train["data_config"], query.records),
             top1_reference_rgb_not_ground_truth=load_ground_truth_images(ROOT / train["data_config"], reference_records), **images)
         save_image(torch.cat(list(rows.values())).clamp(0, 1), output / "comparison_grid.png", nrow=len(query.ids), padding=4)
         tensor_path = work / "conditioning_variants.pt"
         save_tensor(tensor_path, dict(ids=query.ids, initial_noise=noise,
             variants={name: dict(features=x.cpu(), valid_mask=mask.cpu()) for name, (x, mask) in variants.items()}))
-        for mode in ("barycentric", "conditional_displacement"):
+        for mode in modes:
             generated = dict(generation,
                 protocol="fixed_checkpoint_compatibility_not_retraining", mapper_id=fit["artifact_id"],
                 checkpoint=str(args.checkpoint), checkpoint_sha256=checkpoint_hash,
@@ -281,21 +358,23 @@ def run_experiment(args):
             report.update(mapping=str(candidates[-1]), fit_diagnostics=fit_diagnostics(candidates[-1]))
         write_json(report_path, report)
         raise
-    print(f"Saved matched displacement experiment: {output}; image quality still requires review.", flush=True)
+    print(f"Saved matched {experiment} experiment: {output}; image quality still requires review.", flush=True)
     return report
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment", choices=("displacement", "residual_ablation"), default="displacement",
+                        help="Residual ablation reuses the exact completed v7 fit and always saves a UMAP.")
     fitting = parser.add_mutually_exclusive_group(required=True)
     fitting.add_argument("--fit-config", type=Path, help="Fit once in the work directory, then compare both estimators.")
     fitting.add_argument("--mapping", type=Path, help="Reuse an already complete, identity-matched fit.")
-    parser.add_argument("--reference-run", required=True, type=Path, help="Reviewed result with manifest, generation report and fitting_logs/manifest.json.")
+    parser.add_argument("--reference-run", required=True, type=Path, help="Completed experiment-report directory (required for residual ablation), or legacy reviewed result directory.")
     parser.add_argument("--query-bank", required=True, type=Path)
     parser.add_argument("--source-bank", type=Path, help="Fresh fit only: original source bank path.")
     parser.add_argument("--target-bank", type=Path, help="Fresh fit only: original target bank path.")
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path, help="New analysis directory: report + comparison grid only.")
+    parser.add_argument("--output-dir", required=True, type=Path, help="New directory: report + grid; residual ablation also includes umap.png.")
     parser.add_argument("--work-dir", type=Path, help="New directory outside results/ for resumable state; defaults to ignored outputs/infoot_vit/.")
     parser.add_argument("--train-config", default="configs/stage1a_pdae_v2_l/dog.yaml")
     parser.add_argument("--eval-config", default="configs/stage1a_eval/pdae_v2_l.yaml")
@@ -309,6 +388,8 @@ def main(argv=None):
         parser.error("Positive batch/thread counts and nonnegative pair-cache MiB are required.")
     if args.mapping and (args.source_bank is not None or args.target_bank is not None):
         parser.error("Bank overrides apply only to --fit-config.")
+    if args.experiment == "residual_ablation" and args.mapping is None:
+        parser.error("Residual ablation requires --mapping; reuse the completed v7 fit.")
     torch.set_num_threads(args.threads)
     run_experiment(args)
     return 0

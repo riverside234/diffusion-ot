@@ -11,6 +11,30 @@ import torch
 from .feature_bank import write_json
 
 
+POINT_STYLES = dict(source_training=("#2563eb", "o", "Real source training", 12, .3),
+                   target_training=("#f59e0b", "o", "Real target training", 12, .3),
+                   source_query=("#1d4ed8", "o", "Source queries (valid positions)", 45, .9),
+                   mapped_query=("#16a34a", "X", "Mapped queries", 65, .95))
+ARROW_STYLE = dict(arrowstyle="->", color="#64748b", alpha=.45, lw=.8)
+
+
+def draw_umap_panel(axis, coordinates, records, query_ids, *, level, title,
+                    ylabel="UMAP 2", legend_fontsize=None):
+    """Draw the shared offline-test/comparison style on an existing axis."""
+    for name, values in coordinates.items():
+        color, marker, label, size, alpha = POINT_STYLES[name]
+        axis.scatter(values[:, 0], values[:, 1], c=color, marker=marker, s=size, alpha=alpha, label=label)
+    if level == "image":
+        query_index = {sid: i + 1 for i, sid in enumerate(query_ids)}
+        for record, before, after in zip(records, coordinates["source_query"], coordinates["mapped_query"]):
+            axis.annotate("", xy=after.tolist(), xytext=before.tolist(),
+                          arrowprops=dict(ARROW_STYLE))
+            axis.annotate(str(query_index[record["sample_id"]]), after.tolist(),
+                          xytext=(4, 4), textcoords="offset points", fontsize=8)
+    axis.set(xlabel="UMAP 1", ylabel=ylabel, title=title)
+    axis.legend(loc="best", fontsize=legend_fontsize)
+
+
 def _sample_points(features, ids, *, level, limit, seed, mask=None):
     """Sample by stable image ID and patch index, independently of bank order."""
     if (features.ndim != 3 or len(features) != len(ids) or min(features.shape) < 1
@@ -111,21 +135,8 @@ def save_umap(mapper, query_bank, result, output, *, level="image", max_points=1
     figure = Figure(figsize=(10, 8), layout="constrained")
     FigureCanvasAgg(figure)
     axis = figure.subplots()
-    styles = dict(source_training=("#2563eb", "o", "Real source training", 12, .3),
-                  target_training=("#f59e0b", "o", "Real target training", 12, .3),
-                  source_query=("#1d4ed8", "o", "Source queries (valid positions)", 45, .9),
-                  mapped_query=("#16a34a", "X", "Mapped queries", 65, .95))
-    for name, values in coordinates.items():
-        color, marker, label, size, alpha = styles[name]
-        axis.scatter(values[:, 0], values[:, 1], c=color, marker=marker, s=size, alpha=alpha, label=label)
-    if level == "image":
-        query_index = {sid: i + 1 for i, sid in enumerate(query_ids)}
-        for record, before, after in zip(groups["mapped_query"][1], coordinates["source_query"], coordinates["mapped_query"]):
-            axis.annotate("", xy=after.tolist(), xytext=before.tolist(),
-                          arrowprops=dict(arrowstyle="->", color="#64748b", alpha=.45, lw=.8))
-            axis.annotate(str(query_index[record["sample_id"]]), after.tolist(), xytext=(4, 4), textcoords="offset points", fontsize=8)
-    axis.set(xlabel="UMAP 1", ylabel="UMAP 2", title=f"{mapper.mode}: {'valid-token image means' if level == 'image' else 'individual patch features'}")
-    axis.legend(loc="best")
+    draw_umap_panel(axis, coordinates, groups["mapped_query"][1], query_ids, level=level,
+        title=f"{mapper.mode}: {'valid-token image means' if level == 'image' else 'individual patch features'}")
     figure.supxlabel("Fit: real training banks. Queries: transform only. Feature geometry is not an image-quality score.", fontsize=9)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)

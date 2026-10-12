@@ -76,22 +76,30 @@ reached its variance target but did not resolve blur. Native dog controls stayed
 much clearer even after contraction to the mapped variance. Keep the correction
 diagnostic-only; mean and token-direction mismatch remain to be separated.
 
-For the next fit-then-test experiment, use the
-[conditional-displacement run guide](DISPLACEMENT_EXPERIMENT.md).
-Start with `check_failed_pairs.py`: it replays the 37 remaining failures against
-the original training banks, saves one JSON report and returns nonzero if any
-strict certificate fails. The guide chains this check to the full experiment.
-Both `compare_displacement.py` and `diagnose_blur.py` now keep **two analysis
-files** in their result directory: one JSON report and one full-resolution
-comparison grid. Raw plans, logs and tensors stay under Git-ignored
-`outputs/infoot_vit/`; the report records `work_directory`. Only push/pull the
-two analysis files. This output policy does not change the fit or generation.
+The completed v7 run passed all 37 formerly failing pairs and all 16,000 full-fit
+pairs. Displacement improved visible detail but retained cat traits and produced
+some distorted faces. Keep the v7 solver and fitting settings; the value estimator
+remains experimental. The next test is the
+[residual-removal experiment with UMAP](DISPLACEMENT_EXPERIMENT.md#next-experiment-residual-removal-with-umap):
+`compare_displacement.py --experiment residual_ablation --mapping ...`
+reuses the exact completed v7 fit, with the v7 result directory as `--reference-run`.
+It compares `conditional_displacement` with `conditional_edge_mean`, retaining
+barycentric and native/source decoder controls. No refit or co-training occurs.
+
+The residual experiment keeps **three analysis files**: `experiment_report.json`,
+`comparison_grid.png`, and required `umap.png`. UMAP coordinates and settings are
+embedded in the report; image-mean and patch panels share one training-fitted
+reducer per row across all methods. Queries never fit either reducer. UMAP is
+descriptive feature geometry, not a quality score. The original displacement and
+spread runners retain their two-file output. Raw plans, logs and tensors stay
+under Git-ignored `outputs/infoot_vit/`; the report records `work_directory`.
 `compare_displacement.py --fit-config ...` fits once, requires a complete pair
 inventory, and compares the existing mapped baseline with a source-residual
 preserving estimator under identical checkpoint/noise controls. Native-dog and
 unmapped-source controls accompany both mapped rows. This is an unvalidated
 quality candidate; `infoot_test.py --patch-value-mode conditional_displacement`
-is explicit, and the existing default remains `barycentric`. The dense fitting
+and `--patch-value-mode conditional_edge_mean` are explicit, and the default
+remains `barycentric`. The dense fitting
 objective, settings, mass/capacity checks and `.20/.20` bandwidths are unchanged.
 
 ## Start with feature banks

@@ -46,6 +46,40 @@ def test_displacement_matches_independent_joint_expectation():
     torch.testing.assert_close(actual, expected, atol=2e-14, rtol=2e-14)
 
 
+def test_edge_mean_removes_only_the_source_residual_and_is_not_target_kde_mean():
+    q, x, y, plan, logs, ky, b = example()
+    on, on_stats = conditional_displacement(q, x, y, plan, logs, ky, b)
+    off, off_stats = conditional_displacement(q, x, y, plan, logs, ky, b, retain_source_residual=False)
+    expected, source_mean = torch.zeros_like(q), torch.zeros_like(q)
+    for batch in range(len(q)):
+        density = ky[batch] @ b[batch]
+        for r in range(q.shape[1]):
+            total = 0.
+            for i in range(x.shape[1]):
+                for j in range(y.shape[1]):
+                    for k in range(y.shape[1]):
+                        mass = logs[batch, r, i].exp() * plan[batch, i, j] * ky[batch, k, j] * b[batch, k] / density[k]
+                        total += mass
+                        expected[batch, r] += mass * y[batch, j]
+                        source_mean[batch, r] += mass * x[batch, i]
+            expected[batch, r] /= total
+            source_mean[batch, r] /= total
+    torch.testing.assert_close(off, expected, atol=2e-14, rtol=2e-14)
+    torch.testing.assert_close(on - off, q - source_mean, atol=2e-14, rtol=2e-14)
+    assert all(torch.equal(on_stats[k], off_stats[k]) for k in on_stats)
+    # Keeping the query kernel fixed while changing q exposes any accidental
+    # direct source-token passthrough in the residual-off endpoint.
+    changed, _ = conditional_displacement(q + 100, x, y, plan, logs, ky, b, retain_source_residual=False)
+    assert torch.equal(off, changed)
+    a = torch.full(plan.shape[:2], 1 / plan.shape[1], dtype=torch.float64)
+    params = (logs, y, plan, a, b, ky, q.new_full((len(q),), -float("inf")), q.new_full((len(q),), 1e-7))
+    baseline, raw0, valid0, _ = project_pairs(*params)
+    actual, raw1, valid1, _ = project_pairs(*params, value_mode="conditional_edge_mean", query=q, source=x)
+    assert torch.equal(raw0, raw1) and torch.equal(valid0, valid1)
+    torch.testing.assert_close(actual, off, rtol=0, atol=0)
+    assert not torch.allclose(off, baseline)
+
+
 @pytest.mark.parametrize("offset", [0., 1.7])
 def test_identity_and_constant_translation_preserve_unseen_query_detail(offset):
     # Support has no third-channel detail; the unseen query does. Absolute
@@ -68,17 +102,18 @@ def test_identity_and_constant_translation_preserve_unseen_query_detail(offset):
     assert candidate[..., 2].square().mean() == 4
 
 
-def test_rejection_and_extreme_log_kernels_do_not_create_source_fallback():
+@pytest.mark.parametrize("retain", [True, False])
+def test_rejection_and_extreme_log_kernels_do_not_create_source_fallback(retain):
     q, x, y, plans, logs, ky, b = example()
     plans[1] = 0
     # A rejected source is nearest; retained source scores underflow outside log space.
     logs[0] = -10000
     logs[0, :, 2] = 0
-    values, stats = conditional_displacement(q, x, y, plans, logs, ky, b)
+    values, stats = conditional_displacement(q, x, y, plans, logs, ky, b, retain_source_residual=retain)
     assert torch.isfinite(values).all() and values[0].abs().sum() > 0
     assert not values[1].any()
     assert not stats["displacement_norm"][1].any()
-    shifted, _ = conditional_displacement(q, x, y, plans, logs - 12000, ky, b)
+    shifted, _ = conditional_displacement(q, x, y, plans, logs - 12000, ky, b, retain_source_residual=retain)
     torch.testing.assert_close(values, shifted, atol=2e-11, rtol=2e-11)
 
 
@@ -111,7 +146,8 @@ def test_malformed_inputs_rejected(bad):
         conditional_displacement(*args)
 
 
-def test_mapper_preserves_confidence_inventory_routing_and_artifacts(tmp_path, banks, monkeypatch):
+@pytest.mark.parametrize("value_mode", ["conditional_displacement", "conditional_edge_mean"])
+def test_mapper_preserves_confidence_inventory_routing_and_artifacts(tmp_path, banks, monkeypatch, value_mode):
     c = config("grouped_partial")
     c.update(fit_pair_top_k=2, pair_batch_size=3)
     directory = fit_mapping(c, root=tmp_path)
@@ -119,7 +155,7 @@ def test_mapper_preserves_confidence_inventory_routing_and_artifacts(tmp_path, b
     base = FeatureMapper.load(directory, pair_projection_batch_size=2)
     baseline = mapped(base, banks[2], return_metadata=True)
     forbid_fitting(monkeypatch)
-    settings = infoot_test.projection_settings(base.config, None, patch_value_mode="conditional_displacement")
+    settings = infoot_test.projection_settings(base.config, None, patch_value_mode=value_mode)
     mapper = FeatureMapper.load(directory, projection=settings, pair_projection_batch_size=3)
     result = mapped(mapper, banks[2], return_metadata=True)
     torch.testing.assert_close(result.match_confidence, baseline.match_confidence, atol=1e-15, rtol=1e-15)
@@ -129,7 +165,7 @@ def test_mapper_preserves_confidence_inventory_routing_and_artifacts(tmp_path, b
         for key in ("image_weights", "image_projection_h", "patch_projection_h"):
             assert row[key] == old[key]
         assert row["matched_rejected_group_mass_residual"] < 1e-10
-        assert row["patch_value_mode"] == "conditional_displacement"
+        assert row["patch_value_mode"] == value_mode
     # Independent serial reference over the exact same pair, confidence and mask.
     sid, tid = next(iter(mapper.pairs))
     i, j = mapper.source_index[sid], mapper.target_index[tid]
@@ -139,14 +175,14 @@ def test_mapper_preserves_confidence_inventory_routing_and_artifacts(tmp_path, b
     pair = mapper._pair(sid, tid)
     value, raw, valid, _ = project_pairs(logs[None], mapper.y[j:j+1], pair["plan"][None],
         pair["a"][None], pair["b"][None], mapper.projection_ky[j:j+1], query.new_tensor([-float("inf")]),
-        query.new_tensor([tolerance]), value_mode="conditional_displacement", query=query[None], source=mapper.x[i:i+1])
+        query.new_tensor([tolerance]), value_mode=value_mode, query=query[None], source=mapper.x[i:i+1])
     torch.testing.assert_close(value[0], expected, atol=1e-13, rtol=1e-13)
     torch.testing.assert_close(raw[0] * valid[0], g)
     assert hashes(directory) == before
     out = tmp_path / "projected"
     mapper.project_bank(banks[2], out)
     restored, _, manifest = load_mapped(out)
-    assert manifest["projection"]["patch_value_mode"] == "conditional_displacement"
+    assert manifest["projection"]["patch_value_mode"] == value_mode
     assert "conditional_displacement.py" in manifest["projection_dependency_sha256"]
     torch.testing.assert_close(restored.mapped_features, result.mapped_features)
 
@@ -165,14 +201,15 @@ def test_config_rejects_invalid_mode(bad):
         validate_config(c)
 
 
-def test_cli_saves_explicit_variant_and_preserves_legacy_default(tmp_path, banks, monkeypatch, capsys):
+@pytest.mark.parametrize("value_mode", ["conditional_displacement", "conditional_edge_mean"])
+def test_cli_saves_explicit_variant_and_preserves_legacy_default(tmp_path, banks, monkeypatch, capsys, value_mode):
     c = config("grouped_partial")
     assert "patch_value_mode" not in validate_config(c)["projection"]
     before_config = deepcopy(c)
     directory = fit_mapping(c, root=tmp_path)
     forbid_fitting(monkeypatch)
     args = ["--mapping", str(directory), "--query-bank", str(banks[2].path),
-        "--output-dir", str(tmp_path / "cli"), "--patch-value-mode", "conditional_displacement"]
+        "--output-dir", str(tmp_path / "cli"), "--patch-value-mode", value_mode]
     assert infoot_test.main(args) == 0
     _, _, manifest = load_mapped(tmp_path / "cli")
     capsys.readouterr()

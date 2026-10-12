@@ -111,12 +111,15 @@ def decoder_conditioning_diagnostics(evaluator, variants):
 
 
 @torch.inference_mode()
-def decode_variants(evaluator, variants, generation, *, null_label, batch_size, integrate, decode):
+def decode_variants(evaluator, variants, generation, *, null_label, batch_size, integrate, decode,
+                    expected_noise_sha256=None):
     """All conditions receive clones of exactly the same per-query noise tensor."""
     noises = [torch.randn((1, 4, 32, 32),
         generator=torch.Generator(device=evaluator.device).manual_seed(seed),
         device=evaluator.device, dtype=evaluator.model_dtype) for seed in generation["per_image_noise_seeds"]]
     initial_noise = torch.cat(noises)
+    if expected_noise_sha256 is not None and tensor_hash(initial_noise) != expected_noise_sha256:
+        raise ValueError("Instantiated noise differs from the completed reference experiment; stop before decoding.")
     images = {}
     for name, (features, valid) in variants.items():
         if len(features) != len(initial_noise):

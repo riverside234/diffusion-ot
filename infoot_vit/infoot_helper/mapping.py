@@ -260,9 +260,11 @@ class FeatureMapper:
         candidate,g,diag = partial_projection(patches,self.x[i],self.y[j],pair["plan"],pair["a"],pair["b"],
             self.shared["sx"][i],self.shared["sy"][j],self.shared["h_projection"],self.shared["support"][i],
             target_kernel=self.projection_ky[j],query_logs=context)
-        if self.config["projection"].get("patch_value_mode", "barycentric") == "conditional_displacement":
+        value_mode = self.config["projection"].get("patch_value_mode", "barycentric")
+        if value_mode != "barycentric":
             candidate, extra = conditional_displacement(patches[None], self.x[i:i+1], self.y[j:j+1],
-                pair["plan"][None], context[None], self.projection_ky[j:j+1], pair["b"][None])
+                pair["plan"][None], context[None], self.projection_ky[j:j+1], pair["b"][None],
+                retain_source_residual=value_mode == "conditional_displacement")
             candidate = candidate[0]
             diag.update({key: value[0] for key, value in extra.items()})
         diag["weight_row_sums"] = diag["weights"].sum(1)
@@ -588,7 +590,9 @@ def mapping_summary(result, query, source, target, *, confidence_settings=None):
         report["patch_value_modes"] = sorted({row.get("patch_value_mode", "barycentric") for row in rows})
         report["patch_value_note"] = ("within_image_effective_patches/top1 describe the unchanged smoothed target "
             "conditional. conditional_displacement instead evaluates original plan-edge displacements and passes "
-            "the query residual through; its source-neighborhood and norm diagnostics are separate. "
+            "the query residual through; conditional_edge_mean uses the same plan edges without that residual. "
+            "Source-neighborhood and norm diagnostics are separate; source_residual_norm measures the "
+            "residual before retention/removal. "
             "Feature concentration and residual preservation do not certify dog realism or source correspondence.")
         report["partial_geometry_note"] = ("Fitted row statistics precede projection; source-neighborhood and projected-patch "
             "statistics include query smoothing. Dense pair metrics are weighted by routing and retained/support-valid mass. "

@@ -31,8 +31,8 @@ def project_pairs(logs, target, plans, a, b, ky, thresholds, tolerances, *,
     rather than once per pair. All returned statistics remain on the device.
     """
     validate_value_mode(value_mode)
-    if value_mode == "conditional_displacement" and (query is None or source is None):
-        raise ValueError("Conditional displacement requires the original query and source tokens.")
+    if value_mode != "barycentric" and (query is None or source is None):
+        raise ValueError("Plan-edge projection requires the original query and source tokens.")
     row_max = logs.max(-1).values
     centered = logs - torch.where(torch.isfinite(row_max), row_max, 0.)[..., None]
     log_base = torch.logsumexp(centered + a.log()[:, None], dim=-1)
@@ -71,8 +71,9 @@ def project_pairs(logs, target, plans, a, b, ky, thresholds, tolerances, *,
             raise ValueError("Conditional score underflow remains after float64 log-space retry.")
         weights[pair_ids, query_ids] = log_scores.softmax(1)
     extra = {}
-    if value_mode == "conditional_displacement":
-        values, extra = conditional_displacement(query, source, target, plans, logs, ky, b)
+    if value_mode != "barycentric":
+        values, extra = conditional_displacement(query, source, target, plans, logs, ky, b,
+            retain_source_residual=value_mode == "conditional_displacement")
     else:
         values = weights @ target
     return values, raw, valid, dict(
@@ -180,8 +181,8 @@ class DensePartialProjector:
             candidate, raw, valid, diag = project_pairs(logs[inverse], mapper.y[ij[:, 1]], plans, a, b,
                 mapper.projection_ky[ij[:, 1]], self.thresholds[ij[:, 0]], tolerances,
                 value_mode=value_mode,
-                query=patches.expand(len(ids), -1, -1) if value_mode == "conditional_displacement" else None,
-                source=mapper.x[ij[:, 0]] if value_mode == "conditional_displacement" else None)
+                query=patches.expand(len(ids), -1, -1) if value_mode != "barycentric" else None,
+                source=mapper.x[ij[:, 0]] if value_mode != "barycentric" else None)
             clipped = raw.clamp(0, 1)
             roundoff = torch.maximum(roundoff, (raw - clipped).abs().max())
             g = clipped * valid  # Validated storage/solver roundoff only, no plan renormalization.

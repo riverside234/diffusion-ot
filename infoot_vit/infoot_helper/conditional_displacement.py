@@ -16,7 +16,7 @@ Confidence, support rejection, image routing and saved plans are untouched.
 import torch
 
 
-VALUE_MODES = ("barycentric", "conditional_displacement")
+VALUE_MODES = ("barycentric", "conditional_displacement", "conditional_edge_mean")
 
 
 def validate_value_mode(mode):
@@ -25,13 +25,20 @@ def validate_value_mode(mode):
     return mode
 
 
-def conditional_displacement(query, source, target, plans, logs, target_kernel, b):
+def conditional_displacement(query, source, target, plans, logs, target_kernel, b, *,
+                             retain_source_residual=True):
     """Batched float64 [B,Q,D] values; never materialize [B,Q,P,P,D].
 
     Normalize latent plan rows and query weights in log space. Zero retained
     rows have exactly zero weight; an entirely unsupported query returns zero,
     not an unmasked source copy. Caller retains its original confidence gates.
+    With retain_source_residual=False return E_w[y_j] directly, using identical
+    edge weights, rather than q + E_w[y_j-x_i]. This is not the KDE-smoothed
+    barycentric estimator E[y_k]. Residual diagnostics describe q-E_w[x_i]
+    whether that residual is retained or removed.
     """
+    if type(retain_source_residual) is not bool:
+        raise ValueError("retain_source_residual must be boolean, not a gain.")
     if (plans.dtype != torch.float64 or any(x.dtype != torch.float64 for x in
             (query, source, target, logs, target_kernel, b))):
         raise ValueError("Conditional displacement requires float64 projection.")
@@ -52,14 +59,15 @@ def conditional_displacement(query, source, target, plans, logs, target_kernel, 
     row_weights = torch.where(active[..., None],
         (log_edges - log_row_mass.masked_fill(~active, 0.)[..., None]).exp(), 0.)
     # A common displacement is reproduced even when K mixes many target tokens.
-    row_delta = (row_weights @ target - source).masked_fill(~active[..., None], 0.)
+    row_target = row_weights @ target
+    row_delta = (row_target - source).masked_fill(~active[..., None], 0.)
     log_scores = logs + log_row_mass[:, None]
     log_total = log_scores.logsumexp(-1)
     positive = torch.isfinite(log_total)
     weights = torch.where(positive[..., None],
         (log_scores - log_total.masked_fill(~positive, 0.)[..., None]).exp(), 0.)
     delta = weights @ row_delta
-    values = (query + delta).masked_fill(~positive[..., None], 0.)
+    values = (query + delta if retain_source_residual else weights @ row_target).masked_fill(~positive[..., None], 0.)
     source_residual = query - weights @ source
     stats = dict(
         displacement_source_effective_patches=(-torch.special.xlogy(weights, weights).sum(-1)).exp(),
