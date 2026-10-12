@@ -24,6 +24,7 @@ from infoot_vit.infoot_helper.conditioning_spread import (
 from infoot_vit.infoot_helper.feature_bank import FeatureBank, digest, file_hash, save_tensor, write_json
 from infoot_vit.infoot_helper.mapping import load_mapped
 from infoot_vit.infoot_helper.mapping_manifest import load_mapping_manifest
+from infoot_vit.infoot_helper.experiment_output import create_work_directory
 
 
 def validate_comparison(fit, mapped_manifest, generation, query, target, state):
@@ -176,11 +177,13 @@ def run_comparison(args):
     for module in (evaluator.branch, evaluator.transformer, evaluator.vae):
         module.requires_grad_(False).eval()
     diagnostics = decoder_conditioning_diagnostics(evaluator, variants)
+    work = create_work_directory(ROOT, args.output_dir, getattr(args, "work_dir", None))
     args.output_dir.mkdir(parents=True, exist_ok=False)
     report = dict(schema="infoot_conditioning_spread_comparison_v1", status="running",
         hypothesis="Averaged mapped conditions lack within-image token spread; scalar restoration may help.",
         quality_conclusion="Untested visually; requires inspection of the generated matched grid.",
         mapper_id=fit["artifact_id"], mapped_cache_id=mapped_manifest["artifact_id"],
+        work_directory=str(work), analysis_files=["blur_report.json", "comparison_grid.png"],
         original_generation_report_sha256=file_hash(generation_path),
         checkpoint=str(checkpoint), checkpoint_sha256=checkpoint_hash,
         generation={k: generation[k] for k in ("weights", "num_steps", "guidance_scale", "solver", "seed",
@@ -190,6 +193,7 @@ def run_comparison(args):
         incomplete_fit=fit.get("incomplete_fit"),
         code_sha256={str(path.relative_to(ROOT)): file_hash(path) for path in (
             Path(__file__).resolve(), ROOT / "infoot_vit/infoot_helper/conditioning_spread.py",
+            ROOT / "infoot_vit/infoot_helper/experiment_output.py",
             ROOT / "src/diffusion_ot/evaluation/stage1a_eval.py",
             ROOT / "src/diffusion_ot/models/pdae_v2/branch.py",
             ROOT / "src/diffusion_ot/models/pdae_v2/cross_attention.py")},
@@ -206,18 +210,17 @@ def run_comparison(args):
             null_label=config["class_conditioning"]["null_label"], batch_size=args.batch_size,
             integrate=integrate_pdae_flow, decode=decode_vae_latents)
         rows = dict(original_source=originals, top1_reference_rgb_not_ground_truth=reference_images, **images)
-        for name, image_batch in rows.items():
-            save_image(image_batch.clamp(0, 1), args.output_dir / f"{name}.png", nrow=len(query.ids), padding=4)
         save_image(torch.cat(list(rows.values())).clamp(0, 1), args.output_dir / "comparison_grid.png",
                    nrow=len(query.ids), padding=4)
         # Preserve confidence/mask atomically. This is explicitly NOT an ordinary
         # mapped cache: the corrected tensors are an unvalidated decoder input.
-        tensor_path = args.output_dir / "conditioning_variants.pt"
+        tensor_path = work / "conditioning_variants.pt"
         save_tensor(tensor_path, dict(ids=query.ids, initial_noise=noise,
             match_confidence=result.match_confidence.cpu(),
             variants={name: dict(features=x.cpu(), valid_mask=valid.cpu()) for name, (x, valid) in variants.items()}))
         report.update(status="complete", row_order=list(rows), initial_noise_sha256=tensor_hash(noise),
-            output=dict(file=tensor_path.name, sha256=file_hash(tensor_path)),
+            output=dict(file=str(tensor_path), sha256=file_hash(tensor_path)),
+            comparison_grid=dict(file="comparison_grid.png", sha256=file_hash(args.output_dir / "comparison_grid.png")),
             unchanged_match_confidence_sha256=tensor_hash(result.match_confidence),
             unchanged_valid_mask_sha256=tensor_hash(result.valid_mask))
         write_json(report_path, report)
@@ -236,7 +239,8 @@ def main(argv=None):
     parser.add_argument("--query-bank", required=True, type=Path)
     parser.add_argument("--target-bank", type=Path, help="Optional relocated ORIGINAL bank; its hash must still match.")
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path, help="Must not exist.")
+    parser.add_argument("--output-dir", required=True, type=Path, help="New analysis directory: report + comparison grid only.")
+    parser.add_argument("--work-dir", type=Path, help="New directory outside results/ for tensors; defaults to ignored outputs/infoot_vit/.")
     parser.add_argument("--train-config", default="configs/stage1a_pdae_v2_l/dog.yaml")
     parser.add_argument("--eval-config", default="configs/stage1a_eval/pdae_v2_l.yaml")
     parser.add_argument("--allow-failed-pairs", action="store_true",

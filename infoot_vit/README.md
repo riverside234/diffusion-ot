@@ -78,6 +78,11 @@ diagnostic-only; mean and token-direction mismatch remain to be separated.
 
 For the next fit-then-test experiment, use the
 [conditional-displacement run guide](DISPLACEMENT_EXPERIMENT.md).
+Both `compare_displacement.py` and `diagnose_blur.py` now keep **two analysis
+files** in their result directory: one JSON report and one full-resolution
+comparison grid. Raw plans, logs and tensors stay under Git-ignored
+`outputs/infoot_vit/`; the report records `work_directory`. Only push/pull the
+two analysis files. This output policy does not change the fit or generation.
 `compare_displacement.py --fit-config ...` fits once, requires a complete pair
 inventory, and compares the existing mapped baseline with a source-residual
 preserving estimator under identical checkpoint/noise controls. Native-dog and

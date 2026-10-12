@@ -14,6 +14,7 @@ from infoot_vit import compare_displacement as runner
 from infoot_vit.infoot_helper.feature_bank import file_hash, write_json
 from infoot_vit.infoot_helper.fit_mapping import fit_mapping
 from infoot_vit.infoot_helper.mapping import FeatureMapper, load_mapped
+from infoot_vit.infoot_helper.experiment_output import create_work_directory, fit_diagnostics
 
 
 @pytest.fixture
@@ -42,6 +43,7 @@ def experiment(tmp_path, banks):
     eval_config.write_text("{}\n")
     args = SimpleNamespace(mapping=directory, fit_config=None, source_bank=None, target_bank=None,
         reference_run=reference_dir, query_bank=banks[2].path, checkpoint=checkpoint, output_dir=tmp_path / "comparison",
+        work_dir=tmp_path / "work",
         train_config=train, eval_config=eval_config, device="cpu", batch_size=1, pair_cache_mib=1,
         projection_pair_batch_size=2)
     return args, fit, c
@@ -100,8 +102,8 @@ def test_fit_then_map_pair_preserves_noise_checkpoint_and_mask(experiment, banks
     assert not torch.equal(sampled[0][0][0], sampled[0][0][1])
     assert all(torch.equal(row[0], sampled[0][0]) for row in sampled)
     assert all(row[2]["num_steps"] == 40 and row[2]["guidance_scale"] == 1.5 for row in sampled)
-    baseline, _, bm = load_mapped(args.output_dir / "barycentric")
-    candidate, _, cm = load_mapped(args.output_dir / "conditional_displacement")
+    baseline, _, bm = load_mapped(args.work_dir / "barycentric")
+    candidate, _, cm = load_mapped(args.work_dir / "conditional_displacement")
     runner.verify_paired_mapping(baseline, candidate)
     assert bm["mapper_id"] == cm["mapper_id"] == report["mapper_id"]
     torch.testing.assert_close(sampled[3][1], baseline.mapped_features.float())
@@ -111,11 +113,17 @@ def test_fit_then_map_pair_preserves_noise_checkpoint_and_mask(experiment, banks
     assert all(not module.training for module in (evaluator.branch, evaluator.transformer, evaluator.vae))
     assert not any(p.requires_grad for p in evaluator.branch.parameters())
     assert hashes(old_directory) == before and hashes(args.reference_run) == reference_before
-    review = json.loads((args.output_dir / "quality_review.json").read_text())
+    review = report["quality_review"]
     assert review["status"] == "unreviewed" and review["automatic_quality_pass"] is False
     assert all(row["verdict"] is None for row in review["per_query"])
-    assert (args.output_dir / "columns_01_02.png").exists()
-    saved = torch.load(args.output_dir / "conditioning_variants.pt", weights_only=True)
+    assert {p.name for p in args.output_dir.rglob("*")} == {"experiment_report.json", "comparison_grid.png"}
+    assert report["mapping_outputs"]["barycentric"]["manifest"] == bm
+    assert report["mapping_outputs"]["conditional_displacement"]["manifest"] == cm
+    assert report["mapping_outputs"]["barycentric"]["summary"]["mode"] == "grouped_partial"
+    assert report["fit_diagnostics"]["files"]["manifest.json"]["data"]["pair_count"] == 4
+    assert not report["fit_diagnostics"]["export_errors"]
+    assert report["comparison_grid"]["sha256"] == file_hash(args.output_dir / "comparison_grid.png")
+    saved = torch.load(args.work_dir / "conditioning_variants.pt", weights_only=True)
     assert torch.equal(saved["initial_noise"], sampled[0][0])
     with pytest.raises(FileExistsError):
         runner.run_experiment(args)
@@ -165,7 +173,56 @@ def test_failed_generation_leaves_failure_report_and_no_quality_pass(experiment,
         runner.run_experiment(args)
     report = json.loads((args.output_dir / "experiment_report.json").read_text())
     assert report["status"] == "failed" and report["quality_acceptance"] == "unreviewed"
-    assert (args.output_dir / "conditional_displacement/mapped.pt").exists()
+    assert (args.work_dir / "conditional_displacement/mapped.pt").exists()
+    assert [p.name for p in args.output_dir.iterdir()] == ["experiment_report.json"]
+
+
+def test_fit_failure_exports_histories_without_copying_success_logs(experiment, banks, tmp_path, monkeypatch):
+    args, _, c = experiment
+    c["source_bank"], c["target_bank"] = str(banks[0].path), str(banks[1].path)
+    args.fit_config = tmp_path / "candidate.yaml"
+    args.fit_config.write_text(yaml.safe_dump(c))
+    args.mapping = None
+    failure = dict(source_id="source", target_id="target", status="line_search_stalled",
+                   report=dict(history=[dict(iteration=1, objective=.123)]))
+    def fail(config, *, root, output_root):
+        directory = output_root / "failed_fit"
+        write_json(directory / "manifest.json", dict(status="failed", pair_count=3, failed_pair_count=1))
+        (directory / "pair_failures.jsonl").write_text(json.dumps(failure) + "\n")
+        write_json(directory / "plans/pairs/success/iterations.jsonl", dict(retained="locally"))
+        raise RuntimeError("one failed pair")
+    monkeypatch.setattr(runner, "fit_mapping", fail)
+    with pytest.raises(RuntimeError, match="one failed pair"):
+        runner.run_experiment(args)
+    report = json.loads((args.output_dir / "experiment_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["fit_diagnostics"]["files"]["pair_failures.jsonl"]["data"] == [failure]
+    assert (args.work_dir / "fit/failed_fit/plans/pairs/success/iterations.jsonl").exists()
+    assert [p.name for p in args.output_dir.iterdir()] == ["experiment_report.json"]
+
+
+def test_work_files_cannot_leak_into_results_or_existing_directories(tmp_path):
+    output = tmp_path / "results/infoot_vit/run"
+    for work in (output, output / "fit", output.parent, tmp_path / "results/elsewhere"):
+        with pytest.raises(ValueError, match="Working files"):
+            create_work_directory(tmp_path, output, work)
+    work = create_work_directory(tmp_path, output)
+    assert work.is_relative_to(tmp_path / "outputs/infoot_vit")
+    assert not output.exists()
+    (work / "keep.txt").write_text("preserved")
+    with pytest.raises(FileExistsError):
+        create_work_directory(tmp_path, output, work)
+    assert (work / "keep.txt").read_text() == "preserved"
+
+
+def test_diagnostic_export_preserves_original_bytes_and_reports_partial_json(tmp_path):
+    path = tmp_path / "manifest.json"
+    path.write_bytes(b'{"status":"failed"}\r\n')
+    original_hash = file_hash(path)
+    (tmp_path / "pair_failures.jsonl").write_text('{"incomplete":')
+    report = fit_diagnostics(tmp_path)
+    assert report["files"]["manifest.json"]["sha256"] == original_hash == file_hash(path)
+    assert "pair_failures.jsonl" in report["export_errors"]
 
 
 def test_mapping_comparison_rejects_mask_or_routing_change(experiment):

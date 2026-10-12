@@ -23,6 +23,7 @@ import torch
 from infoot_vit.diagnose_blur import decode_variants, decoder_conditioning_diagnostics, tensor_hash
 from infoot_vit.infoot_test import projection_settings
 from infoot_vit.infoot_helper.device import resolve_device
+from infoot_vit.infoot_helper.experiment_output import create_work_directory, fit_diagnostics, mapping_diagnostics
 from infoot_vit.infoot_helper.feature_bank import FeatureBank, digest, file_hash, save_tensor, write_json
 from infoot_vit.infoot_helper.fit_mapping import fit_mapping, validate_config
 from infoot_vit.infoot_helper.mapping import FeatureMapper
@@ -112,14 +113,14 @@ def verify_paired_mapping(baseline, candidate):
         raise ValueError("Matched baseline and displacement changed queries, routing, bandwidth or rejection.")
 
 
-def write_review_template(output, ids, reference_ids):
-    write_json(output / "quality_review.json", dict(status="unreviewed", automatic_quality_pass=False,
+def review_template(ids, reference_ids):
+    return dict(status="unreviewed", automatic_quality_pass=False,
         rule="Inspect every column at native resolution. Accept only if clarity AND dog realism AND source "
              "pose/expression/color improve without greater reference copying or facial artifacts. "
              "A sharper cat-like image, or a retrieved dog, is not successful translation.",
         per_query=[dict(query_id=sid, reference_id=rid, clarity_vs_baseline=None,
             dog_realism=None, source_pose_expression_color=None, facial_artifacts=None,
-            reference_copying=None, verdict=None, notes="") for sid, rid in zip(ids, reference_ids)]))
+            reference_copying=None, verdict=None, notes="") for sid, rid in zip(ids, reference_ids)])
 
 
 def run_experiment(args):
@@ -163,15 +164,18 @@ def run_experiment(args):
                 raise ValueError("Fresh fitting must use the original training banks and selected IDs.")
     else:
         validate_complete_fit(load_mapping_manifest(args.mapping), reference)
+    work = create_work_directory(ROOT, output, getattr(args, "work_dir", None))
     output.mkdir(parents=True, exist_ok=False)
     report = dict(schema="infoot_displacement_comparison_v1", status="running", quality_acceptance="unreviewed",
         reference_run=str(args.reference_run), reference_files_sha256=reference["file_sha256"],
+        work_directory=str(work), analysis_files=["experiment_report.json", "comparison_grid.png"],
         checkpoint=str(args.checkpoint), checkpoint_sha256=checkpoint_hash,
         hypothesis="Transport local source-to-target displacements while preserving query residuals; "
                    "may reduce conditioning blur but can retain cat attributes or wrong semantic matches.",
         config_sha256=dict(train=file_hash(train_path), evaluation=file_hash(eval_path)),
         code_sha256={str(path.relative_to(ROOT)): file_hash(path) for path in (
             Path(__file__).resolve(), ROOT / "infoot_vit/diagnose_blur.py",
+            ROOT / "infoot_vit/infoot_helper/experiment_output.py",
             ROOT / "infoot_vit/infoot_helper/conditional_displacement.py",
             ROOT / "infoot_vit/infoot_helper/dense_partial_projection.py",
             ROOT / "src/diffusion_ot/evaluation/stage1a_eval.py",
@@ -184,11 +188,12 @@ def run_experiment(args):
         if fit_config is not None:
             report["status"] = "fitting"
             write_json(report_path, report)
-            directory = fit_mapping(fit_config, root=ROOT, output_root=output / "fit")
+            directory = fit_mapping(fit_config, root=ROOT, output_root=work / "fit")
         fit = load_mapping_manifest(directory)
         validate_complete_fit(fit, reference)
         report.update(status="mapping", mapping=str(directory), mapper_id=fit["artifact_id"],
-                      successful_pairs=fit["pair_count"], failed_pairs=0)
+                      successful_pairs=fit["pair_count"], failed_pairs=0,
+                      fit_diagnostics=fit_diagnostics(directory))
         write_json(report_path, report)
         projection = deepcopy(reference["mapped"]["projection"])
         projection["patch_value_mode"] = "barycentric"
@@ -199,7 +204,9 @@ def run_experiment(args):
             # Only the value estimator changes; reuse the same validated kernels,
             # support thresholds, mapper and bounded read-only plan cache.
             mapper.config["projection"] = projection_settings(mapper.config, None, patch_value_mode=mode)
-            results[mode], manifests[mode] = mapper.project_bank(query, output / mode, chunk_size=args.batch_size)
+            results[mode], manifests[mode] = mapper.project_bank(query, work / mode, chunk_size=args.batch_size)
+        report["mapping_outputs"] = {mode: mapping_diagnostics(work / mode, manifest)
+                                     for mode, manifest in manifests.items()}
         verify_paired_mapping(results["barycentric"], results["conditional_displacement"])
         baseline, candidate = results["barycentric"], results["conditional_displacement"]
         valid = baseline.valid_mask.cpu()
@@ -235,43 +242,43 @@ def run_experiment(args):
         report.update(status="decoding", generation=generation, device=str(evaluator.device),
             model_dtype=str(evaluator.model_dtype), batch_size=args.batch_size,
             mapped_cache_ids={key: m["artifact_id"] for key, m in manifests.items()},
-            confidence_sha256=tensor_hash(torch.load(output / "barycentric/mapped.pt", weights_only=True)["match_confidence"]),
+            confidence_sha256=tensor_hash(torch.load(work / "barycentric/mapped.pt", weights_only=True)["match_confidence"]),
             valid_mask_sha256=tensor_hash(valid),
             conditioning_diagnostics=decoder_conditioning_diagnostics(evaluator, variants),
             interpretation="Only the two mapped rows isolate the estimator. Native references are decoder controls, "
                 "not paired targets. The source control detects apparent improvements caused by leaving cats untranslated. "
                 "The new fit may have repaired pairs, so comparison with the previous grid also changes pair inventory.")
-        write_review_template(output, query.ids, reference_ids)
+        report["quality_review"] = review_template(query.ids, reference_ids)
         write_json(report_path, report)
         images, noise = decode_variants(evaluator, variants, generation,
             null_label=train["class_conditioning"]["null_label"], batch_size=args.batch_size,
             integrate=integrate_pdae_flow, decode=decode_vae_latents)
         rows = dict(original_source=load_ground_truth_images(ROOT / train["data_config"], query.records),
             top1_reference_rgb_not_ground_truth=load_ground_truth_images(ROOT / train["data_config"], reference_records), **images)
-        for name, batch in rows.items():
-            save_image(batch.clamp(0, 1), output / f"{name}.png", nrow=len(query.ids), padding=4)
         save_image(torch.cat(list(rows.values())).clamp(0, 1), output / "comparison_grid.png", nrow=len(query.ids), padding=4)
-        for start in range(0, len(query.ids), 4):
-            count = min(4, len(query.ids) - start)
-            save_image(torch.cat([batch[start:start+count] for batch in rows.values()]).clamp(0, 1),
-                output / f"columns_{start+1:02d}_{start+count:02d}.png", nrow=count, padding=4)
-        tensor_path = output / "conditioning_variants.pt"
+        tensor_path = work / "conditioning_variants.pt"
         save_tensor(tensor_path, dict(ids=query.ids, initial_noise=noise,
             variants={name: dict(features=x.cpu(), valid_mask=mask.cpu()) for name, (x, mask) in variants.items()}))
-        for mode, name in (("barycentric", "mapped_barycentric"), ("conditional_displacement", "mapped_conditional_displacement")):
-            save_image(torch.cat((rows["original_source"], rows["top1_reference_rgb_not_ground_truth"], images[name])).clamp(0, 1),
-                       output / mode / "translation_grid.png", nrow=len(query.ids), padding=4)
-            write_json(output / mode / "generation_report.json", dict(generation,
+        for mode in ("barycentric", "conditional_displacement"):
+            generated = dict(generation,
                 protocol="fixed_checkpoint_compatibility_not_retraining", mapper_id=fit["artifact_id"],
                 checkpoint=str(args.checkpoint), checkpoint_sha256=checkpoint_hash,
                 projection=manifests[mode]["projection"], confidence_policy=manifests[mode]["projection"]["confidence"],
                 target_domain=train["domain"], row_order=["original_source", "top1_routed_target_reference_not_ground_truth", "translated"],
-                initial_noise_sha256=tensor_hash(noise), quality_acceptance="unreviewed"))
+                initial_noise_sha256=tensor_hash(noise), quality_acceptance="unreviewed")
+            write_json(work / mode / "generation_report.json", generated)
+            report["mapping_outputs"][mode]["generation"] = generated
         report.update(status="complete", row_order=list(rows), initial_noise_sha256=tensor_hash(noise),
-            output=dict(file=tensor_path.name, sha256=file_hash(tensor_path)))
+            output=dict(file=str(tensor_path), sha256=file_hash(tensor_path)),
+            comparison_grid=dict(file="comparison_grid.png", sha256=file_hash(output / "comparison_grid.png")))
         write_json(report_path, report)
     except Exception as error:
         report.update(status="failed", error=f"{type(error).__name__}: {error}")
+        # A fit may raise before returning its newly created directory. Preserve
+        # its failure diagnostics in this one shareable report as well.
+        candidates = sorted((work / "fit").glob("*")) if directory is None else [Path(directory)]
+        if candidates:
+            report.update(mapping=str(candidates[-1]), fit_diagnostics=fit_diagnostics(candidates[-1]))
         write_json(report_path, report)
         raise
     print(f"Saved matched displacement experiment: {output}; image quality still requires review.", flush=True)
@@ -281,14 +288,15 @@ def run_experiment(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     fitting = parser.add_mutually_exclusive_group(required=True)
-    fitting.add_argument("--fit-config", type=Path, help="Fit once in the new output, then compare both estimators.")
+    fitting.add_argument("--fit-config", type=Path, help="Fit once in the work directory, then compare both estimators.")
     fitting.add_argument("--mapping", type=Path, help="Reuse an already complete, identity-matched fit.")
     parser.add_argument("--reference-run", required=True, type=Path, help="Reviewed result with manifest, generation report and fitting_logs/manifest.json.")
     parser.add_argument("--query-bank", required=True, type=Path)
     parser.add_argument("--source-bank", type=Path, help="Fresh fit only: original source bank path.")
     parser.add_argument("--target-bank", type=Path, help="Fresh fit only: original target bank path.")
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path, help="Must not exist.")
+    parser.add_argument("--output-dir", required=True, type=Path, help="New analysis directory: report + comparison grid only.")
+    parser.add_argument("--work-dir", type=Path, help="New directory outside results/ for resumable state; defaults to ignored outputs/infoot_vit/.")
     parser.add_argument("--train-config", default="configs/stage1a_pdae_v2_l/dog.yaml")
     parser.add_argument("--eval-config", default="configs/stage1a_eval/pdae_v2_l.yaml")
     parser.add_argument("--device", default="cuda")

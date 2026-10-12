@@ -232,6 +232,7 @@ def test_full_runner_uses_original_cache_frozen_weights_equal_noise_and_saves_se
     evaluation.write_text("{}\n")
     args = SimpleNamespace(mapping=tmp_path / "fit", mapped=tmp_path / "mapped", target_bank=None,
         query_bank=query.path, checkpoint=evaluator.checkpoint_path, output_dir=tmp_path / "comparison",
+        work_dir=tmp_path / "work",
         allow_failed_pairs=False, train_config=train, eval_config=evaluation, device="cpu", batch_size=1)
     report = diagnose_blur.run_comparison(args)
     assert report["status"] == "complete" and len(sampled) == 5 and len(loaded) == 1
@@ -248,12 +249,14 @@ def test_full_runner_uses_original_cache_frozen_weights_equal_noise_and_saves_se
     assert all(not module.training for module in (evaluator.branch, evaluator.transformer, evaluator.vae))
     assert all(not p.requires_grad for module in (evaluator.branch, evaluator.transformer) for p in module.parameters())
     assert file_hash(tmp_path / "mapped/mapped.pt") == before_hash
-    saved = torch.load(args.output_dir / "conditioning_variants.pt", weights_only=True)
+    saved = torch.load(args.work_dir / "conditioning_variants.pt", weights_only=True)
     assert torch.equal(saved["initial_noise"], sampled[0][0])
     assert torch.equal(saved["match_confidence"], state["match_confidence"])
     assert torch.equal(saved["variants"]["mapped_spread_restored"]["valid_mask"], state["valid_mask"])
     assert report["calibration"]["selected_ids"] == fit["target_ids"]
     assert (args.output_dir / "comparison_grid.png").is_file()
+    assert {p.name for p in args.output_dir.rglob("*")} == {"blur_report.json", "comparison_grid.png"}
+    assert report["comparison_grid"]["sha256"] == file_hash(args.output_dir / "comparison_grid.png")
     disk_report = json.loads((args.output_dir / "blur_report.json").read_text())
     assert disk_report["status"] == "complete" and len(disk_report["row_order"]) == 7
     assert "after_decoder_layernorm" in disk_report["conditioning_diagnostics"]["mapped_spread_restored"]

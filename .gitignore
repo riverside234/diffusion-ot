@@ -224,6 +224,11 @@ __marimo__/
 # Project-local generated data and model artifacts
 /artifacts/
 /outputs/
+# Keep raw solver work out of analysis commits, including older runner layouts.
+/results/infoot_vit/*/fit/
+/results/infoot_vit/*/plans/
+/results/infoot_vit/*/logs/
+/results/infoot_vit/*/fitting_logs/
 /data/hf_cache/
 /data/downloads/
 /data/raw/

@@ -6,6 +6,14 @@ complete fit. This is an implemented, numerically tested experiment, **not yet a
 visually validated blur fix**. The real feature tensors and dog checkpoint are
 not available in this local checkout.
 
+The first lab attempt finished **15,963 of 16,000 pairs** and stopped with
+33 outer line-search stalls and four inner-certificate failures. Mapping and
+generation did not run. The [compact analysis](../results/infoot_vit/displacement_next_analysis.json)
+records the evidence; the original result folder was deleted at the user's
+request. Resolve these numerical failures before repeating a full fit with
+unchanged settings. The command below defines the comparison protocol, not a
+validated fix for those remaining failures or the blurred images.
+
 The completed `blur_spread_20261011T174849Z` experiment showed that native dog
 tokens remain clear at the mapped variance, whereas increasing mapped variance
 does not resolve blur. The next change therefore preserves source information
@@ -25,11 +33,11 @@ python infoot_vit/compare_displacement.py \
   --query-bank data/infoot_vit/cat_val16 \
   --reference-run results/infoot_vit/grouped_partial_20261011T073017Z_39614958_20261011T164734Z_771361 \
   --checkpoint outputs/pdae_v2_l_dog/checkpoints/latest.pt \
-  --output-dir results/infoot_vit/displacement_next \
+  --output-dir results/infoot_vit/displacement_check \
   --device cuda --batch-size 4 --threads 4
 ```
 
-`displacement_next` must not exist; use another new name for a repeat. The
+`displacement_check` must not exist; use another new name for a repeat. The
 4000-image bank paths are the **original bank identities**. Fitting still selects
 the exact same **2000 training images per domain, seed 42**. Do not substitute
 newly extracted banks or use validation images for fitting.
@@ -81,10 +89,19 @@ remain possible; these must be judged in the actual images.
 
 ## Read the result
 
-The output contains `fit/` for a new fit, separate `barycentric/` and
-`conditional_displacement/` mapped caches and translation grids,
-`experiment_report.json`, `conditioning_variants.pt` with exact shared noise,
-`comparison_grid.png`, and four-column panels at original image resolution.
+The result directory contains **only two files** for Git push/pull and analysis:
+
+- `experiment_report.json`: fitting reports and failed-pair histories, both
+  mapping manifests and statistics, generation controls, hashes and review fields.
+- `comparison_grid.png`: all seven rows and all queries at original resolution;
+  zoom in to inspect individual columns. No duplicate row images or panels.
+
+Fitted plans, per-pair logs, mapped tensor caches and `conditioning_variants.pt`
+with exact shared noise stay under **`outputs/infoot_vit/`**, already ignored by
+Git. Their location is recorded as `work_directory` in the report. An optional
+`--work-dir <new-directory-outside-results>` selects a different local storage
+location. Keep that directory on the lab machine for resume or further mapping;
+the two analysis files do not replace a loadable fitted artifact.
 
 The comparison has these seven rows:
 
@@ -108,13 +125,15 @@ reference copying. Columns 2, 6, 12, 14 and 15 of the reviewed set are especiall
 useful expression/pose/copying cases. A sharper cat, generic reference dog,
 sharper facial artifacts, or higher token variance is not a pass.
 
-`quality_review.json` starts **unreviewed** with an empty verdict for each query.
+The report's `quality_review` starts **unreviewed** with an empty verdict for each query.
 `status: complete` in the execution report means the fit, mapping and decoding
 finished; it does not certify image quality. Retain the candidate only if the
 matched images improve both clarity and translation. The default mapper remains
 the previous estimator until that evidence exists.
 
-If the process fails, the report records the error and preserves completed work.
+If the process fails, the single report records the error and available fitting
+diagnostics, including full failed-pair histories. Completed work remains in
+the ignored work directory.
 After a fit has completed, use `--mapping` and a new output directory to retry
 mapping/decoding. An interrupted fit can be resumed with the existing fitting
 CLI and its exact saved configuration; do not restart the full fit merely
