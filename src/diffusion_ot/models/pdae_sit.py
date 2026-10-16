@@ -141,8 +141,12 @@ class PDAELatentEncoder(nn.Module):
         num_groups: int = 32,
         normalize_z: bool = True,
         normalize_input: bool = True,
+        output_batchnorm: bool = False,
     ) -> None:
         super().__init__()
+        if not isinstance(output_batchnorm, bool):
+            raise ValueError("encoder.output_batchnorm must be a Boolean.")
+        self.output_batchnorm = output_batchnorm
         blocks: list[nn.Module] = []
         in_channels = int(input_channels)
         for index, out_channels in enumerate(channels):
@@ -165,11 +169,20 @@ class PDAELatentEncoder(nn.Module):
         self.conv = nn.Sequential(*blocks)
         self.proj = nn.Linear(in_channels * int(spatial_size) * int(spatial_size), int(z_dim))
         self.z_norm = nn.LayerNorm(int(z_dim)) if normalize_z else nn.Identity()
+        self.output_norm = (nn.BatchNorm1d(int(z_dim), affine=False, track_running_stats=True)
+                            if self.output_batchnorm else nn.Identity())
 
     def forward(self, x0_latent: torch.Tensor) -> torch.Tensor:
         h = self.conv(x0_latent)
         z = self.proj(h.flatten(start_dim=1))
-        return self.z_norm(z)
+        return self.output_norm(self.z_norm(z))
+
+    @property
+    def architecture_spec(self) -> dict[str, Any]:
+        spec = {"kind": "plain_cnn_v1"}
+        if self.output_batchnorm:
+            spec["output_batchnorm"] = True
+        return spec
 
     @property
     def spatial_feature_channels(self) -> tuple[int, ...]:
@@ -858,7 +871,7 @@ class PDAESiTBranch(nn.Module):
             "encoder": self.encoder.state_dict(),
             "generator": self.generator_state_dict(),
         }
-        if self.encoder_architecture["kind"] != "plain_cnn_v1":
+        if self.encoder_architecture != {"kind": "plain_cnn_v1"}:
             state["format_version"] = 5
             state["encoder_architecture"] = self.encoder_architecture
         return state
@@ -936,6 +949,7 @@ def build_pdae_sit_branch(
             num_groups=int(encoder_config.get("num_groups", 32)),
             normalize_z=bool(encoder_config.get("normalize_z", True)),
             normalize_input=input_space != "rgb",
+            output_batchnorm=encoder_config.get("output_batchnorm", False),
         )
     elif encoder_kind == "residual_cnn_v1":
         if input_space != "latent":
@@ -951,6 +965,7 @@ def build_pdae_sit_branch(
             attention_resolutions=encoder_config.get("attention_resolutions", [16]),
             attention_heads=encoder_config.get("attention_heads", 4),
             dropout=encoder_config.get("dropout", 0.0),
+            output_batchnorm=encoder_config.get("output_batchnorm", False),
         )
     else:
         raise ValueError(f"Unsupported encoder.kind: {encoder_kind}")

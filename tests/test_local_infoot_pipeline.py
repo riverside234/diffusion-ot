@@ -143,7 +143,9 @@ def test_saved_raw_plan_preserves_query_mapping_and_target_scale(local_helpers, 
     assert "stats" not in saved
 
 
-def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(local_helpers, tmp_path, monkeypatch):
+@pytest.mark.parametrize("mapped_batchnorm", [False, True])
+def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(local_helpers, tmp_path, monkeypatch,
+                                                                            mapped_batchnorm):
     from infoot_helper import infoot_test_helper as helper
     from infoot_helper.batchnorm_matching import batchnorm_checkpoint
 
@@ -155,10 +157,14 @@ def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(l
     output_dir = tmp_path / "outputs/infoot_cotraining"
     output_dir.mkdir(parents=True)
     norms = {name: torch.nn.BatchNorm1d(2, affine=False, momentum=1.) for name in features}
+    mapped_norms = {name: torch.nn.BatchNorm1d(2, affine=False) for name in features}
     for name, norm in norms.items():
         norm(features[name] * .5 + 3)
         norm.eval()
-        torch.save({"domain": name, "step": 2000, "matching_batchnorm": batchnorm_checkpoint(norm)},
+        mapped_norms[name](features[name] * .1)
+        torch.save({"domain": name, "step": 2000, "matching_batchnorm": batchnorm_checkpoint(norm),
+                    "mapped_batchnorm_enabled": mapped_batchnorm,
+                    "mapped_batchnorm": batchnorm_checkpoint(mapped_norms[name]) if mapped_batchnorm else None},
                    output_dir / f"{name}_step_002000.pt")
 
     def load_model(config, evaluation, **kwargs):
@@ -182,6 +188,11 @@ def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(l
     for name in models:
         assert loaded_models[name] is models[name]
         assert not loaded_norms[name].training
+        assert not loaded_models[name].mapped_batchnorm.training
+        if mapped_batchnorm:
+            torch.testing.assert_close(loaded_models[name].mapped_batchnorm.state_dict(), mapped_norms[name].state_dict())
+        else:
+            assert isinstance(loaded_models[name].mapped_batchnorm, torch.nn.Identity)
         torch.testing.assert_close(loaded_norms[name].state_dict(), norms[name].state_dict())
         torch.testing.assert_close(raw_banks[name], features[name])
         torch.testing.assert_close(matching[name], norms[name](features[name]))
@@ -212,7 +223,7 @@ def test_bank_fit_script_passes_raw_features_and_cli_lam(local_helpers, tmp_path
             assert (h, reg, lam) == (0.4, 0.02, 0.37)
 
         def solve(self, numIter, verbose):
-            assert numIter == 50 and verbose is True
+            assert numIter == 100 and verbose is True
             return torch.eye(3) / 3
 
     monkeypatch.setattr(infoot, "FusedInfoOT", Solver)

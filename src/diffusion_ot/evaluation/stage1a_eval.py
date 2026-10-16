@@ -193,7 +193,7 @@ def stage1a_architecture_metadata(branch: Any) -> dict[str, Any]:
         metadata["encoder_input_space"] = "rgb"
         metadata["encoder_image_size"] = getattr(branch, "encoder_image_size", None)
     encoder_architecture = getattr(branch, "encoder_architecture", {"kind": "plain_cnn_v1"})
-    if encoder_architecture["kind"] != "plain_cnn_v1":
+    if encoder_architecture != {"kind": "plain_cnn_v1"}:
         metadata["encoder_architecture"] = encoder_architecture
         if hasattr(branch.encoder, "spatial_feature_spec"):
             metadata["spatial_features"] = branch.encoder.spatial_feature_spec

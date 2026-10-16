@@ -122,8 +122,9 @@ def test_resume_supports_existing_checkpoints_without_rng_and_rejects_bn_mismatc
 
 
 @pytest.mark.parametrize("arguments,expected_step", [([], 400), (["--step", "200"], 200)])
+@pytest.mark.parametrize("mapped_batchnorm", [False, True])
 def test_evaluation_defaults_to_latest_but_allows_explicit_step(local_helpers, tmp_path, monkeypatch,
-                                                               arguments, expected_step):
+                                                               arguments, expected_step, mapped_batchnorm):
     from infoot_helper import infoot_test_helper as helper
     from infoot_helper import umap_plot
     from diffusion_ot.data import manifests, ground_truth
@@ -142,7 +143,11 @@ def test_evaluation_defaults_to_latest_but_allows_explicit_step(local_helpers, t
     for index in range(16):
         (latent_dir / f"{index:03d}.pt").touch()
     features = {name: torch.ones(3, 2) for name in ("cat", "dog")}
-    domains = {name: SimpleNamespace(name=name) for name in features}
+    norm = torch.nn.BatchNorm1d(2, affine=False)
+    norm(torch.tensor([[1., 2.], [2., 4.], [3., 8.]]))
+    domains = {name: SimpleNamespace(name=name, mapped_batchnorm=(norm.eval() if mapped_batchnorm
+                                                                else torch.nn.Identity().eval()))
+               for name in features}
 
     def prepare(root, banks, step, device, **kwargs):
         assert root == tmp_path and step == expected_step
@@ -151,6 +156,7 @@ def test_evaluation_defaults_to_latest_but_allows_explicit_step(local_helpers, t
     def save_grid(dog, codes, images, path, **kwargs):
         assert dog is domains["dog"] and len(codes) == len(images) == 16
         assert path.name == f"cotraining_step_{expected_step:06d}_1.png"
+        torch.testing.assert_close(codes, dog.mapped_batchnorm(torch.ones(16, 2)))
 
     def map_features(query, source, target, plan, **kwargs):
         assert "target_v" not in kwargs
@@ -160,7 +166,7 @@ def test_evaluation_defaults_to_latest_but_allows_explicit_step(local_helpers, t
     def save_umap(cat_bank, dog_bank, queries, mapped, path, **kwargs):
         torch.testing.assert_close(cat_bank, features["cat"])
         torch.testing.assert_close(dog_bank, features["dog"])
-        torch.testing.assert_close(queries, mapped)
+        torch.testing.assert_close(domains["dog"].mapped_batchnorm(queries), mapped)
         assert len(queries) == 16
         assert path.name == f"cotraining_step_{expected_step:06d}_1_umap.png"
         return path

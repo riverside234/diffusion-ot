@@ -80,7 +80,7 @@ class PDAEResidualLatentEncoder(nn.Module):
         blocks_per_stage: Iterable[int] = (2, 2, 2, 2), spatial_size: int = 4,
         num_groups: int = 32, normalize_z: bool = True,
         attention_resolutions: Iterable[int] = (16,), attention_heads: int = 4,
-        dropout: float = 0.0,
+        dropout: float = 0.0, output_batchnorm: bool = False,
     ) -> None:
         super().__init__()
         self.input_channels = _positive_int(input_channels, "input_channels")
@@ -110,6 +110,9 @@ class PDAEResidualLatentEncoder(nn.Module):
         if not isinstance(normalize_z, bool):
             raise ValueError("encoder.normalize_z must be a Boolean.")
         self.normalize_z = normalize_z
+        if not isinstance(output_batchnorm, bool):
+            raise ValueError("encoder.output_batchnorm must be a Boolean.")
+        self.output_batchnorm = output_batchnorm
 
         self.stem = nn.Conv2d(self.input_channels, self.channels[0], 3, stride=1, padding=1)
         self.stages = nn.ModuleList()
@@ -135,10 +138,12 @@ class PDAEResidualLatentEncoder(nn.Module):
         self.out_act = nn.SiLU()
         self.proj = nn.Linear(self.channels[-1] * self.spatial_size ** 2, self.z_dim)
         self.z_norm = nn.LayerNorm(self.z_dim) if self.normalize_z else nn.Identity()
+        self.output_norm = (nn.BatchNorm1d(self.z_dim, affine=False, track_running_stats=True)
+                            if self.output_batchnorm else nn.Identity())
 
     @property
     def architecture_spec(self) -> dict[str, Any]:
-        return {
+        spec = {
             "kind": "residual_cnn_v1", "input_channels": self.input_channels,
             "input_size": self.input_size, "stem_stride": 1, "normalize_input": False,
             "channels": list(self.channels), "blocks_per_stage": list(self.blocks_per_stage),
@@ -147,6 +152,10 @@ class PDAEResidualLatentEncoder(nn.Module):
             "attention_heads": self.attention_heads, "dropout": self.dropout,
             "z_dim": self.z_dim, "normalize_z": self.normalize_z,
         }
+        # Omit the disabled option to preserve legacy checkpoint provenance.
+        if self.output_batchnorm:
+            spec["output_batchnorm"] = True
+        return spec
 
     @property
     def spatial_feature_channels(self) -> tuple[int, ...]:
@@ -172,7 +181,8 @@ class PDAEResidualLatentEncoder(nn.Module):
         for h in self._feature_maps(value):
             pass
         h = self.out_act(self.out_norm(h))
-        return self.z_norm(self.proj(h.flatten(start_dim=1)))
+        z = self.z_norm(self.proj(h.flatten(start_dim=1)))
+        return self.output_norm(z)
 
     def forward_spatial_features(self, value: torch.Tensor, layers: Iterable[int]) -> list[torch.Tensor]:
         layers = tuple(layers)

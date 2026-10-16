@@ -14,16 +14,17 @@ from test_local_infoot_resume import assert_same
 from test_self_supervised_translation import domains as tiny_domains
 
 
-def training_state(affine=True):
+def training_state(affine=True, mapped_batchnorm=False):
     from diffusion_ot.models.generator_adaptation import configure_generator_adaptation
-    from infoot_helper.distributed.model import CoTrainingStep
+    from infoot_helper.training_step import CoTrainingStep
 
     torch.manual_seed(42)
     domains, norms, groups = tiny_domains(), torch.nn.ModuleDict(), []
     settings = dict(query_count=2, encode_batch_size=2, flow_batch_size=2,
                     fit_h=.8, projection_h=.8, mi_weight=.1, reg=.5,
                     fit_iterations=2, sampling_steps=2, flow_weight=1.,
-                    infoOT_loss_weight=.1, contrastive_weight=.05)
+                    infoOT_loss_weight=.1, contrastive_weight=.05, covariance_weight=0.,
+                    mapped_batchnorm=mapped_batchnorm)
     for name, context in domains.items():
         context.model_dtype = torch.float32
         context.training_config["class_conditioning"] = {"null_label": None}
@@ -43,15 +44,28 @@ def latent_batch(rank=0, step=0):
     return {name: torch.randn(6, 4, 8, 8, generator=generator) for name in ("cat", "dog")}
 
 
-def test_single_process_loss_backward(local_helpers):
+def weighted_loss(losses, settings):
+    return (settings["flow_weight"] * losses["flow"]
+            + settings["infoOT_loss_weight"] * losses["infoot"]
+            + settings["contrastive_weight"] * losses["contrastive"]
+            + settings["covariance_weight"] * losses["covariance"])
+
+
+@pytest.mark.parametrize("covariance_weight", [0., .3])
+def test_single_process_loss_backward(local_helpers, covariance_weight):
     model, optimizer = training_state()
-    loss, metrics = model(latent_batch(), report=True)
+    model.settings["covariance_weight"] = covariance_weight
+    losses, metrics = model(latent_batch(), report=True)
+    loss = weighted_loss(losses, model.settings)
     expected = (.5 * (metrics["flow_cat"] + metrics["flow_dog"])
-                + .1 * metrics["infoot"] + .05 * metrics["contrastive"])
+                + .1 * metrics["infoot"] + .05 * metrics["contrastive"]
+                + covariance_weight * .5 * (metrics["cov_cat"] + metrics["cov_dog"]))
     assert loss.item() == pytest.approx(expected)
-    assert not any(key.startswith("cov_") for key in metrics)
+    assert metrics["cov_cat"] >= 0 and metrics["cov_dog"] >= 0
+    assert "total" not in metrics and "cov_weighted" not in metrics
+    assert all(value.requires_grad and torch.isfinite(value) for value in losses.values())
     loss.backward()
-    assert torch.isfinite(loss) and metrics["total"] == loss.item()
+    assert torch.isfinite(loss)
     for name, context in model.domains.items():
         assert any(p.grad is not None and p.grad.norm() > 0 for p in context.branch.encoder.parameters())
         assert model.batch_norms[name].weight.grad.norm() > 0
@@ -60,11 +74,12 @@ def test_single_process_loss_backward(local_helpers):
     optimizer.step()
 
 
-def test_flow_and_translation_condition_on_batchnorm_features(local_helpers, monkeypatch):
-    from infoot_helper.distributed import model as module
+@pytest.mark.parametrize("mapped_batchnorm", [False, True])
+def test_flow_and_translation_condition_on_batchnorm_features(local_helpers, monkeypatch, mapped_batchnorm):
+    from infoot_helper import training_step as module
     from infoot_helper.batchnorm_matching import normalize_features
 
-    model, _ = training_state()
+    model, _ = training_state(mapped_batchnorm=mapped_batchnorm)
     encoded, calls = {}, []
     normalize, flow, translation = module.add_matching_features, module.native_flow_loss, module.translation_contrastive_loss
 
@@ -87,6 +102,11 @@ def test_flow_and_translation_condition_on_batchnorm_features(local_helpers, mon
             plans[target], h=model.settings["projection_h"], target_v=references["v"],
         )
         expected = normalize_features(raw_mapped, model.batch_norms[target], references["v"])
+        if mapped_batchnorm:
+            norm = model.mapped_batch_norms[target]
+            expected = (expected - expected.mean(0)) / (expected.var(0, unbiased=False) + norm.eps).sqrt()
+            assert norm.num_batches_tracked == 1 and not norm.affine
+            assert norm is not model.batch_norms[target]
         torch.testing.assert_close(condition, expected)
         assert not torch.allclose(condition, raw_mapped)
         assert kwargs["batch_norm"] is model.batch_norms[target]
@@ -105,7 +125,8 @@ def test_flow_and_translation_condition_on_batchnorm_features(local_helpers, mon
     monkeypatch.setattr(module, "native_flow_loss", check_flow)
     monkeypatch.setattr(module, "translation_contrastive_loss", check_translation)
     monkeypatch.setattr(module, "fit_transport", capture_plan)
-    loss, _ = model(latent_batch())
+    losses, _ = model(latent_batch())
+    loss = weighted_loss(losses, model.settings)
     loss.backward()
     assert set(calls) == {"flow_cat", "flow_dog", "translation_cat", "translation_dog"}
 
@@ -126,7 +147,7 @@ def distributed_worker(rank, world_size, directory):
     try:
         setup_logging(directory, rank)
         logging.info("writer_rank=%s", rank)
-        model, optimizer = training_state(affine=world_size == 2)
+        model, optimizer = training_state(affine=world_size == 2, mapped_batchnorm=True)
         frozen = {name: value.clone() for name, value in model.named_parameters() if not value.requires_grad}
         ddp = wrap_distributed(model, device)
         torch.manual_seed(42 + rank)
@@ -135,10 +156,12 @@ def distributed_worker(rank, world_size, directory):
             expected = deepcopy(model)
             expected.zero_grad(set_to_none=True)
             rng = torch.get_rng_state()
-            local_loss, local_metrics = expected(latent_batch(rank, step), report=True)
+            local_losses, local_metrics = expected(latent_batch(rank, step), report=True)
+            local_loss = weighted_loss(local_losses, expected.settings)
             local_loss.backward()
             torch.set_rng_state(rng)
-            loss, metrics = ddp(latent_batch(rank, step), report=step == 1)
+            losses, metrics = ddp(latent_batch(rank, step), report=step == 1)
+            loss = weighted_loss(losses, model.settings)
             torch.testing.assert_close(loss, local_loss)
             loss.backward()
             for actual, reference in zip(model.parameters(), expected.parameters()):
@@ -152,8 +175,11 @@ def distributed_worker(rank, world_size, directory):
                                            gradient, rtol=2e-4, atol=2e-6)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
             optimizer.step()
-            sync_batchnorm_buffers(model.batch_norms)
-            for norm, reference in zip(model.batch_norms.values(), expected.batch_norms.values()):
+            sync_batchnorm_buffers(model.batch_norms, model.mapped_batch_norms)
+            for norm, reference in zip(
+                [*model.batch_norms.values(), *model.mapped_batch_norms.values()],
+                [*expected.batch_norms.values(), *expected.mapped_batch_norms.values()],
+            ):
                 for key in ("running_mean", "running_var"):
                     value = getattr(reference, key)
                     dist.all_reduce(value)
@@ -171,10 +197,12 @@ def distributed_worker(rank, world_size, directory):
             if name in frozen:
                 torch.testing.assert_close(value, frozen[name], rtol=0, atol=0)
 
-        save_checkpoint(directory, 2, model.domains, model.batch_norms, optimizer, model.settings, device)
+        save_checkpoint(directory, 2, model.domains, model.batch_norms, optimizer, model.settings, device,
+                        mapped_batch_norms=model.mapped_batch_norms)
         expected_random = torch.rand(5)
-        restored, restored_optimizer = training_state(affine=world_size == 2)
-        assert resume_latest(directory, restored.domains, restored.batch_norms, restored_optimizer, device) == 2
+        restored, restored_optimizer = training_state(affine=world_size == 2, mapped_batchnorm=True)
+        assert resume_latest(directory, restored.domains, restored.batch_norms, restored_optimizer, device,
+                             mapped_batch_norms=restored.mapped_batch_norms) == 2
         torch.testing.assert_close(torch.rand(5), expected_random, rtol=0, atol=0)
         assert_same(restored.state_dict(), model.state_dict())
         assert_same(restored_optimizer.state_dict(), optimizer.state_dict())

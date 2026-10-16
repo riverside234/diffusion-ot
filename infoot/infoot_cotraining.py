@@ -13,7 +13,7 @@ from diffusion_ot.models.generator_adaptation import (
 from infoot_helper.cotraining_checkpoint import resume_latest
 from infoot_helper.distributed.checkpoint import save_checkpoint
 from infoot_helper.distributed.data import make_loader, cycle_batches
-from infoot_helper.distributed.model import CoTrainingStep
+from infoot_helper.training_step import CoTrainingStep
 from infoot_helper.distributed.runtime import (
     setup_distributed, close_distributed, setup_logging,
     wrap_distributed, sync_batchnorm_buffers, mean_metrics,
@@ -50,8 +50,10 @@ def train(rank, world_size, device):
         "sampling_steps": 20,
         "flow_weight": 1.0,
         "contrastive_weight": 0.05,
+        "covariance_weight": 0.0,
         "batchnorm": {"affine": False, "momentum": 0.1, "eps": 1e-5},
         "batchnorm_lr": 1e-5,
+        "mapped_batchnorm": True,
     }
     if not 1 <= settings["flow_batch_size"] <= settings["batch_size"]:
         raise ValueError("flow_batch_size must be between 1 and batch_size.")
@@ -110,8 +112,10 @@ def train(rank, world_size, device):
         loaders[name] = make_loader(records, settings["batch_size"], rank, world_size)
 
     optimizer = torch.optim.Adam(parameter_groups)
+    model = CoTrainingStep(domains, batch_norms, settings)
     torch.manual_seed(42 + rank)
-    start_step = resume_latest(output_dir, domains, batch_norms, optimizer, device=device)
+    start_step = resume_latest(output_dir, domains, batch_norms, optimizer, device=device,
+                               mapped_batch_norms=model.mapped_batch_norms)
     if start_step >= settings["steps"]:
         logging.info(f"Already at step {start_step}; increase settings['steps'] to continue.")
         return
@@ -121,7 +125,7 @@ def train(rank, world_size, device):
         for parameter in group["params"]
     ]
     batches = {name: cycle_batches(loader, start_step) for name, loader in loaders.items()}
-    training_step = wrap_distributed(CoTrainingStep(domains, batch_norms, settings), device)
+    training_step = wrap_distributed(model, device)
 
     for step in range(start_step + 1, settings["steps"] + 1):
         optimizer.zero_grad(set_to_none=True)
@@ -140,20 +144,36 @@ def train(rank, world_size, device):
             ])
 
         report = step == start_step + 1 or step % 100 == 0
-        loss, metrics = training_step(latents, report=report)
+        
+        losses, metrics = training_step(latents, report=report)
+
+        loss = (
+            settings["flow_weight"] * losses["flow"]
+            + settings["infoOT_loss_weight"] * losses["infoot"]
+            + settings["contrastive_weight"] * losses["contrastive"]
+            + settings["covariance_weight"] * losses["covariance"]
+        )
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
             parameters, max_norm=1.0, error_if_nonfinite=True
         )
         optimizer.step()
-        sync_batchnorm_buffers(batch_norms)
+        sync_batchnorm_buffers(batch_norms, model.mapped_batch_norms)
 
         if report:
+            metrics["total"] = loss.detach().item()
+            metrics["cov_weighted"] = (
+                settings["covariance_weight"] * losses["covariance"]
+            ).detach().item()
             metrics = mean_metrics(metrics, device)
-            logging.info("step=%s %s", step, " ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
-
+            logging.info(
+                "step=%s %s", step,
+                " ".join(f"{key}={value:.6g}" for key, value in metrics.items()),
+            )
         if step % 200 == 0 or step == settings["steps"]:
-            save_checkpoint(output_dir, step, domains, batch_norms, optimizer, settings, device)
+            save_checkpoint(output_dir, step, domains, batch_norms, optimizer, settings, device,
+                            mapped_batch_norms=model.mapped_batch_norms)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from . import infoot
 from .batchnorm_matching import batchnorm_checkpoint
 
 
-def save_domain_checkpoints(domains, output_dir, step, batch_norms=None):
+def save_domain_checkpoints(domains, output_dir, step, batch_norms=None, mapped_batch_norms=None):
     for name, domain in domains.items():
         torch.save(
             {
@@ -15,6 +15,10 @@ def save_domain_checkpoints(domains, output_dir, step, batch_norms=None):
                 "native_flow_objective": native_flow_objective(domain.training_config),
                 "matching_batchnorm": (
                     batchnorm_checkpoint(batch_norms[name]) if batch_norms is not None else None
+                ),
+                "mapped_batchnorm_enabled": bool(mapped_batch_norms),
+                "mapped_batchnorm": (
+                    batchnorm_checkpoint(mapped_batch_norms[name]) if mapped_batch_norms else None
                 ),
             },
             output_dir / f"{name}_step_{step:06d}.pt",

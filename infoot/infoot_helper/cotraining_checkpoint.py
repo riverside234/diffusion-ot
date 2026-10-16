@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 
 from .batchnorm_matching import batchnorm_checkpoint
+from .batchnorm_matching.mapped import restore_mapped_batchnorms
 from .distributed.checkpoint import restore_random_state
 
 
@@ -13,7 +14,7 @@ def latest_checkpoint(output_dir):
     return max(paths, key=lambda path: int(path.stem[5:]), default=None)
 
 
-def resume_latest(output_dir, domains, batch_norms, optimizer, device=None):
+def resume_latest(output_dir, domains, batch_norms, optimizer, device=None, mapped_batch_norms=None):
     path = latest_checkpoint(output_dir)
     if dist.is_initialized():
         chosen = [str(path) if path is not None and dist.get_rank() == 0 else None]
@@ -22,6 +23,7 @@ def resume_latest(output_dir, domains, batch_norms, optimizer, device=None):
     if path is None:
         return 0
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    restore_mapped_batchnorms(mapped_batch_norms, checkpoint)
     for name, context in domains.items():
         norm = batch_norms[name]
         saved = checkpoint["matching_batchnorm"][name]

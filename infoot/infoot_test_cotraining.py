@@ -69,6 +69,7 @@ with torch.no_grad():
         m_cat, matching["cat"], matching["dog"], P,
         h=args.h,
     )
+    m_dog = dog.mapped_batchnorm(m_dog)
 
 records = {
     record["sample_id"]: record

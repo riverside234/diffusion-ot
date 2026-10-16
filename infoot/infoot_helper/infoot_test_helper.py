@@ -69,6 +69,9 @@ def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02, lam=0.1)
             weights="raw",
             checkpoint_path=checkpoint,
         )
+        models[name].mapped_batchnorm = load_batchnorm(
+            checkpoint, domain=name, step=step, device=device, key="mapped_batchnorm",
+        )
         features[name] = encode_paths(models[name], bank["latent_paths"])
         with torch.no_grad():
             matching[name] = batch_norms[name](features[name])

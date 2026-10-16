@@ -1,11 +1,12 @@
 import torch
 
 from diffusion_ot.models.matching_head import matching_geometry_diagnostics
-from ..batchnorm_matching import add_matching_features
-from ..encoding import encode_batches
-from ..infoot_cotraining_helper import alignment_loss, conditional_mapping, fit_transport
-from ..native_flow import native_flow_loss
-from ..translation_contrastive import translation_contrastive_loss
+from .batchnorm_matching import add_matching_features, covariance_loss
+from .batchnorm_matching.mapped import make_mapped_batchnorms
+from .encoding import encode_batches
+from .infoot_cotraining_helper import alignment_loss, conditional_mapping, fit_transport
+from .native_flow import native_flow_loss
+from .translation_contrastive import translation_contrastive_loss
 
 
 class CoTrainingStep(torch.nn.Module):
@@ -13,6 +14,7 @@ class CoTrainingStep(torch.nn.Module):
         super().__init__()
         self.branches = torch.nn.ModuleDict({name: context.branch for name, context in domains.items()})
         self.batch_norms = batch_norms
+        self.mapped_batch_norms = make_mapped_batchnorms(batch_norms, settings)
         self.domains, self.settings = domains, settings
 
     def forward(self, latents, report=False):
@@ -29,6 +31,8 @@ class CoTrainingStep(torch.nn.Module):
         }
         references = {name: batch["references"]["v"] for name, batch in encoded.items()}
         matching = {name: batch["references"]["m"] for name, batch in encoded.items()}
+        covariance = {name: covariance_loss(v) for name, v in references.items()}
+        loss_covariance = torch.stack(list(covariance.values())).mean()
         plan = fit_transport(
             matching["cat"], matching["dog"], h=settings["fit_h"],
             mi_weight=settings["mi_weight"], reg=settings["reg"], iterations=settings["fit_iterations"],
@@ -43,6 +47,8 @@ class CoTrainingStep(torch.nn.Module):
                 encoded[source]["queries"]["m"], matching[source], matching[target], coupling,
                 h=settings["projection_h"],
             )
+            if settings.get("mapped_batchnorm", False):
+                mapped_m = self.mapped_batch_norms[target](mapped_m)
             loss, _ = translation_contrastive_loss(
                 self.domains[target], encoded[source], mapped_m,
                 batch_norm=self.batch_norms[target], reference_v=references[target],
@@ -50,17 +56,30 @@ class CoTrainingStep(torch.nn.Module):
             )
             contrastive.append(loss)
         loss_contrastive = torch.stack(contrastive).mean()
-        loss = (settings["flow_weight"] * torch.stack(list(flow.values())).mean()
-                + settings["infoOT_loss_weight"] * loss_infoot
-                + settings["contrastive_weight"] * loss_contrastive)
+        losses = {
+            "flow": torch.stack(list(flow.values())).mean(),
+            "infoot": loss_infoot,
+            "contrastive": loss_contrastive,
+            "covariance": loss_covariance,
+        }
+
         metrics = {}
         if report:
-            metrics = {"flow_cat": flow["cat"], "flow_dog": flow["dog"], "infoot": loss_infoot,
-                       "contrastive": loss_contrastive, "total": loss}
+            metrics = {
+                "flow_cat": flow["cat"],
+                "flow_dog": flow["dog"],
+                "infoot": loss_infoot,
+                "contrastive": loss_contrastive,
+                "cov_cat": covariance["cat"],
+                "cov_dog": covariance["dog"],
+            }
             metrics = {key: value.detach().item() for key, value in metrics.items()}
             for name, v in references.items():
                 geometry = matching_geometry_diagnostics(v, v)
-                metrics.update({f"rank_{name}": geometry["matching_covariance_effective_rank"],
-                                f"max_rank_{name}": min(len(v) - 1, v.shape[1]),
-                                f"var_{name}": geometry["raw_code_variance"]})
-        return loss, metrics
+                metrics.update({
+                    f"rank_{name}": geometry["matching_covariance_effective_rank"],
+                    f"max_rank_{name}": min(len(v) - 1, v.shape[1]),
+                    f"var_{name}": geometry["raw_code_variance"],
+                })
+
+        return losses, metrics

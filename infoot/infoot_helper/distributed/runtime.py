@@ -43,13 +43,14 @@ def wrap_distributed(model, device):
 
 
 @torch.no_grad()
-def sync_batchnorm_buffers(batch_norms):
+def sync_batchnorm_buffers(*groups):
     """Keep local reference normalization; average running estimates for evaluation."""
     if dist.is_initialized():
-        for norm in batch_norms.values():
-            for buffer in (norm.running_mean, norm.running_var):
-                dist.all_reduce(buffer)
-                buffer.div_(dist.get_world_size())
+        for group in groups:
+            for norm in group.values():
+                for buffer in (norm.running_mean, norm.running_var):
+                    dist.all_reduce(buffer)
+                    buffer.div_(dist.get_world_size())
 
 
 def mean_metrics(metrics, device):

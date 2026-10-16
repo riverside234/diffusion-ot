@@ -27,7 +27,10 @@ def restore_random_state(checkpoint, device=None):
         logging.info("GPU count changed or per-rank RNG was absent; reseeded training streams.")
 
 
-def save_checkpoint(output_dir, step, domains, batch_norms, optimizer, settings, device):
+def save_checkpoint(output_dir, step, domains, batch_norms, optimizer, settings, device,
+                    mapped_batch_norms=None):
+    if bool(mapped_batch_norms) != settings.get("mapped_batchnorm", False):
+        raise ValueError("mapped_batchnorm setting does not match checkpoint layers.")
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     state = {"cpu": torch.get_rng_state(),
@@ -38,13 +41,15 @@ def save_checkpoint(output_dir, step, domains, batch_norms, optimizer, settings,
     else:
         states = [state]
     if rank == 0:
-        save_domain_checkpoints(domains, output_dir, step, batch_norms)
+        save_domain_checkpoints(domains, output_dir, step, batch_norms, mapped_batch_norms)
         _save_checkpoint(output_dir / f"step_{step:06d}.pt", {
             "step": step, "settings": settings, "world_size": world_size,
             "models": {name: context.branch.pdae_state_dict() for name, context in domains.items()},
             "training_configs": {name: context.training_config for name, context in domains.items()},
             "optimizer": optimizer.state_dict(), "rank_rng_states": states,
             "matching_batchnorm": {name: batchnorm_checkpoint(norm) for name, norm in batch_norms.items()},
+            "mapped_batchnorm": {name: batchnorm_checkpoint(norm)
+                                 for name, norm in (mapped_batch_norms or {}).items()},
             "batchnorm_policy": "local_references_averaged_running_statistics",
         })
         logging.info("Saved checkpoint at step %s", step)
