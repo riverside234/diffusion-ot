@@ -1,9 +1,10 @@
-"""Cached-latent data loaders and batch preparation for CNN PDAE training."""
+"""Cached validation latents and optional augmented-image training targets."""
 
 import torch
 from torch.utils.data import DataLoader
 
 from diffusion_ot.data.latent_dataset import CachedLatentDataset, collate_latent_batch
+from diffusion_ot.data.pdae_v2_augmentation import augmentation_options
 
 
 def build_loaders(config):
@@ -12,6 +13,7 @@ def build_loaders(config):
     train = config.get("train") or {}
     validation = config.get("evaluation") or {}
     seed = int(train.get("seed", 20260901))
+    augmented_targets = augmentation_options(config) is not None
 
     def make_loader(*, training):
         options = train if training else validation
@@ -22,7 +24,9 @@ def build_loaders(config):
             data_config_path=config["data_config"], domain=config["domain"],
             split=split, project_root=config["project_root"],
             limit=int(limit) if limit is not None else None,
-            random_horizontal_flip=float(data.get("random_horizontal_flip", 0.0)) if training else 0.0,
+            random_horizontal_flip=(float(data.get("random_horizontal_flip", 0.0))
+                                    if training and not augmented_targets else 0.0),
+            include_original_images=training and augmented_targets,
         )
         generator = torch.Generator().manual_seed(
             seed if training else int(validation.get("seed", seed + 1))
@@ -43,8 +47,12 @@ def build_loaders(config):
     return train_loader, validation_loader
 
 
-def prepare_batch(batch, *, device, dtype):
-    """Move cached latents to the model's device and dtype, preserving metadata."""
+def prepare_batch(batch, *, device, dtype, augmentation=None, vae=None):
+    """Optionally replace cached targets with augmented RGB encoded by the frozen VAE."""
+    if augmentation is not None:
+        if vae is None:
+            raise ValueError("Augmented-image targets require the pretrained VAE.")
+        batch, _ = augmentation.prepare_batch(batch, vae, device=device, dtype=dtype)
     return {
         **batch,
         "x0_latent": batch["x0_latent"].to(device=device, dtype=dtype, non_blocking=True),

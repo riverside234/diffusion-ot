@@ -1,4 +1,4 @@
-"""Matched RGB augmentation and online frozen-VAE targets for PDAE v2."""
+"""Matched RGB augmentation and online frozen-VAE targets for PDAE encoders."""
 from __future__ import annotations
 
 import math
@@ -17,8 +17,11 @@ def augmentation_options(config: dict) -> dict | None:
     if not options.get("enabled", False):
         return None
     encoder = config.get("encoder") or {}
-    if encoder.get("kind") != "siglip2_vit_b16" or encoder.get("input_space") != "rgb":
-        raise ValueError("Matched augmentation currently requires the PDAE v2 RGB SigLIP encoder.")
+    rgb_siglip = encoder.get("kind") == "siglip2_vit_b16" and encoder.get("input_space") == "rgb"
+    latent_cnn = (encoder.get("kind") in {"plain_cnn_v1", "residual_cnn_v1"}
+                  and encoder.get("input_space", "latent") == "latent")
+    if not (rgb_siglip or latent_cnn):
+        raise ValueError("Matched augmentation requires the PDAE v2 RGB SigLIP encoder or a latent CNN.")
     color = {"probability": .25, "brightness": .1, "contrast": .1, "saturation": .05,
              "hue": 0., **(options.get("color_jitter") or {})}
     affine = {"probability": .2, "translate": [.03, .03], "scale": [.97, 1.03],

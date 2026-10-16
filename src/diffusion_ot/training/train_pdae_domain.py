@@ -798,7 +798,7 @@ def train_pdae_domain(
         limit=int(limit) if limit is not None else None,
         validate_exists=not dry_run,
         random_horizontal_flip=0.0 if augmentation else random_horizontal_flip,
-        include_original_images=use_original_images,
+        include_original_images=use_original_images or augmentation is not None,
     )
 
     batch_size = int(dataloader_config.get("batch_size", 16))

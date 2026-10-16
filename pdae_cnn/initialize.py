@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from diffusion_ot.data.pdae_v2_augmentation import MatchedRGBAugmentation, augmentation_options
 from diffusion_ot.integrations.hf_snapshot import load_yaml_config, resolve_project_local_path
 from diffusion_ot.integrations.sit_diffusers import load_sit_components, validate_transformer_config
 from diffusion_ot.models.pdae_sit import PDAESiTBranch, build_pdae_sit_branch
@@ -20,16 +21,23 @@ class TrainingState:
     device: torch.device
     dtype: torch.dtype
     vae: torch.nn.Module | None = None
+    augmentation: MatchedRGBAugmentation | None = None
 
 
 def build_training_state(config):
     """Initialize a fresh run from the resolved configuration."""
     train = config.get("train") or {}
     ema_config = config.get("ema") or {}
+    augmentation_config = augmentation_options(config)
     torch.manual_seed(int(train.get("seed", 20260901)))
     device = torch.device(config.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
     root = config["project_root"]
     model_config = load_yaml_config(config["model_config"])
+    augmentation = (
+        MatchedRGBAugmentation(augmentation_config, use_posterior_mean=bool(
+            (model_config.get("latent_cache") or {}).get("use_posterior_mean", True)))
+        if augmentation_config is not None else None
+    )
     pretrained = resolve_project_local_path(
         config.get("pretrained_config") or model_config["pretrained"],
         root, field_name="pretrained_config",
@@ -56,7 +64,7 @@ def build_training_state(config):
         if ema_config.get("enabled", True) else None
     )
     vae = components.vae.eval().requires_grad_(False)
-    return TrainingState(branch, optimizer, ema, device, dtype, vae)
+    return TrainingState(branch, optimizer, ema, device, dtype, vae, augmentation)
 
 
 def build_optimizer(branch, train):

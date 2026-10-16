@@ -38,6 +38,22 @@ ema:
   warmup_steps: 1000
   update_every: 1
 
+# Re-encode each augmented RGB image with the frozen VAE for matched CNN/flow targets.
+augmentation:
+  enabled: true
+  vae_batch_size: 16
+  horizontal_flip_probability: 0.5
+  color_jitter:
+    probability: 0.25
+    brightness: 0.10
+    contrast: 0.10
+    saturation: 0.05
+    hue: 0.0
+  affine:
+    probability: 0.20
+    translate: [0.03, 0.03]
+    scale: [0.97, 1.03]
+
 evaluation:
   enabled: true
   split: val

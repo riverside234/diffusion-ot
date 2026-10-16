@@ -21,7 +21,10 @@ def train_step(state, batches, config, *, step):
     state.optimizer.zero_grad(set_to_none=True)
     metrics = {}
     for _ in range(accumulation):
-        batch = prepare_batch(next(batches), device=state.device, dtype=state.dtype)
+        batch = prepare_batch(
+            next(batches), device=state.device, dtype=state.dtype,
+            augmentation=state.augmentation, vae=state.vae,
+        )
         loss, values = compute_flow_loss(state.branch, batch, config)
         (loss / accumulation).backward()
         for name, value in values.items():
