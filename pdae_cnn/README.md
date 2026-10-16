@@ -1,4 +1,7 @@
-python -m pdae_cnn.train --domain cat --output-dir outputs/pdae_cnn_cat
+Either: python -m pdae_cnn.train --config configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml
+
+
+Other: python -m pdae_cnn.train --domain cat --output-dir outputs/pdae_cnn_cat
 
 
 Add `--resume` to continue from the latest checkpoint.
