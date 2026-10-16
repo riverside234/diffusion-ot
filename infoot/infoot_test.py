@@ -40,7 +40,7 @@ def generate_and_save_grid(
         device=dog.device,
         dtype=dog.model_dtype,
         generator=generator,
-    )
+    ).expand(len(v_dog), -1, -1, -1)
 
     dog_latent = integrate_pdae_flow(
         dog.branch,

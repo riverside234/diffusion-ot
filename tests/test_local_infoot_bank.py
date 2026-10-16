@@ -1,4 +1,3 @@
-from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 import runpy
@@ -93,13 +92,15 @@ def test_new_cnn_bank_fit_and_test_pipeline(local_helpers, cnn_project, monkeypa
     bank_dir = root / "data/infoot_test"
     banks = {name: torch.load(bank_dir / f"{name}_bank.pt", weights_only=True) for name in models}
     captured = {}
+    integrate_flow = stage1a_eval.integrate_pdae_flow
 
     def integrate(branch, transformer, noise, v, **kwargs):
         captured["mapped"] = v
         torch.testing.assert_close(branch.encoder.output_norm.running_mean,
                                    models["dog"].encoder.output_norm.running_mean)
-        assert not branch.encoder.training and noise.shape == (1, 4, 32, 32)
-        return torch.zeros(len(v), 4, 32, 32)
+        assert not branch.encoder.training and noise.shape == (len(v), 4, 32, 32)
+        torch.testing.assert_close(noise, noise[:1].expand_as(noise), rtol=0, atol=0)
+        return integrate_flow(branch, transformer, noise, v, **kwargs)
 
     def save_grid(grid, path, **kwargs):
         assert grid.shape == (32, 3, 32, 32) and kwargs["nrow"] == 16
@@ -117,8 +118,12 @@ def test_new_cnn_bank_fit_and_test_pipeline(local_helpers, cnn_project, monkeypa
         captured["umap"] = True
         return path
 
-    monkeypatch.setattr(sit_diffusers, "load_sit_components", lambda *a, **k:
-                        SimpleNamespace(transformer=deepcopy(FakeSiT()), vae=torch.nn.Identity()))
+    def load_components(*args, **kwargs):
+        transformer = FakeSiT()
+        transformer.pos_embed = torch.nn.Parameter(torch.zeros(1, 256, 8))
+        return SimpleNamespace(transformer=transformer, vae=torch.nn.Identity())
+
+    monkeypatch.setattr(sit_diffusers, "load_sit_components", load_components)
     monkeypatch.setattr(latent_dataset, "CachedLatentDataset", lambda **kwargs: [])
     monkeypatch.setattr(stage1a_eval, "integrate_pdae_flow", integrate)
     monkeypatch.setattr(stage1a_eval, "decode_vae_latents", lambda vae, x: x[:, :3])
