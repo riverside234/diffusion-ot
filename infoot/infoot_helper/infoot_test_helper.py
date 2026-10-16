@@ -56,6 +56,7 @@ def encode_paths(domain, paths, batch_size=32):
 
 
 def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02, lam=0.1):
+    """Re-encode training-bank latents with the co-trained models and saved BatchNorm."""
     models, features = {}, {}
     matching, batch_norms = {}, {}
 
@@ -63,7 +64,7 @@ def prepare_cotraining_test(root, banks, step, device, h=0.4, reg=0.02, lam=0.1)
         checkpoint = root / "outputs/infoot_cotraining" / f"{name}_step_{step:06d}.pt"
         batch_norms[name] = load_batchnorm(checkpoint, domain=name, step=step, device=device)
         models[name] = load_stage1a_evaluator(
-            root / f"configs/stage1a_pdae/{name}_sit_b2_lora_residual_cosmap.yaml",
+            bank.get("config_path", root / f"configs/stage1a_pdae/{name}_sit_b2_lora_residual_cosmap.yaml"),
             root / "configs/stage1a_eval/residual_sit_b2_256.yaml",
             device=device,
             weights="raw",

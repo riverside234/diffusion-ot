@@ -1,4 +1,4 @@
-"""Validate a saved CNN PDAE checkpoint and save a three-row reconstruction grid."""
+"""Validate a saved CNN PDAE checkpoint and save a four-row reconstruction grid."""
 
 import argparse
 import json

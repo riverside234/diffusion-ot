@@ -1,4 +1,4 @@
-"""Save an eight-column grid: original RGB, CFG 1.0, and CFG 1.5."""
+"""Save an eight-column grid: original RGB, null token, CFG 1.0, and CFG 1.5."""
 
 from pathlib import Path
 
@@ -12,7 +12,7 @@ from diffusion_ot.training.native_flow import native_flow_objective
 
 @torch.inference_mode()
 def save_images(state, dataset, config, *, step):
-    """Save three matched rows; call inside validation's eval/EMA context."""
+    """Save four matched rows; call inside validation's eval/EMA context."""
     if len(dataset) < 8:
         raise ValueError("Image previews require at least eight validation samples.")
     if state.vae is None:
@@ -31,7 +31,7 @@ def save_images(state, dataset, config, *, step):
     start, end = (0.0, 1.0) if flow["direction"] == "noise_to_data" else (1.0, 0.0)
     branch = state.branch
     z = branch.encode(x0)
-    for scale in (1.0, 1.5):
+    for scale in (0.0, 1.0, 1.5):
         latents = integrate_pdae_flow(
             branch, branch.semantic_transformer.base, noise, z,
             num_steps=int(options.get("image_steps", 50)), start_time=start, end_time=end,

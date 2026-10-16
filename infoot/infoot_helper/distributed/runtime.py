@@ -38,7 +38,7 @@ def wrap_distributed(model, device):
         return model
     return DistributedDataParallel(
         model, device_ids=[device.index] if device.type == "cuda" else None,
-        broadcast_buffers=False, find_unused_parameters=True,
+        forward_sync_buffers=False, find_unused_parameters=False,
     )
 
 

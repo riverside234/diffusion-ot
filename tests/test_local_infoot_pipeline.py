@@ -144,8 +144,9 @@ def test_saved_raw_plan_preserves_query_mapping_and_target_scale(local_helpers, 
 
 
 @pytest.mark.parametrize("mapped_batchnorm", [False, True])
+@pytest.mark.parametrize("saved_config", [False, True])
 def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(local_helpers, tmp_path, monkeypatch,
-                                                                            mapped_batchnorm):
+                                                                            mapped_batchnorm, saved_config):
     from infoot_helper import infoot_test_helper as helper
     from infoot_helper.batchnorm_matching import batchnorm_checkpoint
 
@@ -154,6 +155,13 @@ def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(l
         "dog": torch.tensor([[20., 10.], [50., 70.], [90., 80.]]),
     }
     models = {name: SimpleNamespace(name=name) for name in features}
+    banks = {name: {"latent_paths": [str(tmp_path / f"{name}_train.pt")],
+                    "v_bank": value * 1000,
+                    "checkpoint_path": str(tmp_path / f"{name}_pdae.pt")}
+             for name, value in features.items()}
+    if saved_config:
+        for name, bank in banks.items():
+            bank["config_path"] = str(tmp_path / f"data/infoot_test/{name}_config.yaml")
     output_dir = tmp_path / "outputs/infoot_cotraining"
     output_dir.mkdir(parents=True)
     norms = {name: torch.nn.BatchNorm1d(2, affine=False, momentum=1.) for name in features}
@@ -168,7 +176,10 @@ def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(l
                    output_dir / f"{name}_step_002000.pt")
 
     def load_model(config, evaluation, **kwargs):
+        config = Path(config)
         name = config.name.split("_")[0]
+        if saved_config:
+            assert str(config) == banks[name]["config_path"]
         assert kwargs["checkpoint_path"] == output_dir / f"{name}_step_002000.pt"
         return models[name]
 
@@ -178,11 +189,15 @@ def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(l
         assert not source.requires_grad and not target.requires_grad
         return torch.eye(3) / 3
 
+    def encode(model, paths):
+        assert paths == banks[model.name]["latent_paths"]
+        return features[model.name]
+
     monkeypatch.setattr(helper, "load_stage1a_evaluator", load_model)
-    monkeypatch.setattr(helper, "encode_paths", lambda model, paths: features[model.name])
+    monkeypatch.setattr(helper, "encode_paths", encode)
     monkeypatch.setattr(helper, "fit_transport", fit)
     result = helper.prepare_cotraining_test(
-        tmp_path, {name: {"latent_paths": []} for name in features}, 2000, "cpu"
+        tmp_path, banks, 2000, "cpu"
     )
     loaded_models, raw_banks, matching, loaded_norms, P = result
     for name in models:

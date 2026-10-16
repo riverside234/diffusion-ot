@@ -96,7 +96,7 @@ if len(paths) < count:
     raise ValueError(f"Need {count} validation latents in {latent_dir}")
 
 cat = load_stage1a_evaluator(
-    ROOT / "configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml",
+    cat_bank.get("config_path", ROOT / "configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml"),
     ROOT / "configs/stage1a_eval/residual_sit_b2_256.yaml",
     device=device,
     weights="raw",
@@ -128,7 +128,7 @@ cat_images = load_ground_truth_images(
 )
 
 dog = load_stage1a_evaluator(
-    ROOT / "configs/stage1a_pdae/dog_sit_b2_lora_residual_cosmap.yaml",
+    dog_bank.get("config_path", ROOT / "configs/stage1a_pdae/dog_sit_b2_lora_residual_cosmap.yaml"),
     ROOT / "configs/stage1a_eval/residual_sit_b2_256.yaml",
     device=device,
     weights="raw",
