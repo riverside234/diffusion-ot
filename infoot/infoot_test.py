@@ -26,6 +26,8 @@ parser.add_argument("--reg", type=float)
 parser.add_argument("--save", type=str, default="1")
 args = parser.parse_args()
 
+settings = {"mapped_batchnorm": True}
+
 @torch.inference_mode()
 def generate_and_save_grid(
     dog, v_dog, cat_image, output_path, steps=20, seed=0
@@ -108,6 +110,11 @@ with torch.no_grad():
 
     scores = solver.conditional_score(v_cat)
     v_dog = infoot.projection(scores, Xt)
+    if settings["mapped_batchnorm"]:
+        mapped_refs = infoot.projection(solver.conditional_score(Xs[:128]), Xt)
+        mapped_norm = torch.nn.BatchNorm1d(Xt.shape[1], affine=False, momentum=1.0).to(Xt)
+        mapped_norm(mapped_refs)
+        v_dog = mapped_norm.eval()(v_dog)
 
 del cat
 

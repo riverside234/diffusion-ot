@@ -19,7 +19,7 @@ def train(config, *, resume_from=None):
     from pdae_cnn.helpers.checkpoint import load_checkpoint, save_checkpoint
     from pdae_cnn.initialize import build_training_state
     from pdae_cnn.train_step import train_step
-    from pdae_cnn.validation import validate
+    from pdae_cnn.eval.validation import validate
 
     options = config.get("train") or {}
     evaluation = config.get("evaluation") or {}
@@ -56,7 +56,7 @@ def train(config, *, resume_from=None):
                             step=step, loader=train_loader)
 
     def evaluate(step):
-        print(f"validation step={step}: {validate(state, val_loader, config)}", flush=True)
+        print(f"validation step={step}: {validate(state, val_loader, config, step=step)}", flush=True)
 
     if resume_path is None:
         save(initial_step)

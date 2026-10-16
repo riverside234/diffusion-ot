@@ -19,6 +19,7 @@ class TrainingState:
     ema: TrainableEMA | None
     device: torch.device
     dtype: torch.dtype
+    vae: torch.nn.Module | None = None
 
 
 def build_training_state(config):
@@ -54,7 +55,8 @@ def build_training_state(config):
                      warmup_steps=int(ema_config.get("warmup_steps", 1000)))
         if ema_config.get("enabled", True) else None
     )
-    return TrainingState(branch, optimizer, ema, device, dtype)
+    vae = components.vae.eval().requires_grad_(False)
+    return TrainingState(branch, optimizer, ema, device, dtype, vae)
 
 
 def build_optimizer(branch, train):

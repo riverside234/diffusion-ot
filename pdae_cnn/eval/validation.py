@@ -12,7 +12,7 @@ from pdae_cnn.objective import prepare_flow_target
 
 
 @torch.no_grad()
-def validate(state, loader, config):
+def validate(state, loader, config, *, step=None):
     """Return sample-averaged MSEs while preserving training mode and RNG state.
 
     Singleton batches are omitted from the shuffled-code comparison.
@@ -32,7 +32,7 @@ def validate(state, loader, config):
     generator = torch.Generator(device=state.device).manual_seed(seed)
     loader_generator = getattr(loader, "generator", None)
     loader_rng = loader_generator.get_state() if loader_generator is not None else None
-    totals, counts = {}, {}
+    totals, counts, previews = {}, {}, {}
 
     try:
         with torch.random.fork_rng(devices=devices), parameters:
@@ -62,6 +62,10 @@ def validate(state, loader, config):
                     )
                     totals[name] = totals.get(name, 0) + mse * len(x0)
                     counts[name] = counts.get(name, 0) + len(x0)
+            if step is not None and options.get("save_images", True):
+                from pdae_cnn.eval.image import save_images
+
+                previews["images_dir"] = str(save_images(state, loader.dataset, config, step=step))
     finally:
         branch.train(was_training)
         if loader_generator is not None:
@@ -70,4 +74,4 @@ def validate(state, loader, config):
     if not counts:
         raise ValueError("Validation loader produced no batches.")
     metrics = {f"{name}_mse": float((total / counts[name]).cpu()) for name, total in totals.items()}
-    return {**metrics, "num_samples": counts["correct_z"], "use_ema": use_ema}
+    return {**metrics, "num_samples": counts["correct_z"], "use_ema": use_ema, **previews}
