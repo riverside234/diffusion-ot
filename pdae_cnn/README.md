@@ -27,6 +27,8 @@ CUDA_VISIBLE_DEVICES=1 python -m pdae_cnn.eval \
 ```
 
 This loads the run's `checkpoints/latest.pt`, prints validation metrics, and saves
-eight images to `results/step_XXXXXX/01.png` through `08.png` under the run directory.
+`results/step_XXXXXX/reconstruction_grid.png` under the run directory.
+The grid has eight images per row: original RGB, CFG 1.0, then CFG 1.5.
+Both generated rows use the same starting noise and sample order.
 Use `--output-dir` for a custom training run, `--checkpoint` for a specific checkpoint,
 or `--weights raw` to evaluate without EMA.
