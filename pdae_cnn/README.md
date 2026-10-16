@@ -11,14 +11,7 @@ The training configs are stored in `configs/stage1a_pdae/`:
 - `--domain cat` → `cat_sit_b2_lora_residual_cosmap.yaml`
 - `--domain dog` → `dog_sit_b2_lora_residual_cosmap.yaml`
 
-Both configs enable `augmentation.enabled: true`: source RGB images receive mild
-flips, color jitter, and affine transforms, then the frozen VAE re-encodes them.
-The CNN and flow target use the same new latent. This requires the original image
-dataset and its source metadata, and adds VAE encoding work during training.
-Validation uses cached, unaugmented latents. Set `augmentation.enabled: false` to
-return to cached-latent training and its configured latent flips.
 
-Validate and generate dog reconstruction images on the second GPU using
 `eval/validation.py` and `eval/image.py`:
 
 ```bash
