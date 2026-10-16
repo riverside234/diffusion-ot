@@ -1,0 +1,116 @@
+adapter:
+  bottleneck_dim: 64
+  freeze_base: true
+  injection_layers:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  lora: true
+  lora_alpha: 64
+  lora_dropout: 0.0
+  lora_layers:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  lora_rank: 64
+class_conditioning:
+  mode: null
+  null_label: 1000
+data_config: /data/not_backed_up/yxu209/diffusion-ot/configs/data/afhq_huggan.yaml
+dataloader:
+  batch_size: 64
+  drop_last: true
+  gradient_accumulation_steps: 1
+  num_workers: 4
+  pin_memory: true
+  random_horizontal_flip: 0.5
+device: cuda:0
+domain: cat
+ema:
+  decay: 0.9999
+  enabled: true
+  update_every: 1
+  warmup_steps: 1000
+encoder:
+  attention_heads: 4
+  attention_resolutions:
+  - 16
+  blocks_per_stage:
+  - 2
+  - 2
+  - 2
+  - 2
+  channels:
+  - 64
+  - 128
+  - 256
+  - 256
+  dropout: 0.0
+  input_channels: 4
+  input_size: 32
+  input_space: latent
+  kind: residual_cnn_v1
+  normalize_z: true
+  num_groups: 32
+  output_batchnorm: true
+  spatial_size: 4
+  z_dim: 512
+evaluation:
+  batch_size: 16
+  enabled: true
+  evaluate_at_start: true
+  every_steps: 1000
+  num_batches: 4
+  num_time_bins: 10
+  seed: 20260902
+  split: val
+  use_ema: true
+flow:
+  direction: noise_to_data
+  time_eps: 1.0e-05
+loss_weighting:
+  type: cosmap
+model_config: /data/not_backed_up/yxu209/diffusion-ot/configs/model/sit_b2_256.yaml
+output_dir: /data/not_backed_up/yxu209/diffusion-ot/outputs/stage1a_cat_rescnn_cosmap
+project_root: /data/not_backed_up/yxu209/diffusion-ot
+semantic_cfg:
+  drop_granularity: sample
+  dropout_probability: 0.1
+  enabled: true
+  null_condition: learned_token
+split: train
+stage: stage1a_pdae
+torch_dtype: float32
+train:
+  betas:
+  - 0.9
+  - 0.999
+  grad_clip_norm: 1.0
+  keep_step_checkpoints: true
+  log_every: 40
+  lr_adapter: 0.0001
+  lr_encoder: 0.0001
+  lr_lora: 2.5e-05
+  max_steps: 50000
+  resume_from: null
+  save_every: 1000
+  seed: 20260901
+  weight_decay: 0.0
