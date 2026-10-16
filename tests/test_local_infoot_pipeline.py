@@ -143,6 +143,27 @@ def test_saved_raw_plan_preserves_query_mapping_and_target_scale(local_helpers, 
     assert "stats" not in saved
 
 
+@pytest.mark.parametrize("count", [1, 16])
+def test_cotraining_grid_matches_noise_and_condition_batches(local_helpers, tmp_path, monkeypatch, count):
+    from PIL import Image
+    from infoot_helper import infoot_test_helper as helper
+    from test_stage1a_eval import TinyBranch, TinyTransformer
+
+    dog = SimpleNamespace(
+        device="cpu", model_dtype=torch.float32, branch=TinyBranch(),
+        transformer=TinyTransformer(), vae=None,
+        training_config={"class_conditioning": {"null_label": None}},
+    )
+    monkeypatch.setattr(helper, "decode_vae_latents", lambda vae, x: x[:, :3].sigmoid())
+    path = tmp_path / "grid.png"
+    helper.generate_and_save_grid(
+        dog, torch.randn(count, 12), torch.zeros(count, 3, 32, 32), path, steps=2,
+    )
+    assert len(dog.branch.timesteps) == 2
+    with Image.open(path) as image:
+        assert image.size == (count * 40 + 8, 88)
+
+
 @pytest.mark.parametrize("mapped_batchnorm", [False, True])
 @pytest.mark.parametrize("saved_config", [False, True])
 def test_cotraining_test_normalizes_reencoded_banks_with_saved_eval_statistics(local_helpers, tmp_path, monkeypatch,
