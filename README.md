@@ -116,13 +116,13 @@ Model weights, datasets, and training checkpoints are prepared separately.
 ```bash
 git clone https://github.com/riverside234/diffusion-ot.git
 cd diffusion-ot
-python -m venv .venv
-source .venv/bin/activate
+conda create -n diffusion-ot python=3.10 -y
+conda activate diffusion-ot
 python -m pip install -r requirements.txt
 ```
 
-The command blocks use Bash syntax. In PowerShell, activate with
-`.\.venv\Scripts\Activate.ps1` and put multiline commands on one line.
+The command blocks use Bash syntax. In PowerShell, use the same Conda activation
+command and put multiline commands on one line.
 The dependency file specifies version ranges; preserve the resolved package
 versions and CUDA environment with each experiment.
 
