@@ -1,7 +1,7 @@
 Run these commands from the repository root.
 
 
-Rebuild banks from the new cat/dog PDAE checkpoints, then refit and test:
+1/build banks from the new cat/dog PDAE checkpoints, and 2/fit and 3/test:
 
 ```bash
 python infoot/bank/bank_cat.py --checkpoint outputs/stage1a_cat_rescnn_cosmap/checkpoints/latest.pt
