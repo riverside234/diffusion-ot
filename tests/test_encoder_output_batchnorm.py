@@ -104,7 +104,7 @@ def test_output_batchnorm_requires_a_boolean(kind, invalid):
 
 
 @pytest.mark.parametrize("domain", ["cat", "dog"])
-def test_default_cnn_recipes_disable_output_batchnorm(domain):
+def test_default_cnn_recipes_enable_output_batchnorm(domain):
     root = Path(__file__).resolve().parents[1]
     recipe = root / "configs/stage1a_pdae" / f"{domain}_sit_b2_lora_residual_cosmap.yaml"
-    assert load_yaml_config(recipe)["encoder"]["output_batchnorm"] is False
+    assert load_yaml_config(recipe)["encoder"]["output_batchnorm"] is True

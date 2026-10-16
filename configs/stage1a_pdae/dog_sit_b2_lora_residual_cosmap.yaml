@@ -78,7 +78,7 @@ encoder:
   z_dim: 512
   num_groups: 32
   normalize_z: true
-  output_batchnorm: false
+  output_batchnorm: true
 
 adapter:
   freeze_base: true
