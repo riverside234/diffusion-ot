@@ -22,13 +22,8 @@ python infoot/infoot_test_cotraining.py --save cnn_bn
 ```
 
 Add `--step 2000` to test a specific co-training checkpoint instead of the latest.
-Co-training testing uses the rebuilt banks' latent paths and configuration,
-re-encodes them with the selected co-trained models, and restores their saved
-matching/mapped BatchNorm statistics from `outputs/infoot_cotraining`.
-Use co-training checkpoints with the same encoder architecture as the banks.
 
-These checkpoint paths match the CNN cosmap recipes' `output_dir` values.
-Each bank saves a frozen raw-weight
-PDAE checkpoint and its configuration under `data/infoot_test`. Encoder BatchNorm
-uses its saved running statistics in evaluation mode for both banks and queries.
-Refit the plan whenever either bank is rebuilt.
+Co-training restores their saved
+matching/mapped BatchNorm statistics from `outputs/infoot_cotraining`.
+
+PDAE checkpoint and its configuration under `data/infoot_test`.  
