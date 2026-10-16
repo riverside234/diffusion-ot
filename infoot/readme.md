@@ -1,10 +1,5 @@
 Run these commands from the repository root.
 
-Co-training:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 infoot/infoot_cotraining.py
-```
 
 Rebuild banks from the new cat/dog PDAE checkpoints, then refit and test:
 
@@ -13,6 +8,13 @@ python infoot/bank/bank_cat.py --checkpoint outputs/stage1a_cat_rescnn_cosmap/ch
 python infoot/bank/bank_dog.py --checkpoint outputs/stage1a_dog_rescnn_cosmap/checkpoints/latest.pt
 python infoot/infoot_fit.py --h 0.4 --reg 0.02 --lam 1
 python infoot/infoot_test.py --save cnn_bn
+```
+
+
+Co-training:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 infoot/infoot_cotraining.py
 ```
 
 Test the latest co-training checkpoint:
