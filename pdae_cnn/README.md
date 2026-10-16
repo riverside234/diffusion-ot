@@ -3,6 +3,8 @@ Config under (change cat/dog name):
 configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml
 ```
 
+Training Commend
+
 ```bash
 
 Either: python -m pdae_cnn.train --config configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml
