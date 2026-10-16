@@ -1,7 +1,7 @@
 Either: python -m pdae_cnn.train --config configs/stage1a_pdae/cat_sit_b2_lora_residual_cosmap.yaml
 
 
-Other: python -m pdae_cnn.train --domain cat --output-dir outputs/pdae_cnn_cat
+Or: python -m pdae_cnn.train --domain cat --output-dir outputs/pdae_cnn_cat
 
 
 Add `--resume` to continue from the latest checkpoint.
@@ -19,9 +19,7 @@ CUDA_VISIBLE_DEVICES=1 python -m pdae_cnn.eval \
   --domain dog --device cuda:0 --weights ema
 ```
 
-This loads the run's `checkpoints/latest.pt`, prints validation metrics, and saves
+loads the run's `checkpoints/latest.pt`, prints validation metrics, and saves
 `results/step_XXXXXX/reconstruction_grid.png` under the run directory.
-The grid has eight images per row: original RGB, null token (CFG 0.0), CFG 1.0,
-then CFG 1.5. All generated rows use the same starting noise and sample order.
-Use `--output-dir` for a custom training run, `--checkpoint` for a specific checkpoint,
-or `--weights raw` to evaluate without EMA.
+original RGB, null token (CFG 0.0), CFG 1.0, then CFG 1.5. same starting noise and sample order.
+ 
