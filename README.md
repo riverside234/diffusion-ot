@@ -18,13 +18,6 @@ remain open research problems.
 
 ## Results
 
-![Cat-to-dog translation: adjacent source and generated-image pairs](results/v6.5-p0/bandwidth-0.35/translation/cat_to_dog_grid_source_pairs.png)
-
-*Read each adjacent pair left to right: original cat → generated dog. These
-16 validation examples use the retained CNN v6 checkpoint at 8,000 steps,
-EMA weights, conditional-mean projection with bandwidth 0.35, and 20 sampling
-steps. The gallery shows transfer behavior alongside blur and correspondence
-errors. The default CNN v7 recipe is a separate experiment.*
 
 | Experiment | Images and supporting reports |
 | --- | --- |
